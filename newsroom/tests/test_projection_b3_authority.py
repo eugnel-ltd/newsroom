@@ -222,13 +222,14 @@ def test_source_bound_validation_is_exact_replayable_and_lookupable(
             0,
             request_digest,
         )
+        boundary = system.projections._NativeProjections__validation.__self__
         with pytest.raises(ProjectionStateError, match="differs from required"):
-            system.projections.validate_generation(
-                request, proof=proof(), required_source_ledger_seq=1
+            boundary.validate_generation(
+                request, proof(), required_source_ledger_seq=1
             )
         validation = system.projections.validate_generation(request, proof=proof())
         assert system.projections.validate_generation(
-            request, proof=proof(), required_source_ledger_seq=0
+            request, proof=proof()
         ) == validation
         assert validation.source_snapshot_digest == snapshot
         assert validation.source_watermark_ledger_seq == 0

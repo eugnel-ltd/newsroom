@@ -89,7 +89,7 @@ class NativeProjections:
         register_family: Callable[[ProjectionFamilyRegistrationRequest, AuthenticationProof], ProjectionFamilyView],
         create_generation: Callable[[ProjectionGenerationCreateRequest, AuthenticationProof], ProjectionGenerationView],
         transition_generation: Callable[[ProjectionGenerationTransitionRequest, AuthenticationProof], ProjectionGenerationView],
-        validate_generation: Callable[..., ProjectionGenerationValidationView],
+        validate_generation: Callable[[ProjectionGenerationValidationRequest, AuthenticationProof], ProjectionGenerationValidationView],
         promote_generation: Callable[[ProjectionGenerationPromotionRequest, AuthenticationProof], ProjectionGenerationPromotionView],
         record_delivery: Callable[[ProjectionDeliveryRequest, AuthenticationProof], DeliveryRecordView],
         resolve_gap: Callable[[ProjectionGapResolutionRequest, AuthenticationProof], ProjectionGapView],
@@ -123,18 +123,8 @@ class NativeProjections:
     def transition_generation(self, request: ProjectionGenerationTransitionRequest, *, proof: AuthenticationProof) -> ProjectionGenerationView:
         return self.__transition_generation(request, proof)
 
-    def validate_generation(
-        self,
-        request: ProjectionGenerationValidationRequest,
-        *,
-        proof: AuthenticationProof,
-        required_source_ledger_seq: int | None = None,
-    ) -> ProjectionGenerationValidationView:
-        return self.__validate_generation(
-            request,
-            proof,
-            required_source_ledger_seq=required_source_ledger_seq,
-        )
+    def validate_generation(self, request: ProjectionGenerationValidationRequest, *, proof: AuthenticationProof) -> ProjectionGenerationValidationView:
+        return self.__validate_generation(request, proof)
 
     def promote_generation(self, request: ProjectionGenerationPromotionRequest, *, proof: AuthenticationProof) -> ProjectionGenerationPromotionView:
         return self.__promote_generation(request, proof)
