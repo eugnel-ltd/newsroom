@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from newsroom.authority import AggregateId, ObjectAdmissionId, UtcTimestamp
-from newsroom.authority.canonical import digest_bytes
+from newsroom.authority.canonical import digest_bytes, digest_canonical
 from newsroom.control_plane.cycle import _receipt
 from newsroom.control_plane.corpus import MAX_EPISODE_BYTES
 from newsroom.control_plane.graphiti import GraphitiCycleResult
@@ -30,6 +30,8 @@ from newsroom.increment5.native_retrieval import (
     NativeRetrievalHold,
 )
 from newsroom.increment6.work_items import RetrievalInputBinding
+from newsroom.graphiti_adapter import RecoveredAmbiguousProgressionProof
+from newsroom.graphiti_adapter.types import GraphitiAdapterOutcome
 from newsroom.tests.discovery_3d_authority_helpers import proof
 from newsroom.tests.test_native_collision import _native_binding
 from newsroom.tests.test_native_graphiti import _native
@@ -120,8 +122,14 @@ class _Documents:
         self.admit_calls = []
         self.require_calls = []
         self.context_reads = []
+        self.expected_extraction_request = None
 
     def admit(self, request, *, proof):
+        if (
+            self.expected_extraction_request is not None
+            and request.extraction_request != self.expected_extraction_request
+        ):
+            raise KeyError(str(request.extraction_request.run_version_id))
         self.admit_calls.append(request)
         receipt = NativeDocumentReceipt(
             f"document-event-{len(self.admit_calls)}",
@@ -190,6 +198,7 @@ def _continuation(
     rights_check=lambda _unit: None,
     rights_inventory_digests=None,
     stale_result=False,
+    retained_attempts=None,
 ):
     class _Port:
         def retrieve(self, lead, *, proof):
@@ -253,7 +262,36 @@ def _continuation(
         port.rights_inventory_digest = rights_inventory_digest
         return port
 
+    def attempt_history(run_id, *, limit, proof):
+        retained = () if retained_attempts is None else retained_attempts.get(
+            str(run_id), ()
+        )
+        if retained:
+            return retained[:limit]
+        for exact_units in journal.units.values():
+            for unit in exact_units:
+                candidate = _evaluation_attempt_for_unit(unit)
+                if candidate.extraction_request.run_id == run_id:
+                    row = connection.execute(
+                        "SELECT receipt_json FROM unpublished_graphiti_receipts "
+                        "WHERE ingest_id=?",
+                        (unit.ingest_id,),
+                    ).fetchone()
+                    number = json.loads(row[0])["attempt_number"]
+                    candidate = _evaluation_attempt_for_unit(
+                        replace(unit, attempt_number=number)
+                    )
+                    return (SimpleNamespace(
+                        attempt_number=number,
+                        run_id=candidate.extraction_request.run_id,
+                        run_version_id=candidate.extraction_request.run_version_id,
+                        outcome=GraphitiAdapterOutcome.COMPLETE,
+                        recovered_ambiguous_progression=None,
+                    ),)
+        return ()
+
     system = SimpleNamespace(
+        graphiti=SimpleNamespace(attempt_history=attempt_history),
         extraction=SimpleNamespace(proposals=lambda *_args, **_kwargs: ()),
         entities=SimpleNamespace(),
         sources=SimpleNamespace(
@@ -272,6 +310,110 @@ def _continuation(
         port_for=port_for,
         rights_check=rights_check,
     )
+
+
+@pytest.mark.parametrize("mismatched_run_version", (False, True))
+def test_recovered_attempt_uses_admitted_extraction_identity_without_redispatch(
+    tmp_path, mismatched_run_version,
+):
+    unit = _native("recovered-retrieval")
+    connection = connect(str(tmp_path / "private.sqlite3"))
+    try:
+        journal = NativeRevisionJournal(connection)
+        journal.land((unit,))
+        journal.advance(
+            unit.revision_id,
+            stage="GRAPHITI_COMPLETE",
+            facts={"graphiti_receipts": [unit.ingest_id]},
+        )
+        _retain_complete(connection, unit, attempt_number=5)
+        third = _evaluation_attempt_for_unit(replace(unit, attempt_number=3))
+        instant = UtcTimestamp.parse("2026-09-20T12:00:00.000000Z")
+        recovery = RecoveredAmbiguousProgressionProof(
+            authoritative_attempt_id=third.attempt_id,
+            authoritative_attempt_digest=digest_canonical({"attempt": 3}),
+            authoritative_attempt_number=3,
+            authoritative_run_version_id=third.extraction_request.run_version_id,
+            authoritative_recorded_at=instant,
+            skipped_attempt_number=4,
+            skipped_receipt_digest=digest_canonical({"receipt": 4}),
+            skipped_ledger_sequence=4,
+            skipped_ledger_digest=digest_canonical({"ledger": 4}),
+            skipped_recorded_at=instant,
+            settled_usage_evidence_digest=digest_canonical({"usage": 3}),
+            recovery_marker_digest=digest_canonical({"marker": 3}),
+            marker_attempt_number=3,
+            marker_workspace_id=third.workspace_id,
+            marker_input_digest=digest_canonical({"marker-input": 3}),
+            input_binding_digest=third.extraction_request.input_binding.digest,
+            ingest_id=unit.ingest_id,
+        )
+        fifth = _evaluation_attempt_for_unit(
+            replace(unit, attempt_number=5),
+            recovered_ambiguous_progression=recovery,
+        )
+        passage = fifth.extraction_request.input_binding.passages[0]
+        journal.advance(
+            unit.revision_id,
+            stage="EMBEDDING_RETAINED",
+            facts={
+                **journal.progress[unit.revision_id]["facts"],
+                "retrieval_embeddings": {
+                    unit.ingest_id: {
+                        "state": "RETAINED",
+                        "passage_id": str(passage.passage_id),
+                        "vector_admission_id": str(ObjectAdmissionId.new()),
+                        "receipt_admission_id": str(ObjectAdmissionId.new()),
+                    }
+                },
+            },
+        )
+        retained = SimpleNamespace(
+            attempt_number=5,
+            run_id=fifth.extraction_request.run_id,
+            run_version_id=(
+                third.extraction_request.run_version_id
+                if mismatched_run_version
+                else fifth.extraction_request.run_version_id
+            ),
+            outcome=GraphitiAdapterOutcome.COMPLETE,
+            recovered_ambiguous_progression=recovery,
+        )
+        lead = _lead(unit)
+        binding, _receipt_value, context = _native_binding(tmp_path, lead)
+        documents, embedder = _Documents(), _Embedder()
+        documents.expected_extraction_request = fifth.extraction_request
+        continuation = _continuation(
+            connection,
+            journal,
+            documents,
+            embedder,
+            binding,
+            context,
+            [],
+            retained_attempts={str(fifth.extraction_request.run_id): (retained,)},
+        )
+
+        if mismatched_run_version:
+            with pytest.raises(
+                NativeRetrievalHold,
+                match="NATIVE_EXTRACTION_RECEIPT_DIFFERS",
+            ):
+                continuation.retrieve(lead, proof=proof())
+            assert embedder.calls == []
+            assert documents.admit_calls == []
+            return
+
+        assert continuation.retrieve(lead, proof=proof()).usable
+        assert embedder.calls == []
+        assert len(documents.admit_calls) == 1
+        assert (
+            documents.admit_calls[0].extraction_request
+            == fifth.extraction_request
+        )
+        assert fifth.extraction_request.version_number == 4
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(

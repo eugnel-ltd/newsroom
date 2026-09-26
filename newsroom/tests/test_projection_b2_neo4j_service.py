@@ -105,6 +105,44 @@ def _cleanup(config: Neo4jProjectorConfig, *generation_ids: ProjectionGeneration
         adapter.close()
 
 
+def test_actual_service_cleanup_batches_preserve_other_namespaces_and_labels() -> None:
+    from neo4j import GraphDatabase
+
+    config = _service_config()
+    retired, active = str(ProjectionGenerationId.new()), str(ProjectionGenerationId.new())
+    adapter = _open_neo4j_adapter(config)
+    with GraphDatabase.driver(config.uri, auth=(config.username, config.password)) as driver:
+        try:
+            with driver.session(database=config.database) as session:
+                session.run(
+                    "UNWIND range(1,2501) AS i "
+                    "CREATE (:NewsroomProjectionNode {generation_id:$retired, canonical_id:toString(i)})",
+                    retired=retired,
+                ).consume()
+                session.run(
+                    "CREATE (:NewsroomProjectionDelivery {generation_id:$active, ledger_seq:1}), "
+                    "(:NewsroomCleanupIsolationFixture {generation_id:$retired})",
+                    active=active, retired=retired,
+                ).consume()
+            assert adapter.cleanup_generation(retired) == 2_501
+            assert adapter.cleanup_generation(retired) == 0
+            with driver.session(database=config.database) as session:
+                assert session.run(
+                    "MATCH (n) WHERE n.generation_id IN [$retired,$active] "
+                    "RETURN labels(n)[0] AS label ORDER BY label",
+                    retired=retired, active=active,
+                ).value() == ["NewsroomCleanupIsolationFixture", "NewsroomProjectionDelivery"]
+        finally:
+            adapter.cleanup_generation(retired)
+            adapter.cleanup_generation(active)
+            adapter.close()
+            with driver.session(database=config.database) as session:
+                session.run(
+                    "MATCH (n:NewsroomCleanupIsolationFixture {generation_id:$retired}) DELETE n",
+                    retired=retired,
+                ).consume()
+
+
 def test_actual_service_public_round_trip_duplicate_and_generation_isolation(
     tmp_path: Path,
 ) -> None:

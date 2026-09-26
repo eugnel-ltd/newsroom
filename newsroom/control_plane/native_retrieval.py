@@ -19,7 +19,8 @@ from newsroom.authority.canonical import (
     digest_canonical,
 )
 from newsroom.entities.types import EntityResolutionProposalId
-from newsroom.extraction.types import ExtractionProposalKind
+from newsroom.extraction.types import ExtractionProposalKind, ExtractionRunId
+from newsroom.graphiti_adapter.types import GraphitiAdapterOutcome
 from newsroom.graphiti_adapter.identity import typed_id
 from newsroom.increment5.fulltext_contracts import (
     FullTextContractError,
@@ -261,8 +262,28 @@ class NativeRetrievalContinuation:
             attempt_number = terminal.get("attempt_number")
             if type(attempt_number) is not int or attempt_number < 1:
                 raise ValueError("native extraction attempt number differs")
-            attempt = _evaluation_attempt_for_unit(replace(unit, attempt_number=attempt_number))
+            retained_attempts = self._system.graphiti.attempt_history(
+                typed_id(ExtractionRunId, "run", unit.ingest_id),
+                limit=1,
+                proof=proof,
+            )
+            if len(retained_attempts) != 1:
+                raise NativeRetrievalHold("NATIVE_EXTRACTION_RECEIPT_DIFFERS")
+            retained_attempt = retained_attempts[0]
+            attempt = _evaluation_attempt_for_unit(
+                replace(unit, attempt_number=attempt_number),
+                recovered_ambiguous_progression=(
+                    retained_attempt.recovered_ambiguous_progression
+                ),
+            )
             request = attempt.extraction_request
+            if (
+                retained_attempt.attempt_number != attempt_number
+                or retained_attempt.run_id != request.run_id
+                or retained_attempt.run_version_id != request.run_version_id
+                or retained_attempt.outcome is not GraphitiAdapterOutcome.COMPLETE
+            ):
+                raise NativeRetrievalHold("NATIVE_EXTRACTION_RECEIPT_DIFFERS")
             if len(request.input_binding.passages) != 1:
                 raise NativeRetrievalHold("NATIVE_PASSAGE_PARTITION_DIFFERS")
             passage = request.input_binding.passages[0]

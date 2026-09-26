@@ -240,6 +240,7 @@ WHERE value.generation_id = $generation_id
   AND (value:NewsroomProjectionNode
        OR value:NewsroomProjectionDelivery
        OR value:NewsroomProjectionRelationIdentity)
+WITH value LIMIT $batch_size
 DETACH DELETE value
 RETURN count(value) AS deleted_count
 """
@@ -778,19 +779,27 @@ class _Neo4jAdapter:
         )
 
     def cleanup_generation(self, generation_id: str) -> int:
-        """Private deterministic cleanup for disposable development/CI state."""
+        """Reclaim one retired/disposable namespace in resumable transactions."""
 
         self._require_open()
         with self._lock:
             try:
                 with self._driver.session(database=self._config.database) as session:
-                    record = session.execute_write(
-                        lambda transaction: transaction.run(
-                            _CLEANUP_GENERATION_QUERY,
-                            {"generation_id": generation_id},
-                        ).single()
-                    )
-                return 0 if record is None else int(record["deleted_count"])
+                    deleted = 0
+                    while True:
+                        # Promotion/retirement is already authoritative. Keep
+                        # reclamation outside one generation-sized transaction;
+                        # an interruption leaves only this namespace to resume.
+                        record = session.execute_write(
+                            lambda transaction: transaction.run(
+                                _CLEANUP_GENERATION_QUERY,
+                                {"generation_id": generation_id, "batch_size": 1_000},
+                            ).single()
+                        )
+                        count = 0 if record is None else int(record["deleted_count"])
+                        deleted += count
+                        if count < 1_000:
+                            return deleted
             except Exception:
                 raise Neo4jWriteError("Neo4j generation cleanup failed") from None
 

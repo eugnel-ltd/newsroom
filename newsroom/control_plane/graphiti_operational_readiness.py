@@ -78,7 +78,10 @@ from newsroom.entities.policy import (
 )
 from newsroom.entities.types import EntityReadPolicy
 from newsroom.extraction.types import ExtractionReadPolicy
-from newsroom.graphiti_adapter import GraphitiAdapterReadPolicy
+from newsroom.graphiti_adapter import (
+    GraphitiAdapterReadPolicy,
+    RecoveredAmbiguousProgressionProof,
+)
 from newsroom.graphiti_adapter.cursor_transport import CURSOR_SDK_TRANSPORT
 from newsroom.graphiti_adapter.evaluation_attempt import (
     GRAPHITI_EVALUATION_HYDRATION_POLICY,
@@ -486,7 +489,11 @@ class OperationalAuthorityBootstrapResult:
         }
 
 
-def _evaluation_attempt_for_unit(unit: CorpusIngestUnit) -> GraphitiAttemptRequest:
+def _evaluation_attempt_for_unit(
+    unit: CorpusIngestUnit,
+    *,
+    recovered_ambiguous_progression: RecoveredAmbiguousProgressionProof | None = None,
+) -> GraphitiAttemptRequest:
     authority = unit.authority
     if authority is None:
         raise GraphitiOperationalReadinessError(
@@ -516,6 +523,7 @@ def _evaluation_attempt_for_unit(unit: CorpusIngestUnit) -> GraphitiAttemptReque
         ),
         attempt_number=unit.attempt_number,
         predecessor_episode_uuid=unit.predecessor_ingest_id,
+        recovered_ambiguous_progression=recovered_ambiguous_progression,
     )
 
 

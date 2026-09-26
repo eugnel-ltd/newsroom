@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -8,6 +10,7 @@ from newsroom.projection import ProjectionNodeType
 from newsroom.projection.neo4j import (
     Neo4jIdentityConflict,
     Neo4jReadError,
+    Neo4jWriteError,
     StructuralGraphNodeView,
 )
 from newsroom.projection.neo4j._adapter import (
@@ -86,6 +89,46 @@ def test_cleanup_is_limited_to_repository_owned_projection_labels() -> None:
     assert "value:NewsroomProjectionRelationIdentity" in _CLEANUP_GENERATION_QUERY
     assert "AND (value:" in _CLEANUP_GENERATION_QUERY
     assert "MATCH (value)\nWHERE value.generation_id" in _CLEANUP_GENERATION_QUERY
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_cleanup_commits_bounded_batches_and_resumes_after_interruption(interrupt) -> None:
+    # A retired generation is already outside the active read namespace. Its
+    # cleanup must not retain the entire generation in one Neo4j transaction.
+    remaining = 2_501
+    committed = []
+    fail_once = interrupt
+
+    def run(statement, parameters):
+        nonlocal remaining, fail_once
+        assert parameters["generation_id"] == "retired-generation"
+        assert "WITH value LIMIT $batch_size" in statement
+        assert statement.index("LIMIT $batch_size") < statement.index("DETACH DELETE")
+        assert 0 < parameters["batch_size"] <= 1_000
+        if committed and fail_once:
+            fail_once = False
+            raise RuntimeError("interrupted between committed batches")
+        deleted = min(remaining, parameters["batch_size"])
+        remaining -= deleted
+        committed.append(deleted)
+        return _SingleResult({"deleted_count": deleted})
+
+    session = SimpleNamespace(execute_write=lambda callback: callback(SimpleNamespace(run=run)))
+    adapter = _Neo4jAdapter(
+        driver=SimpleNamespace(session=lambda **kwargs: nullcontext(session)),
+        config=SimpleNamespace(database="disposable"),
+        driver_version="test",
+    )
+    if interrupt:
+        with pytest.raises(Neo4jWriteError, match="cleanup failed"):
+            adapter.cleanup_generation("retired-generation")
+        assert remaining == 1_501
+    expected_remaining = remaining
+    assert adapter.cleanup_generation("retired-generation") == expected_remaining
+    assert remaining == 0
+    assert sum(committed) == 2_501
+    assert max(committed) == 1_000
+    assert adapter.cleanup_generation("retired-generation") == 0
 
 
 def test_node_properties_never_include_driver_internal_identity() -> None:
