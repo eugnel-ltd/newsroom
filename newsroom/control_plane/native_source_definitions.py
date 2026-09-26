@@ -31,6 +31,7 @@ from newsroom.sources import (
 )
 
 from .native_evidence import PublicationRightsAssessment
+from .govuk_rights import POLICY_VERSION as GOVUK_RIGHTS_POLICY_VERSION
 
 VERSION = "hermes-native-source-definition-v1"
 MISSING_SOURCE_IDS = ("UK-02", "UK-03", "UK-05", "HK-02")
@@ -111,9 +112,9 @@ _CONTRACTS = {
 }
 
 _RIGHTS_POLICY_VERSIONS = {
-    "UK-02": "hermes-govuk-text-ogl-v1",
-    "UK-03": "hermes-govuk-text-ogl-v1",
-    "UK-05": "hermes-govuk-text-ogl-v1",
+    "UK-02": GOVUK_RIGHTS_POLICY_VERSION,
+    "UK-03": GOVUK_RIGHTS_POLICY_VERSION,
+    "UK-05": GOVUK_RIGHTS_POLICY_VERSION,
     "HK-02": "hermes-observed-portfolio-rights-v1",
 }
 

@@ -34,8 +34,9 @@ REVIEWED_TEXT = {
     LICENCE_URL: "sha256:c9f8aa884c89702fc694ea97c91d8db796e6f2a966d93f08e05731c7ab088c61",
 }
 ATTRIBUTION = "Contains public sector information licensed under the Open Government Licence v3.0."
+POLICY_VERSION = "hermes-govuk-text-ogl-v2"
 POLICY_DIGEST = digest_canonical({
-    "version": "hermes-govuk-text-ogl-v2", "reviewed_terms": REVIEWED_TEXT,
+    "version": POLICY_VERSION, "reviewed_terms": REVIEWED_TEXT,
     "use": "PUBLICATION_EVIDENCE", "scope": "GOVUK_PUBLISHED_TEXT_ONLY",
     "required_attribution": ATTRIBUTION,
     "exclusions": ["personal_data", "third_party_rights", "logos_and_insignia",
