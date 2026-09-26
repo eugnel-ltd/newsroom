@@ -997,3 +997,153 @@ def test_discovery_read_boundary_rejects_untyped_identities_before_lookup(
         for call in invalid_calls:
             with pytest.raises(TypeError, match="identity must be typed"):
                 call()
+
+
+@pytest.mark.parametrize('historical_gates', [8, 64])
+def test_current_producer_event_work_does_not_replay_historical_gates(
+    tmp_path: Path, historical_gates: int,
+) -> None:
+    database = tmp_path / 'producer-cost.sqlite3'
+    admitted = _seed_and_admit(database)
+    previous = GATE_ID
+    with open_discovery_system(database) as system:
+        for ordinal in range(2, historical_gates + 2):
+            decision_id = GateDecisionId.new()
+            system.discovery.decide_gate(replace(
+                exact_gate_request(), decision_id=decision_id,
+                decision_ordinal=ordinal, previous_decision_id=previous,
+                idempotency_key=f'producer-history-{ordinal}',
+            ), proof=proof())
+            previous = decision_id
+    connection = _transaction_connection(database)
+    try:
+        event_ids = []
+        port = _create_discovery_governing_producer_read_port(
+            connection, validate_retained_event=event_ids.append,
+        )
+        result = port.require_current_governing_producers((LEAD_ID,))
+        assert result == ((admitted.lead, admitted.signal, admitted.gate),)
+        # Signal, Lead, immutable promoting Gate, current Gate and current
+        # disposition; prior same-signal Gate history does not govern this read.
+        assert len(event_ids) == len(set(event_ids)) == 5
+        selected = {str(admitted.lead.event_id), str(admitted.signal.event_id), str(admitted.gate.event_id)}
+        selected.add(str(connection.execute(
+            'SELECT authority_event_id FROM discovery_gate_decisions WHERE decision_id=?',
+            (str(previous),),
+        ).fetchone()[0]))
+        selected.add(str(connection.execute(
+            'SELECT authority_event_id FROM lead_disposition_decisions WHERE decision_id=?',
+            (str(DISPOSITION_ID),),
+        ).fetchone()[0]))
+        assert set(event_ids) == selected
+    finally:
+        connection.execute('ROLLBACK')
+        connection.close()
+
+
+@pytest.mark.parametrize('target', ['signal', 'lead', 'promoting_gate', 'current_gate', 'disposition', 'command', 'audit', 'head'])
+def test_selected_producer_closure_rejects_corruption_with_real_event_validator(
+    tmp_path: Path, target: str,
+) -> None:
+    database = tmp_path / f'producer-closure-{target}.sqlite3'
+    _seed_and_admit(database)
+    current_id = GateDecisionId.new()
+    with open_discovery_system(database) as system:
+        system.discovery.decide_gate(replace(
+            exact_gate_request(), decision_id=current_id,
+            decision_ordinal=2, previous_decision_id=GATE_ID,
+            idempotency_key='producer-closure-current',
+        ), proof=proof())
+        store = system.discovery._GovernedDiscovery__signal.__self__._store
+        connection = store._connection
+        connection.execute('BEGIN IMMEDIATE')
+        def offline_update(table, statement, parameters):
+            triggers = connection.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+                (table,),
+            ).fetchall()
+            for name, _ in triggers:
+                connection.execute(f'DROP TRIGGER "{name}"')
+            try:
+                connection.execute(statement, parameters)
+            finally:
+                for _, sql in triggers:
+                    connection.execute(sql)
+        try:
+            if target in {'command', 'audit'}:
+                table = 'authority_commands' if target == 'command' else 'authority_audit_events'
+                column = 'idempotency_key' if target == 'command' else 'detail_digest'
+                value = 'changed-producer-command' if target == 'command' else 'sha256:' + '0' * 64
+                where = 'command_id=(SELECT command_id FROM ledger_events WHERE event_id=(SELECT authority_event_id FROM discovery_signals WHERE signal_id=?))'
+                key = str(SIGNAL_ID)
+            elif target == 'head':
+                offline_update('discovery_gate_decision_heads',
+                    'UPDATE discovery_gate_decision_heads SET current_decision_ordinal=1 WHERE signal_id=?',
+                    (str(SIGNAL_ID),),
+                )
+                table = None
+            else:
+                table, pk, key = {
+                    'signal': ('discovery_signals', 'signal_id', str(SIGNAL_ID)),
+                    'lead': ('news_leads', 'lead_id', str(LEAD_ID)),
+                    'promoting_gate': ('discovery_gate_decisions', 'decision_id', str(GATE_ID)),
+                    'current_gate': ('discovery_gate_decisions', 'decision_id', str(current_id)),
+                    'disposition': ('lead_disposition_decisions', 'decision_id', str(DISPOSITION_ID)),
+                }[target]
+                column, value, where = 'canonical_digest', 'sha256:' + '0' * 64, f'{pk}=?'
+            if table is not None:
+                offline_update(table, f'UPDATE {table} SET {column}=? WHERE {where}', (value, key))
+            port = _create_discovery_governing_producer_read_port(
+                connection, validate_retained_event=store._validate_retained_event,
+            )
+            with pytest.raises(DiscoveryContractError):
+                port.require_current_governing_producers((LEAD_ID,))
+        finally:
+            connection.execute('ROLLBACK')
+
+
+@pytest.mark.parametrize('corrupt_watch', [False, True])
+def test_selected_producer_includes_current_disposition_watch_closure(
+    tmp_path: Path, corrupt_watch: bool,
+) -> None:
+    from newsroom.discovery import LeadDispositionOutcome
+    from .discovery_3d_helpers import disposition_request, watch_request
+
+    database = tmp_path / 'producer-watch.sqlite3'
+    admitted = _seed_and_admit(database)
+    with open_discovery_system(database) as system:
+        watch = system.discovery.record_watch_condition(watch_request(), proof=proof())
+        system.discovery.record_lead_disposition(replace(
+            disposition_request(outcome=LeadDispositionOutcome.WATCH_DEFER),
+            decision_id=LeadDispositionDecisionId.new(), decision_ordinal=2,
+            previous_decision_id=DISPOSITION_ID, idempotency_key='producer-current-watch',
+            urgency_route=exact_lead_request().urgency,
+        ), proof=proof())
+        store = system.discovery._GovernedDiscovery__signal.__self__._store
+        connection = store._connection
+        connection.execute('BEGIN IMMEDIATE')
+        try:
+            if corrupt_watch:
+                trigger = _trigger_sql(connection, 'immutable_discovery_watch_conditions_update')
+                connection.execute('DROP TRIGGER immutable_discovery_watch_conditions_update')
+                connection.execute(
+                    'UPDATE discovery_watch_conditions SET canonical_digest=? WHERE watch_condition_id=?',
+                    ('sha256:' + '0' * 64, str(watch.request.watch_condition_id)),
+                )
+                connection.execute(trigger)
+            seen = []
+            def validate(event_id):
+                seen.append(event_id)
+                store._validate_retained_event(event_id)
+            port = _create_discovery_governing_producer_read_port(connection, validate_retained_event=validate)
+            if corrupt_watch:
+                with pytest.raises(DiscoveryContractError):
+                    port.require_current_governing_producers((LEAD_ID,))
+            else:
+                assert port.require_current_governing_producers((LEAD_ID,)) == (
+                    (admitted.lead, admitted.signal, admitted.gate),
+                )
+                assert str(watch.event_id) in seen
+                assert len(seen) == len(set(seen)) == 5
+        finally:
+            connection.execute('ROLLBACK')

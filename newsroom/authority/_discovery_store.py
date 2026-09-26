@@ -145,11 +145,15 @@ class _DiscoveryGoverningProducerReader:
         ):
             raise DiscoveryContractError("Lead IDs must be exact ordered unique values")
         connection = self._connection
-        _validate_discovery_reads_in_transaction(
-            connection,
-            self._object_payload_validator,
-            self._validate_retained_event,
-        )
+        if self._validate_retained_event is None:
+            _validate_discovery_reads_in_transaction(
+                connection, self._object_payload_validator,
+            )
+        selected_rows: dict[str, dict[str, sqlite3.Row]] = {}
+
+        def retain(table: str, row: sqlite3.Row) -> None:
+            selected_rows.setdefault(table, {})[str(row["authority_event_id"])] = row
+
         result: list[tuple[NewsLead, DiscoverySignal, GateDecision]] = []
         for lead_id in lead_ids:
             lead_row = _DiscoveryAuthorityStore._row(
@@ -183,6 +187,35 @@ class _DiscoveryGoverningProducerReader:
             promoting_gate = _DiscoveryAuthorityStore._gate_from_row(
                 connection, promoting_gate_row, replayed=False
             )
+            if self._validate_retained_event is not None:
+                retain("news_leads", lead_row)
+                retain("discovery_signals", signal_row)
+                retain("discovery_gate_decisions", promoting_gate_row)
+                retain("discovery_gate_decisions", current_gate_row)
+                # A recoverable Lead prefix need not yet have a disposition.
+                # Where present, retain its current decision and exact Watch /
+                # Gate references, not every superseded historical decision.
+                disposition_row = connection.execute(
+                    "SELECT d.* FROM lead_disposition_heads h "
+                    "JOIN lead_disposition_decisions d ON d.decision_id=h.current_decision_id "
+                    "WHERE h.lead_id=?", (str(lead_id),),
+                ).fetchone()
+                if disposition_row is not None:
+                    retain("lead_disposition_decisions", disposition_row)
+                    retain("discovery_gate_decisions", _DiscoveryAuthorityStore._row(
+                        connection, "discovery_gate_decisions", "decision_id",
+                        str(disposition_row["gate_decision_id"]),
+                    ))
+                    if disposition_row["watch_condition_id"] is not None:
+                        watch_row = _DiscoveryAuthorityStore._row(
+                            connection, "discovery_watch_conditions", "watch_condition_id",
+                            str(disposition_row["watch_condition_id"]),
+                        )
+                        retain("discovery_watch_conditions", watch_row)
+                        retain("discovery_gate_decisions", _DiscoveryAuthorityStore._row(
+                            connection, "discovery_gate_decisions", "decision_id",
+                            str(watch_row["gate_decision_id"]),
+                        ))
             if (
                 lead.request.signal_id != signal.request.signal_id
                 or promoting_gate.request.signal_id != signal.request.signal_id
@@ -210,12 +243,19 @@ class _DiscoveryGoverningProducerReader:
             # Candidate lineage names the immutable Gate that promoted the Lead;
             # current eligibility is independently established by current_gate.
             result.append((lead, signal, promoting_gate))
+        if self._validate_retained_event is not None:
+            _validate_discovery_domain_reads(
+                connection, self._validate_retained_event,
+                selected_rows=selected_rows,
+            )
         return tuple(result)
 
 
 def _validate_discovery_domain_reads(
     connection: sqlite3.Connection,
     validate_retained_event: Callable[[str], None],
+    *,
+    selected_rows: dict[str, dict[str, sqlite3.Row]] | None = None,
 ) -> None:
     domain_rows = (
         ("discovery_signals", _DiscoveryAuthorityStore._signal_from_row),
@@ -225,7 +265,12 @@ def _validate_discovery_domain_reads(
         ("lead_disposition_decisions", _DiscoveryAuthorityStore._disposition_from_row),
     )
     for table, decoder in domain_rows:
-        for row in connection.execute(f"SELECT * FROM {table}"):
+        rows = (
+            connection.execute(f"SELECT * FROM {table}")
+            if selected_rows is None
+            else selected_rows.get(table, {}).values()
+        )
+        for row in rows:
             validate_retained_event(str(row["authority_event_id"]))
             record = decoder(connection, row, replayed=False)
             if table == "discovery_signals":
