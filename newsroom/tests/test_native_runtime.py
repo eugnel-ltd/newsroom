@@ -67,6 +67,30 @@ def test_native_runtime_real_policy_composition_and_reopen(tmp_path, monkeypatch
     # No target row, provider invocation or fake retrieval success was created.
 
 
+def test_existing_private_target_survives_licence_markup_normalisation(tmp_path, monkeypatch):
+    from newsroom.control_plane import govuk_rights
+    from newsroom.increment10.private_serving import PrivateServingError
+
+    args = _args(tmp_path, monkeypatch)
+    # Exact pre-#1037 permission contract, not a value derived from the new code.
+    prior_policy = "sha256:e3f0f49394d325d0cf82178f3d55d0eea529e4eda4e0d95b1e385d9abe9bffec"
+    with monkeypatch.context() as prior:
+        prior.setattr(govuk_rights, "POLICY_DIGEST", prior_policy)
+        with open_native_runtime(**args):
+            pass
+    with sqlite3.connect(args["target_path"]) as connection:
+        original = connection.execute("SELECT * FROM private_serving_metadata").fetchall()
+    with open_native_runtime(**args):
+        pass
+    with sqlite3.connect(args["target_path"]) as connection:
+        assert connection.execute("SELECT * FROM private_serving_metadata").fetchall() == original
+    # A genuinely different permission contract still cannot silently bind an
+    # existing private destination; no metadata rewrite or blanket fallback.
+    monkeypatch.setattr(govuk_rights, "POLICY_DIGEST", "sha256:" + "f" * 64)
+    with pytest.raises(PrivateServingError, match="target binding differs"):
+        open_native_runtime(**args)
+
+
 def test_native_runtime_rejects_overlapping_store_identity_before_open(tmp_path, monkeypatch):
     args = _args(tmp_path, monkeypatch)
     args["target_path"] = args["authority_path"]
