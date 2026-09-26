@@ -7,6 +7,7 @@ text is a source-local HOLD, not an implicit new licence or a daemon-wide stop.
 
 from __future__ import annotations
 
+import re
 import ssl
 import urllib.error
 import urllib.request
@@ -29,12 +30,12 @@ from .veto import VetoError
 REUSE_URL = "https://www.gov.uk/help/reuse-govuk-content"
 LICENCE_URL = "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/"
 REVIEWED_TEXT = {
-    REUSE_URL: "sha256:b58998ef4b7ffc6754b6780bbec15f4b909f7662a47186329c175a86ea37d9ea",
+    REUSE_URL: "sha256:63a76fbf3f950b96dda85d879f8655f2a7248b9e613bb72d00d8047c39710bad",
     LICENCE_URL: "sha256:c9f8aa884c89702fc694ea97c91d8db796e6f2a966d93f08e05731c7ab088c61",
 }
 ATTRIBUTION = "Contains public sector information licensed under the Open Government Licence v3.0."
 POLICY_DIGEST = digest_canonical({
-    "version": "hermes-govuk-text-ogl-v1", "reviewed_terms": REVIEWED_TEXT,
+    "version": "hermes-govuk-text-ogl-v2", "reviewed_terms": REVIEWED_TEXT,
     "use": "PUBLICATION_EVIDENCE", "scope": "GOVUK_PUBLISHED_TEXT_ONLY",
     "required_attribution": ATTRIBUTION,
     "exclusions": ["personal_data", "third_party_rights", "logos_and_insignia",
@@ -83,6 +84,15 @@ class GovUkLicenceEvidence:
 def licence_text_digest(raw: bytes) -> str:
     tree = html.fromstring(raw)
     roots = tree.xpath("//main") or [tree]
+    for root in roots:
+        for node in (*root.find_class("gem-c-published-dates"), *root.find_class("gem-c-metadata")):
+            # GOV.UK changed its date component without changing the terms.
+            # Exclude only the known date display, never arbitrary class content.
+            if re.fullmatch(
+                r"(?:Updates to this page )?Last updated:? \d{1,2} [A-Z][a-z]+ \d{4}",
+                " ".join(" ".join(node.itertext()).split()),
+            ):
+                node.drop_tree()  # Preserve any substantive following tail text.
     text = " ".join(" ".join(root.text_content().split()) for root in roots)
     return digest_bytes(text.encode("utf-8"))
 
