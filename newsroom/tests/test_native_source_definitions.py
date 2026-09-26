@@ -57,7 +57,7 @@ def test_missing_native_source_definitions_are_typed_exact_and_replayable():
         assert first.version.rights.rights_decision_id
         assert first.version.rights.rights_policy_version == (
             "hermes-observed-portfolio-rights-v1"
-            if source_id == "HK-02" else "hermes-govuk-text-ogl-v1"
+            if source_id == "HK-02" else "hermes-govuk-text-ogl-v2"
         )
 
 

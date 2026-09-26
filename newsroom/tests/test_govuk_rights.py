@@ -58,6 +58,24 @@ def test_licence_substantive_text_changes_are_detected():
     assert first != rights.licence_text_digest(b"<main>Re-use is prohibited.</main>")
 
 
+@pytest.mark.parametrize("metadata", [
+    b'<div class="gem-c-published-dates"><h2>Updates to this page</h2>Last updated 9 December 2022</div>',
+    b'<div class="gem-c-metadata"><dl><dt>Last updated:</dt><dd>9 December 2022</dd></dl></div>',
+])
+def test_licence_digest_ignores_only_recognised_publication_date_chrome(metadata):
+    terms = b"<h1>Reuse policy</h1><p>Re-use is permitted with attribution.</p>"
+    expected = rights.licence_text_digest(b"<main>" + terms + b"</main>")
+    assert rights.licence_text_digest(b"<main>" + terms + metadata + b"</main>") == expected
+    # Substantive text inside recognised chrome, following it, or elsewhere
+    # remains part of the reviewed contract. A CSS class is not a bypass.
+    for changed in (
+        metadata.replace(b"2022", b"2022. Commercial use is prohibited."),
+        metadata + b"Commercial use is prohibited.",
+        metadata.replace(b"gem-c-", b"unknown-"),
+    ):
+        assert rights.licence_text_digest(b"<main>" + terms + changed + b"</main>") != expected
+
+
 @pytest.mark.parametrize("stop_at", [1, 2])
 def test_licence_fence_veto_propagates_before_partial_retention(monkeypatch, stop_at):
     raw = b"<main>Reviewed fixture terms.</main>"
