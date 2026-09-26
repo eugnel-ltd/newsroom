@@ -974,13 +974,17 @@ class _Increment4Neo4jBoundary:
             generation_id=validation.generation_id, family=family,
         ):
             raise ProjectionStateError("Increment 4 source changed during ACTIVE replay")
+        historical_batches = tuple(
+            batch for batch in batches
+            if batch.ledger_seq <= validation.checkpoint_ledger_seq
+        )
         return self._result(
             request=replace(request, generation_id=validation.generation_id),
             snapshot_digest=validation.source_snapshot_digest,
             source_watermark=validation.source_watermark_ledger_seq,
-            batches=tuple(b for b in batches if b.ledger_seq <= validation.checkpoint_ledger_seq),
+            batches=historical_batches,
             deleted_target=0,
-            ignored=validation.source_watermark_ledger_seq - len(batches),
+            ignored=validation.source_watermark_ledger_seq - len(historical_batches),
             validation=validation,
             promotion=self._promotion_for_generation(validation.generation_id),
             state_digest=validation.projection_state_digest,

@@ -24,6 +24,7 @@ from newsroom.control_plane.graphiti_admission import (
     GraphitiProjectionReconciliationReceipt,
     GraphitiProjectionReceipt,
     GraphitiProposalAdmissionAction,
+    graphiti_projection_reconciliation_from_json,
 )
 from newsroom.control_plane.store import (
     connect,
@@ -1723,6 +1724,15 @@ def test_active_generation_extension_retains_each_exact_cohort_and_replays(
     assert consumer.telemetry().projection_reconciled is True
 
     retained = tuple(rows)
+    drifted_envelope = json.loads(str(retained[0][1]))
+    drifted_envelope["projection_state_digest"] = DIGEST_A
+    with pytest.raises(
+        GraphitiAdmissionConsumerError,
+        match="source binding differs",
+    ):
+        graphiti_projection_reconciliation_from_json(
+            canonical_json_bytes(drifted_envelope).decode()
+        )
     assert consumer.finalise_decided_cohort(
         ingest_ids=(first_id,)
     ) == GraphitiAdmissionDrainReport()

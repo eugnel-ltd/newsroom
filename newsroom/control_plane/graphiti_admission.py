@@ -1482,10 +1482,42 @@ def graphiti_projection_reconciliation_from_json(
                 "exact reconciliation generation identity differs"
             )
     elif binding is not None:
+        cohort_digest = str(binding["cohort_digest"])
+        fallback_generation_id = str(
+            typed_id(
+                ProjectionGenerationId,
+                GRAPHITI_ADMISSION_GENERATION_IDENTITY_VERSION,
+                cohort_digest,
+            )
+        )
+        expected_source_request_digest = digest_canonical(
+            {
+                "generation_id": fallback_generation_id,
+                "reason_code": "GRAPHITI_ADMISSION_COHORT",
+                "idempotency_key": f"graphiti-generation:{cohort_digest}",
+                "purge_retired_generation": True,
+                "allow_active_extension": True,
+            }
+        )
+        reconstructed = GraphitiProjectionGenerationResult(
+            cohort_digest=cohort_digest,
+            generation_id=receipt.generation_id,
+            source_snapshot_digest=str(binding["source_snapshot_digest"]),
+            authority_watermark=receipt.authority_watermark,
+            validation_digest=str(binding["validation_digest"]),
+            promotion_digest=str(binding["promotion_digest"]),
+            reconciliation_digest=str(binding["projection_state_digest"]),
+            admitted_authority_ids=receipt.expected_effect_ids,
+            schema_version=GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
+            source_request_digest=str(binding["source_request_digest"]),
+        )
         if (
             receipt.authority_watermark
             != binding["source_watermark_ledger_seq"]
-            or receipt.receipt_digest != binding["generation_result_digest"]
+            or binding["source_request_digest"]
+            != expected_source_request_digest
+            or reconstructed.digest != binding["generation_result_digest"]
+            or receipt.receipt_digest != reconstructed.digest
         ):
             raise GraphitiAdmissionConsumerError(
                 "active extension reconciliation source binding differs"

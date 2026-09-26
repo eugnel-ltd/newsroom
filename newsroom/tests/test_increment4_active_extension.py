@@ -97,6 +97,9 @@ def test_suffix_only_and_exact_historical_replay_after_later_validation(initial)
     assert replay.source_watermark_ledger_seq == second.source_watermark_ledger_seq
     assert replay.projection_state_digest == second.projection_state_digest
     assert commands(state) == before_replay
+    initial_replay = build(state, adapter, request())
+    assert initial_replay.projected_batch_count == first.projected_batch_count
+    assert initial_replay.ignored_optional_count == first.ignored_optional_count
     with pytest.raises(ProjectionStateError, match='request'):
         build(state, adapter, replace(request(G2, 'suffix'), reason_code='ALTERED'))
 

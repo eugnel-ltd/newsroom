@@ -26,6 +26,7 @@ from newsroom.control_plane.graphiti_admission import (
     GraphitiAdmissionRequest,
     GraphitiGovernedDecision,
     GraphitiProposalAuthorityBinding,
+    GraphitiProjectionGenerationResult,
     GraphitiProjectionReceipt,
     graphiti_admission_generation_identity,
 )
@@ -311,10 +312,35 @@ def _seed_entity(
             generation_id = (
                 GENERATION_ID if active_extension else derived_generation_id
             )
-        generation_result_digest = (
+        source_request_digest = (
             digest_canonical(
-                {"generation_id": generation_id, "cohort_digest": cohort_digest}
+                {
+                    "generation_id": derived_generation_id,
+                    "reason_code": "GRAPHITI_ADMISSION_COHORT",
+                    "idempotency_key": f"graphiti-generation:{cohort_digest}",
+                    "purge_retired_generation": True,
+                    "allow_active_extension": True,
+                }
             )
+            if active_extension
+            else None
+        )
+        projection_state_digest = digest_canonical(
+            {"projection": cohort_digest}
+        )
+        generation_result_digest = (
+            GraphitiProjectionGenerationResult(
+                cohort_digest=str(cohort_digest),
+                generation_id=generation_id,
+                source_snapshot_digest=DIGEST_A,
+                authority_watermark=101,
+                validation_digest=DIGEST_B,
+                promotion_digest=DIGEST_C,
+                reconciliation_digest=projection_state_digest,
+                admitted_authority_ids=("effect:entity.0001",),
+                schema_version=GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
+                source_request_digest=source_request_digest,
+            ).digest
             if active_extension
             else DIGEST_A
         )
@@ -339,11 +365,7 @@ def _seed_entity(
             generation_result_digest=(
                 generation_result_digest if exact_binding else None
             ),
-            source_request_digest=(
-                digest_canonical({"request": cohort_digest})
-                if active_extension
-                else None
-            ),
+            source_request_digest=source_request_digest,
         )
         if exact_binding:
             projection_material = projection.canonical_value()
@@ -402,9 +424,7 @@ def _seed_entity(
                         "validation_digest": DIGEST_B,
                         "promotion_digest": DIGEST_C,
                         "generation_result_digest": generation_result_digest,
-                        "projection_state_digest": digest_canonical(
-                            {"projection": cohort_digest}
-                        ),
+                        "projection_state_digest": projection_state_digest,
                     }
                 )
             connection.execute(
@@ -585,8 +605,33 @@ def _seed_exact_all_hold_cohort(
         ),
     )
     generation_id = active_generation_id or derived_generation_id
-    generation_result_digest = digest_canonical(
-        {"generation_id": generation_id, "cohort_digest": cohort_digest}
+    source_request_digest = digest_canonical(
+        {
+            "generation_id": derived_generation_id,
+            "reason_code": "GRAPHITI_ADMISSION_COHORT",
+            "idempotency_key": f"graphiti-generation:{cohort_digest}",
+            "purge_retired_generation": True,
+            "allow_active_extension": True,
+        }
+    )
+    projection_state_digest = digest_canonical(
+        {"projection": cohort_digest}
+    )
+    generation_result_digest = (
+        GraphitiProjectionGenerationResult(
+            cohort_digest=cohort_digest,
+            generation_id=generation_id,
+            source_snapshot_digest=DIGEST_A,
+            authority_watermark=102,
+            validation_digest=DIGEST_B,
+            promotion_digest=DIGEST_C,
+            reconciliation_digest=projection_state_digest,
+            admitted_authority_ids=(),
+            schema_version=GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
+            source_request_digest=source_request_digest,
+        ).digest
+        if active_generation_id is not None
+        else DIGEST_C
     )
     reconciliation = {
         "generation_id": generation_id,
@@ -614,15 +659,11 @@ def _seed_exact_all_hold_cohort(
             {
                 "source_snapshot_digest": DIGEST_A,
                 "source_watermark_ledger_seq": 102,
-                "source_request_digest": digest_canonical(
-                    {"request": cohort_digest}
-                ),
+                "source_request_digest": source_request_digest,
                 "validation_digest": DIGEST_B,
                 "promotion_digest": DIGEST_C,
                 "generation_result_digest": generation_result_digest,
-                "projection_state_digest": digest_canonical(
-                    {"projection": cohort_digest}
-                ),
+                "projection_state_digest": projection_state_digest,
             }
         )
     connection.execute(
@@ -969,6 +1010,41 @@ def test_source_bound_extension_receipt_hydrates_without_cohort_generation_alias
     assert context.projection_generation_id == GENERATION_ID
     assert len(context.items) == 1
     assert context.items[0].projection_generation_id == GENERATION_ID
+
+
+def test_source_bound_extension_context_rejects_rehashed_state_label(
+    tmp_path,
+) -> None:
+    connection = connect(str(tmp_path / "extension-state-drift.sqlite3"))
+    _seed_entity(connection, exact_binding=True, active_extension=True)
+    retained = connection.execute(
+        "SELECT receipt_digest,receipt_json FROM "
+        "unpublished_graphiti_projection_reconciliations"
+    ).fetchone()
+    envelope = json.loads(str(retained[1]))
+    envelope["projection_state_digest"] = digest_canonical(
+        {"forged": "projection-state"}
+    )
+    connection.execute(
+        "DROP TRIGGER immutable_graphiti_projection_reconciliations_update"
+    )
+    connection.execute(
+        "UPDATE unpublished_graphiti_projection_reconciliations "
+        "SET receipt_json=? WHERE receipt_digest=?",
+        (canonical_json_bytes(envelope).decode(), retained[0]),
+    )
+    connection.commit()
+
+    context = GovernedContextHydrator(
+        connection,
+        authority=_CurrentAuthority(),
+        rights=_Rights(),
+        clock=lambda: NOW,
+    ).hydrate()
+
+    assert context.status is GovernedContextStatus.HOLD
+    assert context.reason_code == "AMBIGUOUS_PROJECTION_WATERMARK"
+    assert context.items == ()
 
 
 def test_exact_all_hold_generation_is_the_empty_context_generation(tmp_path) -> None:
