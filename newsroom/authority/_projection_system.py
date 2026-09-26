@@ -4,7 +4,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ._capability import _CapabilityIssuer
+from ._capability import _CapabilityIssuer, _derive_idempotency_namespace
 from ._event_system import _ReadBoundary
 from ._projection_store import _ProjectionAuthorityStore
 from ._security import _AuthorizationRequest
@@ -44,6 +44,7 @@ from newsroom.projection.policy import (
     PROJECTION_COMMAND_TYPES,
     ProjectionContractRegistry,
     merge_projection_authority_registries,
+    projection_command_definitions,
 )
 
 
@@ -303,19 +304,36 @@ class _ProjectionBoundary:
         *,
         required_source_ledger_seq: int | None = None,
     ) -> ProjectionGenerationValidationView:
+        source_bound = request.source_snapshot_digest is not None
+        if source_bound:
+            if required_source_ledger_seq is None:
+                required_source_ledger_seq = request.source_watermark_ledger_seq
+            elif required_source_ledger_seq != request.source_watermark_ledger_seq:
+                raise ProjectionStateError(
+                    "validation source binding differs from required watermark"
+                )
+        payload = {
+            "generation_id": str(request.generation_id),
+            "checkpoint_ledger_seq": request.checkpoint_ledger_seq,
+            "service_compatibility_digest": request.service_compatibility_digest,
+            "projection_state_digest": request.projection_state_digest,
+            "reason_code": request.reason_code,
+        }
+        if source_bound:
+            payload.update(
+                source_snapshot_digest=request.source_snapshot_digest,
+                source_watermark_ledger_seq=request.source_watermark_ledger_seq,
+                source_request_digest=request.source_request_digest,
+            )
         grant = self._grant(
-            command_type="projection.generation.validate",
+            command_type=(
+                "projection.generation.validate-current"
+                if source_bound
+                else "projection.generation.validate"
+            ),
             aggregate_id=request.generation_id.as_aggregate_id(),
             expected_version=request.expected_authority_version,
-            payload={
-                "generation_id": str(request.generation_id),
-                "checkpoint_ledger_seq": request.checkpoint_ledger_seq,
-                "service_compatibility_digest": (
-                    request.service_compatibility_digest
-                ),
-                "projection_state_digest": request.projection_state_digest,
-                "reason_code": request.reason_code,
-            },
+            payload=payload,
             idempotency_key=request.idempotency_key,
             proof=proof,
         )
@@ -329,7 +347,21 @@ class _ProjectionBoundary:
             projection_state_digest=request.projection_state_digest,
             reason_code=request.reason_code,
             required_source_ledger_seq=required_source_ledger_seq,
+            source_snapshot_digest=request.source_snapshot_digest,
+            source_watermark_ledger_seq=request.source_watermark_ledger_seq,
+            source_request_digest=request.source_request_digest,
         )
+
+    def validation_idempotency_namespace(
+        self, proof: AuthenticationProof
+    ) -> str:
+        _, authentication = self._authenticate(proof)
+        definition = next(
+            item
+            for item in projection_command_definitions()
+            if item.command_type == "projection.generation.validate-current"
+        )
+        return _derive_idempotency_namespace(authentication, definition)
 
     def _authorize_promotion(
         self,

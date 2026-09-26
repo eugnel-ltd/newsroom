@@ -248,6 +248,9 @@ class ProjectionGenerationValidationView:
     authority_aggregate_version: int
     authority_event_id: EventId
     recorded_at: UtcTimestamp
+    source_snapshot_digest: str | None = None
+    source_watermark_ledger_seq: int | None = None
+    source_request_digest: str | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -259,6 +262,27 @@ class ProjectionGenerationValidationView:
             ("projection_state_digest", self.projection_state_digest),
         ):
             validate_sha256_digest(value, field=field_name)
+        source_values = (
+            self.source_snapshot_digest,
+            self.source_watermark_ledger_seq,
+            self.source_request_digest,
+        )
+        if any(value is not None for value in source_values):
+            if any(value is None for value in source_values):
+                raise ProjectionContractError("validation source binding must be complete")
+            for field_name, value in (
+                ("source_snapshot_digest", self.source_snapshot_digest),
+                ("source_request_digest", self.source_request_digest),
+            ):
+                validate_sha256_digest(value, field=field_name)  # type: ignore[arg-type]
+            require_non_negative_sequence(
+                self.source_watermark_ledger_seq,  # type: ignore[arg-type]
+                field="source_watermark_ledger_seq",
+            )
+            if self.source_watermark_ledger_seq > self.checkpoint_ledger_seq:  # type: ignore[operator]
+                raise ProjectionContractError(
+                    "validation source watermark exceeds checkpoint"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,6 +435,9 @@ class ProjectionGenerationValidationRequest:
     projection_state_digest: str
     reason_code: str
     idempotency_key: str
+    source_snapshot_digest: str | None = None
+    source_watermark_ledger_seq: int | None = None
+    source_request_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.generation_id, ProjectionGenerationId):
@@ -430,6 +457,31 @@ class ProjectionGenerationValidationRequest:
                 raise ProjectionContractError(f"{field_name} must be canonical lowercase")
         require_reason(self.reason_code)
         require_idempotency_key(self.idempotency_key)
+        source_values = (
+            self.source_snapshot_digest,
+            self.source_watermark_ledger_seq,
+            self.source_request_digest,
+        )
+        if any(value is not None for value in source_values):
+            if any(value is None for value in source_values):
+                raise ProjectionContractError("validation source binding must be complete")
+            for field_name, value in (
+                ("source_snapshot_digest", self.source_snapshot_digest),
+                ("source_request_digest", self.source_request_digest),
+            ):
+                normalized = validate_sha256_digest(value, field=field_name)  # type: ignore[arg-type]
+                if normalized != value:
+                    raise ProjectionContractError(
+                        f"{field_name} must be canonical lowercase"
+                    )
+            require_non_negative_sequence(
+                self.source_watermark_ledger_seq,  # type: ignore[arg-type]
+                field="source_watermark_ledger_seq",
+            )
+            if self.source_watermark_ledger_seq > self.checkpoint_ledger_seq:  # type: ignore[operator]
+                raise ProjectionContractError(
+                    "validation source watermark exceeds checkpoint"
+                )
 
 
 @dataclass(frozen=True, slots=True)

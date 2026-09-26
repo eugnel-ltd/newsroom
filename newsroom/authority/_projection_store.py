@@ -54,6 +54,7 @@ from newsroom.projection.models import (
     ProjectionGenerationView,
     ProjectionStateError,
     ProjectionStatusMetadata,
+    require_idempotency_key,
 )
 from newsroom.projection.policy import ProjectionContractRegistry
 
@@ -953,8 +954,51 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                 )
 
     @staticmethod
-    def _validation_canonical_value(row: sqlite3.Row) -> dict[str, object]:
-        return {
+    def _validation_source_binding(
+        row: sqlite3.Row,
+    ) -> tuple[str | None, int | None, str | None]:
+        try:
+            value = json.loads(bytes(row["canonical_bytes"]))
+        except (TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise AuthorityPersistenceError(
+                "projection generation validation canonical value is invalid"
+            ) from exc
+        names = (
+            "source_snapshot_digest",
+            "source_watermark_ledger_seq",
+            "source_request_digest",
+        )
+        present = tuple(name in value for name in names)
+        if any(present) and not all(present):
+            raise AuthorityPersistenceError(
+                "projection generation validation source binding is incomplete"
+            )
+        if not any(present):
+            return None, None, None
+        try:
+            snapshot = validate_sha256_digest(
+                value[names[0]], field=names[0]
+            )
+            watermark_value = value[names[1]]
+            if isinstance(watermark_value, bool) or not isinstance(
+                watermark_value, int
+            ):
+                raise ValueError("source watermark must be an integer")
+            watermark = watermark_value
+            request = validate_sha256_digest(value[names[2]], field=names[2])
+        except (TypeError, ValueError) as exc:
+            raise AuthorityPersistenceError(
+                "projection generation validation source binding is invalid"
+            ) from exc
+        if watermark < 0 or watermark > int(row["checkpoint_ledger_seq"]):
+            raise AuthorityPersistenceError(
+                "projection generation validation source watermark is invalid"
+            )
+        return snapshot, watermark, request
+
+    @classmethod
+    def _validation_canonical_value(cls, row: sqlite3.Row) -> dict[str, object]:
+        value: dict[str, object] = {
             "generation_id": str(row["generation_id"]),
             "validation_version": int(row["validation_version"]),
             "lifecycle_version": int(row["lifecycle_version"]),
@@ -972,6 +1016,70 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
             ),
             "authority_event_id": str(row["authority_event_id"]),
         }
+        snapshot, watermark, request = cls._validation_source_binding(row)
+        if snapshot is not None:
+            value.update(
+                source_snapshot_digest=snapshot,
+                source_watermark_ledger_seq=watermark,
+                source_request_digest=request,
+            )
+        return value
+
+    def _validate_validation_command_binding(
+        self, conn: sqlite3.Connection, row: sqlite3.Row
+    ) -> None:
+        source_snapshot, source_watermark, source_request = (
+            self._validation_source_binding(row)
+        )
+        command_type = (
+            "projection.generation.validate-current"
+            if source_snapshot is not None
+            else "projection.generation.validate"
+        )
+        command = conn.execute(
+            "SELECT c.command_type,c.aggregate_type,c.aggregate_id,"
+            "c.expected_aggregate_version,c.idempotency_key,p.payload_bytes "
+            "FROM ledger_events e JOIN authority_commands c "
+            "ON c.command_id=e.command_id JOIN authority_payloads p "
+            "ON p.payload_id=c.payload_id WHERE e.event_id=?",
+            (str(row["authority_event_id"]),),
+        ).fetchone()
+        version = conn.execute(
+            "SELECT reason_code FROM projection_generation_versions "
+            "WHERE authority_event_id=?",
+            (str(row["authority_event_id"]),),
+        ).fetchone()
+        if version is None:
+            raise AuthorityPersistenceError(
+                "projection generation validation version is absent"
+            )
+        payload: dict[str, object] = {
+            "generation_id": str(row["generation_id"]),
+            "checkpoint_ledger_seq": int(row["checkpoint_ledger_seq"]),
+            "service_compatibility_digest": str(
+                row["service_compatibility_digest"]
+            ),
+            "projection_state_digest": str(row["projection_state_digest"]),
+            "reason_code": str(version[0]),
+        }
+        if source_snapshot is not None:
+            payload.update(
+                source_snapshot_digest=source_snapshot,
+                source_watermark_ledger_seq=source_watermark,
+                source_request_digest=source_request,
+            )
+        if (
+            command is None
+            or str(command["command_type"]) != command_type
+            or str(command["aggregate_type"]) != "projection_generation"
+            or str(command["aggregate_id"]) != str(row["generation_id"])
+            or int(command["expected_aggregate_version"])
+            != int(row["authority_aggregate_version"]) - 1
+            or bytes(command["payload_bytes"]) != canonical_json_bytes(payload)
+        ):
+            raise AuthorityPersistenceError(
+                "projection generation validation command binding is inconsistent"
+            )
 
     @staticmethod
     def _promotion_canonical_value(row: sqlite3.Row) -> dict[str, object]:
@@ -1017,6 +1125,7 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                 raise AuthorityPersistenceError(
                     "projection generation validation digest is inconsistent"
                 )
+            self._validate_validation_command_binding(conn, row)
             generation = self._generation_row(
                 conn, str(row["generation_id"])
             )
@@ -1787,6 +1896,9 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
         projection_state_digest: str,
         reason_code: str,
         required_source_ledger_seq: int | None = None,
+        source_snapshot_digest: str | None = None,
+        source_watermark_ledger_seq: int | None = None,
+        source_request_digest: str | None = None,
     ) -> ProjectionGenerationValidationView:
         with self._lock, self._transaction() as conn:
             result = self._commit_grant_in_transaction(
@@ -1797,6 +1909,14 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                 checkpoint_ledger_seq=checkpoint_ledger_seq,
                 required_source_ledger_seq=required_source_ledger_seq,
             )
+            if (
+                source_watermark_ledger_seq is not None
+                and required_source_ledger_seq is not None
+                and source_watermark_ledger_seq != required_source_ledger_seq
+            ):
+                raise ProjectionStateError(
+                    "validation source binding must use the exact required watermark"
+                )
             if result.replayed:
                 return self._validation_for_authority_event(conn, result.event_id)
             current = self._generation_row(conn, str(generation_id))
@@ -1854,6 +1974,12 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                 "authority_aggregate_version": result.aggregate_version,
                 "authority_event_id": str(result.event_id),
             }
+            if source_snapshot_digest is not None:
+                canonical_value.update(
+                    source_snapshot_digest=source_snapshot_digest,
+                    source_watermark_ledger_seq=source_watermark_ledger_seq,
+                    source_request_digest=source_request_digest,
+                )
             canonical = canonical_json_bytes(canonical_value)
             validation_digest = digest_bytes(canonical)
             conn.execute(
@@ -3065,14 +3191,18 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
             updated_at=UtcTimestamp.parse(str(row["recorded_at"])),
         )
 
-    @staticmethod
+    @classmethod
     def _validation_view_from_row(
+        cls,
         row: sqlite3.Row | None,
     ) -> ProjectionGenerationValidationView:
         if row is None:
             raise AuthorityPersistenceError(
                 "projection validation evidence is absent"
             )
+        source_snapshot, source_watermark, source_request = (
+            cls._validation_source_binding(row)
+        )
         return ProjectionGenerationValidationView(
             validation_digest=str(row["validation_digest"]),
             generation_id=ProjectionGenerationId.parse(
@@ -3094,6 +3224,9 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
             ),
             authority_event_id=EventId.parse(str(row["authority_event_id"])),
             recorded_at=UtcTimestamp.parse(str(row["recorded_at"])),
+            source_snapshot_digest=source_snapshot,
+            source_watermark_ledger_seq=source_watermark,
+            source_request_digest=source_request,
         )
 
     def _validation_for_authority_event(
@@ -4059,6 +4192,47 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                     (str(generation_id),),
                 ).fetchone()
             )
+
+    def projection_generation_validation_for_key(
+        self, idempotency_namespace: str, idempotency_key: str
+    ) -> ProjectionGenerationValidationView | None:
+        validate_sha256_digest(
+            idempotency_namespace, field="idempotency_namespace"
+        )
+        require_idempotency_key(idempotency_key)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT v.* FROM authority_commands c "
+                "LEFT JOIN ledger_events e ON e.command_id=c.command_id "
+                "LEFT JOIN projection_generation_validations v "
+                "ON v.authority_event_id=e.event_id "
+                "WHERE c.idempotency_namespace=? AND c.idempotency_key=? "
+                "AND c.command_type IN (?,?)",
+                (
+                    idempotency_namespace,
+                    idempotency_key,
+                    "projection.generation.validate",
+                    "projection.generation.validate-current",
+                ),
+            ).fetchall()
+            if not rows:
+                return None
+            if len(rows) != 1 or rows[0]["validation_digest"] is None:
+                raise AuthorityPersistenceError(
+                    "projection validation idempotency key is ambiguous"
+                )
+            canonical = canonical_json_bytes(
+                self._validation_canonical_value(rows[0])
+            )
+            if (
+                bytes(rows[0]["canonical_bytes"]) != canonical
+                or str(rows[0]["validation_digest"]) != digest_bytes(canonical)
+            ):
+                raise AuthorityPersistenceError(
+                    "projection generation validation digest is inconsistent"
+                )
+            self._validate_validation_command_binding(self._connection, rows[0])
+            return self._validation_view_from_row(rows[0])
 
     def projection_promotions(
         self, family_id: str, limit: int

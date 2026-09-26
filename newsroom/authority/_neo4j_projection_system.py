@@ -66,6 +66,7 @@ from newsroom.projection.models import (
     ProjectionReadPolicy,
     ProjectionStateError,
 )
+from newsroom.increment4.contracts import INCREMENT4_ADMITTED_FAMILY_ID
 from newsroom.projection.neo4j._adapter import _open_neo4j_adapter
 from newsroom.projection.neo4j.discovery_health_reads import (
     DiscoveryCoverageHealthReadRequest,
@@ -1282,6 +1283,18 @@ class _Neo4jProjectionBoundary:
         if query_valid_time.value > metadata.serving_time.value:
             raise ProjectionContractError(
                 "query_valid_time cannot be later than serving_time"
+            )
+        if (
+            metadata.family.family_id == INCREMENT4_ADMITTED_FAMILY_ID
+            and metadata.generation.state is ProjectionGenerationState.ACTIVE
+            and (
+                metadata.generation.validated_through_ledger_seq
+                != metadata.contiguous_ledger_seq
+                or metadata.open_gap_count or metadata.dead_letter_count
+            )
+        ):
+            raise ProjectionStateError(
+                "Increment 4 ACTIVE delivery is awaiting complete validation"
             )
         graph = self._adapter.read(
             generation_id=str(metadata.generation.generation_id),

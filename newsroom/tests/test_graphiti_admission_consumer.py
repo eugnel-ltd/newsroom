@@ -13,6 +13,8 @@ from newsroom.authority.canonical import (
 )
 from newsroom.authority.types import UtcTimestamp
 from newsroom.control_plane.graphiti_admission import (
+    GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION,
+    GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
     GraphitiAdmissionConsumer,
     GraphitiAdmissionConsumerError,
     GraphitiAdmissionDrainReport,
@@ -22,6 +24,7 @@ from newsroom.control_plane.graphiti_admission import (
     GraphitiProjectionReconciliationReceipt,
     GraphitiProjectionReceipt,
     GraphitiProposalAdmissionAction,
+    graphiti_projection_reconciliation_from_json,
 )
 from newsroom.control_plane.store import (
     connect,
@@ -1622,6 +1625,138 @@ def test_finalisation_rejects_cross_generation_result(tmp_path) -> None:
     connection.close()
 
 
+def test_active_generation_extension_retains_each_exact_cohort_and_replays(
+    tmp_path,
+) -> None:
+    connection = connect(str(tmp_path / "active-extension.sqlite3"))
+    first_id = "00000000-0000-4000-8000-0000000075e1"
+    second_id = "00000000-0000-4000-8000-0000000075e2"
+    first = _draft("entity.0001", ExtractionProposalKind.ENTITY_MENTION)
+    second = _draft(
+        "entity.0002",
+        ExtractionProposalKind.ENTITY_MENTION,
+        subject="Bob",
+    )
+    _seed_receipt(connection, first, ingest_id=first_id)
+    _seed_receipt(connection, second, ingest_id=second_id)
+
+    class StableGenerationProjector(_Projector):
+        def build_and_promote_increment4_cohort(
+            self, requests, *, cohort_digest, generation_id, idempotency_key
+        ):
+            self.generation_calls.append(tuple(requests))
+            effect_ids = tuple(
+                sorted(
+                    str(item.decision.admitted_authority_id)
+                    for item in requests
+                    if item.decision.action
+                    is GraphitiProposalAdmissionAction.ADMIT
+                )
+            )
+            return self.generation_effects.setdefault(
+                idempotency_key,
+                GraphitiProjectionGenerationResult(
+                    cohort_digest=cohort_digest,
+                    generation_id=PROJECTION_GENERATION_ID,
+                    source_snapshot_digest=digest_canonical(
+                        {"snapshot": cohort_digest}
+                    ),
+                    authority_watermark=max(
+                        item.decision.authority_ledger_seq for item in requests
+                    ),
+                    validation_digest=digest_canonical(
+                        {"validation": cohort_digest}
+                    ),
+                    promotion_digest=DIGEST_B,
+                    reconciliation_digest=digest_canonical(
+                        {"active": PROJECTION_GENERATION_ID, "cohort": cohort_digest}
+                    ),
+                    admitted_authority_ids=effect_ids,
+                    schema_version=GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
+                    source_request_digest=digest_canonical(
+                        {
+                            "generation_id": generation_id,
+                            "reason_code": "GRAPHITI_ADMISSION_COHORT",
+                            "idempotency_key": idempotency_key,
+                            "purge_retired_generation": True,
+                            "allow_active_extension": True,
+                        }
+                    ),
+                ),
+            )
+
+    projector = StableGenerationProjector()
+    consumer = _consumer(
+        connection,
+        _Authority(
+            {
+                first.local_id: GraphitiProposalAdmissionAction.ADMIT,
+                second.local_id: GraphitiProposalAdmissionAction.ADMIT,
+            }
+        ),
+        projector,
+        _Rights(),
+    )
+    for ingest_id in (first_id, second_id):
+        assert consumer.enqueue_complete_receipts(ingest_ids=(ingest_id,)) == 1
+        assert consumer.drain(
+            worker_id="worker-a", limit=1, ingest_ids=(ingest_id,)
+        ).decided == 1
+        assert consumer.finalise_decided_cohort(
+            ingest_ids=(ingest_id,)
+        ).projected == 1
+
+    rows = connection.execute(
+        "SELECT generation_id,receipt_json FROM "
+        "unpublished_graphiti_projection_reconciliations ORDER BY reconciled_at"
+    ).fetchall()
+    assert [row[0] for row in rows] == [
+        PROJECTION_GENERATION_ID,
+        PROJECTION_GENERATION_ID,
+    ]
+    assert {
+        json.loads(row[1])["schema_version"] for row in rows
+    } == {GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION}
+    assert connection.execute(
+        "SELECT DISTINCT schema_version FROM "
+        "unpublished_graphiti_projection_receipts"
+    ).fetchall() == [(GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,)]
+    assert consumer.telemetry().projection_reconciled is True
+
+    retained = tuple(rows)
+    drifted_envelope = json.loads(str(retained[0][1]))
+    drifted_envelope["projection_state_digest"] = DIGEST_A
+    with pytest.raises(
+        GraphitiAdmissionConsumerError,
+        match="source binding differs",
+    ):
+        graphiti_projection_reconciliation_from_json(
+            canonical_json_bytes(drifted_envelope).decode()
+        )
+    assert consumer.finalise_decided_cohort(
+        ingest_ids=(first_id,)
+    ) == GraphitiAdmissionDrainReport()
+    assert connection.execute(
+        "SELECT generation_id,receipt_json FROM "
+        "unpublished_graphiti_projection_reconciliations ORDER BY reconciled_at"
+    ).fetchall() == list(retained)
+    first_key = next(iter(projector.generation_effects))
+    projector.generation_effects[first_key] = replace(
+        projector.generation_effects[first_key],
+        source_request_digest=DIGEST_A,
+    )
+    with pytest.raises(
+        GraphitiAdmissionConsumerError,
+        match="differs from exact admission authority",
+    ):
+        consumer.finalise_decided_cohort(ingest_ids=(first_id,))
+    assert connection.execute(
+        "SELECT generation_id,receipt_json FROM "
+        "unpublished_graphiti_projection_reconciliations ORDER BY reconciled_at"
+    ).fetchall() == list(retained)
+    connection.close()
+
+
 def test_invalid_generation_result_retains_no_receipts_and_fails_closed(
     tmp_path,
 ) -> None:
@@ -1660,6 +1795,57 @@ def test_invalid_generation_result_retains_no_receipts_and_fails_closed(
     assert connection.execute(
         "SELECT state FROM unpublished_graphiti_admission_queue"
     ).fetchone() == ("DECIDED",)
+    assert connection.execute(
+        "SELECT COUNT(*) FROM unpublished_graphiti_projection_receipts"
+    ).fetchone() == (0,)
+    assert connection.execute(
+        "SELECT COUNT(*) FROM unpublished_graphiti_projection_reconciliations"
+    ).fetchone() == (0,)
+    connection.close()
+
+
+def test_active_extension_watermark_before_decision_retains_nothing(
+    tmp_path,
+) -> None:
+    connection = connect(str(tmp_path / "extension-watermark.sqlite3"))
+    draft = _draft("entity.0001", ExtractionProposalKind.ENTITY_MENTION)
+    receipt = _seed_receipt(connection, draft)
+
+    class StaleExtensionProjector(_Projector):
+        def build_and_promote_increment4_cohort(self, *args, **kwargs):
+            result = super().build_and_promote_increment4_cohort(*args, **kwargs)
+            return replace(
+                result,
+                generation_id=SECOND_PROJECTION_GENERATION_ID,
+                authority_watermark=result.authority_watermark - 1,
+                schema_version=GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
+                source_request_digest=digest_canonical(
+                    {
+                        "generation_id": kwargs["generation_id"],
+                        "reason_code": "GRAPHITI_ADMISSION_COHORT",
+                        "idempotency_key": kwargs["idempotency_key"],
+                        "purge_retired_generation": True,
+                        "allow_active_extension": True,
+                    }
+                ),
+            )
+
+    consumer = _consumer(
+        connection,
+        _Authority({draft.local_id: GraphitiProposalAdmissionAction.ADMIT}),
+        StaleExtensionProjector(),
+        _Rights(),
+    )
+    consumer.enqueue_complete_receipts()
+    assert consumer.drain(worker_id="worker-a", limit=1).decided == 1
+
+    with pytest.raises(
+        GraphitiAdmissionConsumerError,
+        match="differs from exact admission authority",
+    ):
+        consumer.finalise_decided_cohort(
+            ingest_ids=(str(receipt["ingest_id"]),)
+        )
     assert connection.execute(
         "SELECT COUNT(*) FROM unpublished_graphiti_projection_receipts"
     ).fetchone() == (0,)

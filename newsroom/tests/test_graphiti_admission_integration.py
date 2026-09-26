@@ -15,6 +15,7 @@ from newsroom.authority.canonical import (
 )
 from newsroom.authority.types import EventId, UtcTimestamp
 from newsroom.control_plane.graphiti_admission import (
+    GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
     GraphitiAdmissionConsumer,
     GraphitiAdmissionConsumerError,
     GraphitiAdmissionRequest,
@@ -1167,6 +1168,9 @@ def test_generation_projector_uses_one_current_increment4_snapshot() -> None:
                 validation=SimpleNamespace(
                     validation_digest=DIGEST,
                     projection_state_digest=DIGEST,
+                    source_snapshot_digest=None,
+                    source_watermark_ledger_seq=None,
+                    source_request_digest=None,
                 ),
                 promotion=SimpleNamespace(
                     promotion_digest=DIGEST,
@@ -1195,6 +1199,94 @@ def test_generation_projector_uses_one_current_increment4_snapshot() -> None:
     assert isinstance(build_request, Increment4Neo4jCurrentBuildRequest)
     assert build_request.generation_id == generation_id
     assert build_request.idempotency_key == "graphiti-generation:fixture"
+    assert build_request.allow_active_extension is True
+
+
+def test_generation_projector_accepts_only_complete_source_bound_active_extension() -> None:
+    request = _request()
+    decision = GraphitiGovernedDecision(
+        proposal_key=request.proposal_key,
+        proposal_digest=request.proposal.digest,
+        proposal_kind=request.proposal.kind,
+        proposal_local_id=request.proposal.local_id,
+        action=GraphitiProposalAdmissionAction.ADMIT,
+        decision_id="decision:active-extension",
+        authority_ledger_seq=42,
+        reason_code="EXACT_MENTION_TO_NEW_UNKNOWN_ENTITY",
+        authority_receipt_digest=DIGEST,
+        admitted_authority_id="00000000-0000-4000-8000-0000000076f1",
+    )
+    requested = ProjectionGenerationId.parse(
+        "00000000-0000-4000-8000-0000000076f2"
+    )
+    active = ProjectionGenerationId.parse(
+        "00000000-0000-4000-8000-0000000076f4"
+    )
+
+    class Controller:
+        source_snapshot_digest = DIGEST
+        validation_snapshot_digest = DIGEST
+        source_watermark = 42
+        source_request_digest = digest_canonical(
+            {
+                "generation_id": str(requested),
+                "reason_code": "GRAPHITI_ADMISSION_COHORT",
+                "idempotency_key": "graphiti-generation:active-extension",
+                "purge_retired_generation": True,
+                "allow_active_extension": True,
+            }
+        )
+
+        def build_current_and_promote(self, build_request, *, proof):
+            del build_request, proof
+            return SimpleNamespace(
+                generation=SimpleNamespace(
+                    generation_id=active,
+                    state=ProjectionGenerationState.ACTIVE,
+                ),
+                source_watermark_ledger_seq=self.source_watermark,
+                checkpoint_ledger_seq=50,
+                source_snapshot_digest=self.source_snapshot_digest,
+                validation=SimpleNamespace(
+                    validation_digest=digest_canonical({"validation": "cohort"}),
+                    projection_state_digest=DIGEST,
+                    source_snapshot_digest=self.validation_snapshot_digest,
+                    source_watermark_ledger_seq=self.source_watermark,
+                    source_request_digest=self.source_request_digest,
+                ),
+                promotion=SimpleNamespace(
+                    promotion_digest=digest_canonical({"promotion": "original"}),
+                    validation_digest=digest_canonical({"validation": "original"}),
+                ),
+                projection_state_digest=DIGEST,
+            )
+
+    controller = Controller()
+    projector = ExistingIncrement4GenerationProjector(
+        controller=controller,  # type: ignore[arg-type]
+        proof=AuthenticationProof(method="STATIC_TOKEN", credential="fixture"),
+    )
+    result = projector.build_and_promote_increment4_cohort(
+        (GraphitiProjectionRequest(request=request, decision=decision),),
+        cohort_digest=DIGEST,
+        generation_id=str(requested),
+        idempotency_key="graphiti-generation:active-extension",
+    )
+    assert result.generation_id == str(active)
+    assert result.schema_version == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION
+    assert result.source_request_digest == controller.source_request_digest
+
+    controller.source_snapshot_digest = digest_canonical({"wrong": "snapshot"})
+    with pytest.raises(
+        GraphitiAdmissionConsumerError,
+        match="exact cohort cutoff",
+    ):
+        projector.build_and_promote_increment4_cohort(
+            (GraphitiProjectionRequest(request=request, decision=decision),),
+            cohort_digest=DIGEST,
+            generation_id=str(requested),
+            idempotency_key="graphiti-generation:active-extension",
+        )
 
 
 def test_rights_authority_rehydrates_exact_current_source_bytes() -> None:

@@ -23,11 +23,13 @@ from newsroom.authority.migrations import MIGRATIONS
 from newsroom.authority.types import UtcTimestamp
 from newsroom.control_plane.command_service import ControlPlaneCommandService
 from newsroom.control_plane.graphiti_admission import (
+    GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
     GRAPHITI_ADMISSION_GENERATION_IDENTITY_VERSION,
     GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION,
     GraphitiAdmissionConsumerError,
     GraphitiGovernedDecision,
     GraphitiProjectionReconciliationReceipt,
+    GraphitiProjectionGenerationResult,
 )
 from newsroom.control_plane.graphiti_event_reconciliation import GraphitiEventReconciliationError
 from newsroom.control_plane.graphiti_events import (
@@ -44,6 +46,7 @@ from newsroom.control_plane.graphiti_steady_state import (
     GraphitiCampaignRuntime,
     PRE_FRONTIER_BACKLOG_HOLD_REASON,
     _authority_snapshot_evidence,
+    _exact_admission_reconciliation,
     _mint_graphiti_campaign_runtime,
     _spend,
     _store_descriptor,
@@ -75,6 +78,15 @@ from newsroom.increment4.contracts import (
 from newsroom.projection import ProjectionGenerationId
 from newsroom.projection.neo4j import StructuralReconciliationView
 from scripts import graphiti_steady_state_report
+
+from .test_graphiti_admission_consumer import (
+    _Authority as _AdmissionAuthority,
+    _Projector as _AdmissionProjector,
+    _Rights as _AdmissionRights,
+    _consumer as _admission_consumer,
+    _draft as _admission_draft,
+    _seed_receipt as _seed_admission_receipt,
+)
 
 GRAPH_DESTINATION_ID = "sha256:" + "9" * 64
 NOW = datetime(2026, 9, 1, 12, tzinfo=UTC)
@@ -2907,6 +2919,95 @@ def test_exact_all_hold_generation_reconciliation_is_ready(
     assert corrupt_state["admission"]["projection_reconciled"] is False
     assert corrupt_state["verdict"] == "NO_GO"
     assert "ADMISSION_PROJECTION_UNRECONCILED" in corrupt_state["blockers"]
+
+
+def test_active_extension_inventory_counts_cohorts_not_generation_ids(
+    tmp_path: Path,
+) -> None:
+    connection = connect(str(tmp_path / "active-extension-inventory.sqlite3"))
+    first_id = "00000000-0000-4000-8000-0000000075f1"
+    second_id = "00000000-0000-4000-8000-0000000075f2"
+    first = _admission_draft(
+        "entity.0001", ExtractionProposalKind.ENTITY_MENTION
+    )
+    second = _admission_draft(
+        "entity.0002", ExtractionProposalKind.ENTITY_MENTION, subject="Bob"
+    )
+    _seed_admission_receipt(connection, first, ingest_id=first_id)
+    _seed_admission_receipt(connection, second, ingest_id=second_id)
+    active_generation_id = "00000000-0000-4000-8000-000000007599"
+
+    class StableProjector(_AdmissionProjector):
+        def build_and_promote_increment4_cohort(
+            self, requests, *, cohort_digest, generation_id, idempotency_key
+        ):
+            effect_ids = tuple(
+                sorted(
+                    str(item.decision.admitted_authority_id)
+                    for item in requests
+                    if item.decision.action
+                    is GraphitiProposalAdmissionAction.ADMIT
+                )
+            )
+            return self.generation_effects.setdefault(
+                idempotency_key,
+                GraphitiProjectionGenerationResult(
+                    cohort_digest=cohort_digest,
+                    generation_id=active_generation_id,
+                    source_snapshot_digest=digest_canonical(
+                        {"snapshot": cohort_digest}
+                    ),
+                    authority_watermark=max(
+                        item.decision.authority_ledger_seq for item in requests
+                    ),
+                    validation_digest=digest_canonical(
+                        {"validation": cohort_digest}
+                    ),
+                    promotion_digest="sha256:" + "b2" * 32,
+                    reconciliation_digest=digest_canonical(
+                        {"projection": cohort_digest}
+                    ),
+                    admitted_authority_ids=effect_ids,
+                    schema_version=GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
+                    source_request_digest=digest_canonical(
+                        {
+                            "generation_id": generation_id,
+                            "reason_code": "GRAPHITI_ADMISSION_COHORT",
+                            "idempotency_key": idempotency_key,
+                            "purge_retired_generation": True,
+                            "allow_active_extension": True,
+                        }
+                    ),
+                ),
+            )
+
+    consumer = _admission_consumer(
+        connection,
+        _AdmissionAuthority(
+            {
+                first.local_id: GraphitiProposalAdmissionAction.ADMIT,
+                second.local_id: GraphitiProposalAdmissionAction.ADMIT,
+            }
+        ),
+        StableProjector(),
+        _AdmissionRights(),
+    )
+    for ingest_id in (first_id, second_id):
+        consumer.enqueue_complete_receipts(ingest_ids=(ingest_id,))
+        consumer.drain(
+            worker_id="worker-a", limit=1, ingest_ids=(ingest_id,)
+        )
+        consumer.finalise_decided_cohort(ingest_ids=(ingest_id,))
+
+    inventory = _exact_admission_reconciliation(connection)
+    assert inventory["cohort_count"] == 2
+    assert inventory["covered_ingest_count"] == 2
+    assert inventory["queue_ingest_count"] == 2
+    assert inventory["latest_generation_id"] == active_generation_id
+    assert [item["effect_count"] for item in inventory["cohorts"]] == [1, 1]
+    assert inventory["total"] is True
+    assert inventory["disjoint"] is True
+    connection.close()
 
 
 def test_untyped_caller_graph_readback_is_no_go(

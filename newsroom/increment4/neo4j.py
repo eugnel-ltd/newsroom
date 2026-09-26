@@ -75,12 +75,13 @@ class Increment4Neo4jBuildRequest:
 
 @dataclass(frozen=True, slots=True)
 class Increment4Neo4jCurrentBuildRequest:
-    """Request a complete rebuild from current admitted authority."""
+    """Build current authority, optionally extending an unchanged ACTIVE prefix."""
 
     generation_id: ProjectionGenerationId
     reason_code: str
     idempotency_key: str
     purge_retired_generation: bool = True
+    allow_active_extension: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.generation_id, ProjectionGenerationId):
@@ -89,6 +90,9 @@ class Increment4Neo4jCurrentBuildRequest:
         _require_idempotency_key(self.idempotency_key)
         if not isinstance(self.purge_retired_generation, bool):
             raise TypeError("Increment 4 retired-generation purge flag must be boolean")
+
+        if not isinstance(self.allow_active_extension, bool):
+            raise TypeError("Increment 4 ACTIVE extension flag must be boolean")
 
 
 @dataclass(frozen=True, slots=True)

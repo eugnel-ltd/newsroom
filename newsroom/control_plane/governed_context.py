@@ -28,6 +28,7 @@ from newsroom.control_plane.graphiti_admission import (
     graphiti_decided_cohort_generation_identity,
     graphiti_governed_decision_from_json,
     graphiti_projection_receipt_from_json,
+    graphiti_projection_receipt_matches_binding,
     graphiti_projection_reconciliation_from_json,
 )
 from newsroom.extraction.types import ExtractionProposalKind
@@ -648,13 +649,12 @@ class GovernedContextHydrator:
     ) -> str:
         """Validate the latest generation and every active receipt's cohort."""
 
-        parsed: dict[
-            str,
+        parsed: list[
             tuple[
                 GraphitiProjectionReconciliationReceipt,
                 dict[str, object] | None,
-            ],
-        ] = {}
+            ]
+        ] = []
         for row in reconciliation_rows:
             receipt_text = str(row[0])
             receipt, binding = graphiti_projection_reconciliation_from_json(
@@ -665,14 +665,13 @@ class GovernedContextHydrator:
                 or receipt.projector_family_id != str(row[2])
                 or receipt.generation_id != str(row[3])
                 or receipt.authority_watermark != int(row[4])
-                or receipt.generation_id in parsed
             ):
                 raise GraphitiAdmissionConsumerError(
                     "projection reconciliation SQL identity differs"
                 )
-            parsed[receipt.generation_id] = (receipt, binding)
+            parsed.append((receipt, binding))
 
-        latest_receipt, latest_binding = next(iter(parsed.values()))
+        latest_receipt, latest_binding = parsed[0]
         if latest_binding is None:
             raise GraphitiAdmissionConsumerError(
                 "latest projection generation lacks exact cohort authority"
@@ -683,26 +682,17 @@ class GovernedContextHydrator:
                 "latest projection watermark differs from contiguous authority"
             )
 
-        required_generation_ids = {
-            latest_generation_id,
-            *(
-                generation_id
-                for _effect_id, _watermark, generation_id
-                in active_projection_snapshot
-            ),
-        }
         bound_ingest_ids: set[str] = set()
-        for generation_id in required_generation_ids:
-            retained = parsed.get(generation_id)
-            if retained is None or retained[1] is None:
+        reconciled_generation_ids: set[str] = set()
+        for reconciliation, binding in parsed:
+            if binding is None:
                 raise GraphitiAdmissionConsumerError(
                     "active projection lacks exact cohort reconciliation"
                 )
-            reconciliation = retained[0]
-            binding = retained[1]
-            assert binding is not None
+            generation_id = reconciliation.generation_id
+            reconciled_generation_ids.add(generation_id)
             ingest_ids = tuple(str(item) for item in binding["ingest_ids"])
-            cohort_digest, rebuilt_generation_id = (
+            cohort_digest, _rebuilt_generation_id = (
                 graphiti_decided_cohort_generation_identity(
                     self._connection,
                     ingest_ids=ingest_ids,
@@ -711,7 +701,6 @@ class GovernedContextHydrator:
             )
             if (
                 cohort_digest != str(binding["cohort_digest"])
-                or rebuilt_generation_id != generation_id
                 or bound_ingest_ids.intersection(ingest_ids)
             ):
                 raise GraphitiAdmissionConsumerError(
@@ -748,10 +737,10 @@ class GovernedContextHydrator:
                     or projection.authority_watermark != int(projection_row[3])
                     or projection.generation_id != str(projection_row[4])
                     or str(projection_row[5]) not in ingest_ids
-                    or projection.schema_version
-                    != "newsroom.increment4.admitted-generation-binding.v2"
-                    or projection.cohort_digest != cohort_digest
                     or projection.generation_id != generation_id
+                    or not graphiti_projection_receipt_matches_binding(
+                        projection, binding
+                    )
                     or projection.authority_watermark
                     != reconciliation.authority_watermark
                 ):
@@ -785,6 +774,18 @@ class GovernedContextHydrator:
                 raise GraphitiAdmissionConsumerError(
                     "exact projection cohort watermark differs"
                 )
+        required_generation_ids = {
+            latest_generation_id,
+            *(
+                generation_id
+                for _effect_id, _watermark, generation_id
+                in active_projection_snapshot
+            ),
+        }
+        if not required_generation_ids.issubset(reconciled_generation_ids):
+            raise GraphitiAdmissionConsumerError(
+                "active projection lacks exact cohort reconciliation"
+            )
         return latest_generation_id
 
     def _empty_or_size_hold(
