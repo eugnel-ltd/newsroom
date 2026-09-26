@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import sqlite3
 
 from newsroom.authority.persistence import AuthorityPersistenceError
 from newsroom.entities.types import (
@@ -15,6 +16,7 @@ from newsroom.increment4.models import (
     Increment4EntityProjectionState,
     Increment4RelationProjectionState,
     sorted_snapshot,
+    _required_event_ids,
     _stream_admitted_provenance,
 )
 from newsroom.increment4.projection import build_increment4_admitted_batches
@@ -317,16 +319,31 @@ class _Increment4ProjectionAuthorityStore(
         family: ProjectionFamilyDefinition,
     ) -> tuple[StructuralBatch, ...]:
         with self._increment4_projection_read() as (conn, entities, relations, watermark):
+            # Reconciliation has no full-history digest. Read its exact current
+            # provenance through the existing unique event index, not every
+            # historical control/audit event. The build-input path stays full.
+            required = sorted(_required_event_ids(entities, relations))
+            events = []
+            chunk_size = min(512, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+            for offset in range(0, len(required), chunk_size):
+                chunk = required[offset:offset + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                events.extend(
+                    self._event_from_row(row) for row in conn.execute(
+                        f"SELECT * FROM ledger_events WHERE event_id IN ({placeholders})",
+                        chunk,
+                    )
+                )
+            if not any(event.ledger_seq == watermark for event in events):
+                row = conn.execute(
+                    "SELECT * FROM ledger_events WHERE ledger_seq=?", (watermark,),
+                ).fetchone()
+                if row is not None:
+                    events.append(self._event_from_row(row))
             provenance, _ = _stream_admitted_provenance(
                 entities=entities,
                 relations=relations,
-                events=(
-                    self._event_from_row(row)
-                    for row in conn.execute(
-                        "SELECT * FROM ledger_events WHERE ledger_seq<=? ORDER BY ledger_seq",
-                        (watermark,),
-                    )
-                ),
+                events=sorted(events, key=lambda event: event.ledger_seq),
                 through_ledger_seq=watermark,
                 # Reconciliation requires exact provenance, not a new build's
                 # full-history command identity. All state checks still run.
