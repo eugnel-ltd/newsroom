@@ -219,7 +219,7 @@ def test_governing_producer_read_port_uses_exact_scoped_event_validation(
         assert set(event_ids) == expected
         traced = " ".join(statements).lower()
         assert "where e.aggregate_type=" in traced
-        assert "pragma foreign_key_check" in traced
+        assert "pragma foreign_key_list" in traced
         assert "pragma foreign_key_check()" not in traced
     finally:
         connection.set_trace_callback(None)

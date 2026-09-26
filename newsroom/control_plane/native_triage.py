@@ -18,6 +18,7 @@ from newsroom.increment6.candidates import (
     CandidateAdmission,
     CandidateAdmissionOutcome,
     CandidateAdmissionRequest,
+    CandidateGoverningManifest,
     CandidateGoverningState,
     CandidateGoverningStateStatus,
     StoryCandidateVersion,
@@ -532,6 +533,7 @@ def _admit_native_triage_candidate(
     candidate_request: CandidateAdmissionRequest,
     current_candidate_version: StoryCandidateVersion | None,
     proof: AuthenticationProof,
+    prepared_manifest: CandidateGoverningManifest | None = None,
 ) -> NativeTriageResult:
     """Continue one exact prepared native result through Candidate admission."""
 
@@ -545,14 +547,23 @@ def _admit_native_triage_candidate(
         or type(candidate_request) is not CandidateAdmissionRequest
         or type(current_candidate_version) not in (type(None), StoryCandidateVersion)
         or type(proof) is not AuthenticationProof
+        or type(prepared_manifest) not in (type(None), CandidateGoverningManifest)
     ):
         raise NativeTriageError("Candidate continuation requires exact typed inputs")
-    manifest = system.build_candidate_manifest(
-        triage.hypothesis.version_id,
-        triage.relationship.canonical_digest,
-        collision_decision,
-        proof=proof,
-    )
+    manifest = prepared_manifest
+    if manifest is None:
+        manifest = system.build_candidate_manifest(
+            triage.hypothesis.version_id,
+            triage.relationship.canonical_digest,
+            collision_decision,
+            proof=proof,
+        )
+    if (
+        manifest.hypothesis_version_id != triage.hypothesis.version_id
+        or manifest.hypothesis_version_digest != triage.hypothesis.canonical_digest
+        or manifest.relationship_assessment_digest != triage.relationship.canonical_digest
+    ):
+        raise NativeTriageError("prepared Candidate manifest differs from triage")
     admission = evaluate_candidate_admission(
         request=candidate_request,
         manifest=manifest,
@@ -577,6 +588,9 @@ def _admit_native_triage_candidate(
             admission,
             None,
         )
+    # Admission still rederives and compares current producers inside its own
+    # transaction before committing. Reuse only the caller's immutable input;
+    # this is not a cached currentness decision or an authority bypass.
     candidate = system.candidates.admit(
         admission.canonical_bytes,
         collision_request=collision_request,

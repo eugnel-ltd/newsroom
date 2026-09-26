@@ -440,6 +440,7 @@ def advance_native_cycle(
                 candidate_request=candidate_request,
                 current_candidate_version=current,
                 proof=proof,
+                prepared_manifest=manifest,
             )
         outcomes.append(
             NativeCycleOutcome(revision_id, admitted.state, admitted, None)
