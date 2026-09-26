@@ -185,6 +185,12 @@ def test_projection_authority_contracts_merge_without_caller_semantics() -> None
             contract.contract_digest,
             contract.canonicalizer_implementation_version,
         ) is not None
+    assert registry.resolve("projection.generation.validate").definition_version == (
+        "projection-command-v1"
+    )
+    current = registry.resolve("projection.generation.validate-current")
+    assert current.definition_version == "projection-command-v2"
+    assert current.payload_schema_version == "projection_generation_validate_v2"
 
 
 def test_graphiti_contract_is_proposal_only_and_has_no_execution_api() -> None:

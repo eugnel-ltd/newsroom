@@ -31,6 +31,7 @@ from newsroom.control_plane.graphiti_admission import (
     graphiti_decided_cohort_generation_identity,
     graphiti_governed_decision_from_json,
     graphiti_projection_receipt_from_json,
+    graphiti_projection_receipt_matches_binding,
     graphiti_projection_reconciliation_from_json,
 )
 from newsroom.control_plane.corpus import CorpusIngestUnit
@@ -2150,7 +2151,7 @@ def _exact_admission_reconciliation(
                 "projection reconciliation lacks exact cohort membership"
             )
         ingest_ids = tuple(str(item) for item in binding["ingest_ids"])
-        cohort_digest, expected_generation_id = (
+        cohort_digest, _expected_generation_id = (
             graphiti_decided_cohort_generation_identity(
                 connection,
                 ingest_ids=ingest_ids,
@@ -2163,7 +2164,6 @@ def _exact_admission_reconciliation(
             or receipt.generation_id != str(generation_id)
             or receipt.authority_watermark != int(authority_watermark)
             or binding["cohort_digest"] != cohort_digest
-            or receipt.generation_id != expected_generation_id
         ):
             raise GraphitiAdmissionConsumerError(
                 "projection reconciliation SQL or cohort identity differs"
@@ -2239,7 +2239,9 @@ def _exact_admission_reconciliation(
                 or projection.trust_scope != str(projection_row[7])
                 or projection.receipt_digest != str(projection_row[9])
                 or projection.generation_id != receipt.generation_id
-                or projection.cohort_digest != cohort_digest
+                or not graphiti_projection_receipt_matches_binding(
+                    projection, binding
+                )
             ):
                 raise GraphitiAdmissionConsumerError(
                     "projection receipt differs from exact cohort reconciliation"

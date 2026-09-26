@@ -73,6 +73,15 @@ GRAPHITI_ADMISSION_GENERATION_IDENTITY_VERSION = (
 GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION = (
     "newsroom.graphiti-admission.exact-generation-reconciliation.v1"
 )
+GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION = (
+    "newsroom.graphiti-admission.exact-active-extension-reconciliation.v2"
+)
+GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION = (
+    "newsroom.increment4.admitted-generation-binding.v2"
+)
+GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION = (
+    "newsroom.increment4.admitted-active-extension-binding.v3"
+)
 
 
 class GraphitiAdmissionConsumerError(RuntimeError):
@@ -660,6 +669,7 @@ class GraphitiProjectionReceipt:
     validation_digest: str | None = None
     promotion_digest: str | None = None
     generation_result_digest: str | None = None
+    source_request_digest: str | None = None
     provider_model_calls: int = 0
 
     def __post_init__(self) -> None:
@@ -694,9 +704,6 @@ class GraphitiProjectionReceipt:
                 "projection receipt generation identity must be UUIDv4"
             ) from exc
         legacy_schema = "newsroom.increment4.admitted-projection.v1"
-        generation_schema = (
-            "newsroom.increment4.admitted-generation-binding.v2"
-        )
         generation_fields = (
             self.cohort_digest,
             self.source_snapshot_digest,
@@ -705,11 +712,13 @@ class GraphitiProjectionReceipt:
             self.generation_result_digest,
         )
         if self.schema_version == legacy_schema:
-            if any(item is not None for item in generation_fields):
+            if any(item is not None for item in generation_fields) or (
+                self.source_request_digest is not None
+            ):
                 raise GraphitiAdmissionConsumerError(
                     "legacy projection receipt cannot claim generation binding"
                 )
-        elif self.schema_version == generation_schema:
+        elif self.schema_version == GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION:
             if any(item is None for item in generation_fields):
                 raise GraphitiAdmissionConsumerError(
                     "generation binding receipt is incomplete"
@@ -726,6 +735,32 @@ class GraphitiProjectionReceipt:
                 strict=True,
             ):
                 validate_sha256_digest(str(value), field=field)
+            if self.source_request_digest is not None:
+                raise GraphitiAdmissionConsumerError(
+                    "generation binding receipt cannot claim active extension"
+                )
+        elif self.schema_version == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION:
+            if any(item is None for item in generation_fields) or (
+                self.source_request_digest is None
+            ):
+                raise GraphitiAdmissionConsumerError(
+                    "active extension receipt is incomplete"
+                )
+            for field, value in zip(
+                (
+                    "cohort_digest",
+                    "source_snapshot_digest",
+                    "validation_digest",
+                    "promotion_digest",
+                    "generation_result_digest",
+                ),
+                generation_fields,
+                strict=True,
+            ):
+                validate_sha256_digest(str(value), field=field)
+            validate_sha256_digest(
+                self.source_request_digest, field="source_request_digest"
+            )
         else:
             raise GraphitiAdmissionConsumerError(
                 "projection receipt schema differs"
@@ -740,7 +775,7 @@ class GraphitiProjectionReceipt:
             )
 
     def canonical_value(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "proposal_key": self.proposal_key,
             "decision_id": self.decision_id,
             "effect_id": self.effect_id,
@@ -757,6 +792,9 @@ class GraphitiProjectionReceipt:
             "generation_result_digest": self.generation_result_digest,
             "provider_model_calls": self.provider_model_calls,
         }
+        if self.schema_version == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION:
+            value["source_request_digest"] = self.source_request_digest
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -771,6 +809,8 @@ class GraphitiProjectionGenerationResult:
     promotion_digest: str
     reconciliation_digest: str
     admitted_authority_ids: tuple[str, ...]
+    schema_version: str = GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION
+    source_request_digest: str | None = None
     provider_model_calls: int = 0
 
     def __post_init__(self) -> None:
@@ -806,9 +846,26 @@ class GraphitiProjectionGenerationResult:
             raise GraphitiAdmissionConsumerError(
                 "generation projection must make zero provider/model calls"
             )
+        if self.schema_version == GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION:
+            if self.source_request_digest is not None:
+                raise GraphitiAdmissionConsumerError(
+                    "generation result cannot claim active extension"
+                )
+        elif self.schema_version == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION:
+            if self.source_request_digest is None:
+                raise GraphitiAdmissionConsumerError(
+                    "active extension result lacks source request authority"
+                )
+            validate_sha256_digest(
+                self.source_request_digest, field="source_request_digest"
+            )
+        else:
+            raise GraphitiAdmissionConsumerError(
+                "generation result schema differs"
+            )
 
     def canonical_value(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "cohort_digest": self.cohort_digest,
             "generation_id": self.generation_id,
             "source_snapshot_digest": self.source_snapshot_digest,
@@ -819,6 +876,10 @@ class GraphitiProjectionGenerationResult:
             "admitted_authority_ids": list(self.admitted_authority_ids),
             "provider_model_calls": self.provider_model_calls,
         }
+        if self.schema_version == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION:
+            value["schema_version"] = self.schema_version
+            value["source_request_digest"] = self.source_request_digest
+        return value
 
     @property
     def digest(self) -> str:
@@ -1263,6 +1324,11 @@ def graphiti_projection_receipt_from_json(value: str) -> GraphitiProjectionRecei
             if raw.get("generation_result_digest") is None
             else str(raw["generation_result_digest"])
         ),
+        source_request_digest=(
+            None
+            if raw.get("source_request_digest") is None
+            else str(raw["source_request_digest"])
+        ),
         provider_model_calls=_exact_integer(
             raw["provider_model_calls"], field="provider model calls"
         ),
@@ -1281,11 +1347,33 @@ def graphiti_projection_reconciliation_from_json(
     binding: dict[str, object] | None = None
     raw = record
     if record.get("schema_version") is not None:
+        schema_version = record.get("schema_version")
+        legacy_fields = {
+            "schema_version", "cohort_digest", "ingest_ids", "raw_receipt",
+        }
+        extension_fields = {
+            *legacy_fields,
+            "source_snapshot_digest",
+            "source_watermark_ledger_seq",
+            "source_request_digest",
+            "validation_digest",
+            "promotion_digest",
+            "generation_result_digest",
+            "projection_state_digest",
+        }
         if (
-            set(record)
-            != {"schema_version", "cohort_digest", "ingest_ids", "raw_receipt"}
-            or record.get("schema_version")
-            != GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION
+            schema_version
+            not in {
+                GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION,
+                GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION,
+            }
+            or set(record)
+            != (
+                legacy_fields
+                if schema_version
+                == GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION
+                else extension_fields
+            )
             or canonical_json_bytes(record).decode("utf-8") != value
         ):
             raise GraphitiAdmissionConsumerError(
@@ -1310,10 +1398,31 @@ def graphiti_projection_reconciliation_from_json(
             field="exact reconciliation raw receipt",
         )
         binding = {
-            "schema_version": GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "cohort_digest": cohort_digest,
             "ingest_ids": list(ingest_ids),
         }
+        if schema_version == GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION:
+            for field in (
+                "source_snapshot_digest",
+                "source_request_digest",
+                "validation_digest",
+                "promotion_digest",
+                "generation_result_digest",
+                "projection_state_digest",
+            ):
+                value_digest = str(record.get(field) or "")
+                validate_sha256_digest(value_digest, field=field)
+                binding[field] = value_digest
+            source_watermark = _exact_integer(
+                record.get("source_watermark_ledger_seq"),
+                field="source watermark ledger sequence",
+            )
+            if source_watermark <= 0:
+                raise GraphitiAdmissionConsumerError(
+                    "source watermark ledger sequence must be positive"
+                )
+            binding["source_watermark_ledger_seq"] = source_watermark
 
     if set(raw) != {
         "generation_id",
@@ -1356,7 +1465,11 @@ def graphiti_projection_reconciliation_from_json(
         raise GraphitiAdmissionConsumerError(
             "projection reconciliation receipt value differs"
         )
-    if binding is not None:
+    if (
+        binding is not None
+        and binding["schema_version"]
+        == GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION
+    ):
         expected_generation_id = str(
             typed_id(
                 ProjectionGenerationId,
@@ -1368,7 +1481,78 @@ def graphiti_projection_reconciliation_from_json(
             raise GraphitiAdmissionConsumerError(
                 "exact reconciliation generation identity differs"
             )
+    elif binding is not None:
+        if (
+            receipt.authority_watermark
+            != binding["source_watermark_ledger_seq"]
+            or receipt.receipt_digest != binding["generation_result_digest"]
+        ):
+            raise GraphitiAdmissionConsumerError(
+                "active extension reconciliation source binding differs"
+            )
     return receipt, binding
+
+
+def graphiti_projection_receipt_matches_binding(
+    receipt: GraphitiProjectionReceipt,
+    binding: Mapping[str, object],
+) -> bool:
+    """Match one immutable projection receipt to its exact cohort envelope."""
+
+    if receipt.cohort_digest != binding.get("cohort_digest"):
+        return False
+    schema_version = binding.get("schema_version")
+    if schema_version == GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION:
+        return (
+            receipt.schema_version
+            == GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION
+            and receipt.source_request_digest is None
+        )
+    if schema_version != GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION:
+        return False
+    return (
+        receipt.schema_version == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION
+        and receipt.source_snapshot_digest
+        == binding.get("source_snapshot_digest")
+        and receipt.authority_watermark
+        == binding.get("source_watermark_ledger_seq")
+        and receipt.source_request_digest == binding.get("source_request_digest")
+        and receipt.validation_digest == binding.get("validation_digest")
+        and receipt.promotion_digest == binding.get("promotion_digest")
+        and receipt.generation_result_digest
+        == binding.get("generation_result_digest")
+    )
+
+
+def _cohort_reconciliation_rows(
+    connection: sqlite3.Connection,
+    *,
+    cohort_digest: str,
+    ingest_ids: tuple[str, ...],
+) -> tuple[tuple[object, ...], ...]:
+    matches: list[tuple[object, ...]] = []
+    for row in connection.execute(
+        "SELECT receipt_json,receipt_digest,projector_family_id,generation_id,"
+        "authority_watermark FROM "
+        "unpublished_graphiti_projection_reconciliations "
+        "ORDER BY reconciled_at,receipt_digest"
+    ).fetchall():
+        _receipt, binding = graphiti_projection_reconciliation_from_json(
+            str(row[0])
+        )
+        if binding is not None and (
+            binding.get("cohort_digest") == cohort_digest
+            or tuple(binding.get("ingest_ids", ())) == ingest_ids
+        ):
+            if (
+                binding.get("cohort_digest") != cohort_digest
+                or tuple(binding.get("ingest_ids", ())) != ingest_ids
+            ):
+                raise GraphitiAdmissionConsumerError(
+                    "exact Graphiti reconciliation cohort identity differs"
+                )
+            matches.append(tuple(row))
+    return tuple(matches)
 
 
 def graphiti_decided_cohort_generation_identity(
@@ -2678,12 +2862,11 @@ class GraphitiAdmissionConsumer:
             """,
             exact,
         ).fetchall()
-        reconciliation_rows = self._connection.execute(
-            "SELECT receipt_json FROM "
-            "unpublished_graphiti_projection_reconciliations "
-            "WHERE generation_id=? ORDER BY reconciled_at, receipt_digest",
-            (generation_id,),
-        ).fetchall()
+        reconciliation_rows = _cohort_reconciliation_rows(
+            self._connection,
+            cohort_digest=cohort_digest,
+            ingest_ids=exact,
+        )
         retained_receipts: list[GraphitiProjectionReceipt] = []
         retained_reconciliation: GraphitiProjectionReconciliationReceipt | None = None
         if existing_rows or reconciliation_rows:
@@ -2697,14 +2880,12 @@ class GraphitiAdmissionConsumer:
             expected_by_key = {
                 item.request.proposal_key: item for item in admitted
             }
+            retained_binding: dict[str, object] | None = None
             for proposal_key, receipt_json in existing_rows:
                 receipt = graphiti_projection_receipt_from_json(str(receipt_json))
                 item = expected_by_key.get(str(proposal_key))
                 if (
                     item is None
-                    or receipt.schema_version
-                    != "newsroom.increment4.admitted-generation-binding.v2"
-                    or receipt.generation_id != generation_id
                     or receipt.cohort_digest != cohort_digest
                     or receipt.decision_id != item.decision.decision_id
                     or receipt.effect_id != item.decision.admitted_authority_id
@@ -2719,15 +2900,17 @@ class GraphitiAdmissionConsumer:
                 )
             )
             if (
-                retained_binding
-                != {
-                    "schema_version": (
-                        GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION
-                    ),
-                    "cohort_digest": cohort_digest,
-                    "ingest_ids": list(exact),
-                }
-                or retained_reconciliation.generation_id != generation_id
+                retained_reconciliation.receipt_digest
+                != str(reconciliation_rows[0][1])
+                or retained_reconciliation.projector_family_id
+                != str(reconciliation_rows[0][2])
+                or retained_reconciliation.generation_id
+                != str(reconciliation_rows[0][3])
+                or retained_reconciliation.authority_watermark
+                != int(reconciliation_rows[0][4])
+                or retained_binding is None
+                or retained_binding.get("cohort_digest") != cohort_digest
+                or retained_binding.get("ingest_ids") != list(exact)
                 or retained_reconciliation.expected_effect_ids
                 != admitted_authority_ids
                 or retained_reconciliation.actual_effect_ids
@@ -2737,38 +2920,101 @@ class GraphitiAdmissionConsumer:
                     "exact Graphiti retained reconciliation differs"
                 )
 
+        generation_idempotency_key = f"graphiti-generation:{cohort_digest}"
         result = self._projector.build_and_promote_increment4_cohort(
             projection_requests,
             cohort_digest=cohort_digest,
             generation_id=generation_id,
-            idempotency_key=f"graphiti-generation:{cohort_digest}",
+            idempotency_key=generation_idempotency_key,
         )
         required_watermark = max(
             decision.authority_ledger_seq for _request, decision in decided_items
         )
         if (
             result.cohort_digest != cohort_digest
-            or result.generation_id != generation_id
             or result.authority_watermark < required_watermark
             or result.admitted_authority_ids != admitted_authority_ids
+            or (
+                result.schema_version
+                == GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION
+                and result.generation_id != generation_id
+            )
+            or (
+                result.schema_version
+                == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION
+                and result.source_request_digest
+                != digest_canonical(
+                    {
+                        "generation_id": generation_id,
+                        "reason_code": "GRAPHITI_ADMISSION_COHORT",
+                        "idempotency_key": generation_idempotency_key,
+                        "purge_retired_generation": True,
+                        "allow_active_extension": True,
+                    }
+                )
+            )
         ):
             raise GraphitiAdmissionConsumerError(
                 "Increment 4 generation result differs from exact admission authority"
             )
 
         if retained_reconciliation is not None:
+            assert retained_binding is not None
             if (
                 retained_reconciliation.authority_watermark
                 != result.authority_watermark
-                or retained_reconciliation.receipt_digest
-                != result.reconciliation_digest
+                or retained_reconciliation.generation_id != result.generation_id
+                or retained_binding.get("schema_version")
+                != (
+                    GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION
+                    if result.schema_version
+                    == GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION
+                    else GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION
+                )
+                or (
+                    result.schema_version
+                    == GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION
+                    and retained_reconciliation.receipt_digest
+                    != result.reconciliation_digest
+                )
+                or (
+                    result.schema_version
+                    == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION
+                    and (
+                        retained_reconciliation.receipt_digest != result.digest
+                        or retained_binding.get("source_snapshot_digest")
+                        != result.source_snapshot_digest
+                        or retained_binding.get("source_watermark_ledger_seq")
+                        != result.authority_watermark
+                        or retained_binding.get("source_request_digest")
+                        != result.source_request_digest
+                        or retained_binding.get("validation_digest")
+                        != result.validation_digest
+                        or retained_binding.get("promotion_digest")
+                        != result.promotion_digest
+                        or retained_binding.get("generation_result_digest")
+                        != result.digest
+                        or retained_binding.get("projection_state_digest")
+                        != result.reconciliation_digest
+                    )
+                )
                 or any(
                     receipt.authority_watermark != result.authority_watermark
+                    or receipt.generation_id != result.generation_id
+                    or receipt.schema_version != result.schema_version
                     or receipt.source_snapshot_digest
                     != result.source_snapshot_digest
+                    or receipt.source_request_digest
+                    != result.source_request_digest
                     or receipt.validation_digest != result.validation_digest
                     or receipt.promotion_digest != result.promotion_digest
                     or receipt.generation_result_digest != result.digest
+                    for receipt in retained_receipts
+                )
+                or any(
+                    not graphiti_projection_receipt_matches_binding(
+                        receipt, retained_binding
+                    )
                     for receipt in retained_receipts
                 )
             ):
@@ -2786,9 +3032,9 @@ class GraphitiAdmissionConsumer:
                 "effect_id": item.decision.admitted_authority_id,
                 "authority_watermark": result.authority_watermark,
                 "projector_family_id": "graph.increment4.admitted",
-                "generation_id": generation_id,
+                "generation_id": result.generation_id,
                 "schema_version": (
-                    "newsroom.increment4.admitted-generation-binding.v2"
+                    result.schema_version
                 ),
                 "trust_scope": "ADMITTED",
                 "cohort_digest": cohort_digest,
@@ -2798,6 +3044,8 @@ class GraphitiAdmissionConsumer:
                 "generation_result_digest": generation_result_digest,
                 "provider_model_calls": 0,
             }
+            if result.schema_version == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION:
+                material["source_request_digest"] = result.source_request_digest
             receipts.append(
                 GraphitiProjectionReceipt(
                     **material,
@@ -2805,11 +3053,16 @@ class GraphitiAdmissionConsumer:
                 )
             )
         reconciliation = GraphitiProjectionReconciliationReceipt(
-            generation_id=generation_id,
+            generation_id=result.generation_id,
             expected_effect_ids=admitted_authority_ids,
             actual_effect_ids=admitted_authority_ids,
             authority_watermark=result.authority_watermark,
-            receipt_digest=result.reconciliation_digest,
+            receipt_digest=(
+                result.reconciliation_digest
+                if result.schema_version
+                == GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION
+                else result.digest
+            ),
         )
         now = self._time_text(self._now())
         with _transaction(self._connection):
@@ -2825,13 +3078,12 @@ class GraphitiAdmissionConsumer:
                     exact,
                 ).fetchone()[0]
             )
-            retained_reconciliation_count = int(
-                self._connection.execute(
-                    "SELECT COUNT(*) FROM "
-                    "unpublished_graphiti_projection_reconciliations "
-                    "WHERE generation_id=?",
-                    (generation_id,),
-                ).fetchone()[0]
+            retained_reconciliation_count = len(
+                _cohort_reconciliation_rows(
+                    self._connection,
+                    cohort_digest=cohort_digest,
+                    ingest_ids=exact,
+                )
             )
             if retained_count or retained_reconciliation_count:
                 raise GraphitiAdmissionConsumerError(
@@ -2875,15 +3127,31 @@ class GraphitiAdmissionConsumer:
                     raise GraphitiAdmissionConsumerError(
                         "exact Graphiti admitted cohort state changed before retention"
                     )
+            reconciliation_value: dict[str, object] = {
+                "schema_version": (
+                    GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION
+                    if result.schema_version
+                    == GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION
+                    else GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION
+                ),
+                "cohort_digest": cohort_digest,
+                "ingest_ids": list(exact),
+                "raw_receipt": reconciliation.canonical_value(),
+            }
+            if result.schema_version == GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION:
+                reconciliation_value.update(
+                    {
+                        "source_snapshot_digest": result.source_snapshot_digest,
+                        "source_watermark_ledger_seq": result.authority_watermark,
+                        "source_request_digest": result.source_request_digest,
+                        "validation_digest": result.validation_digest,
+                        "promotion_digest": result.promotion_digest,
+                        "generation_result_digest": result.digest,
+                        "projection_state_digest": result.reconciliation_digest,
+                    }
+                )
             reconciliation_json = canonical_json_bytes(
-                {
-                    "schema_version": (
-                        GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION
-                    ),
-                    "cohort_digest": cohort_digest,
-                    "ingest_ids": list(exact),
-                    "raw_receipt": reconciliation.canonical_value(),
-                }
+                reconciliation_value
             ).decode("utf-8")
             self._connection.execute(
                 """
@@ -3456,7 +3724,7 @@ def graphiti_admission_telemetry(
         )
     )
     reconciliation_row = connection.execute(
-        "SELECT receipt_json FROM unpublished_graphiti_projection_reconciliations "
+        "SELECT generation_id,receipt_json FROM unpublished_graphiti_projection_reconciliations "
         "ORDER BY reconciled_at DESC,receipt_digest DESC LIMIT 1"
     ).fetchone()
     reconciled = False
@@ -3468,10 +3736,16 @@ def graphiti_admission_telemetry(
     )
     if reconciliation_row is not None:
         try:
-            reconciliation, _binding = (
-                graphiti_projection_reconciliation_from_json(
-                    str(reconciliation_row[0])
-                )
+            generation_id = str(reconciliation_row[0])
+            reconciliation_rows = connection.execute(
+                "SELECT receipt_json FROM "
+                "unpublished_graphiti_projection_reconciliations "
+                "WHERE generation_id=? ORDER BY reconciled_at,receipt_digest",
+                (generation_id,),
+            ).fetchall()
+            parsed = tuple(
+                graphiti_projection_reconciliation_from_json(str(row[0]))
+                for row in reconciliation_rows
             )
         except (GraphitiAdmissionConsumerError, json.JSONDecodeError, ValueError):
             pass
@@ -3488,12 +3762,34 @@ def graphiti_admission_telemetry(
                       AND tombstone.proposal_key IS NULL
                     ORDER BY projection.effect_id
                     """,
-                    (reconciliation.generation_id,),
+                    (generation_id,),
                 )
             )
+            bindings = tuple(binding for _receipt, binding in parsed)
+            if len(parsed) == 1 and bindings == (None,):
+                reconciled_effect_ids = parsed[0][0].actual_effect_ids
+            elif all(binding is not None for binding in bindings):
+                cohort_digests = tuple(
+                    str(binding["cohort_digest"])
+                    for binding in bindings
+                    if binding is not None
+                )
+                effects = tuple(
+                    effect_id
+                    for receipt, _binding in parsed
+                    for effect_id in receipt.actual_effect_ids
+                )
+                reconciled_effect_ids = (
+                    tuple(sorted(effects))
+                    if len(cohort_digests) == len(set(cohort_digests))
+                    and len(effects) == len(set(effects))
+                    else ()
+                )
+            else:
+                reconciled_effect_ids = ()
             reconciled = (
                 rights_tombstone_failures == 0
-                and reconciliation.actual_effect_ids == generation_effect_ids
+                and reconciled_effect_ids == generation_effect_ids
                 and active_admitted == len(active_effect_ids)
             )
     integrity_holds = int(
@@ -3614,11 +3910,15 @@ __all__ = [
     "GraphitiProposalAdmissionAction",
     "GraphitiRelationHoldBasis",
     "GraphitiRightsAuthority",
+    "GRAPHITI_ADMISSION_EXTENSION_RECONCILIATION_SCHEMA_VERSION",
     "GRAPHITI_ADMISSION_RECONCILIATION_SCHEMA_VERSION",
+    "GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION",
+    "GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION",
     "graphiti_admission_request_from_value",
     "graphiti_admission_telemetry",
     "graphiti_decided_cohort_generation_identity",
     "graphiti_governed_decision_from_json",
     "graphiti_projection_receipt_from_json",
+    "graphiti_projection_receipt_matches_binding",
     "graphiti_projection_reconciliation_from_json",
 ]

@@ -31,6 +31,8 @@ from newsroom.control_plane.governed_context import (
     GovernedAuthorityContext,
 )
 from newsroom.control_plane.graphiti_admission import (
+    GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION,
+    GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION,
     GraphitiAdmissionConsumer,
     GraphitiAdmissionConsumerError,
     GraphitiAdmissionRequest,
@@ -355,32 +357,81 @@ class ExistingIncrement4GenerationProjector:
                 reason_code="GRAPHITI_ADMISSION_COHORT",
                 idempotency_key=idempotency_key,
                 purge_retired_generation=True,
+                allow_active_extension=True,
             ),
             proof=self._proof,
         )
+        source_bound = (
+            result.validation.source_snapshot_digest,
+            result.validation.source_watermark_ledger_seq,
+            result.validation.source_request_digest,
+        )
+        if any(item is not None for item in source_bound) and any(
+            item is None for item in source_bound
+        ):
+            raise GraphitiAdmissionConsumerError(
+                "Increment 4 generation result has partial source authority"
+            )
+        extension = all(item is not None for item in source_bound)
+        expected_source_request_digest = digest_canonical(
+            {
+                "generation_id": generation_id,
+                "reason_code": "GRAPHITI_ADMISSION_COHORT",
+                "idempotency_key": idempotency_key,
+                "purge_retired_generation": True,
+                "allow_active_extension": True,
+            }
+        )
         if (
-            result.generation.generation_id
-            != ProjectionGenerationId.parse(generation_id)
+            (
+                not extension
+                and result.generation.generation_id
+                != ProjectionGenerationId.parse(generation_id)
+            )
             or result.generation.state is not ProjectionGenerationState.ACTIVE
             or result.source_watermark_ledger_seq < required_watermark
             or result.checkpoint_ledger_seq < result.source_watermark_ledger_seq
-            or result.validation.validation_digest
-            != result.promotion.validation_digest
             or result.validation.projection_state_digest
             != result.projection_state_digest
+            or (
+                not extension
+                and result.validation.validation_digest
+                != result.promotion.validation_digest
+            )
+            or (
+                extension
+                and (
+                    result.validation.source_snapshot_digest
+                    != result.source_snapshot_digest
+                    or result.validation.source_watermark_ledger_seq
+                    != result.source_watermark_ledger_seq
+                    or result.validation.source_request_digest
+                    != expected_source_request_digest
+                )
+            )
         ):
             raise GraphitiAdmissionConsumerError(
                 "Increment 4 full generation does not bind the exact cohort cutoff"
             )
         return GraphitiProjectionGenerationResult(
             cohort_digest=cohort_digest,
-            generation_id=generation_id,
+            generation_id=str(result.generation.generation_id),
             source_snapshot_digest=result.source_snapshot_digest,
             authority_watermark=result.source_watermark_ledger_seq,
             validation_digest=result.validation.validation_digest,
             promotion_digest=result.promotion.promotion_digest,
             reconciliation_digest=result.projection_state_digest,
             admitted_authority_ids=admitted_ids,
+            schema_version=(
+                GRAPHITI_PROJECTION_EXTENSION_SCHEMA_VERSION
+                if extension
+                else GRAPHITI_PROJECTION_GENERATION_SCHEMA_VERSION
+            ),
+            source_request_digest=(
+                None
+                if not extension
+                else result.validation.source_request_digest
+            ),
         )
 
     @staticmethod

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from threading import RLock
 from typing import Any, Protocol
 
@@ -42,6 +43,7 @@ from newsroom.projection.neo4j.models import (
     StructuralReconciliationView,
 )
 from newsroom.projection.neo4j.qualification import neo4j_compatibility_digest
+from newsroom.projection.neo4j._state import _expected_projection_state_digest
 
 from ._increment4_projection_store import (
     _Increment4CurrentBuildInputs, _Increment4ProjectionAuthorityStore,
@@ -558,15 +560,18 @@ class _Increment4Neo4jBoundary:
                     service_compatibility_digest=compatibility_digest,
                     projection_state_digest=state_digest,
                     reason_code=request.reason_code,
-                    idempotency_key=self._operation_key(
-                        request.idempotency_key,
-                        "validate",
-                        {
-                            "generation_id": str(request.generation_id),
-                            "source_watermark": source_watermark,
-                            "snapshot_digest": snapshot_digest,
-                        },
+                    idempotency_key=(
+                        self._current_validation_key(request)
+                        if isinstance(request, Increment4Neo4jCurrentBuildRequest)
+                        and request.allow_active_extension
+                        else self._operation_key(
+                            request.idempotency_key, "validate",
+                            {"generation_id": str(request.generation_id),
+                             "source_watermark": source_watermark,
+                             "snapshot_digest": snapshot_digest},
+                        )
                     ),
+                    **self._source_binding(request, snapshot_digest, source_watermark),
                 ),
                 proof,
                 required_source_ledger_seq=source_watermark,
@@ -901,6 +906,212 @@ class _Increment4Neo4jBoundary:
             state_digest=state_digest,
         )
 
+    @classmethod
+    def _current_validation_key(cls, request):
+        return cls._operation_key(request.idempotency_key, "validate-current", {})
+
+    @staticmethod
+    def _source_request_digest(request):
+        return digest_canonical({
+            "generation_id": str(request.generation_id),
+            "reason_code": request.reason_code,
+            "idempotency_key": request.idempotency_key,
+            "purge_retired_generation": request.purge_retired_generation,
+            "allow_active_extension": request.allow_active_extension,
+        })
+
+    @classmethod
+    def _source_binding(cls, request, snapshot_digest, source_watermark):
+        if not (
+            isinstance(request, Increment4Neo4jCurrentBuildRequest)
+            and request.allow_active_extension
+        ):
+            return {}
+        return {
+            "source_snapshot_digest": snapshot_digest,
+            "source_watermark_ledger_seq": source_watermark,
+            "source_request_digest": cls._source_request_digest(request),
+        }
+
+    def _replay_current_validation(self, request, validation, proof):
+        if validation.source_request_digest != self._source_request_digest(request):
+            raise ProjectionStateError("Increment 4 retained build request differs")
+        metadata = self._store.projection_generation_metadata(validation.generation_id)
+        self._require_family(metadata)
+        if metadata.generation.state is ProjectionGenerationState.VALIDATING:
+            # Validation committed before initial promotion. Resume the existing
+            # full-build protocol, never attach this intent to another generation.
+            if validation.generation_id != request.generation_id:
+                raise ProjectionStateError("Increment 4 unfinished build request differs")
+            return None
+        if metadata.generation.state is not ProjectionGenerationState.ACTIVE:
+            raise ProjectionStateError("Increment 4 retained build is no longer ACTIVE")
+        self._authenticate_build(
+            request, validation.source_snapshot_digest,
+            validation.source_watermark_ledger_seq, proof,
+        )
+        # Replay the immutable cohort receipt, but prove the current graph first.
+        # A newer ACTIVE validation is not a rewrite of an earlier cohort receipt.
+        current = self._store.projection_generation_validation(validation.generation_id)
+        if (
+            metadata.contiguous_ledger_seq != current.checkpoint_ledger_seq
+            or metadata.generation.validated_through_ledger_seq != current.checkpoint_ledger_seq
+            or metadata.open_gap_count or metadata.dead_letter_count
+            or neo4j_compatibility_digest(self._adapter.verify_compatibility())
+            != current.service_compatibility_digest
+        ):
+            raise Neo4jIdentityConflict("Increment 4 ACTIVE replay lacks current validation")
+        family = self._store.projection_family_definition(INCREMENT4_ADMITTED_FAMILY_ID)
+        batches = self._store._increment4_current_batches(
+            generation_id=validation.generation_id, family=family,
+        )
+        state_digest = self._adapter.reconcile_generation(
+            generation_id=str(validation.generation_id), expected_batches=batches,
+        )
+        if state_digest != current.projection_state_digest:
+            raise Neo4jIdentityConflict("Increment 4 ACTIVE replay differs from current authority")
+        if batches != self._store._increment4_current_batches(
+            generation_id=validation.generation_id, family=family,
+        ):
+            raise ProjectionStateError("Increment 4 source changed during ACTIVE replay")
+        return self._result(
+            request=replace(request, generation_id=validation.generation_id),
+            snapshot_digest=validation.source_snapshot_digest,
+            source_watermark=validation.source_watermark_ledger_seq,
+            batches=tuple(b for b in batches if b.ledger_seq <= validation.checkpoint_ledger_seq),
+            deleted_target=0,
+            ignored=validation.source_watermark_ledger_seq - len(batches),
+            validation=validation,
+            promotion=self._promotion_for_generation(validation.generation_id),
+            state_digest=validation.projection_state_digest,
+        )
+
+    def _extend_or_replay_current(self, request, proof):
+        retained = self._store.projection_generation_validation_for_key(
+            self._projection_boundary.validation_idempotency_namespace(proof),
+            self._current_validation_key(request),
+        )
+        if retained is not None:
+            return self._replay_current_validation(request, retained, proof)
+        if self._metadata_or_none(request.generation_id) is not None:
+            # Preserve old v2 creation/replay and unfinished full-build behaviour.
+            return None
+        metadata = self._active_metadata_or_none()
+        if metadata is None:
+            return None
+        self._require_family(metadata)
+        generation_id = metadata.generation.generation_id
+        validation = self._store.projection_generation_validation(generation_id)
+        if metadata.open_gap_count or metadata.dead_letter_count:
+            raise ProjectionStateError("Increment 4 ACTIVE extension retained gaps or dead letters")
+        compatibility = neo4j_compatibility_digest(self._adapter.verify_compatibility())
+        if compatibility != validation.service_compatibility_digest:
+            raise Neo4jIdentityConflict("Increment 4 ACTIVE service compatibility changed")
+        family = self._store.projection_family_definition(INCREMENT4_ADMITTED_FAMILY_ID)
+        inputs = self._store._increment4_current_build_inputs(
+            generation_id=generation_id, family=family,
+        )
+        self._authenticate_build(request, inputs.snapshot_digest, inputs.source_watermark, proof)
+        prefix = tuple(b for b in inputs.batches if b.ledger_seq <= validation.checkpoint_ledger_seq)
+        if _expected_projection_state_digest(str(generation_id), prefix) != validation.projection_state_digest:
+            # Changed rights, lineage or historical membership require the
+            # established replacement-generation path. Graph-only drift below
+            # never enters this fallback.
+            return None
+
+        by_seq = self._batch_by_sequence(inputs.batches)
+        states = self._store.projection_rebuild_delivery_states(generation_id)
+        delivered = set()
+        for seq, state in states.items():
+            if not state.finalized or state.outcome not in {
+                ProjectionDeliveryOutcome.APPLIED, ProjectionDeliveryOutcome.IGNORED_OPTIONAL,
+            }:
+                raise ProjectionStateError("Increment 4 ACTIVE delivery retained a failure")
+            source = self._store.projection_delivery_source(generation_id, seq)
+            if str(state.source_event_id) != source.event.event_id or state.source_event_digest != source.source_event_digest:
+                raise ProjectionStateError("Increment 4 retained delivery provenance changed")
+            if state.outcome is ProjectionDeliveryOutcome.APPLIED:
+                if seq not in by_seq:
+                    raise ProjectionStateError("Increment 4 retained APPLIED delivery lacks current batch")
+                delivered.add(seq)
+            elif seq in by_seq:
+                raise ProjectionStateError("Increment 4 admitted batch was previously ignored")
+        if any(b.ledger_seq not in delivered for b in prefix):
+            raise ProjectionStateError("Increment 4 validated prefix lacks delivery authority")
+        committed = tuple(b for b in inputs.batches if b.ledger_seq in delivered)
+        pending = tuple(b for b in inputs.batches if b.ledger_seq not in delivered)
+        if pending and any(seq > pending[0].ledger_seq for seq in delivered):
+            raise ProjectionStateError("Increment 4 ACTIVE delivery history has a gap")
+        try:
+            self._adapter.reconcile_generation(
+                generation_id=str(generation_id), expected_batches=committed,
+            )
+        except Neo4jIdentityConflict:
+            if not pending:
+                raise
+            # apply is one graph transaction and precedes SQLite delivery commit.
+            # Exactly the next authorised batch may therefore already exist;
+            # any other graph difference still fails before a write or cleanup.
+            self._require_batch_source(pending[0])
+            self._adapter.reconcile_generation(
+                generation_id=str(generation_id),
+                expected_batches=committed + (pending[0],),
+            )
+        for batch in pending:
+            metadata = self._store.projection_generation_metadata(generation_id)
+            self._apply_and_record(
+                batch=batch,
+                expected_authority_version=metadata.generation.authority_aggregate_version,
+                idempotency_key=self._operation_key(request.idempotency_key, "active-delivery", {
+                    "generation_id": str(generation_id), "batch_digest": batch.batch_digest,
+                }), proof=proof,
+            )
+        metadata = self._store.projection_generation_metadata(generation_id)
+        if metadata.contiguous_ledger_seq < inputs.source_watermark:
+            self._record_ignored(
+                generation_id=generation_id, ledger_seq=metadata.contiguous_ledger_seq + 1,
+                expected_authority_version=metadata.generation.authority_aggregate_version,
+                idempotency_key=self._operation_key(request.idempotency_key, "active-ignored", {
+                    "generation_id": str(generation_id), "snapshot_digest": inputs.snapshot_digest,
+                }), proof=proof,
+            )
+            metadata = self._store.projection_generation_metadata(generation_id)
+        if (
+            metadata.generation.state is not ProjectionGenerationState.ACTIVE
+            or metadata.contiguous_ledger_seq < inputs.source_watermark
+            or metadata.open_gap_count or metadata.dead_letter_count
+        ):
+            raise ProjectionStateError("Increment 4 ACTIVE extension lacks complete source watermark")
+        state_digest = self._adapter.reconcile_generation(
+            generation_id=str(generation_id), expected_batches=inputs.batches,
+        )
+        if inputs.batches != self._store._increment4_current_batches(
+            generation_id=generation_id, family=family,
+        ):
+            raise ProjectionStateError("Increment 4 source changed during ACTIVE extension")
+        if compatibility != neo4j_compatibility_digest(self._adapter.verify_compatibility()):
+            raise Neo4jIdentityConflict("Increment 4 ACTIVE service compatibility changed")
+        validation = self._projection_boundary.validate_generation(
+            ProjectionGenerationValidationRequest(
+                generation_id=generation_id,
+                expected_authority_version=metadata.generation.authority_aggregate_version,
+                checkpoint_ledger_seq=metadata.contiguous_ledger_seq,
+                service_compatibility_digest=compatibility,
+                projection_state_digest=state_digest,
+                reason_code=request.reason_code,
+                idempotency_key=self._current_validation_key(request),
+                **self._source_binding(request, inputs.snapshot_digest, inputs.source_watermark),
+            ), proof, required_source_ledger_seq=inputs.source_watermark,
+        )
+        return self._result(
+            request=replace(request, generation_id=generation_id),
+            snapshot_digest=inputs.snapshot_digest, source_watermark=inputs.source_watermark,
+            batches=inputs.batches, deleted_target=0,
+            ignored=inputs.source_watermark - len(inputs.batches),
+            validation=validation, promotion=self._promotion_for_generation(generation_id),
+            state_digest=state_digest,
+        )
+
     def build_current_and_promote(
         self,
         request: Increment4Neo4jCurrentBuildRequest,
@@ -920,6 +1131,10 @@ class _Increment4Neo4jBoundary:
                 },
                 proof=proof,
             )
+            if request.allow_active_extension:
+                result = self._extend_or_replay_current(request, proof)
+                if result is not None:
+                    return result
             inputs = self._store._increment4_current_build_inputs(
                 generation_id=request.generation_id,
                 family=self._store.projection_family_definition(INCREMENT4_ADMITTED_FAMILY_ID),

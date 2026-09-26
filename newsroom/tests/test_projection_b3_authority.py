@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sqlite3
 
 import pytest
 
-from newsroom.authority import AggregateId, InlinePayload, SemanticCommand, digest_canonical
+from newsroom.authority import (
+    AggregateId,
+    InlinePayload,
+    SemanticCommand,
+    canonical_json_bytes,
+    digest_bytes,
+    digest_canonical,
+)
 from newsroom.projection import (
     ProjectionDeliveryOutcome,
     ProjectionDeliveryRequest,
@@ -17,6 +25,7 @@ from newsroom.projection import (
     ProjectionGenerationTransitionRequest,
     ProjectionGenerationValidationRequest,
     ProjectionStateError,
+    ProjectionContractError,
 )
 
 from .projection_b1_helpers import FAMILY_ID, open_projection_system, proof
@@ -186,6 +195,203 @@ def test_validation_evidence_is_exact_typed_and_replayable(tmp_path: Path) -> No
         assert system.projections.validation(
             created.generation_id, proof=proof()
         ) == validation
+        assert validation.source_snapshot_digest is None
+    finally:
+        system.close()
+
+
+def test_source_bound_validation_is_exact_replayable_and_lookupable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "authority.sqlite3"
+    snapshot = digest_canonical({"source": "snapshot"})
+    request_digest = digest_canonical({"source": "request"})
+    system = open_projection_system(path)
+    try:
+        _register(system)
+        created = _create(system, "generation-create-source-bound")
+        request = ProjectionGenerationValidationRequest(
+            created.generation_id,
+            created.authority_aggregate_version,
+            0,
+            SERVICE_DIGEST,
+            GRAPH_DIGEST,
+            "B3_VALIDATE_CURRENT",
+            "generation-validate-current",
+            snapshot,
+            0,
+            request_digest,
+        )
+        with pytest.raises(ProjectionStateError, match="differs from required"):
+            system.projections.validate_generation(
+                request, proof=proof(), required_source_ledger_seq=1
+            )
+        validation = system.projections.validate_generation(request, proof=proof())
+        assert system.projections.validate_generation(
+            request, proof=proof(), required_source_ledger_seq=0
+        ) == validation
+        assert validation.source_snapshot_digest == snapshot
+        assert validation.source_watermark_ledger_seq == 0
+        assert validation.source_request_digest == request_digest
+        boundary = system.projections._NativeProjections__validation.__self__
+        namespace = boundary.validation_idempotency_namespace(proof())
+        assert boundary._store.projection_generation_validation_for_key(
+            namespace, request.idempotency_key
+        ) == validation
+        current = system.projections.generations(FAMILY_ID, proof=proof())[0]
+        promoted = _promote(
+            system, current, validation, "generation-promote-source-bound"
+        ).generation
+        active_request = ProjectionGenerationValidationRequest(
+            promoted.generation_id,
+            promoted.authority_aggregate_version,
+            0,
+            SERVICE_DIGEST,
+            GRAPH_DIGEST,
+            "B3_VALIDATE_CURRENT_ACTIVE",
+            "generation-validate-current-active",
+            snapshot,
+            0,
+            digest_canonical({"source": "active-request"}),
+        )
+        active_validation = system.projections.validate_generation(
+            active_request, proof=proof()
+        )
+        assert system.projections.generations(FAMILY_ID, proof=proof())[0].state is (
+            ProjectionGenerationState.ACTIVE
+        )
+    finally:
+        system.close()
+
+    reopened = open_projection_system(path)
+    try:
+        boundary = reopened.projections._NativeProjections__validation.__self__
+        namespace = boundary.validation_idempotency_namespace(proof())
+        assert boundary._store.projection_generation_validation_for_key(
+            namespace, request.idempotency_key
+        ) == validation
+        assert boundary._store.projection_generation_validation_for_key(
+            namespace, active_request.idempotency_key
+        ) == active_validation
+    finally:
+        reopened.close()
+
+
+def test_validation_source_binding_is_all_or_none_and_within_checkpoint() -> None:
+    generation_id = ProjectionGenerationId.new()
+    digest = digest_canonical({"source": "binding"})
+    common = (
+        generation_id,
+        1,
+        0,
+        SERVICE_DIGEST,
+        GRAPH_DIGEST,
+        "B3_VALIDATE_CURRENT",
+        "generation-validate-current-invalid",
+    )
+    with pytest.raises(ProjectionContractError, match="complete"):
+        ProjectionGenerationValidationRequest(*common, digest, None, digest)
+    with pytest.raises(ProjectionContractError, match="exceeds checkpoint"):
+        ProjectionGenerationValidationRequest(*common, digest, 1, digest)
+    for invalid_watermark in (True, "0", 0.0):
+        with pytest.raises(ProjectionContractError):
+            ProjectionGenerationValidationRequest(
+                *common, digest, invalid_watermark, digest
+            )
+
+
+def test_source_bound_validation_reopen_rejects_self_consistent_command_drift(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "authority.sqlite3"
+    digest = digest_canonical({"source": "original"})
+    system = open_projection_system(path)
+    try:
+        _register(system)
+        created = _create(system, "generation-create-source-tamper")
+        system.projections.validate_generation(
+            ProjectionGenerationValidationRequest(
+                created.generation_id,
+                created.authority_aggregate_version,
+                0,
+                SERVICE_DIGEST,
+                GRAPH_DIGEST,
+                "B3_VALIDATE_CURRENT",
+                "generation-validate-current-tamper",
+                digest,
+                0,
+                digest,
+            ),
+            proof=proof(),
+        )
+    finally:
+        system.close()
+
+    conn = sqlite3.connect(path)
+    try:
+        trigger = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND "
+            "name='immutable_projection_generation_validation_update'"
+        ).fetchone()[0]
+        row = conn.execute(
+            "SELECT validation_digest,canonical_bytes "
+            "FROM projection_generation_validations"
+        ).fetchone()
+        value = json.loads(row[1])
+        value["source_request_digest"] = digest_canonical({"source": "other"})
+        canonical = canonical_json_bytes(value)
+        conn.execute("DROP TRIGGER immutable_projection_generation_validation_update")
+        conn.execute(
+            "UPDATE projection_generation_validations SET validation_digest=?,"
+            "canonical_bytes=? WHERE validation_digest=?",
+            (digest_bytes(canonical), canonical, row[0]),
+        )
+        conn.execute(trigger)
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(Exception, match="command binding is inconsistent"):
+        open_projection_system(path)
+
+
+def test_source_bound_lookup_recomputes_validation_digest(tmp_path: Path) -> None:
+    system = open_projection_system(tmp_path / "authority.sqlite3")
+    try:
+        _register(system)
+        created = _create(system, "generation-create-source-digest-tamper")
+        digest = digest_canonical({"source": "lookup"})
+        request = ProjectionGenerationValidationRequest(
+            created.generation_id,
+            created.authority_aggregate_version,
+            0,
+            SERVICE_DIGEST,
+            GRAPH_DIGEST,
+            "B3_VALIDATE_CURRENT",
+            "generation-validate-current-digest-tamper",
+            digest,
+            0,
+            digest,
+        )
+        system.projections.validate_generation(request, proof=proof())
+        boundary = system.projections._NativeProjections__validation.__self__
+        conn = boundary._store._connection
+        trigger = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND "
+            "name='immutable_projection_generation_validation_update'"
+        ).fetchone()[0]
+        conn.execute("DROP TRIGGER immutable_projection_generation_validation_update")
+        conn.execute(
+            "UPDATE projection_generation_validations SET validation_digest=?",
+            ("sha256:" + "0" * 64,),
+        )
+        conn.execute(trigger)
+        conn.commit()
+        namespace = boundary.validation_idempotency_namespace(proof())
+        with pytest.raises(Exception, match="validation digest is inconsistent"):
+            boundary._store.projection_generation_validation_for_key(
+                namespace, request.idempotency_key
+            )
     finally:
         system.close()
 

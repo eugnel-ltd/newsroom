@@ -794,3 +794,64 @@ def test_actual_service_increment4_tombstone_purges_and_never_resurrects(
             ).fetchone()[0] == 1
     finally:
         _cleanup(config, first_id, purge_id)
+
+
+def test_actual_service_active_suffix_reopen_and_replay(tmp_path, monkeypatch):
+    from newsroom.projection.neo4j._adapter import _Neo4jAdapter
+    from .test_increment4_active_extension import add_suffix, request
+
+    config = _service_config()
+    state = seed_increment4_graphiti_path(tmp_path / 'authority')
+    admit_increment4_graphiti_path(state)
+    first_id, fallback_id = ProjectionGenerationId.new(), ProjectionGenerationId.new()
+    calls = []
+    apply = _Neo4jAdapter.apply
+
+    def measured_apply(self, batch):
+        calls.append(batch.ledger_seq)
+        return apply(self, batch)
+
+    monkeypatch.setattr(_Neo4jAdapter, 'apply', measured_apply)
+    try:
+        with open_graphiti_path_increment4_neo4j_system(
+            state.relation, _open_neo4j_adapter(config),
+        ) as system:
+            first = system.increment4.build_current_and_promote(
+                request(first_id, 'service-initial'), proof=extraction_proof(),
+            )
+        add_suffix(state)
+        calls.clear()
+        before = _event_count(state.extraction.database)
+        with open_graphiti_path_increment4_neo4j_system(
+            state.relation, _open_neo4j_adapter(config),
+        ) as system:
+            second = system.increment4.build_current_and_promote(
+                request(fallback_id, 'service-suffix'), proof=extraction_proof(),
+            )
+            assert second.generation.generation_id == first_id
+            assert second.promotion == first.promotion
+            assert len(calls) == 1
+            assert _event_count(state.extraction.database) - before == 2
+            system.increment4.reconcile_active(proof=extraction_proof())
+        calls.clear()
+        before = _event_count(state.extraction.database)
+        with open_graphiti_path_increment4_neo4j_system(
+            state.relation, _open_neo4j_adapter(config),
+        ) as system:
+            replay = system.increment4.build_current_and_promote(
+                request(fallback_id, 'service-suffix'), proof=extraction_proof(),
+            )
+            assert replay.validation == second.validation
+            assert replay.source_snapshot_digest == second.source_snapshot_digest
+            assert calls == []
+            assert _event_count(state.extraction.database) == before
+        assert _scalar(
+            'MATCH (d:NewsroomProjectionDelivery {generation_id:$generation_id}) RETURN count(d)',
+            generation_id=str(first_id),
+        ) == first.projected_batch_count + 1
+        assert _scalar(
+            'MATCH (d {generation_id:$generation_id}) RETURN count(d)',
+            generation_id=str(fallback_id),
+        ) == 0
+    finally:
+        _cleanup(config, first_id, fallback_id)
