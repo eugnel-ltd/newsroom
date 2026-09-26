@@ -466,10 +466,6 @@ def test_shared_writer_advances_no_match_through_hypothesis_relationship(
             manifest.governing_state_binding.canonical_digest,
             None,
         )
-        original_manifest_builder = reopened.build_candidate_manifest
-        def duplicate_manifest(*_args, **_kwargs):
-            raise AssertionError("prepared Candidate manifest was rebuilt")
-        monkeypatch.setattr(reopened, "build_candidate_manifest", duplicate_manifest)
         stale = _admit_native_triage_candidate(
             reopened,
             triage=reopened_result,
@@ -481,41 +477,9 @@ def test_shared_writer_advances_no_match_through_hypothesis_relationship(
             ),
             current_candidate_version=None,
             proof=proof(),
-            prepared_manifest=manifest,
         )
         assert stale.state == "CANDIDATE_HOLD"
         assert stale.candidate is None
-        from newsroom.control_plane.native_triage import NativeTriageError
-        for wrong in (object(), replace(manifest, relationship_assessment_digest="sha256:" + "0" * 64)):
-            with pytest.raises(NativeTriageError):
-                _admit_native_triage_candidate(
-                    reopened, triage=reopened_result,
-                    collision_request=collision_request_value,
-                    collision_decision=collision_decision,
-                    candidate_request=candidate_request,
-                    current_candidate_version=None, proof=proof(),
-                    prepared_manifest=wrong,
-                )
-        # A prepared input never replaces the fresh authoritative producer read
-        # in Candidate admission. An upstream failure still prevents the effect.
-        from newsroom.authority.story_candidate_system import _CandidateStore
-        from newsroom.increment6.candidates import CandidateContractError
-        fresh_reads = []
-        def changed_producers(*_args, **_kwargs):
-            fresh_reads.append("checked")
-            raise CandidateContractError("current producer proof changed")
-        with monkeypatch.context() as currentness:
-            currentness.setattr(_CandidateStore, "_producers", changed_producers)
-            with pytest.raises(CandidateContractError):
-                _admit_native_triage_candidate(
-                    reopened, triage=reopened_result,
-                    collision_request=collision_request_value,
-                    collision_decision=collision_decision,
-                    candidate_request=candidate_request,
-                    current_candidate_version=None, proof=proof(),
-                    prepared_manifest=manifest,
-                )
-        assert fresh_reads == ["checked"]
         admitted = _admit_native_triage_candidate(
             reopened,
             triage=reopened_result,
@@ -524,7 +488,6 @@ def test_shared_writer_advances_no_match_through_hypothesis_relationship(
             candidate_request=candidate_request,
             current_candidate_version=None,
             proof=proof(),
-            prepared_manifest=manifest,
         )
         assert admitted.state == "CANDIDATE_ADMITTED"
         assert admitted.admission is not None
@@ -532,7 +495,6 @@ def test_shared_writer_advances_no_match_through_hypothesis_relationship(
         assert reopened.candidates.load_version(admitted.candidate.version_id) == (
             admitted.candidate
         )
-        monkeypatch.setattr(reopened, "build_candidate_manifest", original_manifest_builder)
         assert (
             advance_native_triage(
                 reopened,

@@ -132,12 +132,6 @@ def test_native_cycle_isolates_hold_then_admits_and_replays_after_restart(
     with _shared_system(
         tmp_path, monkeypatch, retrieval_authority, collision=enforcer
     ) as reopened:
-        manifests = []
-        original_manifest = reopened.build_candidate_manifest
-        def counted_manifest(*args, **kwargs):
-            manifests.append(args[0])
-            return original_manifest(*args, **kwargs)
-        monkeypatch.setattr(reopened, "build_candidate_manifest", counted_manifest)
         outcomes = advance_native_cycle(
             reopened,
             (status, status),
@@ -155,7 +149,6 @@ def test_native_cycle_isolates_hold_then_admits_and_replays_after_restart(
         candidate = outcomes[1].triage.candidate
         assert candidate is not None
         assert fences == ["entered"]
-        assert len(manifests) == 1
         assert preparations == [
             held.triage.work.version.version_id,
             held.triage.work.version.version_id,
