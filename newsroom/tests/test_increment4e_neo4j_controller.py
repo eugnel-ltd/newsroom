@@ -746,3 +746,104 @@ def test_streamed_current_provenance_preserves_mapping_and_requires_every_witnes
                 events=(item for item in complete.events if item.event_id != missing_id),
                 through_ledger_seq=complete.through_ledger_seq, hash_history=hash_history,
             )
+
+
+def test_reconciliation_decodes_only_admitted_witnesses_and_watermark(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import contextmanager
+    from newsroom.authority._increment4_projection_store import _Increment4ProjectionAuthorityStore
+    from newsroom.increment4.models import _required_event_ids
+
+    state, _ = admitted_increment4_fixture(tmp_path)
+    adapter = MemoryNeo4jAdapter()
+    with open_increment4_neo4j_system(state, adapter) as system:
+        for seq in range(200):
+            system.commands.execute(authority_command(
+                key=f'reconcile-unmapped-{seq}',
+                aggregate_id=AggregateId.parse(f'00000000-0000-4000-8000-{810000 + seq:012d}'),
+            ), proof=extraction_proof())
+        boundary = system.increment4._Increment4Neo4jController__reconcile_active.__self__
+        boundary._register_family(extraction_proof())
+        store = boundary._store
+        family = store.projection_family_definition('graph.increment4.admitted')
+        complete = store._increment4_current_build_inputs(generation_id=GENERATION_1, family=family)
+        with store._increment4_projection_read() as (conn, entities, relations, watermark):
+            required = _required_event_ids(entities, relations)
+            expected_ids = required | {str(conn.execute(
+                'SELECT event_id FROM ledger_events WHERE ledger_seq=?', (watermark,),
+            ).fetchone()[0])}
+        original_read = _Increment4ProjectionAuthorityStore._increment4_projection_read
+        original_decode = store._event_from_row
+        decoded = []
+        def decode(row):
+            event = original_decode(row)
+            decoded.append(event.event_id)
+            return event
+        @contextmanager
+        def constrained_read(self):
+            with original_read(self) as inputs:
+                connection = inputs[0]
+                previous = connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 2)
+                try:
+                    yield inputs
+                finally:
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+        monkeypatch.setattr(store, '_event_from_row', decode)
+        monkeypatch.setattr(_Increment4ProjectionAuthorityStore, '_increment4_projection_read', constrained_read)
+        batches = store._increment4_current_batches(generation_id=GENERATION_1, family=family)
+        assert batches == complete.batches
+        assert len(decoded) == len(expected_ids)
+        assert set(decoded) == expected_ids
+        assert not store._connection.in_transaction
+        # The full build still decodes and hashes the entire history; this
+        # optimisation applies only to reconciliation's existing no-hash path.
+        monkeypatch.setattr(_Increment4ProjectionAuthorityStore, '_increment4_projection_read', original_read)
+        decoded.clear()
+        again = store._increment4_current_build_inputs(generation_id=GENERATION_1, family=family)
+        assert again == complete
+        assert len(decoded) == complete.source_watermark
+        unrelated = next(item for item in decoded if item not in required)
+        def changed_unmapped(row):
+            event = original_decode(row)
+            return replace(event, payload_digest='sha256:' + '0' * 64) if event.event_id == unrelated else event
+        monkeypatch.setattr(store, '_event_from_row', changed_unmapped)
+        altered = store._increment4_current_build_inputs(generation_id=GENERATION_1, family=family)
+        assert altered.snapshot_digest != complete.snapshot_digest
+        assert altered.batches == complete.batches
+
+
+@pytest.mark.parametrize('fault', ['missing_witness', 'missing_watermark', 'future_sequence', 'duplicate_sequence'])
+def test_indexed_reconciliation_keeps_provenance_refusals(tmp_path, monkeypatch, fault):
+    from contextlib import contextmanager
+    import newsroom.authority._increment4_projection_store as store_module
+
+    state, snapshot = admitted_increment4_fixture(tmp_path)
+    with open_increment4_neo4j_system(state, MemoryNeo4jAdapter()) as system:
+        boundary = system.increment4._Increment4Neo4jController__reconcile_active.__self__
+        boundary._register_family(extraction_proof())
+        store = boundary._store
+        family = store.projection_family_definition('graph.increment4.admitted')
+        required = store_module._required_event_ids(snapshot.entities, snapshot.relations)
+        target = sorted(required)[0]
+        if fault == 'missing_witness':
+            original = store_module._required_event_ids
+            monkeypatch.setattr(store_module, '_required_event_ids', lambda e, r: original(e, r) - {target})
+        elif fault == 'missing_watermark':
+            original = store._increment4_projection_read
+            @contextmanager
+            def missing_watermark():
+                with original() as (conn, entities, relations, watermark):
+                    yield conn, entities, relations, watermark + 10000
+            monkeypatch.setattr(store, '_increment4_projection_read', missing_watermark)
+        else:
+            original = store._event_from_row
+            other = next(event for event in snapshot.events if event.event_id in required and event.event_id != target)
+            def corrupt(row):
+                event = original(row)
+                if event.event_id == target:
+                    event = replace(event, ledger_seq=(other.ledger_seq if fault == 'duplicate_sequence' else snapshot.through_ledger_seq + 10000))
+                return event
+            monkeypatch.setattr(store, '_event_from_row', corrupt)
+        with pytest.raises(ValueError):
+            store._increment4_current_batches(generation_id=GENERATION_1, family=family)
+        assert not store._connection.in_transaction
