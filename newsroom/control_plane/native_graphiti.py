@@ -236,28 +236,53 @@ class NativeGraphitiProcessor:
                     )
                     continue
         deferred = set()
+        considered = set()
 
         def defer(unit: CorpusIngestUnit) -> bool:
+            considered.add(unit.ingest_id)
             self._stop_check()
             if defer_before_unit(unit):
                 deferred.add(unit.ingest_id)
                 return True
             return False
 
-        _ingest(
-            self._connection, graphiti=self._runner,
-            units=tuple(unit for ingest_id, unit in units_by_ingest.items() if ingest_id not in terminal_holds),
-            max_graphiti=len(units), rights_check=self._rights,
-            rights_fence=self._fence, clock=self._clock,
-            model_usage=self._usage, cycle_id=cycle_id,
-            operator_drain_requested=self._operator_drain_requested,
-            defer_before_unit=defer,
-            preserve_unit_order=True,
-            fallback_permitted=True,
-            recovered_ambiguous_attempts=recovered_ambiguous_attempts,
-            authenticated_rejected_attempts=authenticated_rejected_attempts,
-            authenticated_reentry_attempts=authenticated_reentry_attempts,
-        )
+        remaining = {
+            ingest_id: unit for ingest_id, unit in units_by_ingest.items()
+            if ingest_id not in terminal_holds
+        }
+        # Refresh only after settled progress. Each queued identity is offered
+        # at most once per advance; failed/deferred work is not retried here.
+        # The existing defer callback retains the pipeline's wall-time quantum.
+        while remaining:
+            considered.clear()
+            _ingest(
+                self._connection, graphiti=self._runner,
+                units=tuple(remaining.values()),
+                max_graphiti=len(remaining), rights_check=self._rights,
+                rights_fence=self._fence, clock=self._clock,
+                model_usage=self._usage, cycle_id=cycle_id,
+                operator_drain_requested=self._operator_drain_requested,
+                defer_before_unit=defer,
+                preserve_unit_order=True,
+                fallback_permitted=True,
+                recovered_ambiguous_attempts=recovered_ambiguous_attempts,
+                authenticated_rejected_attempts=authenticated_rejected_attempts,
+                authenticated_reentry_attempts=authenticated_reentry_attempts,
+            )
+            for ingest_id in considered:
+                remaining.pop(ingest_id, None)
+            if (
+                not considered or self._operator_drain_requested()
+                or graphiti_required_route_holds(self._usage, fallback_permitted=True)
+                or not any(
+                    self._connection.execute(
+                        "SELECT 1 FROM unpublished_graphiti_ingest WHERE ingest_id=? AND outcome='COMPLETE'",
+                        (ingest_id,),
+                    ).fetchone() is not None
+                    for ingest_id in considered
+                )
+            ):
+                break
         self._settle_missing_subscription_usage(units)
         if self._operator_drain_requested():
             raise OperatorDrainRequested
