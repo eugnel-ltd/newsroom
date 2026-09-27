@@ -1,4 +1,6 @@
 """Literal, bounded CSV cells on the existing declared-attachment route."""
+import csv
+import io
 import json
 
 import pytest
@@ -47,6 +49,14 @@ def test_csv_reuses_finite_row_column_cell_and_output_bounds(monkeypatch, bound)
         parse(raw, url=URL)
 
 
-def test_csv_cell_rights_exclusion_stays_a_hold():
+@pytest.mark.parametrize('notice', [
+    'All rights reserved', 'All rights\nreserved', 'All  rights reserved',
+    'Third-party\ncopyright', 'Permission required from the\ncopyright holder',
+    'Not covered by the\r\nOpen Government Licence',
+    'All\trights\u00a0reserved',
+])
+def test_csv_cell_rights_exclusion_stays_a_hold(notice):
+    stream = io.StringIO(newline='')
+    csv.writer(stream).writerows([['heading', 'note'], ['value', notice]])
     with pytest.raises(ValueError, match='rights exclusion'):
-        parse(b'heading,note\nvalue,All rights reserved\n', url=URL)
+        parse(stream.getvalue().encode(), url=URL)

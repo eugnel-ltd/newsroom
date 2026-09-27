@@ -53,6 +53,7 @@ POLICY_DIGEST = digest_canonical({
     "formats": MIME_TYPES,
     "csv": "utf8-optional-bom-comma-doublequote-strict-literal-cells",
     "csv_whitespace_empty_multiline": "preserved-no-header-or-type-inference",
+    "csv_rights_view": "decoded-cells-with-whitespace-normalised-before-quoting",
 })
 O = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
 T = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
@@ -488,6 +489,8 @@ def _csv(raw, output):
         for number, row in enumerate(csv.reader(io.StringIO(text, newline=""), strict=True), 1):
             if number > MAX_ROWS or len(row) > MAX_COLUMNS:
                 raise ValueError("spreadsheet CSV dimensions exceed bounds")
+            if any(_exclusion_signals({"details": {}}, " ".join(value.split())) for value in row):
+                raise ValueError("spreadsheet cell rights exclusion")
             if row:
                 output.row(number, [(column, _quoted(value)) for column, value in enumerate(row, 1)])
             else:
