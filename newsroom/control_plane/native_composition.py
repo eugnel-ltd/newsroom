@@ -243,7 +243,7 @@ def deployed_native_service(args):
         assessment = usage.qualified_policy(
             workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
             provider=native_assessor.CONT_PRIMARY_PROVIDER, route=native_assessor.ROUTE,
-            model=native_assessor.CONT_PRIMARY_MODEL, reasoning=native_assessor.CONT_PRIMARY_REASONING,
+            model=native_assessor.CONT_PRIMARY_MODEL, reasoning=native_assessor.REASONING,
             config_identity=native_assessor.CONFIG_IDENTITY,
             output_schema_digest=native_assessor.PROVIDER_SCHEMA_DIGEST,
         )

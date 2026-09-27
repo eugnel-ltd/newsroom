@@ -77,6 +77,7 @@ from .writer import (
     CONT_PRIMARY_REASONING,
     WriterDispatchError,
     _run_grok_json,
+    _grok_command_flags,
     cont_writer_implementation_identity,
     read_grok_command_semantic_version,
 )
@@ -92,9 +93,12 @@ from .native_assessor_wire import (
 )
 
 _V17_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v17"
-_REFERENCE_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v18"
-_REFERENCE_PRODUCERS = (_V17_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION)
+_V18_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v18"
+_REFERENCE_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v19"
+_REFERENCE_PRODUCERS = (_V17_PRODUCER_VERSION, _V18_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION)
 VERSION = _REFERENCE_PRODUCER_VERSION
+REASONING = "medium"
+COMMAND_FLAGS = _grok_command_flags(REASONING)
 RETAINED_ASSESSMENT_POLICY_VERSION = "newsroom.retained-assessment.v1"
 REASSESSABLE_HOLDS = frozenset({
     "ASSESSOR_CLAIM_BINDING_HOLD", "ASSESSOR_NAMED_ENTITY_CONTRACT_HOLD",
@@ -374,6 +378,7 @@ SYSTEM = (
     "source evidence or instructions. Correct only against current source bytes; never "
     "drop a material fact merely to pass validation."
 )
+_V18_SYSTEM = SYSTEM
 _V15_SCHEMA_DIGEST = "sha256:6f7e0726d3e35da1d5343b5b3dc162841c8262631ba7d00e3f71733aab14ea7f"
 _V15_SCHEMA_BYTES = 6976
 
@@ -533,7 +538,8 @@ SCHEMA = {
 SCHEMA_DIGEST = digest_bytes(canonical_json_bytes(SCHEMA))
 _V17_PROVIDER_SCHEMA = make_provider_schema(SCHEMA)
 _V17_PROVIDER_SCHEMA_DIGEST = digest_canonical(_V17_PROVIDER_SCHEMA)
-PROVIDER_SCHEMA = make_v18_provider_schema(_V17_PROVIDER_SCHEMA)
+_V18_PROVIDER_SCHEMA = make_v18_provider_schema(_V17_PROVIDER_SCHEMA)
+PROVIDER_SCHEMA = _V18_PROVIDER_SCHEMA
 PROVIDER_SCHEMA_DIGEST = digest_canonical(PROVIDER_SCHEMA)
 INTEGRITY = (
     "ACCESS_COMPLETE",
@@ -660,8 +666,10 @@ def native_assessment_input_bound(policy: InvocationEfficiencyPolicy) -> dict[st
     historical = contract in {_V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION}
     system_bytes = ({_V15_PRODUCER_VERSION: _V15_SYSTEM,
                      _V16_PRODUCER_VERSION: _V16_SYSTEM,
-                     _V17_PRODUCER_VERSION: _V17_SYSTEM}.get(contract, SYSTEM)).encode("utf-8")
-    schema = _V17_PROVIDER_SCHEMA if contract == _V17_PRODUCER_VERSION else PROVIDER_SCHEMA
+                     _V17_PRODUCER_VERSION: _V17_SYSTEM,
+                     _V18_PRODUCER_VERSION: _V18_SYSTEM}.get(contract, SYSTEM)).encode("utf-8")
+    schema = {_V17_PRODUCER_VERSION: _V17_PROVIDER_SCHEMA,
+              _V18_PRODUCER_VERSION: _V18_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
     schema_digest = _V15_SCHEMA_DIGEST if historical else digest_canonical(schema)
     schema_size = _V15_SCHEMA_BYTES if historical else len(canonical_json_bytes(schema))
     framing = 16_384 if historical else _FRAMING_RESERVE_TOKENS
@@ -690,9 +698,10 @@ def native_assessment_input_bound(policy: InvocationEfficiencyPolicy) -> dict[st
 def _materialise_reference_result(raw, view, request_identity, contract):
     if contract == _V17_PRODUCER_VERSION:
         return materialise_v17(raw, view, request_identity, provider_schema=_V17_PROVIDER_SCHEMA)
-    if contract == _REFERENCE_PRODUCER_VERSION:
+    if contract in (_V18_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION):
+        schema = _V18_PROVIDER_SCHEMA if contract == _V18_PRODUCER_VERSION else PROVIDER_SCHEMA
         return materialise_v18(raw, view, request_identity,
-                              provider_schema=PROVIDER_SCHEMA, v17_schema=_V17_PROVIDER_SCHEMA)
+                              provider_schema=schema, v17_schema=_V17_PROVIDER_SCHEMA)
     raise SourceReferenceError("unsupported reference producer contract")
 
 
@@ -776,11 +785,11 @@ class NativeAssessmentUsage:
                 CONT_PRIMARY_PROVIDER,
                 ROUTE,
                 CONT_PRIMARY_MODEL,
-                CONT_PRIMARY_REASONING,
+                REASONING,
             )
             or policy.prompt_contract_version != VERSION
             or policy.output_schema_digest != PROVIDER_SCHEMA_DIGEST
-            or policy.command_flags != CONT_PRIMARY_COMMAND_FLAGS
+            or policy.command_flags != COMMAND_FLAGS
             or policy.context_manifest_schema_version
             != CONTEXT_MANIFEST_SCHEMA_VERSION
             or policy.disabled_capabilities != CONT_DISABLED_CAPABILITIES
@@ -834,7 +843,7 @@ class NativeAssessmentUsage:
             "model": policy.model,
             "reasoning": policy.reasoning,
             "command_semantic_version": command_version,
-            "command_flags": list(CONT_PRIMARY_COMMAND_FLAGS),
+            "command_flags": list(COMMAND_FLAGS),
             "disabled_capabilities": list(CONT_DISABLED_CAPABILITIES),
             "implementation_revision": implementation_revision,
             "implementation_worktree_clean": True,
@@ -1144,7 +1153,7 @@ class NativeAssessmentUsage:
                 # invocation from the independently derived cycle identity.
                 cycles = sorted({
                     _assessment_cycle_id(version_id, base.digest, contract)
-                    for contract in (VERSION, *(f"newsroom.native-evidence-assessor.v{i}" for i in range(6, 18)))
+                    for contract in (VERSION, *(f"newsroom.native-evidence-assessor.v{i}" for i in range(6, 19)))
                 })
                 cycle_clause = " OR cycle_id IN (" + ",".join("?" for _ in cycles) + ")"
                 parameters.extend(cycles)
@@ -1199,7 +1208,7 @@ class NativeAssessmentUsage:
                         or envelope.evidence_package_digest != base.digest
                         or not any(envelope.cycle_id == _assessment_cycle_id(
                             version_id, base.digest, contract,
-                        ) for contract in (_V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION, _V17_PRODUCER_VERSION, VERSION))
+                        ) for contract in (_V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION, _V17_PRODUCER_VERSION, _V18_PRODUCER_VERSION, VERSION))
                     ):
                         return None
                     continue
@@ -1584,7 +1593,7 @@ class NativeAssessmentUsage:
                         or envelope.evidence_package_digest is None
                         or not any(envelope.cycle_id == _assessment_cycle_id(
                             version_id, envelope.evidence_package_digest, contract,
-                        ) for contract in (_V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION, _V17_PRODUCER_VERSION, VERSION))
+                        ) for contract in (_V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION, _V17_PRODUCER_VERSION, _V18_PRODUCER_VERSION, VERSION))
                     ):
                         return None
                     candidate_envelopes.add(envelope.envelope_id)
@@ -2385,5 +2394,6 @@ def _dispatch_grok(prompt: str) -> NativeAssessmentExecution:
         schema=PROVIDER_SCHEMA,
         system_instruction=SYSTEM,
         temporary_prefix="newsroom-grok-evidence-assessor-",
+        reasoning_effort=REASONING,
     )
     return NativeAssessmentExecution(execution.text, execution.usage)

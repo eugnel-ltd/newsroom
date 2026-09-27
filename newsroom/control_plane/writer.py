@@ -1809,8 +1809,17 @@ CONT_DISABLED_CAPABILITIES = (
 )
 
 
+def _grok_command_flags(reasoning_effort: str = CONT_PRIMARY_REASONING) -> tuple[str, ...]:
+    """Keep the hermetic command unchanged apart from its declared effort."""
+    return tuple(
+        reasoning_effort if index and _GROK_WRITER_SEMANTIC_FLAGS[index - 1] == "--reasoning-effort"
+        else value for index, value in enumerate(_GROK_WRITER_SEMANTIC_FLAGS)
+    )
+
+
 def _grok_json_command(
-    path: str, schema: str, system_instruction: str
+    path: str, schema: str, system_instruction: str, *,
+    reasoning_effort: str = CONT_PRIMARY_REASONING,
 ) -> tuple[str, ...]:
     replacements = {
         "REQUEST": path,
@@ -1819,7 +1828,7 @@ def _grok_json_command(
     }
     return (
         GROK_BIN,
-        *(replacements.get(value, value) for value in _GROK_WRITER_SEMANTIC_FLAGS),
+        *(replacements.get(value, value) for value in _grok_command_flags(reasoning_effort)),
     )
 
 
@@ -1829,6 +1838,7 @@ def _run_grok_json(
     schema: dict[str, object],
     system_instruction: str,
     temporary_prefix: str,
+    reasoning_effort: str = CONT_PRIMARY_REASONING,
 ) -> WriterCliExecution:
     auth = _minimal_grok_auth_bytes()
     _prove_grok_hermetic_capabilities(auth)
@@ -1840,7 +1850,7 @@ def _run_grok_json(
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(prompt)
         raw = _run(
-            _grok_json_command(path, schema_text, system_instruction),
+            _grok_json_command(path, schema_text, system_instruction, reasoning_effort=reasoning_effort),
             timeout=300,
             cwd=workspace.cwd,
             environment=workspace.environment,

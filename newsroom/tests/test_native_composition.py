@@ -34,9 +34,9 @@ NOW = datetime(2026, 9, 8, 14, tzinfo=UTC)
 
 
 def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
-    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v18"
+    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v19"
     assert native_composition.ASSESSMENT_CONTRACT_VERSION == (
-        "newsroom.native-evidence-assessor.v18+newsroom.named-entity.v15+"
+        "newsroom.native-evidence-assessor.v19+newsroom.named-entity.v15+"
         "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v1+"
         "newsroom.qualification-relation.v3+newsroom.retained-assessment.v1"
     )
@@ -352,10 +352,11 @@ def _assessment_policy() -> InvocationEfficiencyPolicy:
         policy_id="native-composition-assessment", version="v1",
         workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
         provider="grok-build-cli", route=native_assessor.ROUTE,
-        model="grok-4.6", reasoning="low", one_turn=True, exact_input=True,
+        model="grok-4.6", reasoning=native_assessor.REASONING,
+        one_turn=True, exact_input=True,
         skills_enabled=False, tools_enabled=False, mcp_enabled=False,
         prior_message_count=0, command_semantic_version="1.0.8",
-        command_flags=CONT_PRIMARY_COMMAND_FLAGS,
+        command_flags=native_assessor.COMMAND_FLAGS,
         context_manifest_schema_version=native_assessor.CONTEXT_MANIFEST_SCHEMA_VERSION,
         disabled_capabilities=CONT_DISABLED_CAPABILITIES,
         implementation_revision="1" * 40, max_prompt_bytes=1_000_000,
