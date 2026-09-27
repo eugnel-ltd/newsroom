@@ -27,10 +27,13 @@ def _changed_policy(policy, **changes):
 def _fixture(tmp_path, monkeypatch):
     # These are immutable v15 historical records, even after producer upgrades.
     import newsroom.control_plane.native_assessor as native
-    import newsroom.tests.test_native_assessor as helpers
     monkeypatch.setattr(native, 'VERSION', native._V15_PRODUCER_VERSION)
     monkeypatch.setattr(native, 'SYSTEM', native._V15_SYSTEM)
-    monkeypatch.setattr(helpers, 'VERSION', native._V15_PRODUCER_VERSION)
+    monkeypatch.setattr(native, 'PROVIDER_SCHEMA_DIGEST', native._V15_SCHEMA_DIGEST)
+    monkeypatch.setattr(
+        native, 'CONTEXT_MANIFEST_SCHEMA_VERSION',
+        'newsroom.native-evidence-assessor.context-manifest.v1',
+    )
     connection, _port, candidate = _candidate(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
@@ -63,9 +66,21 @@ def _fixture(tmp_path, monkeypatch):
     })
     usage.retain_result(allocation, execution, dispatch_at=dispatch_at)
     usage.complete(allocation, outcome='ASSESSOR_VALIDATION_FAILED', execution=execution, provider_dispatched=True, dispatch_at=dispatch_at, failure_class='ASSESSMENT_VALIDATION_FAILED')
-    from newsroom.control_plane.native_assessor import CONTEXT_MANIFEST_SCHEMA_VERSION
-    new = _changed_policy(old, version='bounded-input-v1', context_manifest_schema_version=CONTEXT_MANIFEST_SCHEMA_VERSION, max_prompt_bytes=native_assessment_input_bound(old)['max_request_bytes'])
+    new = _changed_policy(
+        old,
+        version='bounded-input-v1',
+        context_manifest_schema_version=(
+            'newsroom.native-evidence-assessor.context-manifest.v2'
+        ),
+        max_prompt_bytes=native_assessment_input_bound(old)['max_request_bytes'],
+    )
     service.register_policy(new)
+    # #1053's corrected v15 writer used manifest v2; the failed predecessor
+    # above remains an authenticated v1 allocation.
+    monkeypatch.setattr(
+        native, 'CONTEXT_MANIFEST_SCHEMA_VERSION',
+        'newsroom.native-evidence-assessor.context-manifest.v2',
+    )
     current = NativeAssessmentUsage(service, new, clock=lambda: datetime(2026,9,8,tzinfo=UTC)+timedelta(minutes=1))
     connection.close()
     return service, current, candidate, base, allocation, new
