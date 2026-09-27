@@ -1222,21 +1222,31 @@ def _assessor_requalification_authority(connection, invocation_id, qualified_pol
     if len(dispatches) != 1 or tuple(dispatches[0]) != (_utc_text(terminal.dispatch_at), allocation.request_digest):
         raise ModelUsageIntegrityError("assessor requalification dispatch differs")
     row = connection.execute(
-        "SELECT record_json FROM model_work_envelopes WHERE envelope_id=?", (allocation.envelope_id,),
+        "SELECT envelope_id,cycle_id,workload_class,admitted_at,canonical_digest,record_json "
+        "FROM model_work_envelopes WHERE envelope_id=?", (allocation.envelope_id,),
     ).fetchone()
-    envelope = _envelope_from_record(_object(row[0]))
-    if (row[0] != _json(envelope.as_record()) or envelope.cycle_id != allocation.cycle_id
+    if row is None:
+        raise ModelUsageIntegrityError("assessor requalification candidate envelope is absent")
+    envelope = _envelope_from_record(_object(row[5]))
+    if (tuple(row[:5]) != (envelope.envelope_id, envelope.cycle_id, envelope.workload_class.value,
+                          _utc_text(envelope.admitted_at), envelope.canonical_digest)
+            or envelope.envelope_id != allocation.envelope_id
+            or row[5] != _json(envelope.as_record()) or envelope.cycle_id != allocation.cycle_id
             or envelope.workload_class is not allocation.workload_class
             or not envelope.candidate_id or not envelope.hypothesis_digest or not envelope.evidence_package_digest
             or connection.execute("SELECT count(*) FROM model_invocation_allocations WHERE envelope_id=?", (allocation.envelope_id,)).fetchone()[0] != 1):
         raise ModelUsageIntegrityError("assessor requalification candidate envelope differs")
     row = connection.execute(
-        "SELECT record_json FROM model_invocation_context_manifests WHERE context_manifest_digest=?",
+        "SELECT context_manifest_digest,provider,route,evidence_package_digest,record_json "
+        "FROM model_invocation_context_manifests WHERE context_manifest_digest=?",
         (allocation.context_manifest_digest,),
     ).fetchone()
-    manifest = _object(row[0])
+    if row is None:
+        raise ModelUsageIntegrityError("assessor requalification context is absent")
+    manifest = _object(row[4])
     unsigned = dict(manifest); manifest_digest = unsigned.pop("context_manifest_digest", None)
-    if (row[0] != _json(manifest) or digest_canonical(unsigned) != manifest_digest
+    if (tuple(row[:4]) != (manifest_digest, allocation.provider, allocation.route, envelope.evidence_package_digest)
+            or row[4] != _json(manifest) or digest_canonical(unsigned) != manifest_digest
             or manifest_digest != allocation.context_manifest_digest
             or manifest.get("schema_version") != old.context_manifest_schema_version
             or manifest.get("system_digest") != digest_bytes(SYSTEM.encode())
@@ -3296,6 +3306,16 @@ class ModelUsageService:
                     "ON ledger(kind,json_extract(payload_json,'$.revision_id')) "
                     "WHERE kind='NATIVE_REVISION_LANDED'"
                 )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS model_usage_assessor_requalification "
+                    "ON ledger(kind,json_extract(payload_json,'$.invocation_id')) "
+                    "WHERE kind='NATIVE_ASSESSOR_INPUT_REQUALIFICATION'"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS model_usage_assessor_result "
+                    "ON ledger(kind,json_extract(payload_json,'$.invocation_id')) "
+                    "WHERE kind='NATIVE_ASSESSMENT_RESULT'"
+                )
             applied_at = _utc_text(datetime.now(tz=UTC))
             connection.executemany(
                 "INSERT OR IGNORE INTO model_usage_migrations("
@@ -3441,16 +3461,19 @@ class ModelUsageService:
         try:
             connection.execute("BEGIN")
             row = connection.execute(
-                "SELECT record_json FROM model_work_envelopes WHERE envelope_id=?",
+                "SELECT envelope_id,cycle_id,workload_class,admitted_at,canonical_digest,record_json "
+                "FROM model_work_envelopes WHERE envelope_id=?",
                 (envelope.envelope_id,),
             ).fetchone()
             if row is not None:
-                record = _object(row[0])
+                record = _object(row[5])
                 retained = _envelope_from_record(record)
                 expected = envelope.as_record()
                 for key in ("admitted_at", "canonical_digest"):
                     expected[key] = record.get(key)
-                if record != expected or retained.as_record() != record or row[0] != _json(record):
+                if (tuple(row[:5]) != (retained.envelope_id, retained.cycle_id, retained.workload_class.value,
+                                      _utc_text(retained.admitted_at), retained.canonical_digest)
+                        or record != expected or retained.as_record() != record or row[5] != _json(record)):
                     raise ModelUsageIntegrityError("retained assessor envelope differs")
                 if connection.execute(
                     "SELECT 1 FROM model_invocation_allocations WHERE envelope_id=?",

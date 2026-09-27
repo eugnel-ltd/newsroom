@@ -142,3 +142,62 @@ def test_requalification_authenticates_retained_reported_components(tmp_path, mo
         c.execute("UPDATE model_provider_telemetry SET record_json=json_set(record_json,'$.provider_telemetry.total_tokens',1) WHERE invocation_id=?", (allocation.invocation_id,))
     with pytest.raises(ModelUsageIntegrityError):
         _recover(service, allocation, policy)
+
+
+def test_assessor_requalification_reads_do_not_scan_unrelated_ledger(tmp_path):
+    from newsroom.control_plane.store import connect, append_ledger
+    path = str(tmp_path / 'indexed.sqlite3')
+    connect(path).close()
+    service = ModelUsageService(path)
+    with sqlite3.connect(path) as c:
+        queries = (
+            ('NATIVE_ASSESSOR_INPUT_REQUALIFICATION', 'SELECT payload_digest,payload_json FROM ledger WHERE kind=?', ('NATIVE_ASSESSOR_INPUT_REQUALIFICATION',)),
+            ('NATIVE_ASSESSMENT_RESULT', "SELECT payload_digest,payload_json FROM ledger WHERE kind='NATIVE_ASSESSMENT_RESULT' AND json_extract(payload_json,'$.invocation_id')=?", ('invocation',)),
+        )
+        before = []
+        for _kind, query, values in queries:
+            plan = ' '.join(str(row[3]) for row in c.execute('EXPLAIN QUERY PLAN '+query, values))
+            assert 'SEARCH ledger USING INDEX model_usage_' in plan
+            steps = [0]
+            def count():
+                steps[0] += 1
+                return 0
+            c.set_progress_handler(count, 1)
+            assert c.execute(query, values).fetchall() == []
+            c.set_progress_handler(None, 0)
+            before.append(steps[0])
+        for i in range(400):
+            append_ledger(c, 'UNRELATED_TEST_EVENT', {'i':i})
+        for index, (_kind, query, values) in enumerate(queries):
+            steps = [0]
+            c.set_progress_handler(count, 1)
+            assert c.execute(query, values).fetchall() == []
+            c.set_progress_handler(None, 0)
+            assert steps[0] == before[index]
+
+
+@pytest.mark.parametrize('substitute_candidate', (False, True))
+def test_requalification_binds_the_selected_envelope_row(tmp_path, monkeypatch, substitute_candidate):
+    from newsroom.control_plane.model_usage import WorkEnvelope
+    service, _usage_, _candidate_, _base_, allocation, policy = _fixture(tmp_path, monkeypatch)
+    with sqlite3.connect(service.path) as c:
+        if substitute_candidate:
+            record = json.loads(c.execute('SELECT record_json FROM model_work_envelopes WHERE envelope_id=?', (allocation.envelope_id,)).fetchone()[0])
+            from newsroom.control_plane.model_usage import _envelope_from_record
+            values = asdict(_envelope_from_record(record))
+            values.pop('envelope_id');values.pop('canonical_digest');values['candidate_id'] = 'unrelated-candidate'
+            changed = WorkEnvelope.create(**values)
+            from newsroom.authority.canonical import canonical_json_bytes
+            c.execute('UPDATE model_work_envelopes SET record_json=? WHERE envelope_id=?', (canonical_json_bytes(changed.as_record()).decode(),allocation.envelope_id))
+        else:
+            c.execute('UPDATE model_work_envelopes SET canonical_digest=? WHERE envelope_id=?', (digest_bytes(b'wrong'), allocation.envelope_id))
+    with pytest.raises(ModelUsageIntegrityError):
+        _recover(service, allocation, policy)
+
+
+def test_requalification_binds_context_scalar_columns(tmp_path, monkeypatch):
+    service, _usage_, _candidate_, _base_, allocation, policy = _fixture(tmp_path, monkeypatch)
+    with sqlite3.connect(service.path) as c:
+        c.execute("UPDATE model_invocation_context_manifests SET provider='other-provider' WHERE context_manifest_digest=?", (allocation.context_manifest_digest,))
+    with pytest.raises(ModelUsageIntegrityError):
+        _recover(service, allocation, policy)
