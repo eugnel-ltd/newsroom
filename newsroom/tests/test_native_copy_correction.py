@@ -88,8 +88,8 @@ def test_copy_correction_retains_predecessor_and_replays_exact_intent(tmp_path, 
             assert not continuation().copy_correction_due(retained)
             continuation().advance(revision_id=unit.revision_id, candidate_version_id="candidate-version")
             assert all((c["expected_story_version"], c["expected_publication_version"], c["expected_delivery_evidence_version"]) == (1, 2, 0) for c in calls)
-            assert {c["applied_at"] for c in calls} == {"2026-09-08T12:04:00.000000Z"}
-            assert {c["observed_at"] for c in calls} == {"2026-09-08T12:05:00.000000Z"}
+            assert retained["publication_started_at"] == "2026-09-08T12:04:00.000000Z"
+            assert all("applied_at" not in call and "observed_at" not in call for call in calls)
         for seq, payload in original_rows:
             assert connection.execute("SELECT payload_json FROM ledger WHERE seq=?", (seq,)).fetchone()[0] == payload
     finally:

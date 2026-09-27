@@ -189,8 +189,9 @@ class NativePublicationController:
         candidate_port: StoryCandidateReadPort,
         evidence_packages: GovernedEvidencePackages,
         bindings: NativePublicationBindings,
+        clock: Callable[[], UtcTimestamp] = UtcTimestamp.now,
     ) -> None:
-        if not all(
+        if not callable(clock) or not all(
             type(value) is expected
             for value, expected in (
                 (objects, GovernedObjects),
@@ -210,6 +211,7 @@ class NativePublicationController:
         self._candidate_port = candidate_port
         self._evidence = evidence_packages
         self._bindings = bindings
+        self._clock = clock
         self._editorial = NativeEditorial(
             objects=objects,
             commands=commands,
@@ -307,8 +309,6 @@ class NativePublicationController:
         expected_story_version: int,
         expected_publication_version: int,
         expected_delivery_evidence_version: int,
-        applied_at: str,
-        observed_at: str,
         proof: AuthenticationProof,
         correction_of: NativePublicationResult | None = None,
     ) -> NativePublicationResult:
@@ -391,7 +391,9 @@ class NativePublicationController:
             publication_receipt=publication_receipt,
             story_receipt=story_receipt,
             candidate_port=self._candidate_port,
-            applied_at=applied_at,
+            # Intent can predate a crash or a blocked writer by hours. Sample
+            # the effect boundary; apply preserves any already committed time.
+            applied_at=self._clock().to_text(),
             proof=proof,
         )
         evidence = self._delivery.observe(
@@ -399,7 +401,7 @@ class NativePublicationController:
             publication_receipt=publication_receipt,
             story_receipt=story_receipt,
             candidate_port=self._candidate_port,
-            observed_at=observed_at,
+            observed_at=self._clock().to_text(),
             proof=proof,
         )
         evidence_receipt = self._delivery.record(
@@ -662,7 +664,8 @@ class NativePublicationContinuation:
                 "package_admission_id", "editorial_decision", "acquisition_receipt_digests",
                 "expected_story_version", "expected_publication_version",
                 "expected_delivery_evidence_version", "publication_applied_at",
-                "publication_observed_at", "acquisition_retryable", "reason",
+                "publication_observed_at", "publication_started_at",
+                "acquisition_retryable", "reason",
                 "assessment_started_at", "acquisition_started_at", "failure_class",
                 "editorial_hold_reason_codes",
             ):
@@ -969,9 +972,10 @@ class NativePublicationContinuation:
                 revision_id, stage="PUBLICATION_PREPARED", facts=facts
             )
 
-        if "publication_applied_at" not in facts:
-            facts["publication_applied_at"] = self._clock().to_text()
-            facts["publication_observed_at"] = self._clock().to_text()
+        # Legacy progress named its intent times applied/observed. Keep those
+        # historical facts readable, but never use them as effect timestamps.
+        if not any(key in facts for key in ("publication_started_at", "publication_applied_at")):
+            facts["publication_started_at"] = self._clock().to_text()
             self._journal.advance(
                 revision_id, stage="PUBLICATION_STARTED", facts=facts
             )
@@ -984,8 +988,6 @@ class NativePublicationContinuation:
                 expected_delivery_evidence_version=int(
                     facts["expected_delivery_evidence_version"]
                 ),
-                applied_at=str(facts["publication_applied_at"]),
-                observed_at=str(facts["publication_observed_at"]),
                 proof=self._runtime.proof,
             )
         except EditorialHold as exc:
@@ -1075,8 +1077,7 @@ class NativePublicationContinuation:
                     copy_correction_of=predecessor,
                     expected_story_version=expected[0], expected_publication_version=expected[1],
                     expected_delivery_evidence_version=0,
-                    publication_applied_at=self._clock().to_text(),
-                    publication_observed_at=self._clock().to_text(),
+                    publication_started_at=self._clock().to_text(),
                 )
                 self._journal.advance(revision_id, stage="COPY_CORRECTION_PREPARED", facts=facts)
                 prepared = True
@@ -1087,7 +1088,6 @@ class NativePublicationContinuation:
             published = self._runtime.publication.advance(
                 package_id, decision, expected_story_version=expected[0],
                 expected_publication_version=expected[1], expected_delivery_evidence_version=0,
-                applied_at=facts["publication_applied_at"], observed_at=facts["publication_observed_at"],
                 proof=self._runtime.proof, correction_of=prior,
             )
         except (OperatorDrainRequested, VetoError):
