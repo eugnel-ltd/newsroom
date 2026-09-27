@@ -1,0 +1,144 @@
+{
+  "source_url": "https://www.gov.uk/guidance/academies-budget-forecast-return",
+  "source_observation_digest": "sha256:d2378aa99c98fb6d6c9fade0504fb850e21a773860f09977ab61ba8b97483c69",
+  "assessment_result_digest": "sha256:f5f1d90ebd5cd74bae7b285e91de60fc7bb87499b98dcd0ff8a9ca1d256cca01",
+  "source_text": "Academies budget forecast return (BFR) The deadline for the 2026 academies budget forecast return (BFR) has now passed. The form will remain open for a short period for late submissions. If you have not yet submitted your return, submit it as soon as possible. Completing the BFR The BFR is a collection that spans the past, current and future financial years. It collects data in a format to allow for academic and financial year analysis by the Department for Education (DfE). BFR 2026 covers these periods: September 2024 to March 2025 and April 2025 to August 2025 (part pre-populated from previous BFR return) September 2025 to March 2026 and April 2026 to August 2026 September 2026 to March 2027 and April 2027 to August 2027 Summary forecasts for September 2027 to August 2028 Summary forecasts for September 2028 to August 2029 You should complete the BFR if your academy trust was active on 1 May 2026. You can find out more about how to complete the BFR online form in the Academies budget forecast return: guide to using the online form. There are 2 versions of the Excel workbook to help you prepare your BFR: a single-page version a multi-page version structured to look like the online form Both versions have the same questions and validations contained within the online form. BFR 2026: traditional workbook MS Excel Spreadsheet, 1000 KB This file may not be suitable for users of assistive technology. Request an accessible format. If you use assistive technology (such as a screen reader) and need a version of this document in a more accessible format, please email alternative.formats@education.gov.uk. Please tell us what format you need. It will help us if you say what assistive technology you use. BFR 2026: multi-page workbook MS Excel Spreadsheet, 1020 KB This file may not be suitable for users of assistive technology. Request an accessible format. If you use assistive technology (such as a screen reader) and need a version of this document in a more accessible format, please email alternative.formats@education.gov.uk. Please tell us what format you need. It will help us if you say what assistive technology you use. We know that some parts of these workbooks are not fully accessible because they contain tables that are not formatted as tables. This means they do not meet Web Content Accessibility Guidelines success criteria 1.3.1: info and relationships. We are currently working on an accessible version, which should be available by May 2027. Recording in-year academy transfers You must include any academies transferring in or out of your trust in the BFR. The re-brokerage of academies guidance contains details of what you need to include based on the month of transfer. Access your BFR online form The BFR form uses the DfE Sign-in registration service. Academy trusts must be registered and set up to use the service before they can access the form. You can find out how to register and set up the online forms for the BFR. Log in here Getting support If you have any questions about the BFR, you can contact us using the customer help portal.",
+  "governed_claims": [
+    {
+      "admitted_use": "PUBLICATION_EVIDENCE",
+      "certainty": "CONFIRMED",
+      "claim": "The deadline for the 2026 academies budget forecast return (BFR) has now passed.",
+      "claim_id": "c1",
+      "claim_role": "HEADLINE",
+      "localised_factual_expressions": [],
+      "originality_basis": "FACTUAL_REWRITE_REQUIRED",
+      "originality_policy_version": "newsroom.cont-originality.v3",
+      "passage_index": 0,
+      "policy_version": "newsroom.governed-claim.v7",
+      "quotations": [],
+      "rendered_assertion_zh_hant_hk": "2026年學園預算預測申報（BFR）的截止日期現已過。",
+      "semantic_relation": {
+        "relation": "SEMANTICALLY_EQUIVALENT",
+        "rendered_modality": "ASSERTED",
+        "rendered_polarity": "AFFIRMED",
+        "source_modality": "ASSERTED",
+        "source_polarity": "AFFIRMED"
+      },
+      "source_ids": [
+        "UK-05"
+      ],
+      "status": "CONFIRMED_FACT",
+      "supporting_excerpt": "The deadline for the 2026 academies budget forecast return (BFR) has now passed."
+    },
+    {
+      "admitted_use": "PUBLICATION_EVIDENCE",
+      "certainty": "CONFIRMED",
+      "claim": "The form will remain open for a short period for late submissions.",
+      "claim_id": "c2",
+      "claim_role": "SUBSTANTIVE",
+      "localised_factual_expressions": [],
+      "originality_basis": "FACTUAL_REWRITE_REQUIRED",
+      "originality_policy_version": "newsroom.cont-originality.v3",
+      "passage_index": 0,
+      "policy_version": "newsroom.governed-claim.v7",
+      "quotations": [],
+      "rendered_assertion_zh_hant_hk": "表格會繼續開放一段短時間，供逾期提交。",
+      "semantic_relation": {
+        "relation": "SEMANTICALLY_EQUIVALENT",
+        "rendered_modality": "ASSERTED",
+        "rendered_polarity": "AFFIRMED",
+        "source_modality": "ASSERTED",
+        "source_polarity": "AFFIRMED"
+      },
+      "source_ids": [
+        "UK-05"
+      ],
+      "status": "CONFIRMED_FACT",
+      "supporting_excerpt": "The form will remain open for a short period for late submissions."
+    },
+    {
+      "admitted_use": "PUBLICATION_EVIDENCE",
+      "certainty": "CONFIRMED",
+      "claim": "If you have not yet submitted your return, submit it as soon as possible.",
+      "claim_id": "c3",
+      "claim_role": "SUBSTANTIVE",
+      "localised_factual_expressions": [],
+      "originality_basis": "FACTUAL_REWRITE_REQUIRED",
+      "originality_policy_version": "newsroom.cont-originality.v3",
+      "passage_index": 0,
+      "policy_version": "newsroom.governed-claim.v7",
+      "quotations": [],
+      "rendered_assertion_zh_hant_hk": "如尚未提交申報，請盡快提交。",
+      "semantic_relation": {
+        "relation": "SEMANTICALLY_EQUIVALENT",
+        "rendered_modality": "ASSERTED",
+        "rendered_polarity": "AFFIRMED",
+        "source_modality": "ASSERTED",
+        "source_polarity": "AFFIRMED"
+      },
+      "source_ids": [
+        "UK-05"
+      ],
+      "status": "CONFIRMED_FACT",
+      "supporting_excerpt": "If you have not yet submitted your return, submit it as soon as possible."
+    },
+    {
+      "admitted_use": "PUBLICATION_EVIDENCE",
+      "certainty": "CONFIRMED",
+      "claim": "You should complete the BFR if your academy trust was active on 1 May 2026.",
+      "claim_id": "c4",
+      "claim_role": "SUBSTANTIVE",
+      "localised_factual_expressions": [
+        [
+          "1 May 2026",
+          "2026年5月1日"
+        ]
+      ],
+      "originality_basis": "FACTUAL_REWRITE_REQUIRED",
+      "originality_policy_version": "newsroom.cont-originality.v3",
+      "passage_index": 0,
+      "policy_version": "newsroom.governed-claim.v7",
+      "quotations": [],
+      "rendered_assertion_zh_hant_hk": "如學園信託於2026年5月1日仍在運作，便應填寫BFR。",
+      "semantic_relation": {
+        "relation": "SEMANTICALLY_EQUIVALENT",
+        "rendered_modality": "ASSERTED",
+        "rendered_polarity": "AFFIRMED",
+        "source_modality": "ASSERTED",
+        "source_polarity": "AFFIRMED"
+      },
+      "source_ids": [
+        "UK-05"
+      ],
+      "status": "CONFIRMED_FACT",
+      "supporting_excerpt": "You should complete the BFR if your academy trust was active on 1 May 2026."
+    }
+  ],
+  "qualification_evidence": [
+    {
+      "governed_claim_id": "c1",
+      "policy_version": "newsroom.evid-012.v7",
+      "test": "LAW_RIGHT_STATUS_POLICY",
+      "test_evidence": {
+        "change_kind": "OFFICIAL_DEADLINE",
+        "change_relation": "NEW_OR_CHANGED_STATE",
+        "event_polarity": "AFFIRMED",
+        "material_relation_span": "The deadline for the 2026 academies budget forecast return (BFR) has now passed.",
+        "new_state": "The deadline for the 2026 academies budget forecast return (BFR) has now passed."
+      }
+    },
+    {
+      "governed_claim_id": "c3",
+      "policy_version": "newsroom.evid-012.v7",
+      "test": "OFFICIAL_ACTION_OR_DEADLINE",
+      "test_evidence": {
+        "action_class": "INSTRUCTION",
+        "action_relation": "NEW_OR_CHANGED_OFFICIAL_ACTION",
+        "event_polarity": "AFFIRMED",
+        "material_relation_span": "If you have not yet submitted your return, submit it as soon as possible.",
+        "reader_action": "If you have not yet submitted your return, submit it as soon as possible."
+      }
+    }
+  ],
+  "licence": "Contains public sector information licensed under the Open Government Licence v3.0."
+}
