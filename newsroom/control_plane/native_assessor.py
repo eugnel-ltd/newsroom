@@ -271,18 +271,20 @@ _V16_SYSTEM = _V15_SYSTEM + (
 SYSTEM = (
     "Provider wire contract: select source references, never generate claim or excerpt text. "
     "Each source is presented once as lossless ordered segments. Use claim_range and "
-    "support_range with first_span_id/last_span_id (inclusive); both must belong to "
+    "support_range with first_span_id/last_span_id (inclusive). A selected range "
+    "ends at the last line content end, excluding only its final line separator; "
+    "all intervening separators and content whitespace stay exact. Both must belong to "
     "one source, and the support range must contain the claim range. Select complete "
     "meaningful lines, not arbitrary labels or an unrelated headline. The controller "
     "copies the exact selected bytes, source ID and passage index and creates claim IDs. "
     "Select substantive_claim_indexes as zero-based indexes into governed_claims; "
     "qualification_evidence uses claim_index, not governed_claim_id. "
-    "For each selected claim, take its recognised entities in first-occurrence order, "
-    "deduplicating repeated names across segments. Return N+1 rendered_fragments for "
-    "N names: fragment0, then the controller inserts name0, then fragment1, name1, "
+    "For each selected claim, take its recognised non-overlapping entity occurrences "
+    "in source order, including repeated names across segments. Return N+1 rendered_fragments for "
+    "N occurrences: fragment0, then the controller inserts name0, then fragment1, name1, "
     "and so on. Fragments contain the Hong Kong Traditional Chinese connective and "
     "factual prose only. Never copy, translate or replace a source name in a fragment. "
-    "The controller inserts each exact source name once. Preserve every number, date "
+    "The controller inserts each exact source name occurrence once. Preserve every number, date "
     "and relationship; do not add UK or another inferred entity. The assembled text "
     "must be faithful and self-contained; do not hide facts to pass validation. "
     "Source-side localisation pairs, quotations and non-classifier qualification "
@@ -497,8 +499,8 @@ def _contract_hold_reason(error: EvidencePackageError) -> str:
     current: BaseException | None = error
     while current is not None:
         message = str(current)
-        if isinstance(current, SourceReferenceError):
-            return current.reason_code
+        if isinstance(current, SourceReferenceError) or message == "native assessor source references differ":
+            return "ASSESSOR_SOURCE_REFERENCE_HOLD"
         if "named entit" in message:
             return "ASSESSOR_NAMED_ENTITY_CONTRACT_HOLD"
         if "localised factual expression" in message:
@@ -1070,6 +1072,7 @@ class NativeAssessmentUsage:
                 parameters,
             ).fetchall()
             matches: list[RetainedAssessorResult] = []
+            reference_view = None
             for row in rows:
                 try:
                     envelope_record = json.loads(row[5])
@@ -1405,7 +1408,21 @@ class NativeAssessmentUsage:
                         if (digest_bytes(materialised_raw.encode()) != materialised_digest
                                 or canonical_json_bytes(expected).decode() != materialised_raw):
                             return None
-                        execution = NativeAssessmentExecution(record["receipt"]["materialised_text"], {})
+                        if base is None or base.digest != envelope.evidence_package_digest:
+                            # A diagnostic proof may be read without the source,
+                            # but a derived package is not executable authority.
+                            execution = None
+                        else:
+                            reference_view = reference_view or build_source_view(base.passages, base.source_ids)
+                            if _reference_binding(reference_view) != context.get("source_reference_binding"):
+                                return None
+                            _package, derived = materialise(
+                                execution.text, reference_view, allocation.request_digest,
+                                provider_schema=PROVIDER_SCHEMA,
+                            )
+                            if derived != record["receipt"]:
+                                return None
+                            execution = NativeAssessmentExecution(derived["materialised_text"], {})
                     else:
                         if terminal.outcome == "ASSESSOR_ACCEPTED":
                             return None
@@ -1817,22 +1834,25 @@ class AutonomousNativeEvidenceAssessor:
                 materialised = execution
                 receipt = None
                 reference_error = None
-                if reference_view is not None and type(execution) is NativeAssessmentExecution:
-                    try:
+                try:
+                    if reference_view is not None and type(execution) is NativeAssessmentExecution:
                         _package, receipt = materialise(
                             execution.text, reference_view,
                             allocation.request_digest if allocation is not None else digest_bytes(request.encode()),
                             provider_schema=PROVIDER_SCHEMA,
                         )
                         materialised = NativeAssessmentExecution(receipt["materialised_text"], execution.usage)
-                    except SourceReferenceError as exc:
-                        reference_error = exc
-                if allocation is not None and not self._usage.retain_result(
-                    allocation, execution, dispatch_at=dispatch_at, materialisation=receipt,
-                ):
-                    raise EvidencePackageError(
-                        "native assessment output exceeds retained result limit"
-                    )
+                except (ValueError, RecursionError) as exc:
+                    reference_error = exc
+                finally:
+                    # Preserve exact bounded provider bytes even when decoding or
+                    # materialisation fails before an internal package exists.
+                    if allocation is not None and not self._usage.retain_result(
+                        allocation, execution, dispatch_at=dispatch_at, materialisation=receipt,
+                    ):
+                        raise EvidencePackageError(
+                            "native assessment output exceeds retained result limit"
+                        )
                 if reference_error is not None:
                     raise EvidencePackageError("native assessor source references differ") from reference_error
             result = self._validated_execution(

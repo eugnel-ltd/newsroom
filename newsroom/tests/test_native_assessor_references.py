@@ -70,6 +70,39 @@ def test_view_is_lossless_across_utf8_lines_and_preserves_whole_csv_row():
     assert ('Boston Consulting Group', 'ORGANISATION') in view.source_entities[1]
 
 
+def test_range_uses_final_content_endpoint_without_stripping_source_bytes():
+    body = '  香港首句。 \r\n第二句。\r\n'
+    view = build_source_view((body,), ('HK-01',))
+    assert ''.join(item.text for item in view.segments) == body
+    assert view.resolve_range({'first_span_id': 'S1L1', 'last_span_id': 'S1L1'})[0] == '  香港首句。 '
+    assert view.resolve_range({'first_span_id': 'S1L2', 'last_span_id': 'S1L2'})[0] == '第二句。'
+    assert view.resolve_range({'first_span_id': 'S1L1', 'last_span_id': 'S1L2'})[0] == '  香港首句。 \r\n第二句。'
+    manifest = view.manifest['segments']
+    assert manifest[0]['content_end_byte'] == len('  香港首句。 '.encode())
+    assert manifest[0]['end_byte'] == len('  香港首句。 \r\n'.encode())
+
+
+def test_blank_line_and_unterminated_unicode_end_of_body_are_exact():
+    view = build_source_view(('首句。\n\n終句。',), ('HK-01',))
+    assert [item.text for item in view.segments] == ['首句。\n', '\n', '終句。']
+    assert view.resolve_range({'first_span_id': 'S1L2', 'last_span_id': 'S1L2'})[0] == ''
+    assert view.resolve_range({'first_span_id': 'S1L1', 'last_span_id': 'S1L2'})[0] == '首句。\n'
+    assert view.resolve_range({'first_span_id': 'S1L3', 'last_span_id': 'S1L3'})[0] == '終句。'
+    assert view.resolve_range({'first_span_id': 'S1L1', 'last_span_id': 'S1L3'})[0] == '首句。\n\n終句。'
+
+
+def test_completed_event_sentence_excludes_only_newline_before_disclaimer():
+    sentence = 'The warning was cancelled on 20 September 2026 at 10:30.'
+    body = sentence + '\nThis retained record is not a current warning.\n'
+    view = build_source_view((body,), ('HKO-02',))
+    assert view.resolve_range({'first_span_id': 'S1L1', 'last_span_id': 'S1L1'})[0] == sentence
+    assert view.segments[0].text == sentence + '\n'
+    csv = build_source_view((PREFIX + ROW + '\n',), ('UK-02',))
+    assert csv.segments[-1].text == ROW + '\n'
+    assert csv.resolve_range({'first_span_id': csv.segments[-1].span_id,
+                              'last_span_id': csv.segments[-1].span_id})[0] == ROW
+
+
 def test_segment_entity_order_is_local_even_when_source_first_occurrence_differs():
     body = 'Alice Smith said yes; Bob Jones said no.\nBob Jones said yes; Alice Smith said no.\n'
     view = build_source_view((body,), ('NEWS-1',))
@@ -77,10 +110,10 @@ def test_segment_entity_order_is_local_even_when_source_first_occurrence_differs
     assert [name for name, _ in view.segments[1].entities] == ['Bob Jones', 'Alice Smith']
 
 
-def test_advertised_entities_match_materialiser_dedup_and_boundaries():
+def test_advertised_entities_match_materialiser_occurrences_and_boundaries():
     body = 'Alice Smith said yes; Alice Smith said no.\nThe Department for Education said yes.\n'
     view = build_source_view((body,), ('NEWS-1',))
-    assert view.segments[0].entities == (('Alice Smith', 'PERSON'),)
+    assert view.segments[0].entities == (('Alice Smith', 'PERSON'), ('Alice Smith', 'PERSON'))
     assert view.segments[1].entities == (('Department for Education', 'ORGANISATION'),)
     assert view.source_entities[0] == (
         ('Alice Smith', 'PERSON'), ('Department for Education', 'ORGANISATION'),
@@ -126,16 +159,17 @@ def test_materialisation_reconstructs_exact_row_names_and_replays_identically():
     assert materialise(raw, view, 'request-digest') == (package, receipt)
 
 
-def test_repeated_entity_is_inserted_once_in_first_occurrence_order():
+def test_repeated_entity_occurrences_are_inserted_in_source_order():
     body = 'Alice Smith said yes. Alice Smith said no.\n'
     view = build_source_view((body,), ('NEWS-1',))
     wire = _wire('S1L1')
-    wire['package']['governed_claims'][0]['rendered_fragments'] = ['', ' 表示。']
+    wire['package']['governed_claims'][0]['rendered_fragments'] = ['', ' 表示同意；', ' 表示反對。']
     wire['package']['governed_claims'][0]['localised_factual_expressions'] = []
     wire['package']['governed_claims'][0]['quotations'] = []
     package, receipt = materialise(wire, view, 'request-digest')
-    assert receipt['claim_entity_order'] == [[['Alice Smith', 'PERSON']]]
-    assert package['package']['governed_claims'][0]['rendered_assertion_zh_hant_hk'] == 'Alice Smith 表示。'
+    assert receipt['claim_entity_order'] == [[['Alice Smith', 'PERSON'], ['Alice Smith', 'PERSON']]]
+    assert view.segments[0].entities == (('Alice Smith', 'PERSON'), ('Alice Smith', 'PERSON'))
+    assert package['package']['governed_claims'][0]['rendered_assertion_zh_hant_hk'] == 'Alice Smith 表示同意；Alice Smith 表示反對。'
 
 
 def test_empty_no_news_materialises_without_entities():
@@ -168,7 +202,7 @@ def test_invalid_references_fragments_keys_or_duplicates_fail_closed(change):
 def test_cross_source_reversed_and_uncontained_ranges_fail_closed():
     view = build_source_view(('First sentence.\nSecond sentence.\n', 'Other sentence.\n'), ('A', 'B'))
     range_one = {'first_span_id': 'S1L1', 'last_span_id': 'S1L2'}
-    assert view.resolve_range(range_one)[0] == 'First sentence.\nSecond sentence.\n'
+    assert view.resolve_range(range_one)[0] == 'First sentence.\nSecond sentence.'
     for reference in (
         {'first_span_id': 'S1L2', 'last_span_id': 'S1L1'},
         {'first_span_id': 'S1L2', 'last_span_id': 'S2L1'},

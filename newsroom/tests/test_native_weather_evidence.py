@@ -348,10 +348,23 @@ def test_hko_acquires_exact_retained_warning_with_current_rights(
             class AssessmentReached(Exception):
                 pass
             def dispatch(prompt):
-                assert json.loads(prompt)["sources"][0]["acquisition_receipt_id"] == result.receipt_digest
+                request_value = json.loads(prompt)
+                request_source = request_value["sources"][0]
+                assert request_source["acquisition_receipt_id"] == result.receipt_digest
+                assert "body" not in request_source
+                assert "passages" not in request_value["base_package"]
+                assert "".join(
+                    segment["text"] for segment in request_source["segments"]
+                ) == result.body.decode("utf-8")
                 raise AssessmentReached
             assessor = AutonomousNativeEvidenceAssessor(dispatch=dispatch)
             base = _base_package(_ready_package(candidate)[1])
+            base = replace(
+                base,
+                source_ids=("HK-02",),
+                passages=(result.body.decode("utf-8"),),
+                observation_digests=(result.body_digest,),
+            )
             with pytest.raises(AssessmentReached):
                 assessor(candidate, base, (source,), (result,))
             # Exercise actual structured-field prose through the existing model
@@ -658,6 +671,116 @@ def test_hko_absent_current_item_rehydrates_exact_retained_cancellation(
             )
             assert _qualification_relation_is_proven(
                 output.qualification_evidence[0], output.governed_claims[0],
+                source_context=result.body.decode(),
+            )
+            # Prove the v17 provider reference boundary reconstructs the exact
+            # completed-event headline without retaining its terminal newline.
+            from newsroom.control_plane.native_assessor import PROVIDER_SCHEMA
+            from newsroom.control_plane.native_assessor_references import (
+                build_source_view, materialise,
+            )
+
+            view = build_source_view((result.body.decode(),), ("HK-02",))
+            by_text = {
+                view.resolve_range({
+                    "first_span_id": segment.span_id,
+                    "last_span_id": segment.span_id,
+                })[0]: segment
+                for segment in view.segments
+            }
+
+            def fragments(target, segment):
+                values = []
+                offset = 0
+                for name, _kind in segment.entities:
+                    index = target.find(name, offset)
+                    assert index >= offset
+                    values.append(target[offset:index])
+                    offset = index + len(name)
+                values.append(target[offset:])
+                return values
+
+            reference_claims = []
+            for role, span, rendering in (
+                ("HEADLINE", source_span, rendered_headline),
+                (
+                    "SUBSTANTIVE",
+                    updated,
+                    "該紀錄於香港時間2026年9月8日12時00分更新。",
+                ),
+            ):
+                segment = by_text[span]
+                reference_claims.append({
+                    "claim_role": role,
+                    "claim_range": {
+                        "first_span_id": segment.span_id,
+                        "last_span_id": segment.span_id,
+                    },
+                    "support_range": {
+                        "first_span_id": segment.span_id,
+                        "last_span_id": segment.span_id,
+                    },
+                    "rendered_fragments": fragments(rendering, segment),
+                    "status": "CONFIRMED_FACT",
+                    "semantic_relation": {
+                        "source_modality": "ASSERTED",
+                        "rendered_modality": "ASSERTED",
+                        "source_polarity": "AFFIRMED",
+                        "rendered_polarity": "AFFIRMED",
+                        "relation": "SEMANTICALLY_EQUIVALENT",
+                    },
+                    "localised_factual_expressions": [[
+                        source_date, rendered_date,
+                    ]],
+                    "quotations": [],
+                    "certainty": "CONFIRMED",
+                    "originality_basis": "FACTUAL_REWRITE_REQUIRED",
+                    "originality_policy_version": "newsroom.cont-originality.v3",
+                    "admitted_use": "PUBLICATION_EVIDENCE",
+                    "policy_version": "newsroom.governed-claim.v7",
+                })
+            wire = {"package": {
+                "substantive_claim_indexes": [0, 1],
+                "governed_claims": reference_claims,
+                "qualification_evidence": [{
+                    "test": "LAW_RIGHT_STATUS_POLICY",
+                    "claim_index": 0,
+                    "policy_version": "newsroom.evid-012.v7",
+                    "test_evidence": {
+                        "change_kind": "STATUS",
+                        "event_polarity": "AFFIRMED",
+                        "change_relation": "NEW_OR_CHANGED_STATE",
+                        "material_relation_span": source_span,
+                        "new_state": "cancelled",
+                    },
+                }],
+                "selection_rationale": "Exact completed-event source spans selected.",
+                "geography": ["Hong Kong"],
+                "categories": ["Weather and disasters"],
+                "explicit_exclusions": [],
+            }}
+            materialised, receipt = materialise(
+                canonical_json_bytes(wire), view, "historical-weather-request",
+                provider_schema=PROVIDER_SCHEMA,
+            )
+            assert receipt["materialised_text"] == canonical_json_bytes(
+                materialised
+            ).decode()
+            reference_output = AutonomousNativeEvidenceAssessor._validated_execution(
+                NativeAssessmentExecution(receipt["materialised_text"], {}),
+                candidate, base, (source,), (result,),
+            )
+            assert reference_output.governed_claims[0].claim == source_span
+            assert (
+                reference_output.governed_claims[0].rendered_assertion_zh_hant_hk
+                == rendered_headline
+            )
+            assert reference_output.governed_claims[0].localised_factual_expressions == (
+                (source_date, rendered_date),
+            )
+            assert _qualification_relation_is_proven(
+                reference_output.qualification_evidence[0],
+                reference_output.governed_claims[0],
                 source_context=result.body.decode(),
             )
             from copy import deepcopy

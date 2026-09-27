@@ -209,7 +209,7 @@ _USAGE = {"usage_basis": "PROVIDER_REPORTED", "input_tokens": 1,
           "reasoning_tokens": 0, "context_tokens": 1, "total_tokens": 2}
 
 
-def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False):
+def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_override=None):
     candidate, base, source, acquired, view, wire, _row, _body = _literal_reference_inputs()
     service, usage = _usage(tmp_path, monkeypatch)
     # Fixture creates the ledger after the usage schema; exercise normal startup
@@ -219,14 +219,14 @@ def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False):
     calls = []
     if malformed:
         wire["package"]["governed_claims"][0]["claim_range"]["first_span_id"] = "S99L1"
-    raw = canonical_json_bytes(wire).decode()
+    raw = raw_override if raw_override is not None else canonical_json_bytes(wire).decode()
 
     def dispatch(prompt):
         calls.append(json.loads(prompt))
         return NativeAssessmentExecution(raw, dict(_USAGE))
 
     assessor = AutonomousNativeEvidenceAssessor(dispatch, usage=usage, dispatch_fence=nullcontext)
-    if malformed:
+    if malformed or raw_override is not None:
         with pytest.raises(NativeEvidenceHold, match="ASSESSOR_SOURCE_REFERENCE_HOLD"):
             assessor(candidate, base, (source,), (acquired,))
         result = None
@@ -399,3 +399,55 @@ def test_current_v17_reads_frozen_v16_full_package_without_relabelling_or_dispat
     with sqlite3.connect(service.path) as connection:
         assert connection.execute("SELECT count(*) FROM model_invocation_allocations").fetchone() == (1,)
         assert connection.execute("SELECT count(*) FROM ledger WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'").fetchone() == (0,)
+
+
+def test_rehashed_materialisation_cannot_drop_a_provider_selected_claim(tmp_path, monkeypatch):
+    service, usage, assessor, candidate, base, source, acquired, calls, raw, result = (
+        _run_reference_assessment(tmp_path, monkeypatch)
+    )
+    assert len(result.governed_claims) == 2
+    with sqlite3.connect(service.path) as connection:
+        seq, text = connection.execute("SELECT seq,payload_json FROM ledger WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'").fetchone()
+        record = json.loads(text)
+        receipt = record['receipt']
+        package = json.loads(receipt['materialised_text'])
+        package['package']['governed_claims'] = package['package']['governed_claims'][:1]
+        package['package']['substantive_new_information'] = package['package']['substantive_new_information'][:1]
+        receipt['claim_entity_order'] = receipt['claim_entity_order'][:1]
+        changed = canonical_json_bytes(package)
+        receipt['materialised_text'] = changed.decode()
+        receipt['package_digest'] = digest_bytes(changed)
+        receipt['receipt_digest'] = digest_canonical({key: value for key, value in receipt.items() if key != 'receipt_digest'})
+        updated = canonical_json_bytes(record)
+        connection.execute('UPDATE ledger SET payload_json=?,payload_digest=? WHERE seq=?',
+                           (updated.decode(), digest_bytes(updated), seq))
+        assert json.loads(connection.execute("SELECT payload_json FROM ledger WHERE kind='NATIVE_ASSESSMENT_RESULT'").fetchone()[0])['result_text'] == raw
+    assert usage.retained_assessments(candidate, base) is None
+    with pytest.raises(NativeEvidenceHold, match='ASSESSOR_REVALIDATION_UNRESOLVED_HOLD'):
+        assessor.assess_with_boundary(candidate, base, (source,), (acquired,),
+                                      before_dispatch=None, cached_only=True)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('malformed', ['nested', 'surrogate'])
+def test_bounded_decoder_failure_retains_raw_and_usage_without_retry(tmp_path, monkeypatch, malformed):
+    if malformed == 'nested':
+        raw = '{"package":' + '[' * 10_000 + '0' + ']' * 10_000 + '}'
+    else:
+        _candidate, _base, _source, _acquired, _view, wire, _row, _body = _literal_reference_inputs()
+        wire['package']['selection_rationale'] = '\ud800'
+        raw = json.dumps(wire, ensure_ascii=True)
+    service, usage, assessor, candidate, base, source, acquired, calls, _raw, _result = (
+        _run_reference_assessment(tmp_path, monkeypatch, raw_override=raw)
+    )
+    assert len(raw.encode()) < 256 * 1024
+    assert usage.retained_output_contract_failure(candidate) is not None
+    with pytest.raises(NativeEvidenceHold):
+        assessor(candidate, base, (source,), (acquired,))
+    with sqlite3.connect(service.path) as connection:
+        stored, = connection.execute("SELECT payload_json FROM ledger WHERE kind='NATIVE_ASSESSMENT_RESULT'").fetchone()
+        assert json.loads(stored)['result_text'] == raw
+        assert connection.execute('SELECT usage_status,outcome FROM model_invocation_terminals').fetchone() == ('REPORTED', 'ASSESSOR_VALIDATION_FAILED')
+        assert connection.execute("SELECT count(*) FROM ledger WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'").fetchone() == (0,)
+        assert connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone() == (1,)
+    assert len(calls) == 1

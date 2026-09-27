@@ -25,6 +25,7 @@ _QUALIFICATION_WITNESSES = {
     "EXCEPTIONAL_PUBLIC_IMPORTANCE": {"importance_class", "event_polarity", "importance_relation", "material_relation_span", "affected_group"},
 }
 _SPAN_ID = re.compile(r"S([1-9][0-9]*)L([1-9][0-9]*)\Z")
+_LINE_SEPARATORS = ("\r\n", "\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
 _RANGE = {
     "type": "object", "properties": {
         "first_span_id": {"type": "string", "pattern": r"^S[1-9][0-9]*L[1-9][0-9]*$"},
@@ -56,6 +57,7 @@ class SourceSegment:
     ordinal: int
     text: str
     start_byte: int
+    content_end_byte: int
     end_byte: int
     digest: str
     entities: tuple[tuple[str, str], ...]
@@ -67,7 +69,8 @@ class SourceSegment:
     def manifest_record(self) -> dict[str, object]:
         return {"span_id": self.span_id, "source_id": self.source_id,
                 "passage_index": self.passage_index, "ordinal": self.ordinal,
-                "start_byte": self.start_byte, "end_byte": self.end_byte,
+                "start_byte": self.start_byte, "content_end_byte": self.content_end_byte,
+                "end_byte": self.end_byte,
                 "text_digest": self.digest, "entities": [list(item) for item in self.entities]}
 
 
@@ -105,11 +108,15 @@ class SourceView:
             selected[0].ordinal, selected[-1].ordinal + 1,
         )):
             raise SourceReferenceError("source range is not contiguous")
-        text = "".join(item.text for item in selected)
         body = self.passages[selected[0].passage_index]
         encoded = body.encode("utf-8")
-        if encoded[selected[0].start_byte:selected[-1].end_byte] != text.encode("utf-8"):
+        if encoded[selected[0].start_byte:selected[-1].end_byte] != "".join(
+            item.text for item in selected
+        ).encode("utf-8"):
             raise SourceReferenceError("source range bytes differ")
+        # Preserve every internal separator, but the selected last line's
+        # separator is framing, not part of its literal content.
+        text = encoded[selected[0].start_byte:selected[-1].content_end_byte].decode("utf-8")
         return text, selected[0].passage_index, selected[0].source_id
 
 
@@ -141,6 +148,8 @@ def build_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...]) ->
             if len(segments) >= MAX_SEGMENTS:
                 raise SourceReferenceError("source segment count exceeds bound")
             raw = text.encode("utf-8")
+            separator = next((ending for ending in _LINE_SEPARATORS if text.endswith(ending)), "")
+            content_end = offset + len(text[:-len(separator)].encode("utf-8")) if separator else offset + len(raw)
             found = _claim_entities(text, body)
             for item in found:
                 if item not in seen_entities:
@@ -148,7 +157,7 @@ def build_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...]) ->
                     body_entities.append(item)
             segments.append(SourceSegment(
                 f"S{passage_index + 1}L{ordinal}", source_id, passage_index,
-                ordinal, text, offset, offset + len(raw), digest_bytes(raw), found,
+                ordinal, text, offset, content_end, offset + len(raw), digest_bytes(raw), found,
             ))
             offset += len(raw)
         if offset != len(body_bytes):
@@ -225,12 +234,9 @@ def _claim_entities(claim: str, body: str) -> tuple[tuple[str, str], ...]:
                 found.append((offset + match.start(), offset + match.end(), name, kind))
         offset += len(line)
     selected = []
-    seen = set()
     for item in sorted(found, key=lambda value: (value[0], -(value[1] - value[0]))):
-        if ((not selected or item[0] >= selected[-1][1])
-                and (item[2], item[3]) not in seen):
+        if not selected or item[0] >= selected[-1][1]:
             selected.append(item)
-            seen.add((item[2], item[3]))
     return tuple((name, kind) for _, _, name, kind in selected)
 
 
@@ -259,7 +265,7 @@ def materialise(raw_wire: bytes | str | dict[str, object], view: SourceView,
         raise SourceReferenceError("reference result exceeds bound")
     try:
         wire = json.loads(raw, object_pairs_hook=_unique_object)
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise SourceReferenceError("reference result JSON differs") from exc
     if type(wire) is not dict or set(wire) != {"package"} or type(wire["package"]) is not dict:
         raise SourceReferenceError("reference result shape differs")
@@ -267,7 +273,7 @@ def materialise(raw_wire: bytes | str | dict[str, object], view: SourceView,
         from jsonschema import Draft202012Validator, ValidationError
         try:
             Draft202012Validator(provider_schema).validate(wire)
-        except (TypeError, ValueError, ValidationError) as exc:
+        except (TypeError, ValueError, ValidationError, RecursionError) as exc:
             raise SourceReferenceError("reference result violates static schema") from exc
     payload = wire["package"]
     expected = {"substantive_claim_indexes", "governed_claims", "qualification_evidence",
@@ -319,7 +325,7 @@ def materialise(raw_wire: bytes | str | dict[str, object], view: SourceView,
         support_last = by_id[item["support_range"]["last_span_id"]]
         if (passage_index != support_index
                 or support_first.start_byte > claim_first.start_byte
-                or support_last.end_byte < claim_last.end_byte
+                or support_last.content_end_byte < claim_last.content_end_byte
                 or claim not in support):
             raise SourceReferenceError("claim is not contained in its support")
         range_identity = (source_id, item["claim_range"]["first_span_id"],
@@ -334,8 +340,10 @@ def materialise(raw_wire: bytes | str | dict[str, object], view: SourceView,
                 or len(fragments) > 65 or any(type(part) is not str
                 or len(part) > MAX_FRAGMENT_LENGTH for part in fragments)):
             raise SourceReferenceError("rendered fragment count differs")
-        retained_names = {name for names in view.source_entities for name, _ in names}
-        if any(name in part for part in fragments for name in retained_names):
+        # Only these names will be inserted. Unselected source inventories
+        # must not turn ordinary HK/date wording into an extra rejection gate.
+        if any(re.search(_entity_pattern(name), part)
+               for part in fragments for name, _kind in entities):
             raise SourceReferenceError("rendered fragment copied a source entity")
         rendered = "".join(part + (entities[index][0] if index < len(entities) else "")
                            for index, part in enumerate(fragments))
