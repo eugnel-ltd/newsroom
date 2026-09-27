@@ -91,6 +91,18 @@ def _unit(value: dict, bodies: dict[str, str]) -> CorpusIngestUnit:
     return CorpusIngestUnit(**value)
 
 
+def _landed_units(value: dict) -> tuple[CorpusIngestUnit, ...]:
+    """Decode both retained encodings for journal and selected accounting reads."""
+    bodies: dict[str, str] = {}
+    raw_units = value.get("units", ())
+    if "shared_body" in value:
+        body = value["shared_body"]
+        if type(body) is not str or any("body" in item for item in raw_units):
+            raise ValueError("native progress shared body differs")
+        raw_units = ({**item, "body": body} for item in raw_units)
+    return tuple(_unit(item, bodies) for item in raw_units)
+
+
 class NativeRevisionJournal:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
@@ -118,14 +130,7 @@ class NativeRevisionJournal:
         if kind == LAND:
             # Chunk receipts repeat the full source body. Share exact-equal text
             # in this revision only; retain and validate the original ledger bytes.
-            bodies: dict[str, str] = {}
-            raw_units = value["units"]
-            if "shared_body" in value:
-                body = value["shared_body"]
-                if type(body) is not str or any("body" in item for item in raw_units):
-                    raise ValueError("native progress shared body differs")
-                raw_units = ({**item, "body": body} for item in raw_units)
-            units = tuple(_unit(item, bodies) for item in raw_units)
+            units = _landed_units(value)
             self._validate_units(units)
             revision_id = units[0].revision_id
             if value["revision_id"] != revision_id:
