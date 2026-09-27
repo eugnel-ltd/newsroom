@@ -37,7 +37,7 @@ from .graphiti_fallback_policy import (
 from .graphiti_requests import load_checked_native_graphiti_call_shape_policy
 from .graphiti_admission import GraphitiAdmissionConsumerError
 from .graphiti_admission_integration import compose_existing_graphiti_admission_consumer
-from .model_usage import ModelUsageAdmissionError, ModelUsageService
+from .model_usage import ModelUsageAdmissionError, ModelUsageService, reported_output_rejected_ingests
 from .native_cycle import _uuid4_for
 from .store import append_ledger, graphiti_failure_state
 from .veto import OperatorDrainRequested, VetoError
@@ -156,11 +156,17 @@ class NativeGraphitiProcessor:
         self._stop_check()
         # Resolve retained accounting before considering another provider call.
         self._settle_missing_subscription_usage(units)
-        terminal_holds = {}
+        terminal_holds = {
+            ingest_id: "REPORTED_OUTPUT_REJECTION_NO_RETRY"
+            for ingest_id in reported_output_rejected_ingests(self._connection)
+            if ingest_id in units_by_ingest
+        }
         recovered_ambiguous_attempts: dict[str, int] = {}
         authenticated_rejected_attempts: dict[str, tuple[int, ...]] = {}
         authenticated_reentry_attempts: dict[str, int] = {}
         for ingest_id in units_by_ingest:
+            if ingest_id in terminal_holds:
+                continue
             # The authority commits before the private receipt/failure journal.
             # Inspect it even if a crash left no local failure row.
             if self._connection.execute(
@@ -284,6 +290,11 @@ class NativeGraphitiProcessor:
             ):
                 break
         self._settle_missing_subscription_usage(units)
+        terminal_holds.update({
+            ingest_id: "REPORTED_OUTPUT_REJECTION_NO_RETRY"
+            for ingest_id in reported_output_rejected_ingests(self._connection)
+            if ingest_id in units_by_ingest
+        })
         if self._operator_drain_requested():
             raise OperatorDrainRequested
         route_held = bool(

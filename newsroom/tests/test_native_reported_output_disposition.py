@@ -349,3 +349,44 @@ def test_reported_nested_receipt_telemetry_keeps_valid_binding(tmp_path, monkeyp
         assert case.usage.route_state(ROUTE)['state'] == 'CLOSED'
     finally:
         case.connection.close()
+
+
+@pytest.mark.parametrize('authority_failed', [False, True])
+def test_full_advance_excludes_disposed_failed_ingest_but_dispatches_healthy_peer(tmp_path, monkeypatch, authority_failed):
+    from newsroom.tests.test_native_graphiti import _open
+    from newsroom.control_plane.store import record_graphiti_failure
+    from newsroom.graphiti_adapter.types import GraphitiAdapterOutcome
+    from newsroom.graphiti_adapter.identity import typed_id
+    from newsroom.extraction.types import ExtractionRunId
+
+    case = _failed(tmp_path, monkeypatch)
+    queued = []
+    processor, connection, _calls = _open(
+        tmp_path, monkeypatch,
+        ingest=lambda _connection, **kw: queued.extend(unit.ingest_id for unit in kw['units']),
+    )
+    peer = _native('healthy-peer')
+    try:
+        _dispose(case)
+        record_graphiti_failure(connection, ingest_id=case.unit.ingest_id,
+                                source_id=case.unit.source_id, item_key=case.unit.item_key,
+                                outcome='FAILED', failure_code='PRODUCER_INTERNAL_ERROR')
+        connection.commit()
+        bad_run = typed_id(ExtractionRunId, 'run', case.unit.ingest_id)
+        processor._system.graphiti = SimpleNamespace(attempt_history=lambda run, **_kw: (
+            (SimpleNamespace(outcome=GraphitiAdapterOutcome.FAILED,
+                             failure_code='PRODUCER_INTERNAL_ERROR', attempt_number=1),)
+            if authority_failed and run == bad_run else ()
+        ))
+        assert GraphitiAdapterOutcome.FAILED.terminal is False
+        before = _history(case)
+        for cycle in ('first', 'repeat'):
+            result = {item.ingest_id: item for item in processor.advance((case.unit, peer), cycle_id=cycle)}
+            assert result[case.unit.ingest_id].state == 'GRAPHITI_HOLD'
+            assert result[case.unit.ingest_id].reason == 'REPORTED_OUTPUT_REJECTION_NO_RETRY'
+        assert case.unit.ingest_id not in queued
+        assert queued == [peer.ingest_id, peer.ingest_id]
+        assert _history(case) == before
+    finally:
+        connection.close()
+        case.connection.close()
