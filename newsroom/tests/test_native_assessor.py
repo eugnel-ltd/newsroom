@@ -56,6 +56,7 @@ from newsroom.increment10.evidence import EvidencePackageError, _base_package
 from newsroom.control_plane.writer import (
     CONT_DISABLED_CAPABILITIES,
     CONT_PRIMARY_COMMAND_FLAGS,
+    CONT_PRIMARY_REASONING,
 )
 from newsroom.tests.test_increment10_editorial import _ready_package
 from newsroom.tests.test_increment10_ingress import _candidate
@@ -80,6 +81,12 @@ def _use_historical_v16(monkeypatch):
         native_assessor_module,
         "CONTEXT_MANIFEST_SCHEMA_VERSION",
         "newsroom.native-evidence-assessor.context-manifest.v2",
+    )
+    monkeypatch.setattr(
+        native_assessor_module, "REASONING", CONT_PRIMARY_REASONING,
+    )
+    monkeypatch.setattr(
+        native_assessor_module, "COMMAND_FLAGS", CONT_PRIMARY_COMMAND_FLAGS,
     )
 
 
@@ -249,7 +256,7 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     invalid_geography["geography"] = ["Britain"]
     with pytest.raises(ValidationError):
         validator.validate({"package": invalid_geography})
-    assert VERSION == "newsroom.native-evidence-assessor.v18"
+    assert VERSION == "newsroom.native-evidence-assessor.v19"
     assert "ASSESSOR_CLAIM_BINDING_HOLD" in REASSESSABLE_HOLDS
     legacy = native_assessor_module._V17_SYSTEM
     assert "whitespace, newlines and country labels exactly" in legacy
@@ -1441,7 +1448,7 @@ def _usage(tmp_path, monkeypatch):
         provider="grok-build-cli",
         route="NATIVE_EVIDENCE_ASSESSOR",
         model="grok-4.6",
-        reasoning="low",
+        reasoning=native_assessor_module.REASONING,
         one_turn=True,
         exact_input=True,
         skills_enabled=False,
@@ -1449,7 +1456,7 @@ def _usage(tmp_path, monkeypatch):
         mcp_enabled=False,
         prior_message_count=0,
         command_semantic_version="1.0.8",
-        command_flags=CONT_PRIMARY_COMMAND_FLAGS,
+        command_flags=native_assessor_module.COMMAND_FLAGS,
         context_manifest_schema_version=(
             native_assessor_module.CONTEXT_MANIFEST_SCHEMA_VERSION
         ),
@@ -1480,7 +1487,7 @@ def test_native_assessor_input_bound_includes_fixed_input_and_output_reserve(
     bound = native_assessment_input_bound(policy)
     assert bound['version'] == INPUT_BOUND_VERSION
     assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v3')
-    assert VERSION.endswith('.v18')
+    assert VERSION.endswith('.v19')
     assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
     assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
     assert bound['schema_digest'] == PROVIDER_SCHEMA_DIGEST
@@ -2770,12 +2777,13 @@ def test_literal_csv_names_survive_full_assessment_and_governed_records(retained
             AutonomousNativeEvidenceAssessor._validated_execution(NativeAssessmentExecution(canonical_json_bytes(altered).decode(), {}),candidate,base,(source,),(acquired,))
 
 
-def test_v18_wire_contract_preserves_v15_v16_v17_historical_contracts():
+def test_v19_reasoning_profile_preserves_v15_v16_v17_v18_contracts():
     from newsroom.control_plane.native_assessor import (
         _V15_SYSTEM, _V15_SCHEMA_DIGEST, _V15_SCHEMA_BYTES, _V16_SYSTEM,
         _V17_SYSTEM, _V17_PROVIDER_SCHEMA_DIGEST,
+        _V18_SYSTEM, _V18_PROVIDER_SCHEMA,
     )
-    assert VERSION == 'newsroom.native-evidence-assessor.v18'
+    assert VERSION == 'newsroom.native-evidence-assessor.v19'
     assert digest_bytes(_V15_SYSTEM.encode()) == 'sha256:5788c3e827199e12932d106ad494c80b71b2691e3f9c7e535a44c5d09811d4a6'
     assert len(_V15_SYSTEM.encode()) == 6797
     assert SCHEMA_DIGEST == _V15_SCHEMA_DIGEST
@@ -2790,6 +2798,10 @@ def test_v18_wire_contract_preserves_v15_v16_v17_historical_contracts():
     assert 'source_range' in SYSTEM
     assert 'rendered_assertion_zh_hant_hk_fragments' in SYSTEM
     assert _V17_PROVIDER_SCHEMA_DIGEST != PROVIDER_SCHEMA_DIGEST
+    assert SYSTEM == _V18_SYSTEM
+    assert PROVIDER_SCHEMA == _V18_PROVIDER_SCHEMA
+    assert native_assessor_module.REASONING == 'medium'
+    assert native_assessor_module.COMMAND_FLAGS != CONT_PRIMARY_COMMAND_FLAGS
     assert PROVIDER_SCHEMA_DIGEST != SCHEMA_DIGEST
     assert PROVIDER_SCHEMA['properties']['package']['properties'][
         'governed_claims'

@@ -34,9 +34,9 @@ NOW = datetime(2026, 9, 8, 14, tzinfo=UTC)
 
 
 def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
-    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v18"
+    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v19"
     assert native_composition.ASSESSMENT_CONTRACT_VERSION == (
-        "newsroom.native-evidence-assessor.v18+newsroom.named-entity.v15+"
+        "newsroom.native-evidence-assessor.v19+newsroom.named-entity.v15+"
         "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v1+"
         "newsroom.qualification-relation.v3+newsroom.retained-assessment.v1"
     )
@@ -69,7 +69,7 @@ def test_native_cursor_credential_loads_only_provisioned_key_and_restores_enviro
 @pytest.mark.parametrize(
     "missing_workload",
     (WorkloadClass.NATIVE_RETRIEVAL_EMBEDDING, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
-     "stale-assessor-contract"),
+     "stale-assessor-contract", "stale-assessor-flags", "stale-assessor-reasoning"),
 )
 def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
     tmp_path, monkeypatch, missing_workload,
@@ -103,9 +103,19 @@ def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
     def qualified_policy(**request):
         if request["workload_class"] is missing_workload:
             raise ValueError("qualification is absent")
-        if (missing_workload == "stale-assessor-contract"
+        if (isinstance(missing_workload, str) and missing_workload.startswith("stale-assessor-")
                 and request["workload_class"] is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR):
-            return SimpleNamespace(prompt_contract_version="stale-contract")
+            values = asdict(policies[request["workload_class"]])
+            values.pop("canonical_digest")
+            values.update(
+                prompt_contract_version=("stale-contract" if missing_workload == "stale-assessor-contract"
+                                         else native_assessor.VERSION),
+                reasoning=("low" if missing_workload == "stale-assessor-reasoning"
+                           else native_assessor.REASONING),
+                command_flags=(CONT_PRIMARY_COMMAND_FLAGS if missing_workload == "stale-assessor-flags"
+                               else native_assessor.COMMAND_FLAGS),
+            )
+            return InvocationEfficiencyPolicy.create(**values)
         return policies[request["workload_class"]]
 
     monkeypatch.setattr(native_composition, "ModelUsageService", lambda _: SimpleNamespace(
@@ -122,8 +132,9 @@ def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
         ledger=str(paths.CANONICAL_UNPUBLISHED_STORE), lock=str(root / "hermes.lock"),
         once=False, interval=300, failure_backoff=60,
     ))
-    expected = ("prompt contract differs before authority OPEN"
-                if missing_workload == "stale-assessor-contract" else "qualification is absent")
+    expected = ("profile differs before authority OPEN"
+                if isinstance(missing_workload, str) and missing_workload.startswith("stale-assessor-")
+                else "qualification is absent")
     with pytest.raises(ValueError, match=expected):
         service.run()
 
@@ -352,10 +363,11 @@ def _assessment_policy() -> InvocationEfficiencyPolicy:
         policy_id="native-composition-assessment", version="v1",
         workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
         provider="grok-build-cli", route=native_assessor.ROUTE,
-        model="grok-4.6", reasoning="low", one_turn=True, exact_input=True,
+        model="grok-4.6", reasoning=native_assessor.REASONING,
+        one_turn=True, exact_input=True,
         skills_enabled=False, tools_enabled=False, mcp_enabled=False,
         prior_message_count=0, command_semantic_version="1.0.8",
-        command_flags=CONT_PRIMARY_COMMAND_FLAGS,
+        command_flags=native_assessor.COMMAND_FLAGS,
         context_manifest_schema_version=native_assessor.CONTEXT_MANIFEST_SCHEMA_VERSION,
         disabled_capabilities=CONT_DISABLED_CAPABILITIES,
         implementation_revision="1" * 40, max_prompt_bytes=1_000_000,

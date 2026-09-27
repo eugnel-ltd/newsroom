@@ -34,6 +34,8 @@ def _fixture(tmp_path, monkeypatch):
         native, 'CONTEXT_MANIFEST_SCHEMA_VERSION',
         'newsroom.native-evidence-assessor.context-manifest.v1',
     )
+    monkeypatch.setattr(native, 'REASONING', native.CONT_PRIMARY_REASONING)
+    monkeypatch.setattr(native, 'COMMAND_FLAGS', native.CONT_PRIMARY_COMMAND_FLAGS)
     connection, _port, candidate = _candidate(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
