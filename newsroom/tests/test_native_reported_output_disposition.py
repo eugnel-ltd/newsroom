@@ -164,7 +164,7 @@ def test_other_failures_and_uncertainty_remain_blocked(tmp_path, monkeypatch, ch
 
 @pytest.mark.parametrize('defect', [
     'revision', 'terminal-digest', 'allocation-digest', 'receipt-failure',
-    'receipt-sdk-status', 'receipt-sdk-run', 'receipt-output', 'receipt-allocation',
+    'receipt-sdk-status', 'receipt-sdk-run', 'receipt-output', 'receipt-basis', 'receipt-allocation',
     'receipt-accounting', 'telemetry', 'dispatch',
 ])
 def test_changed_authority_fails_closed(tmp_path, monkeypatch, defect):
@@ -181,6 +181,8 @@ def test_changed_authority_fails_closed(tmp_path, monkeypatch, defect):
                     leaf['sdk_run_id'] = 'different'
                 elif defect == 'receipt-output':
                     leaf['usage']['output_tokens'] += 1
+                elif defect == 'receipt-basis':
+                    leaf['usage'] = {'usage_basis': 'UNREPORTED', 'provider_telemetry': leaf['usage']}
                 elif defect == 'receipt-allocation':
                     leaf['model_invocation_allocation_digest'] = 'different'
                 else:
@@ -329,5 +331,21 @@ def test_disposition_rechecks_conflicting_landing_via_scoped_index(tmp_path, mon
         case.connection.commit()
         with pytest.raises(m.ModelUsageIntegrityError):
             case.usage.route_state(ROUTE)
+    finally:
+        case.connection.close()
+
+
+def test_reported_nested_receipt_telemetry_keeps_valid_binding(tmp_path, monkeypatch):
+    case = _failed(tmp_path, monkeypatch)
+    try:
+        def nest(receipt):
+            leaf = receipt['chat_invocations'][0]
+            leaf['usage'] = {'usage_basis': 'PROVIDER_REPORTED', 'provider_telemetry': leaf['usage']}
+        _rewrite_receipt(case, nest)
+        case.connection.commit()
+        before = _history(case)
+        _dispose(case)
+        assert _history(case) == before
+        assert case.usage.route_state(ROUTE)['state'] == 'CLOSED'
     finally:
         case.connection.close()

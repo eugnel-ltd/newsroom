@@ -1088,6 +1088,7 @@ def _reported_output_disposition_authority(
         raise ModelUsageAdmissionError("reported output lacks a finished SDK receipt")
     leaf_usage = bound[0].get("usage")
     if (not isinstance(leaf_usage, dict)
+            or leaf_usage.get("usage_basis") != "PROVIDER_REPORTED"
             or digest_canonical(leaf_usage.get("provider_telemetry", leaf_usage)) != terminal.provider_telemetry_digest
             or any(name in leaf_usage and leaf_usage[name] != getattr(components, name)
                    for name in (*counters, "reasoning_tokens", "context_tokens"))):
