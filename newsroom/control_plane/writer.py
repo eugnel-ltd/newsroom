@@ -338,6 +338,74 @@ def _signed_number_relations(text: str) -> tuple[str, ...]:
     return tuple(re.findall(r"[+\-−]\d+(?:[.,]\d+)*", text))
 
 
+def _document_year_localisation(claim: GovernedClaimEvidence) -> tuple[tuple[str, str], ...]:
+    """Prove one year label on an evidenced named annual document, not a count.
+
+    The immutable claim/rendering stays unchanged. Bare numbers, form numbers,
+    durations, extra precision and additional numeric facts receive no exemption.
+    """
+    source, target = claim.claim, claim.rendered_assertion_zh_hant_hk
+    numbers = re.findall(r"\d+(?:[.,]\d+)*", source)
+    if len(numbers) != 1 or re.findall(r"\d+(?:[.,]\d+)*", target) != numbers:
+        return ()
+    year = numbers[0]
+    if not re.fullmatch(r"(?:19|20)\d{2}", year):
+        return ()
+    if any(unicodedata.category(c) == "Sc" or c in "%％" for c in source + target):
+        return ()
+    if re.search(r"[+\-−]\s*" + year, source + "\n" + target):
+        return ()
+    match = re.fullmatch(
+        r"The (?:deadline|closing date) for the " + year
+        + r" (?P<title>(?:[A-Za-z]+[ -]){1,9}(?:return|report)) "
+        r"\((?P<term>[A-Z][A-Za-z]{1,9})\) has now (?:passed|expired)\.?", source,
+    )
+    if match is None or not re.search(r"\b(?:annual|budget|financial|academic)\b", match["title"], flags=re.IGNORECASE):
+        return ()
+    term = match["term"]
+    if (term not in claim.rendered_named_entities
+            or not any(text == term and kind == "OFFICIAL_TERM" for text, kind, _ in claim.named_entity_evidence)):
+        return ()
+    rendered = re.fullmatch(
+        re.escape(year) + r"年(?P<title>[^0-9零〇一二三四五六七八九十百千萬億年月日時分秒%％]{1,80})[（(]"
+        + re.escape(term) + r"[)）]的(?:截止日期|限期)現已(?:過|屆滿)\。?", target,
+    )
+    if rendered is None:
+        return ()
+    if re.search(
+        r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+        r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+        r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|"
+        r"billion|trillion|half|quarter|dozen|first|second|third|fourth|fifth|sixth|"
+        r"seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|"
+        r"fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|"
+        r"thirtieth|fortieth|fiftieth|sixtieth|seventieth|eightieth|ninetieth|"
+        r"hundredth|thousandth|millionth|billionth|trillionth)\b", match["title"],
+        flags=re.IGNORECASE,
+    ) or re.search(r"[半數数幾几首第廿卅]", rendered["title"]):
+        return ()
+    return ((year, year + "年"),)
+
+
+def _writer_numeric_localisations(claim: GovernedClaimEvidence) -> tuple[tuple[str, str], ...]:
+    pairs = (*claim.localised_factual_expressions, *_document_year_localisation(claim))
+    # Cantonese's indefinite measure phrase is not an invented exact duration.
+    # A month/day/hour or any additional numeric fact still faces the ordinary
+    # fidelity checks; only this exact source/target phrase is removed.
+    short_period = re.fullmatch(
+        r"The form will remain open (?P<period>for a short period)"
+        r"(?P<late> for late submissions)?\.?", claim.claim,
+    )
+    rendered_period = re.fullmatch(
+        r"表格會繼續開放一段短時間(?P<late>，供逾期提交)?。?",
+        claim.rendered_assertion_zh_hant_hk,
+    )
+    if (short_period is not None and rendered_period is not None
+            and bool(short_period["late"]) == bool(rendered_period["late"])):
+        pairs += ((short_period["period"], "一段短時間"),)
+    return pairs
+
+
 def _numeric_han_context(text: str) -> str:
     match = re.search(
         r"\d|[零〇一二三四五六七八九十百千萬万億亿兆兩两壹貳贰參叁肆伍陸陆"
@@ -1254,6 +1322,10 @@ def validate_writer_copy(
         ),
         re.compile(r"[零〇一二三四五六七八九十百千萬万億亿兆兩两]+"),
     )
+    numeric_localisations = {
+        claim.claim_id: _writer_numeric_localisations(claim)
+        for claim in package.governed_claims
+    }
     approved_numeric_expressions = tuple(
         match.group(0)
         for claim in package.governed_claims
@@ -1263,7 +1335,7 @@ def validate_writer_copy(
     ) + tuple(
         match.group(0)
         for claim in package.governed_claims
-        for _source, target in claim.localised_factual_expressions
+        for _source, target in numeric_localisations[claim.claim_id]
         for pattern in numeric_expression_patterns
         for match in pattern.finditer(target)
     )
@@ -1327,7 +1399,7 @@ def validate_writer_copy(
     governed_numbers.update(
         number
         for claim in package.governed_claims
-        for _source, target in claim.localised_factual_expressions
+        for _source, target in numeric_localisations[claim.claim_id]
         for number in re.findall(r"\d+(?:[.,]\d+)*(?:%|％)?", target)
     )
     draft_numeric_expressions = {
@@ -1365,14 +1437,14 @@ def validate_writer_copy(
                     claim.claim,
                     tuple(
                         source
-                        for source, _target in claim.localised_factual_expressions
+                        for source, _target in numeric_localisations[claim.claim_id]
                     ),
                 ),
                 _remove_exact_expressions(
                     claim.rendered_assertion_zh_hant_hk,
                     tuple(
                         target
-                        for _source, target in claim.localised_factual_expressions
+                        for _source, target in numeric_localisations[claim.claim_id]
                     ),
                 ),
             ),
