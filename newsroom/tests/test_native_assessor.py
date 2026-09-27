@@ -65,7 +65,7 @@ REVISION = "1" * 40
 
 
 def _use_historical_v16(monkeypatch):
-    """Seed a genuine full-package v16 result; never bypass v17 references."""
+    """Seed a genuine full-package v16 result; never bypass v18 references."""
 
     monkeypatch.setattr(
         native_assessor_module, "VERSION", native_assessor_module._V16_PRODUCER_VERSION
@@ -95,6 +95,60 @@ def _empty_reference_result(reason="No supported new information."):
             "explicit_exclusions": [],
         }
     }
+
+
+def _v18_wire_from_v17(value):
+    """Convert test fixtures only; production accepts no v17-shaped v18 output."""
+
+    from newsroom.control_plane.admission import _QUALIFICATION_CLASSIFIER_FIELDS
+
+    package = value["package"]
+    claims = []
+    for item in package["governed_claims"]:
+        claims.append({
+            "claim_role": item["claim_role"],
+            "status": item["status"],
+            "source_range": item["claim_range"],
+            "rendered_assertion_zh_hant_hk_fragments": item[
+                "rendered_fragments"
+            ],
+            "factual_localisations": [
+                {
+                    "source_lookup_key": source,
+                    "rendered_expression": rendered,
+                }
+                for source, rendered in item["localised_factual_expressions"]
+            ],
+            "quotation_source_keys": item["quotations"],
+        })
+    qualifications = []
+    for item in package["qualification_evidence"]:
+        qualifications.append({
+            "test": item["test"],
+            "claim_index": item["claim_index"],
+            "test_evidence": {
+                (
+                    key
+                    if key in _QUALIFICATION_CLASSIFIER_FIELDS
+                    else key + "_source_lookup_key"
+                ): witness
+                for key, witness in item["test_evidence"].items()
+            },
+        })
+    return {"package": {
+        **{
+            key: package[key]
+            for key in (
+                "substantive_claim_indexes",
+                "selection_rationale",
+                "geography",
+                "categories",
+                "explicit_exclusions",
+            )
+        },
+        "governed_claims": claims,
+        "qualification_evidence": qualifications,
+    }}
 
 
 @pytest.mark.parametrize(("changes", "expected"), [
@@ -195,25 +249,27 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     invalid_geography["geography"] = ["Britain"]
     with pytest.raises(ValidationError):
         validator.validate({"package": invalid_geography})
-    assert VERSION == "newsroom.native-evidence-assessor.v17"
+    assert VERSION == "newsroom.native-evidence-assessor.v18"
     assert "ASSESSOR_CLAIM_BINDING_HOLD" in REASSESSABLE_HOLDS
-    assert "whitespace, newlines and country labels exactly" in SYSTEM
-    assert "unfamiliar official source-bound literal" in SYSTEM
-    assert "calendar months as months without converting them" in SYSTEM
-    assert "calendar years as years without converting them" in SYSTEM
-    assert "Ordinary unit and process nouns must be translated" in SYSTEM
-    assert "excerpt-only entities" not in SYSTEM
-    assert "first observation of an old clause" in SYSTEM
-    assert "DELETED" in SYSTEM
-    assert "Only rendered_assertion_zh_hant_hk is translated" in SYSTEM
-    assert "must exactly equal the named-entity set in claim" in SYSTEM
-    assert "only in the excerpt, source body or inventory" in SYSTEM
-    assert "must not be copied unchanged" in SYSTEM
-    assert "byte-for-byte from the claim or supporting excerpt" in SYSTEM
-    assert "one complete affirmative source clause" in SYSTEM
-    assert "Never paraphrase or invent new_state" in SYSTEM
-    assert "Return no qualification evidence" in SYSTEM
-    assert "and no substantive new information" in SYSTEM
+    legacy = native_assessor_module._V17_SYSTEM
+    assert "whitespace, newlines and country labels exactly" in legacy
+    assert "unfamiliar official source-bound literal" in legacy
+    assert "calendar months as months without converting them" in legacy
+    assert "calendar years as years without converting them" in legacy
+    assert "Ordinary unit and process nouns must be translated" in legacy
+    assert "excerpt-only entities" not in legacy
+    assert "first observation of an old clause" in legacy
+    assert "DELETED" in legacy
+    assert "Only rendered_assertion_zh_hant_hk is translated" in legacy
+    assert "must exactly equal the named-entity set in claim" in legacy
+    assert "only in the excerpt, source body or inventory" in legacy
+    assert "must not be copied unchanged" in legacy
+    assert "byte-for-byte from the claim or supporting excerpt" in legacy
+    assert "Never paraphrase or invent new_state" in legacy
+    assert "rendered_assertion_zh_hant_hk_fragments" in SYSTEM
+    assert "one contiguous source_range" in SYSTEM
+    assert "ending _source_lookup_key" in SYSTEM
+    assert "no substantive_claim_indexes" in SYSTEM
     connection.close()
 
 
@@ -1127,7 +1183,7 @@ def test_assessor_qualification_witnesses_match_admission_helpers(
 
 @pytest.mark.parametrize(
     "prior_contract",
-    ["newsroom.native-evidence-assessor.v7", "newsroom.native-evidence-assessor.v16"],
+    ["newsroom.native-evidence-assessor.v15", "newsroom.native-evidence-assessor.v16"],
 )
 @pytest.mark.parametrize("cached_only", [False, True])
 @pytest.mark.parametrize("valid", [False, True])
@@ -1150,6 +1206,20 @@ def test_retained_qualification_validation_controls_existing_fresh_attempt(
         "reasoning_tokens": 0, "context_tokens": 1, "total_tokens": 2,
     })
     monkeypatch.setattr(module, "VERSION", prior_contract)
+    monkeypatch.setattr(
+        module,
+        "SYSTEM",
+        module._V15_SYSTEM
+        if prior_contract == module._V15_PRODUCER_VERSION
+        else module._V16_SYSTEM,
+    )
+    monkeypatch.setattr(
+        module,
+        "CONTEXT_MANIFEST_SCHEMA_VERSION",
+        "newsroom.native-evidence-assessor.context-manifest.v1"
+        if prior_contract == module._V15_PRODUCER_VERSION
+        else "newsroom.native-evidence-assessor.context-manifest.v2",
+    )
     service, prior_usage = _usage(tmp_path, monkeypatch)
     # Seed the actual old acceptance shape without invoking an older validator:
     # a settled, exact retained raw result whose structural contract was accepted.
@@ -1168,6 +1238,12 @@ def test_retained_qualification_validation_controls_existing_fresh_attempt(
         ).fetchone()
     assert json.loads(original_allocation[0])["prompt_contract_version"] == prior_contract
     monkeypatch.setattr(module, "VERSION", current_contract)
+    monkeypatch.setattr(module, "SYSTEM", module._V16_SYSTEM)
+    monkeypatch.setattr(
+        module,
+        "CONTEXT_MANIFEST_SCHEMA_VERSION",
+        "newsroom.native-evidence-assessor.context-manifest.v2",
+    )
     _, usage = _usage(tmp_path, monkeypatch)
     calls = []
 
@@ -1404,7 +1480,7 @@ def test_native_assessor_input_bound_includes_fixed_input_and_output_reserve(
     bound = native_assessment_input_bound(policy)
     assert bound['version'] == INPUT_BOUND_VERSION
     assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v3')
-    assert VERSION.endswith('.v17')
+    assert VERSION.endswith('.v18')
     assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
     assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
     assert bound['schema_digest'] == PROVIDER_SCHEMA_DIGEST
@@ -2073,8 +2149,12 @@ def test_retained_assessment_revalidation_reuses_output_without_provider(tmp_pat
 
     _use_historical_v16(monkeypatch)
     if new_contract:
-        monkeypatch.setattr(module, "VERSION", "newsroom.native-evidence-assessor.v11")
-        monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", module.VERSION)
+        monkeypatch.setattr(module, "VERSION", module._V15_PRODUCER_VERSION)
+        monkeypatch.setattr(module, "SYSTEM", module._V15_SYSTEM)
+        monkeypatch.setattr(
+            module, "CONTEXT_MANIFEST_SCHEMA_VERSION",
+            "newsroom.native-evidence-assessor.context-manifest.v1",
+        )
     connection, _port, candidate = _candidate(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
@@ -2100,8 +2180,12 @@ def test_retained_assessment_revalidation_reuses_output_without_provider(tmp_pat
             candidate, base, (), (), before_dispatch=None, cached_only=True,
         ) == first
     if new_contract:
-        monkeypatch.setattr(module, "VERSION", "newsroom.native-evidence-assessor.v12")
-        monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", module.VERSION)
+        monkeypatch.setattr(module, "VERSION", module._V16_PRODUCER_VERSION)
+        monkeypatch.setattr(module, "SYSTEM", module._V16_SYSTEM)
+        monkeypatch.setattr(
+            module, "CONTEXT_MANIFEST_SCHEMA_VERSION",
+            "newsroom.native-evidence-assessor.context-manifest.v2",
+        )
         _, usage = _usage(tmp_path, monkeypatch)
         assessor = AutonomousNativeEvidenceAssessor(dispatch, usage=usage, dispatch_fence=nullcontext)
     assert assessor(candidate, base, (), ()) == first
@@ -2149,8 +2233,12 @@ def test_consumer_only_revalidation_requires_exact_cached_input(
     first = AutonomousNativeEvidenceAssessor(
         dispatch, usage=old_usage, dispatch_fence=nullcontext,
     )(candidate, base, (), ())
-    monkeypatch.setattr(module, "VERSION", "newsroom.native-evidence-assessor.v12")
-    monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", module.VERSION)
+    monkeypatch.setattr(module, "VERSION", module._V15_PRODUCER_VERSION)
+    monkeypatch.setattr(module, "SYSTEM", module._V15_SYSTEM)
+    monkeypatch.setattr(
+        module, "CONTEXT_MANIFEST_SCHEMA_VERSION",
+        "newsroom.native-evidence-assessor.context-manifest.v1",
+    )
     _, usage = _usage(tmp_path, monkeypatch)
     assessor = AutonomousNativeEvidenceAssessor(
         dispatch, usage=usage, dispatch_fence=nullcontext,
@@ -2299,8 +2387,12 @@ def test_settled_rendering_failure_supplies_feedback_once_then_reuses_valid_resu
         "reasoning_tokens": 0, "context_tokens": 1, "total_tokens": 2,
     })
     current_contract = module._V16_PRODUCER_VERSION
-    monkeypatch.setattr(module, "VERSION", "newsroom.native-evidence-assessor.v12")
-    monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", module.VERSION)
+    monkeypatch.setattr(module, "VERSION", module._V15_PRODUCER_VERSION)
+    monkeypatch.setattr(module, "SYSTEM", module._V15_SYSTEM)
+    monkeypatch.setattr(
+        module, "CONTEXT_MANIFEST_SCHEMA_VERSION",
+        "newsroom.native-evidence-assessor.context-manifest.v1",
+    )
     service, prior_usage = _usage(tmp_path, monkeypatch)
     with pytest.raises(NativeEvidenceHold, match="ASSESSOR_RENDERING_CONTRACT_HOLD"):
         AutonomousNativeEvidenceAssessor(
@@ -2308,7 +2400,11 @@ def test_settled_rendering_failure_supplies_feedback_once_then_reuses_valid_resu
         )(candidate, base, (source,), (acquired,))
 
     monkeypatch.setattr(module, "VERSION", current_contract)
-    monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", current_contract)
+    monkeypatch.setattr(module, "SYSTEM", module._V16_SYSTEM)
+    monkeypatch.setattr(
+        module, "CONTEXT_MANIFEST_SCHEMA_VERSION",
+        "newsroom.native-evidence-assessor.context-manifest.v2",
+    )
     _, usage = _usage(tmp_path, monkeypatch)
     prompts = []
 
@@ -2674,11 +2770,12 @@ def test_literal_csv_names_survive_full_assessment_and_governed_records(retained
             AutonomousNativeEvidenceAssessor._validated_execution(NativeAssessmentExecution(canonical_json_bytes(altered).decode(), {}),candidate,base,(source,),(acquired,))
 
 
-def test_v17_reference_contract_preserves_v15_v16_historical_contracts():
+def test_v18_wire_contract_preserves_v15_v16_v17_historical_contracts():
     from newsroom.control_plane.native_assessor import (
         _V15_SYSTEM, _V15_SCHEMA_DIGEST, _V15_SCHEMA_BYTES, _V16_SYSTEM,
+        _V17_SYSTEM, _V17_PROVIDER_SCHEMA_DIGEST,
     )
-    assert VERSION == 'newsroom.native-evidence-assessor.v17'
+    assert VERSION == 'newsroom.native-evidence-assessor.v18'
     assert digest_bytes(_V15_SYSTEM.encode()) == 'sha256:5788c3e827199e12932d106ad494c80b71b2691e3f9c7e535a44c5d09811d4a6'
     assert len(_V15_SYSTEM.encode()) == 6797
     assert SCHEMA_DIGEST == _V15_SCHEMA_DIGEST
@@ -2688,8 +2785,11 @@ def test_v17_reference_contract_preserves_v15_v16_historical_contracts():
     assert 'same complete literal Row line' in _V16_SYSTEM
     assert 'CSV JSON delimiter quotes are not attributed speech' in _V16_SYSTEM
     assert 'existing empty governed_claims/qualification_evidence/no-new-information path' in _V16_SYSTEM
-    assert 'claim_range and support_range' in SYSTEM
-    assert 'N+1 rendered_fragments' in SYSTEM
+    assert 'claim_range and support_range' in _V17_SYSTEM
+    assert 'N+1 rendered_fragments' in _V17_SYSTEM
+    assert 'source_range' in SYSTEM
+    assert 'rendered_assertion_zh_hant_hk_fragments' in SYSTEM
+    assert _V17_PROVIDER_SCHEMA_DIGEST != PROVIDER_SCHEMA_DIGEST
     assert PROVIDER_SCHEMA_DIGEST != SCHEMA_DIGEST
     assert PROVIDER_SCHEMA['properties']['package']['properties'][
         'governed_claims'

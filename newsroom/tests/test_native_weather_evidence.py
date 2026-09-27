@@ -673,12 +673,16 @@ def test_hko_absent_current_item_rehydrates_exact_retained_cancellation(
                 output.qualification_evidence[0], output.governed_claims[0],
                 source_context=result.body.decode(),
             )
-            # Prove the v17 provider reference boundary reconstructs the exact
+            # Prove the v18 provider boundary reconstructs the exact
             # completed-event headline without retaining its terminal newline.
-            from newsroom.control_plane.native_assessor import PROVIDER_SCHEMA
-            from newsroom.control_plane.native_assessor_references import (
-                build_source_view, materialise,
+            from newsroom.control_plane.native_assessor import (
+                PROVIDER_SCHEMA, _V17_PROVIDER_SCHEMA,
             )
+            from newsroom.control_plane.native_assessor_references import (
+                build_source_view,
+            )
+            from newsroom.control_plane.native_assessor_wire import materialise
+            from newsroom.tests.test_native_assessor import _v18_wire_from_v17
 
             view = build_source_view((result.body.decode(),), ("HK-02",))
             by_text = {
@@ -759,9 +763,11 @@ def test_hko_absent_current_item_rehydrates_exact_retained_cancellation(
                 "categories": ["Weather and disasters"],
                 "explicit_exclusions": [],
             }}
+            wire = _v18_wire_from_v17(wire)
             materialised, receipt = materialise(
                 canonical_json_bytes(wire), view, "historical-weather-request",
                 provider_schema=PROVIDER_SCHEMA,
+                v17_schema=_V17_PROVIDER_SCHEMA,
             )
             assert receipt["materialised_text"] == canonical_json_bytes(
                 materialised

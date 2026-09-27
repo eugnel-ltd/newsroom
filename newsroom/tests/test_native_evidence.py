@@ -55,7 +55,9 @@ from newsroom.tests.test_graphiti_operational_readiness import _rights, _unit
 from newsroom.tests.test_increment10_editorial import _evidence_facade, _ready_package
 from newsroom.tests.test_increment10_ingress import _candidate, _receive
 from newsroom.tests.test_increment10_private_serving import _open
-from newsroom.tests.test_native_assessor import _model_package_value
+from newsroom.tests.test_native_assessor import (
+    _model_package_value, _v18_wire_from_v17,
+)
 from newsroom.tests.test_native_publication import _bindings
 
 NOW = UtcTimestamp.parse("2026-09-02T12:02:00.000000Z")
@@ -291,7 +293,12 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
             assert "body" not in request["sources"][0]
             assert "passages" not in request["base_package"]
             assert "".join(segment["text"] for segment in request["sources"][0]["segments"]) == passage
-            return NativeAssessmentExecution(canonical_json_bytes(reference_value(value)).decode(), {})
+            return NativeAssessmentExecution(
+                canonical_json_bytes(
+                    _v18_wire_from_v17(reference_value(value))
+                ).decode(),
+                {},
+            )
         return AutonomousNativeEvidenceAssessor(
             dispatch
         )
@@ -362,9 +369,9 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
 
     candidate_connection.commit()
     negative_value = _model_package_value(assessed_package)
-    negative_value["governed_claims"][0]["semantic_relation"][
-        "source_polarity"
-    ] = "NEGATED"
+    # Semantic relation is a controller constant in v18; exercise a
+    # remaining provider choice rather than pretending it can be emitted.
+    negative_value["governed_claims"][0]["status"] = "UNSUPPORTED"
     negative_assessor = model_assessor(negative_value)
     with pytest.raises(EvidencePackageError, match="source references differ"):
         negative_assessor(
@@ -472,7 +479,7 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
                 ),
             )
         else:
-            # The v17 provider cannot emit these invalid free-text values.
+            # The v18 provider cannot emit these invalid free-text values.
             # Preserve the separate downstream-admission defence by mutating
             # the already materialised assessment, never bypassing the positive
             # current producer path above.
