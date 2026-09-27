@@ -25,6 +25,12 @@ def _changed_policy(policy, **changes):
 
 
 def _fixture(tmp_path, monkeypatch):
+    # These are immutable v15 historical records, even after producer upgrades.
+    import newsroom.control_plane.native_assessor as native
+    import newsroom.tests.test_native_assessor as helpers
+    monkeypatch.setattr(native, 'VERSION', native._V15_PRODUCER_VERSION)
+    monkeypatch.setattr(native, 'SYSTEM', native._V15_SYSTEM)
+    monkeypatch.setattr(helpers, 'VERSION', native._V15_PRODUCER_VERSION)
     connection, _port, candidate = _candidate(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
@@ -201,3 +207,38 @@ def test_requalification_binds_context_scalar_columns(tmp_path, monkeypatch):
         c.execute("UPDATE model_invocation_context_manifests SET provider='other-provider' WHERE context_manifest_digest=?", (allocation.context_manifest_digest,))
     with pytest.raises(ModelUsageIntegrityError):
         _recover(service, allocation, policy)
+
+
+@pytest.mark.parametrize(('field', 'future'), (('VERSION', 'newsroom.native-evidence-assessor.v16'), ('SYSTEM', 'Changed future producer instructions'), ('SCHEMA_DIGEST', 'sha256:'+'f'*64)))
+def test_historical_requalification_survives_current_producer_change(tmp_path, monkeypatch, field, future):
+    import newsroom.control_plane.native_assessor as native
+    service, _usage_, _candidate_, _base_, allocation, policy = _fixture(tmp_path, monkeypatch)
+    _recover(service, allocation, policy)
+    monkeypatch.setattr(native, field, future)
+    with sqlite3.connect(service.path) as c:
+        assert service._route_state(c, policy.route)['state'] == 'CLOSED'
+
+
+@pytest.mark.parametrize('field', ('system_digest', 'schema_digest'))
+def test_native_admission_binds_actual_context_to_input_bound(tmp_path, monkeypatch, field):
+    service, usage = _usage(tmp_path, monkeypatch)
+    connection, _port, candidate = _candidate(tmp_path)
+    try:
+        base = _base_package(_ready_package(candidate)[1])
+        allocation = usage.begin(candidate, base, 'initial request')
+        with sqlite3.connect(service.path) as c:
+            manifest = json.loads(c.execute('SELECT record_json FROM model_invocation_context_manifests WHERE context_manifest_digest=?',(allocation.context_manifest_digest,)).fetchone()[0])
+        manifest.pop('context_manifest_digest')
+        manifest[field] = digest_bytes(b'different contract content')
+        manifest['prompt_digest'] = digest_bytes(b'different input')
+        manifest['request_digest'] = digest_canonical({key:manifest[key] for key in ('provider','route','model','reasoning','command_semantic_version','command_flags','implementation_revision','system_digest','prompt_digest','output_schema_digest')})
+        manifest['context_manifest_digest'] = digest_canonical(manifest)
+        service.retain_context_manifest(manifest)
+        values = asdict(allocation)
+        values.pop('canonical_digest');values.pop('invocation_id')
+        values.update(prompt_digest=manifest['prompt_digest'],request_digest=manifest['request_digest'],context_manifest_digest=manifest['context_manifest_digest'])
+        changed = InvocationAllocation.create(**values)
+        with sqlite3.connect(service.path) as c, pytest.raises(ModelUsageAdmissionError,match='complete input exceeds qualified bound'):
+            service._validate_preflight(c,changed,usage._policy)
+    finally:
+        connection.close()

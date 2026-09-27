@@ -159,7 +159,7 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     invalid_geography["geography"] = ["Britain"]
     with pytest.raises(ValidationError):
         validator.validate({"package": invalid_geography})
-    assert VERSION == "newsroom.native-evidence-assessor.v15"
+    assert VERSION == "newsroom.native-evidence-assessor.v16"
     assert "ASSESSOR_CLAIM_BINDING_HOLD" in REASSESSABLE_HOLDS
     assert "whitespace, newlines and country labels exactly" in SYSTEM
     assert "unfamiliar official source-bound literal" in SYSTEM
@@ -1360,7 +1360,7 @@ def test_native_assessor_input_bound_includes_fixed_input_and_output_reserve(
     bound = native_assessment_input_bound(policy)
     assert bound['version'] == INPUT_BOUND_VERSION
     assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v2')
-    assert VERSION.endswith('.v15')
+    assert VERSION.endswith('.v16')
     assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
     assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
     assert bound['schema_digest'] == SCHEMA_DIGEST
@@ -2517,3 +2517,81 @@ def test_retained_elapsed_deadline_qualification_preserves_claims_without_new_mo
     assert [claim.claim for claim in result.governed_claims] == [item['claim'] for item in claims]
     assert [item.governed_claim_id for item in result.qualification_evidence] == ['c1']
     assert dict(result.qualification_evidence[0].test_evidence)['change_kind'] == 'OFFICIAL_DEADLINE'
+
+
+def test_literal_csv_names_survive_full_assessment_and_governed_records(retained_22589_assessment):
+    """Synthetic evidence proves representation, not a production news decision."""
+    import csv
+    import io
+    from newsroom.control_plane.govuk_spreadsheet import _Text, _csv
+    from newsroom.control_plane.native_evidence import rights_eligibility_digest
+
+    candidate, base, source, acquired, raw = _qualification_assessor_inputs(retained_22589_assessment)
+    title = 'The department announced the application deadline changed to 30 June 2026'
+    buffer = io.StringIO(newline='')
+    writer = csv.writer(buffer)
+    writer.writerow(["Senior Official's Name ", 'Date ', 'Name of individual or organisation ', 'Purpose of Meeting'])
+    writer.writerow(['Marianthi Leontaridi', '2026-05-21', 'Boston Consulting Group', title])
+    output = _Text()
+    _csv(buffer.getvalue().encode(), output)
+    row = output.lines[-1]
+    body = title + '\n\nAttachment: https://assets.publishing.service.gov.uk/media/fixture/meetings.csv\n' + '\n'.join(output.lines)
+    encoded = body.encode()
+    base = replace(base, passages=(body,), observation_digests=(digest_bytes(encoded),))
+    acquired = SimpleNamespace(**{
+        **vars(acquired), 'body': encoded, 'body_digest': digest_bytes(encoded),
+        'rights_eligibility_digest': rights_eligibility_digest(
+            source.rights, body_digest=digest_bytes(encoded), transport_digest=acquired.transport_evidence_digest,
+            exclusion_signals=(), text_only=True,
+        ),
+    })
+    template = raw['package']['governed_claims'][0]
+    headline = {**template, 'claim_id':'csv-headline', 'claim':title, 'supporting_excerpt':title,
+                'claim_role':'HEADLINE', 'rendered_assertion_zh_hant_hk':'部門宣布申請限期改為2026年6月30日。',
+                'localised_factual_expressions':[['30 June 2026','2026年6月30日']], 'quotations':[]}
+    data_claim = {**headline, 'claim_id':'csv-row', 'claim':row, 'supporting_excerpt':row,
+                  'claim_role':'SUBSTANTIVE', 'rendered_assertion_zh_hant_hk':
+                  '第2行紀錄：Marianthi Leontaridi，日期2026-05-21，Boston Consulting Group；部門宣布申請限期改為2026年6月30日。'}
+    witnesses = {'action_class':'OFFICIAL_DEADLINE','event_polarity':'AFFIRMED',
+                 'action_relation':'NEW_OR_CHANGED_OFFICIAL_ACTION',
+                 'material_relation_span':title,'reader_action':title}
+    raw['package'].update(substantive_new_information=[title,row], governed_claims=[headline,data_claim],
+                          qualification_evidence=[{'test':'OFFICIAL_ACTION_OR_DEADLINE', 'governed_claim_id':'csv-headline',
+                                                   'test_evidence':witnesses, 'policy_version':'newsroom.evid-012.v7'}])
+    execution = NativeAssessmentExecution(canonical_json_bytes(raw).decode(), {})
+    assessment = AutonomousNativeEvidenceAssessor._validated_execution(execution, candidate, base, (source,), (acquired,))
+    assert assessment.governed_claims[1].named_entities == ('Boston Consulting Group','Marianthi Leontaridi')
+    governed = replace(base, substantive_new_information=assessment.substantive_new_information,
+                       governed_claims=assessment.governed_claims, qualification_evidence=assessment.qualification_evidence,
+                       selection_rationale=assessment.selection_rationale, geography=assessment.geography,
+                       categories=assessment.categories, explicit_exclusions=assessment.explicit_exclusions)
+    records = NativeEvidenceController._records(base, governed, (source,), (acquired,), assessment)
+    retained = tuple((r['record_id'],r['record_type'],canonical_json_bytes(r).decode(),digest_bytes(canonical_json_bytes(r))) for r in records)
+    assert validate_governed_evidence_records(candidate_id=candidate.candidate_id,
+        source_inventory=((source.unit.source_id, acquired.canonical_url),), base_package_digest=base.digest,
+        package=governed, retained_records=retained)
+    from newsroom.control_plane.admission import _qualification_relation_is_proven
+    assert _qualification_relation_is_proven(governed.qualification_evidence[0],governed.governed_claims[0],source_context=body)
+    # A copied name does not authorise a paraphrased claim or a new country.
+    for mutation in ('paraphrase','new_entity','changed_row'):
+        altered = json.loads(canonical_json_bytes(raw))
+        claim = altered['package']['governed_claims'][1]
+        if mutation == 'paraphrase':claim['claim'] = 'Marianthi Leontaridi met Boston Consulting Group.'
+        elif mutation == 'new_entity':claim['rendered_assertion_zh_hant_hk'] += ' UK'
+        else:claim['claim'] = claim['claim'].replace('Row 2:', 'Row 3:')
+        with pytest.raises((NativeEvidenceHold, EvidencePackageError)):
+            AutonomousNativeEvidenceAssessor._validated_execution(NativeAssessmentExecution(canonical_json_bytes(altered).decode(), {}),candidate,base,(source,),(acquired,))
+
+
+def test_v16_literal_guidance_preserves_v15_historical_contract():
+    from newsroom.control_plane.native_assessor import _V15_SYSTEM, _V15_SCHEMA_DIGEST, _V15_SCHEMA_BYTES
+    assert VERSION == 'newsroom.native-evidence-assessor.v16'
+    assert digest_bytes(_V15_SYSTEM.encode()) == 'sha256:5788c3e827199e12932d106ad494c80b71b2691e3f9c7e535a44c5d09811d4a6'
+    assert len(_V15_SYSTEM.encode()) == 6797
+    assert SCHEMA_DIGEST == _V15_SCHEMA_DIGEST
+    assert len(canonical_json_bytes(SCHEMA)) == _V15_SCHEMA_BYTES
+    assert SYSTEM.startswith(_V15_SYSTEM)
+    assert 'Illustration only, not evidence for the current candidate:' in SYSTEM
+    assert 'same complete literal Row line' in SYSTEM
+    assert 'CSV JSON delimiter quotes are not attributed speech' in SYSTEM
+    assert 'existing empty governed_claims/qualification_evidence/no-new-information path' in SYSTEM

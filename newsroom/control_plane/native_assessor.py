@@ -83,7 +83,7 @@ from .writer import (
 from .cycle import _complete_writer_usage
 from .store import append_ledger
 
-VERSION = "newsroom.native-evidence-assessor.v15"
+VERSION = "newsroom.native-evidence-assessor.v16"
 RETAINED_ASSESSMENT_POLICY_VERSION = "newsroom.retained-assessment.v1"
 REASSESSABLE_HOLDS = frozenset({
     "ASSESSOR_CLAIM_BINDING_HOLD", "ASSESSOR_NAMED_ENTITY_CONTRACT_HOLD",
@@ -133,7 +133,9 @@ CONTEXT_MANIFEST_SCHEMA_VERSION = (
 )
 INPUT_BOUND_VERSION = "newsroom.native-evidence-assessor.input-bound.v1"
 _FRAMING_RESERVE_TOKENS = 16_384
-SYSTEM = (
+_V15_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v15"
+# Immutable historical contract: deployed requalification receipts bind these bytes.
+_V15_SYSTEM = (
     "You are a one-turn evidence extraction transform. Use only the supplied "
     "candidate and exact source bytes. Return JSON matching the schema. "
     "When a source contains raw HKO JSON followed by canonical structured-fact "
@@ -229,6 +231,39 @@ SYSTEM = (
     "not just the first failure. Do not drop a material claim to pass validation "
     "or copy unsupported facts from the previous output."
 )
+SYSTEM = _V15_SYSTEM + (
+    " Exact-copy checkpoint: a faithful paraphrase is still invalid in claim or "
+    "supporting_excerpt. Copy a contiguous source span, not a summary you compose. "
+    "Do not add UK, a publication action, an institution or any other fact merely "
+    "because it seems implicit in the page. A source title naming Home Office "
+    "does not authorise adding UK or replacing its name with 英國內政部. "
+    "For the canonical Published CSV cells format, select the exact declared title "
+    "for HEADLINE when it supplies a qualified headline; the table title need not "
+    "be rewritten into a sentence. Each SUBSTANTIVE claim and supporting_excerpt "
+    "must be the same complete literal Row line, copied with its row number, "
+    "column labels, JSON string quotes, escapes and every cell. Never combine rows "
+    "into a new sentence, count entries or add an aggregate unsupported by an exact "
+    "source statement. Preserve the row number in the Chinese rendering (Row 2 "
+    "becomes 第2行); preserve every date/quantity and the exact recognised source "
+    "person/company spellings. Translate ordinary cell descriptions, not names. "
+    "The recognised_named_entities inventory may include names explicitly declared "
+    "by a canonical table column; use only names actually present in the selected row. "
+    "CSV JSON delimiter quotes are not attributed speech: do not list a whole Row "
+    "as a quotation merely because its cell values have JSON quotes. "
+    "Illustration only, not evidence for the current candidate:\n"
+    "Row 2: A=\"Marianthi Leontaridi\"; B=\"2026-05-21\"; "
+    "C=\"Boston Consulting Group\"; D=\"The deadline changed.\"\n"
+    "The claim and excerpt copy that whole Row line exactly; a faithful rendering "
+    "is 第2行紀錄：Marianthi Leontaridi，日期2026-05-21，Boston Consulting Group；限期已經更改。 "
+    "substantive_new_information copies the exact selected claim, not its rendering. "
+    "This format rule does not make an ordinary historical table newsworthy. "
+    "If no exact headline has independently supported qualification, use the "
+    "existing empty governed_claims/qualification_evidence/no-new-information path; "
+    "never invent a title, event or qualification to make a table publishable."
+)
+_V15_SCHEMA_DIGEST = "sha256:6f7e0726d3e35da1d5343b5b3dc162841c8262631ba7d00e3f71733aab14ea7f"
+_V15_SCHEMA_BYTES = 6976
+
 _STRING = {"type": "string"}
 _STRINGS = {"type": "array", "items": _STRING}
 _PAIRS = {
@@ -500,16 +535,20 @@ def native_assessment_input_bound(policy: InvocationEfficiencyPolicy) -> dict[st
     A byte ceiling is not a prediction of provider tokenisation; reported
     provider usage remains subject to the existing context and total limits.
     """
-    system_bytes = SYSTEM.encode("utf-8")
-    schema_bytes = canonical_json_bytes(SCHEMA)
-    fixed = len(system_bytes) + len(schema_bytes) + _FRAMING_RESERVE_TOKENS
+    historical = policy.prompt_contract_version == _V15_PRODUCER_VERSION
+    system_bytes = (_V15_SYSTEM if historical else SYSTEM).encode("utf-8")
+    schema_digest = _V15_SCHEMA_DIGEST if historical else SCHEMA_DIGEST
+    schema_size = _V15_SCHEMA_BYTES if historical else len(canonical_json_bytes(SCHEMA))
+    framing = 16_384 if historical else _FRAMING_RESERVE_TOKENS
+    version = "newsroom.native-evidence-assessor.input-bound.v1" if historical else INPUT_BOUND_VERSION
+    fixed = len(system_bytes) + schema_size + framing
     record: dict[str, object] = {
-        "version": INPUT_BOUND_VERSION,
+        "version": version,
         "system_digest": digest_bytes(system_bytes),
         "system_bytes": len(system_bytes),
-        "schema_digest": SCHEMA_DIGEST,
-        "schema_bytes": len(schema_bytes),
-        "framing_reserve_tokens": _FRAMING_RESERVE_TOKENS,
+        "schema_digest": schema_digest,
+        "schema_bytes": schema_size,
+        "framing_reserve_tokens": framing,
         "output_reserve_tokens": policy.max_output_tokens,
         "max_context_tokens": policy.max_context_tokens,
         "max_total_tokens": policy.max_total_tokens,
@@ -882,7 +921,7 @@ class NativeAssessmentUsage:
                 # invocation from the independently derived cycle identity.
                 cycles = sorted({
                     _assessment_cycle_id(version_id, base.digest, contract)
-                    for contract in (VERSION, *(f"newsroom.native-evidence-assessor.v{i}" for i in range(6, 15)))
+                    for contract in (VERSION, *(f"newsroom.native-evidence-assessor.v{i}" for i in range(6, 16)))
                 })
                 cycle_clause = " OR cycle_id IN (" + ",".join("?" for _ in cycles) + ")"
                 parameters.extend(cycles)
@@ -934,9 +973,9 @@ class NativeAssessmentUsage:
                     if (
                         base is None
                         or envelope.evidence_package_digest != base.digest
-                        or envelope.cycle_id != _assessment_cycle_id(
-                            version_id, base.digest, VERSION,
-                        )
+                        or not any(envelope.cycle_id == _assessment_cycle_id(
+                            version_id, base.digest, contract,
+                        ) for contract in (_V15_PRODUCER_VERSION, VERSION))
                     ):
                         return None
                     continue
@@ -1279,9 +1318,9 @@ class NativeAssessmentUsage:
                     if (
                         envelope.hypothesis_digest != manifest_digest
                         or envelope.evidence_package_digest is None
-                        or envelope.cycle_id != _assessment_cycle_id(
-                            version_id, envelope.evidence_package_digest, VERSION,
-                        )
+                        or not any(envelope.cycle_id == _assessment_cycle_id(
+                            version_id, envelope.evidence_package_digest, contract,
+                        ) for contract in (_V15_PRODUCER_VERSION, VERSION))
                     ):
                         return None
                     candidate_envelopes.add(envelope.envelope_id)

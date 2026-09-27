@@ -285,6 +285,12 @@ _ENGLISH_UNIVERSITY_OF = re.compile(
     r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_]|/[A-Za-z0-9_]|"
     r"[ \t]+[A-Z][A-Za-z-]*\b)"
 )
+_LITERAL_CSV_PREAMBLE = (
+    "Published CSV cells: Row and column identify each literal text cell. "
+    "Whitespace, empty fields, quoted newlines and formula-like text are preserved; "
+    "nothing is executed. No header or numeric types are inferred."
+)
+_LITERAL_CSV_NIL = frozenset({"nil return", "n/a", "none", "not applicable"})
 # A rejected prefix such as "The Department" must not hide an overlapping
 # complete name such as "Department for Education". Selection below still
 # retains only the longest non-overlapping, independently checked spans.
@@ -482,6 +488,135 @@ def _is_bounded_english_organisation(text: str) -> bool:
     )
 
 
+def _literal_csv_cells(line: str, number: int) -> dict[str, str] | None:
+    prefix = f"Row {number}: "
+    if not line.startswith(prefix):
+        return None
+    if line == prefix + "[empty record]":
+        return {}
+    cells: dict[str, str] = {}
+    offset = len(prefix)
+    decoder = json.JSONDecoder()
+    column_number = 0
+    while offset < len(line):
+        start = offset
+        column_number += 1
+        value = column_number
+        column = ""
+        while value:
+            value, digit = divmod(value - 1, 26)
+            column = chr(65 + digit) + column
+        marker = column + "="
+        if not line.startswith(marker, offset):
+            return None
+        offset += len(marker)
+        try:
+            cell, offset = decoder.raw_decode(line, offset)
+        except ValueError:
+            return None
+        if type(cell) is not str or line[start:offset] != marker + json.dumps(cell, ensure_ascii=False):
+            return None
+        cells[column] = cell
+        if offset == len(line):
+            break
+        if not line.startswith("; ", offset):
+            return None
+        offset += 2
+        if offset == len(line):
+            return None
+    return cells or None
+
+
+def _table_group_organisation_shape(text: str, source_context: str) -> bool:
+    if (
+        len(text) > 80
+        or not re.fullmatch(r"[A-Z][A-Za-z.-]+(?: [A-Z][A-Za-z.-]+){1,3} Group", text)
+        or any(token.casefold() in _ENGLISH_ORGANISATION_ACTION_WORDS
+               for token in text.split())
+    ):
+        return False
+    return any(
+        cells is not None and cells.get("C") == text
+        for line in source_context.splitlines()
+        if (match := re.fullmatch(r"Row ([2-9]|[1-9][0-9]+): .*", line))
+        for cells in (_literal_csv_cells(line, int(match.group(1))),)
+    )
+
+
+def _source_bound_literal_csv_entities(
+    text: str, source_context: str,
+) -> tuple[tuple[int, int, str, str], ...]:
+    # The converter caps the source body at 1 MiB; this parser never indexes
+    # every cell against the full table for each proposed entity.
+    if len(source_context.encode("utf-8")) > 1_048_576:
+        return ()
+    lines = source_context.splitlines()
+    if len(lines) >= 7 and lines[0].strip() and lines[1] == "":
+        # Independent acquisition retains one declared title before the
+        # converter's otherwise exact attachment body.
+        lines = lines[2:]
+    if (
+        len(lines) < 5
+        or not re.fullmatch(
+            r"Attachment: https://assets\.publishing\.service\.gov\.uk/\S+\.csv",
+            lines[0],
+        )
+        or lines[1:3] != [_LITERAL_CSV_PREAMBLE, 'Sheet "CSV"']
+    ):
+        return ()
+    parsed = []
+    for number, line in enumerate(lines[3:], 1):
+        cells = _literal_csv_cells(line, number)
+        if cells is None:
+            return ()
+        parsed.append((line, cells))
+    header = parsed[0][1]
+    labels = [value.strip().casefold() for value in header.values()]
+    if not all(labels) or len(labels) != len(set(labels)):
+        return ()
+    typed = []
+    if header.get("A", "").strip().casefold() == "senior official's name":
+        typed.append(("A", "PERSON"))
+    if header.get("C", "").strip().casefold() in {
+        "name of individual or organisation",
+        "individual or organisation that provided hospitality",
+    }:
+        typed.append(("C", "ORGANISATION"))
+    if not typed:
+        return ()
+    claimed_lines: dict[str, list[int]] = {}
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        claimed_lines.setdefault(line.rstrip("\r\n"), []).append(offset)
+        offset += len(line)
+    matches = []
+    for line, cells in parsed[1:]:
+        if line not in claimed_lines:
+            continue
+        for column, entity_type in typed:
+            name = cells.get(column)
+            if not name or name.strip().casefold() in _LITERAL_CSV_NIL:
+                continue
+            # Only literal unescaped name bytes can form the same exact span
+            # in a claim and the retained JSON-string cell.
+            if (name != name.strip()
+                    or json.dumps(name, ensure_ascii=False) != '"' + name + '"'
+                    or re.search(r"[\n\r;:！？!?]", name)):
+                continue
+            if not _has_bounded_named_entity_shape(
+                name, entity_type, source_context=line,
+            ):
+                continue
+            cell_start = line.find(column + "=" + json.dumps(name, ensure_ascii=False))
+            if cell_start < 0:
+                continue
+            name_start = cell_start + len(column) + 2
+            for line_start in claimed_lines[line]:
+                matches.append((line_start + name_start, line_start + name_start + len(name),
+                                name, entity_type))
+    return tuple(matches)
+
+
 def _has_bounded_named_entity_shape(
     text: str,
     entity_type: str,
@@ -510,7 +645,8 @@ def _has_bounded_named_entity_shape(
                 )
             )
         if entity_type == "ORGANISATION":
-            return _is_bounded_english_organisation(text)
+            return (_is_bounded_english_organisation(text)
+                    or _table_group_organisation_shape(text, source_context))
         tokens = re.findall(r"[A-Za-z]+", text)
         if not tokens or any(
             not (
@@ -632,6 +768,7 @@ def bounded_named_entities(
     if source_context is not None:
         for start, end, term in _source_bound_official_terms(text, source_context):
             candidates.append((start, end, term, "OFFICIAL_TERM"))
+        candidates.extend(_source_bound_literal_csv_entities(text, source_context))
     titled_chinese_person = re.compile(
         r"(行政長官|財政司司長|政務司司長|律政司司長|特首|司長|局長|署長)"
         r"([趙錢孫李周吳鄭王馮陳褚衛蔣沈韓楊朱秦尤許何呂施張孔曹嚴華金魏陶姜戚謝鄒喻柏水竇章雲蘇潘葛奚范彭郎魯韋昌馬苗鳳花方俞任袁柳唐羅薛伍余米貝姚孟顧尹江鍾蔡葉杜夏汪田]"

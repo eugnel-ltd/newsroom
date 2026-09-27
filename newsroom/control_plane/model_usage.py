@@ -1156,8 +1156,8 @@ _ASSESSOR_REQUALIFICATION_KIND = "NATIVE_ASSESSOR_INPUT_REQUALIFICATION"
 def _assessor_requalification_authority(connection, invocation_id, qualified_policy_digest):
     """Authenticate one input-bound correction, not forgiveness of actual usage."""
     from .native_assessor import (
-        CONFIG_IDENTITY, CONTEXT_MANIFEST_SCHEMA_VERSION, SCHEMA_DIGEST, SYSTEM,
-        VERSION, _ASSESSMENT_RESULT_SCHEMA_VERSION, native_assessment_input_bound,
+        _V15_PRODUCER_VERSION, _V15_SYSTEM, _V15_SCHEMA_DIGEST,
+        _ASSESSMENT_RESULT_SCHEMA_VERSION, native_assessment_input_bound,
     )
 
     allocation, terminal = _retained_terminal_allocation(connection, invocation_id)
@@ -1178,13 +1178,13 @@ def _assessor_requalification_authority(connection, invocation_id, qualified_pol
     if (
         allocation.workload_class is not WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
         or allocation.route != "NATIVE_EVIDENCE_ASSESSOR"
-        or allocation.config_identity != CONFIG_IDENTITY
+        or allocation.config_identity != "native-evidence-assessor-grok-hermetic-command-v1"
         or allocation.parent_invocation_id is not None or allocation.leaf_ordinal != 1
         or not old.qualified or not new.qualified or old.calibration_only or new.calibration_only
         or old.context_manifest_schema_version != "newsroom.native-evidence-assessor.context-manifest.v1"
-        or new.context_manifest_schema_version != CONTEXT_MANIFEST_SCHEMA_VERSION
+        or new.context_manifest_schema_version != "newsroom.native-evidence-assessor.context-manifest.v2"
         or any(getattr(old, key) != getattr(new, key) for key in unchanged)
-        or old.prompt_contract_version != VERSION or old.output_schema_digest != SCHEMA_DIGEST
+        or old.prompt_contract_version != _V15_PRODUCER_VERSION or old.output_schema_digest != _V15_SCHEMA_DIGEST
         or not 0 < new.max_prompt_bytes < old.max_prompt_bytes
         or new.max_prompt_bytes != bound["max_request_bytes"]
         or allocation.prompt_bytes <= bound["max_request_bytes"]
@@ -1249,7 +1249,7 @@ def _assessor_requalification_authority(connection, invocation_id, qualified_pol
             or row[4] != _json(manifest) or digest_canonical(unsigned) != manifest_digest
             or manifest_digest != allocation.context_manifest_digest
             or manifest.get("schema_version") != old.context_manifest_schema_version
-            or manifest.get("system_digest") != digest_bytes(SYSTEM.encode())
+            or manifest.get("system_digest") != digest_bytes(_V15_SYSTEM.encode())
             or manifest.get("evidence_package_digest") != envelope.evidence_package_digest
             or any(manifest.get(key) != getattr(allocation, key) for key in (
                 "provider", "route", "model", "reasoning", "prompt_bytes", "prompt_digest",
@@ -4821,7 +4821,11 @@ class ModelUsageService:
             from .native_assessor import native_assessment_input_bound
 
             bound = native_assessment_input_bound(policy)
-            if manifest.get("input_bound") != bound or allocation.prompt_bytes > bound["max_request_bytes"]:
+            if (manifest.get("input_bound") != bound
+                    or manifest.get("system_digest") != bound["system_digest"]
+                    or manifest.get("schema_digest") != bound["schema_digest"]
+                    or manifest.get("output_schema_digest") != bound["schema_digest"]
+                    or allocation.prompt_bytes > bound["max_request_bytes"]):
                 raise ModelUsageAdmissionError(
                     "native assessor complete input exceeds qualified bound",
                     reason_code="EXACT_INPUT_EXCEEDS_QUALIFIED_BOUND",
