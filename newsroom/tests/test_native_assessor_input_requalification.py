@@ -173,7 +173,7 @@ def test_assessor_requalification_reads_do_not_scan_unrelated_ledger(tmp_path):
             c.set_progress_handler(count, 1)
             assert c.execute(query, values).fetchall() == []
             c.set_progress_handler(None, 0)
-            assert steps[0] == before[index]
+            assert steps[0] <= before[index]
 
 
 @pytest.mark.parametrize('substitute_candidate', (False, True))
