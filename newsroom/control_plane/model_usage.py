@@ -45,8 +45,9 @@ if TYPE_CHECKING:
     from newsroom.control_plane.corpus import CorpusIngestUnit
 
 MODEL_USAGE_SCHEMA_VERSION = "newsroom.model-usage.v3"
-MODEL_USAGE_INTERFACE_SCHEMA_VERSION = "newsroom.model-usage.v4"
-MODEL_USAGE_MIGRATION_ID = "model-usage-v4-conservative-disposition"
+MODEL_USAGE_INTERFACE_SCHEMA_VERSION = "newsroom.model-usage.v5"
+MODEL_USAGE_MIGRATION_ID = "model-usage-v5-reported-output-disposition"
+REPORTED_OUTPUT_DISPOSITION_SCHEMA = "newsroom.model-usage.reported-output-disposition.v1"
 CONSERVATIVE_DISPOSITION_SCHEMA_VERSION = (
     "newsroom.model-usage.conservative-disposition.v2"
 )
@@ -73,6 +74,7 @@ _MODEL_USAGE_MIGRATIONS = (
     ("model-usage-v1", "newsroom.model-usage.v1"),
     ("model-usage-v2", "newsroom.model-usage.v2"),
     ("model-usage-v3", "newsroom.model-usage.v3"),
+    ("model-usage-v4-conservative-disposition", "newsroom.model-usage.v4"),
     (MODEL_USAGE_MIGRATION_ID, MODEL_USAGE_INTERFACE_SCHEMA_VERSION),
 )
 _HERMETIC_CONT_CONFIG_IDENTITIES = frozenset(
@@ -357,6 +359,13 @@ CREATE TABLE IF NOT EXISTS model_usage_conservative_dispositions(
     FOREIGN KEY(policy_digest) REFERENCES model_invocation_policies(canonical_digest)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 );
+CREATE TABLE IF NOT EXISTS model_usage_reported_output_dispositions(
+    invocation_id TEXT PRIMARY KEY,
+    disposition_digest TEXT NOT NULL UNIQUE,
+    record_json TEXT NOT NULL,
+    FOREIGN KEY(invocation_id) REFERENCES model_invocation_allocations(invocation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
 CREATE TABLE IF NOT EXISTS model_usage_route_circuit_events(
     event_digest TEXT PRIMARY KEY,
     route TEXT NOT NULL,
@@ -506,6 +515,10 @@ def _usage_blocking_routes(connection: sqlite3.Connection) -> set[str]:
         policy_breach_clause = (
             f"({policy_breach_clause} AND NOT ({canary_non_success_leaf}))"
         )
+    output_disposed = _reported_output_disposed_invocations(connection)
+    output_bindings = ",".join("?" for _ in output_disposed)
+    if output_bindings:
+        policy_breach_clause = f"({policy_breach_clause} AND t.invocation_id NOT IN ({output_bindings}))"
     native_disposed = _native_disposed_invocation_ids(connection)
     native_bindings = " OR ".join("t.invocation_id=?" for _ in native_disposed)
     native_clause = (
@@ -530,7 +543,7 @@ def _usage_blocking_routes(connection: sqlite3.Connection) -> set[str]:
         "OR EXISTS (SELECT 1 FROM model_usage_reconciliations r "
         "WHERE r.invocation_id=t.invocation_id "
         "AND json_extract(r.record_json,'$.policy_breach') IS NOT NULL)",
-        parameters + tuple(sorted(native_disposed)),
+        parameters + tuple(sorted(native_disposed)) + tuple(sorted(output_disposed)),
     ).fetchall()
     return {_canonical_circuit_route(str(row[0])) for row in rows}
 
@@ -790,7 +803,7 @@ def _valid_native_disposition(
                 raise ModelUsageIntegrityError(
                     "native fallback request authority differs"
                 )
-            _require_native_fallback_failure_receipt(
+            _require_native_failed_attempt_receipt(
                 connection,
                 allocation=allocation,
                 terminal=terminal,
@@ -978,6 +991,186 @@ def _valid_native_graphiti_fallback_cancellation_disposition_record(
     return retained == dict(disposition_record)
 
 
+def _reported_output_disposition_authority(
+    connection: sqlite3.Connection, *, invocation_id: str, revision_id: str,
+) -> dict[str, object]:
+    """Prove a settled native SDK output rejection, never reclassify its usage."""
+    allocation, terminal = _retained_terminal_allocation(connection, invocation_id)
+    policy = _policy_for_allocation(connection, allocation)
+    components = terminal.components
+    counters = ("input_tokens", "output_tokens", "cached_read_tokens", "cached_write_tokens", "total_tokens")
+    if (
+        _native_conservative_subscription_leaf(allocation) is not GraphitiLeafClass.PRIMARY
+        or allocation.config_identity != "cursor-sdk-api-key-composer-floor-v2"
+        or allocation.parent_invocation_id is not None
+        or not policy.qualified or policy.calibration_only
+        or terminal.outcome != "OUTPUT_LIMIT_EXCEEDED"
+        or terminal.failure_class is not None
+        or terminal.usage_status is not UsageStatus.REPORTED
+        or terminal.policy_breach != "REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED"
+        or components.provenance != "PROVIDER_REPORTED"
+        or any(type(getattr(components, name)) is not int for name in counters)
+        or _invalid_reported_components(terminal) is not None
+        or terminal.dispatch_at is None or terminal.pre_dispatch_zero_proved
+        or terminal.subscription_cli_chat_not_cash_debited is not True
+        or allocation.prompt_bytes > policy.max_prompt_bytes
+        or allocation.max_output_tokens > policy.max_output_tokens
+        or components.output_tokens <= allocation.max_output_tokens
+        or components.total_tokens != (components.input_tokens + components.output_tokens
+                                        + components.cached_read_tokens + components.cached_write_tokens)
+        or components.total_tokens > policy.max_total_tokens
+        # Without a context measurement, require the entire reported run to
+        # fit the context bound; missing context is not represented as zero.
+        or (components.context_tokens is None and components.total_tokens > policy.max_context_tokens)
+        or (components.context_tokens is not None and components.context_tokens > policy.max_context_tokens)
+        or (components.reasoning_tokens is not None and components.reasoning_tokens > components.output_tokens)
+        or allocation.context_identity not in policy.allowed_context_identities
+        or allocation.config_identity not in policy.allowed_config_identities
+        or any(getattr(allocation, key) != getattr(policy, key) for key in (
+            "reasoning", "prompt_contract_version", "output_schema_digest", "one_turn",
+            "exact_input", "skills_enabled", "tools_enabled", "mcp_enabled", "prior_message_count",
+        ))
+    ):
+        raise ModelUsageAdmissionError("reported output-only disposition is ineligible")
+    if not _has_exact_dispatch(connection, terminal):
+        raise ModelUsageIntegrityError("reported output disposition lacks exact dispatch")
+    dispatches = connection.execute(
+        "SELECT observed_at,evidence_digest FROM model_transport_observations "
+        "WHERE invocation_id=? AND state='DISPATCH_STARTED'", (invocation_id,),
+    ).fetchall()
+    if len(dispatches) != 1 or tuple(dispatches[0]) != (_utc_text(terminal.dispatch_at), digest_canonical({
+        "invocation_id": invocation_id, "provider": allocation.provider,
+        "route": allocation.route, "request_digest": allocation.request_digest,
+    })):
+        raise ModelUsageIntegrityError("reported output dispatch request differs")
+    _require_reported_telemetry(connection, terminal)
+    telemetry = _object(connection.execute(
+        "SELECT record_json FROM model_provider_telemetry WHERE invocation_id=?", (invocation_id,),
+    ).fetchone()[0])["provider_telemetry"]
+    if (not isinstance(telemetry, dict) or telemetry.get("usage_basis") != "PROVIDER_REPORTED"
+            or any(telemetry.get(name) != getattr(components, name)
+                   for name in (*counters, "reasoning_tokens", "context_tokens"))):
+        raise ModelUsageIntegrityError("reported output telemetry components differ")
+    identity = _retained_graphiti_request_identity(connection, allocation)
+    if identity is None or identity.leaf_class is not GraphitiLeafClass.PRIMARY:
+        raise ModelUsageIntegrityError("reported output request identity differs")
+    envelope = _native_envelope(connection, allocation, revision_id_hint=revision_id)
+    attempt = int(str(envelope.graphiti_attempt_id).rpartition(":")[2])
+    if envelope.cycle_id != native_graphiti_usage_cycle_id(ingest_id=envelope.ingest_id, attempt_number=attempt):
+        raise ModelUsageIntegrityError("reported output is outside native work")
+    unit = _native_landed_source_unit(
+        connection, ingest_id=envelope.ingest_id,
+        effective_revision_digest=identity.effective_revision_digest, revision_id_hint=revision_id,
+    )
+    if unit is None or unit.proving_run_id != "native-source:" + unit.observation_digest:
+        raise ModelUsageIntegrityError("reported output source binding differs")
+    outcome_digest, receipt_digest = _require_native_failed_attempt_receipt(
+        connection, allocation=allocation, terminal=terminal, envelope=envelope,
+    )
+    outcome = _object(connection.execute(
+        "SELECT record_json FROM model_work_outcomes WHERE envelope_id=?", (envelope.envelope_id,),
+    ).fetchone()[0])
+    receipt = _object(connection.execute(
+        "SELECT receipt_json FROM unpublished_graphiti_attempt_receipts WHERE ingest_id=? AND attempt_number=?",
+        (envelope.ingest_id, attempt),
+    ).fetchone()[0])
+    bound = [leaf for leaf in receipt.get("chat_invocations", [])
+             if isinstance(leaf, dict) and leaf.get("model_invocation_id") == invocation_id]
+    spends = connection.execute(
+        "SELECT spend_id,status,actual_usd_microunits,actual_gbp_microunits FROM unpublished_graphiti_spend "
+        "WHERE ingest_id=? AND attempt_number=?", (envelope.ingest_id, attempt),
+    ).fetchall()
+    accounting = receipt.get("accounting", {})
+    if isinstance(accounting, dict) and accounting.get("status") != "RECONCILED":
+        raise ModelUsageAdmissionError("reported output attempt accounting is unsettled")
+    sdk = bound[0].get("sdk_terminal") if len(bound) == 1 else None
+    if not isinstance(sdk, dict):
+        raise ModelUsageAdmissionError("reported output lacks a finished SDK receipt")
+    leaf_usage = bound[0].get("usage")
+    if (not isinstance(leaf_usage, dict)
+            or leaf_usage.get("usage_basis") != "PROVIDER_REPORTED"
+            or digest_canonical(leaf_usage.get("provider_telemetry", leaf_usage)) != terminal.provider_telemetry_digest
+            or any(name in leaf_usage and leaf_usage[name] != getattr(components, name)
+                   for name in (*counters, "reasoning_tokens", "context_tokens"))):
+        raise ModelUsageIntegrityError("reported output receipt usage differs")
+    from newsroom.graphiti_adapter.cursor_transport import _diagnostic_digest
+    sdk_digest = sdk.get("diagnostic_digest")
+    if sdk_digest != _diagnostic_digest(**{key: sdk.get(key) for key in (
+        "status", "error_class", "error_code", "tool_call_count", "cancelled", "duration_ms",
+    )}):
+        raise ModelUsageIntegrityError("reported output SDK receipt digest differs")
+    if (sdk.get("schema_version") != "newsroom.cursor-sdk-terminal.v1"
+            or sdk.get("status") != "finished" or sdk.get("cancelled") is not False
+            or sdk.get("error_class") != "NONE" or sdk.get("error_code") != "NONE"
+            or type(sdk.get("tool_call_count")) is not int or sdk.get("tool_call_count") != 0
+            or sdk.get("resolved_model") != allocation.model
+            or any(type(sdk.get(key)) is not str or sdk.get(key) in {"", "UNOBSERVED"}
+                   for key in ("agent_id", "run_id"))):
+        raise ModelUsageAdmissionError("reported output SDK completion is ineligible")
+    if (
+        outcome.get("outcome") != "GRAPHITI_FAILED"
+        or receipt.get("failure_code") != "PRODUCER_INTERNAL_ERROR"
+        or len(bound) != 1
+        or bound[0].get("outcome") != "OUTPUT_LIMIT_EXCEEDED"
+        or bound[0].get("provider") != allocation.provider
+        or bound[0].get("model") != allocation.model
+        or type(bound[0].get("requested_max_tokens")) is not int
+        or bound[0].get("requested_max_tokens") != allocation.max_output_tokens
+        or bound[0].get("sdk_run_id") != sdk.get("run_id")
+        or bound[0].get("sdk_agent_id") != sdk.get("agent_id")
+        or bound[0].get("model_work_envelope_id") != envelope.envelope_id
+        or bound[0].get("model_invocation_allocation_digest") != allocation.canonical_digest
+        or bound[0].get("model_invocation_terminal_digest") != terminal.terminal_digest
+        or not isinstance(accounting, dict) or len(spends) != 1
+        or accounting.get("unused_reservation_released") is not True
+        or any(type(accounting.get(key)) is not int for key in ("actual_usd_microunits", "actual_gbp_microunits"))
+        or tuple(spends[0]) != (accounting.get("spend_id"), "RECONCILED",
+                                accounting.get("actual_usd_microunits"), accounting.get("actual_gbp_microunits"))
+        or accounting.get("status") != "RECONCILED"
+    ):
+        raise ModelUsageIntegrityError("reported output failed-attempt closure differs")
+    return {
+        "schema_version": REPORTED_OUTPUT_DISPOSITION_SCHEMA,
+        "authority_scope": "NATIVE_REPORTED_OUTPUT_ONLY_CANDIDATE_FAILURE",
+        "invocation_id": invocation_id, "route": allocation.route,
+        "terminal_outcome": terminal.outcome, "allocation_digest": allocation.canonical_digest,
+        "terminal_digest": terminal.terminal_digest, "policy_digest": policy.canonical_digest,
+        "envelope_digest": envelope.canonical_digest, "internal_request_digest": identity.canonical_digest,
+        "provider_telemetry_digest": terminal.provider_telemetry_digest,
+        "sdk_terminal_digest": sdk_digest,
+        "revision_id": unit.revision_id, "ingest_id": envelope.ingest_id,
+        "landed_unit_digest": digest_canonical(asdict(unit)),
+        "work_outcome_digest": outcome_digest, "attempt_receipt_digest": receipt_digest,
+        "failure_settled_at": outcome["terminal_at"],
+        "policy_breach": terminal.policy_breach, "usage_status": terminal.usage_status.value,
+        "components": components.as_record(), "requested_max_output_tokens": allocation.max_output_tokens,
+        "maximum_context_tokens": policy.max_context_tokens, "maximum_total_tokens": policy.max_total_tokens,
+        "failed_attempt_preserved": True, "retry_authorised": False, "unknown_spend_released": False,
+    }
+
+
+def _reported_output_disposed_invocations(connection: sqlite3.Connection) -> set[str]:
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='model_usage_reported_output_dispositions'").fetchone() is None:
+        return set()
+    result = set()
+    for invocation_id, digest, raw in connection.execute(
+        "SELECT invocation_id,disposition_digest,record_json FROM model_usage_reported_output_dispositions"
+    ):
+        record = _object(raw)
+        expected = _reported_output_disposition_authority(
+            connection, invocation_id=invocation_id, revision_id=str(record.get("revision_id", "")),
+        )
+        observed_at = _instant(str(record.get("observed_at")))
+        if observed_at < _instant(str(expected["failure_settled_at"])):
+            raise ModelUsageIntegrityError("reported output disposition precedes failure")
+        expected["observed_at"] = _utc_text(observed_at)
+        expected["disposition_digest"] = digest_canonical(expected)
+        if expected != record or record["disposition_digest"] != digest or raw != _json(record):
+            raise ModelUsageIntegrityError("reported output disposition differs")
+        result.add(str(invocation_id))
+    return result
+
+
 def _native_disposed_invocation_ids(connection: sqlite3.Connection) -> set[str]:
     rows = connection.execute(
         "SELECT invocation_id FROM model_usage_conservative_dispositions "
@@ -1015,7 +1208,8 @@ def _native_disposed_invocation_ids(connection: sqlite3.Connection) -> set[str]:
 
 
 def _native_envelope(
-    connection: sqlite3.Connection, allocation: InvocationAllocation
+    connection: sqlite3.Connection, allocation: InvocationAllocation,
+    *, revision_id_hint: str | None = None,
 ) -> WorkEnvelope:
     row = connection.execute(
         "SELECT envelope_id,cycle_id,workload_class,admitted_at,canonical_digest,"
@@ -1064,7 +1258,7 @@ def _native_envelope(
         )
     if _native_landed_source_unit(
         connection,
-        ingest_id=envelope.ingest_id,
+        ingest_id=envelope.ingest_id, revision_id_hint=revision_id_hint,
         effective_revision_digest=(
             identity.effective_revision_digest if identity is not None else None
         ),
@@ -1092,7 +1286,7 @@ def _native_conservative_subscription_leaf(
     }.get((allocation.workload_class, allocation.route, allocation.provider))
 
 
-def _require_native_fallback_failure_receipt(
+def _require_native_failed_attempt_receipt(
     connection: sqlite3.Connection,
     *,
     allocation: InvocationAllocation,
@@ -1330,6 +1524,7 @@ def _native_landed_source_unit(
     *,
     ingest_id: str,
     effective_revision_digest: str | None = None,
+    revision_id_hint: str | None = None,
 ) -> CorpusIngestUnit | None:
     """Prove one governed unit without replaying unrelated native progress."""
 
@@ -1363,7 +1558,9 @@ def _native_landed_source_unit(
         return units[0].revision_id, units
 
     candidate_revisions: set[str] = set()
-    if effective_revision_digest is not None:
+    if revision_id_hint is not None:
+        candidate_revisions.add(_token(revision_id_hint, field="native revision hint"))
+    elif effective_revision_digest is not None:
         for revision_id, raw_revision in connection.execute(
             "SELECT json_extract(payload_json,'$.revision_id'),"
             "json_extract(unit.value,'$.effective_revision') FROM ledger "
@@ -1486,7 +1683,7 @@ def _native_graphiti_fallback_cancellation_authority(
     )
     if unit is None or unit.proving_run_id != "native-source:" + unit.observation_digest:
         raise ModelUsageIntegrityError("native fallback cancellation lacks native source landing")
-    outcome_digest, receipt_digest = _require_native_fallback_failure_receipt(
+    outcome_digest, receipt_digest = _require_native_failed_attempt_receipt(
         connection, allocation=allocation, terminal=terminal, envelope=envelope, cancelled=True,
     )
     return {
@@ -2924,6 +3121,12 @@ class ModelUsageService:
         connection = self._connection()
         try:
             connection.executescript(_SCHEMA)
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone():
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS model_usage_native_landed_revision "
+                    "ON ledger(kind,json_extract(payload_json,'$.revision_id')) "
+                    "WHERE kind='NATIVE_REVISION_LANDED'"
+                )
             applied_at = _utc_text(datetime.now(tz=UTC))
             connection.executemany(
                 "INSERT OR IGNORE INTO model_usage_migrations("
@@ -5198,7 +5401,7 @@ class ModelUsageService:
                         raise ModelUsageIntegrityError(
                             "native fallback request authority differs"
                         )
-                    _require_native_fallback_failure_receipt(
+                    _require_native_failed_attempt_receipt(
                         connection,
                         allocation=allocation,
                         terminal=terminal,
@@ -6071,6 +6274,74 @@ class ModelUsageService:
                 recorded_at=recorded_at,
             )
             connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def disposition_native_reported_output_rejection(
+        self, *, invocation_id: str, revision_id: str,
+        expected_terminal_digest: str, expected_allocation_digest: str,
+        observed_at: datetime,
+    ) -> dict[str, object]:
+        """Isolate one accounted FAILED candidate; neither accept nor retry it.
+
+        This versioned exception is restricted to the SDK's soft requested
+        output target. All usage and the old OPEN/FAILED records stay intact.
+        """
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authority = _reported_output_disposition_authority(
+                connection, invocation_id=invocation_id, revision_id=revision_id,
+            )
+            if (authority["terminal_digest"] != expected_terminal_digest
+                    or authority["allocation_digest"] != expected_allocation_digest
+                    or observed_at < _instant(str(authority["failure_settled_at"]))):
+                raise ModelUsageIntegrityError("reported output disposition binding differs")
+            prior = connection.execute(
+                "SELECT disposition_digest,record_json FROM model_usage_reported_output_dispositions WHERE invocation_id=?",
+                (invocation_id,),
+            ).fetchone()
+            if prior is None:
+                record = {**authority, "observed_at": _utc_text(observed_at)}
+                record["disposition_digest"] = digest_canonical(record)
+                connection.execute(
+                    "INSERT INTO model_usage_reported_output_dispositions VALUES(?,?,?)",
+                    (invocation_id, record["disposition_digest"], _json(record)),
+                )
+            else:
+                record = _object(prior[1])
+                expected = {**authority, "observed_at": record.get("observed_at")}
+                if _instant(str(expected["observed_at"])) < _instant(str(authority["failure_settled_at"])):
+                    raise ModelUsageIntegrityError("reported output disposition precedes failure")
+                expected["disposition_digest"] = digest_canonical(expected)
+                if record != expected or prior[0] != record["disposition_digest"] or prior[1] != _json(record):
+                    raise ModelUsageIntegrityError("reported output disposition differs")
+            latest = connection.execute(
+                "SELECT state,reason,invocation_id,recorded_at FROM model_usage_route_circuit_events "
+                "WHERE route='GRAPHITI_CHAT_PRIMARY' ORDER BY recorded_at DESC,rowid DESC LIMIT 1"
+            ).fetchone()
+            if (
+                latest is not None and latest[0] == "OPEN" and latest[2] == invocation_id
+                and observed_at >= _instant(str(latest[3]))
+                and latest[1] in {"REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED", "CONTEXT_OUTPUT_BREACH"}
+                and connection.execute(
+                    "SELECT 1 FROM model_invocation_allocations a LEFT JOIN model_invocation_terminals t "
+                    "ON t.invocation_id=a.invocation_id WHERE a.route='GRAPHITI_CHAT_PRIMARY' "
+                    "AND t.invocation_id IS NULL LIMIT 1"
+                ).fetchone() is None
+                and "GRAPHITI_CHAT_PRIMARY" not in _usage_blocking_routes(connection)
+            ):
+                self._append_route_state(
+                    connection, route="GRAPHITI_CHAT_PRIMARY", state="CLOSED",
+                    reason="AUTHORISED_OPERATOR_RESET:" + str(record["disposition_digest"]),
+                    invocation_id=None, recorded_at=observed_at,
+                )
+            connection.commit()
+            return record
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
