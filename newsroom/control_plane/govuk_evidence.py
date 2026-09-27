@@ -282,9 +282,10 @@ def parse_govuk_content_document(
         )
     elif document_type == "document_collection":
         children = _require_collection_inventory(value)
+        body = value["details"].get("body")
         raise GovUkContentHold(
             "SOURCE_ITEM_CHILD_COVERAGE_INCOMPLETE", child_items=children,
-            exclusion_signals=_exclusion_signals(value, ""),
+            exclusion_signals=_exclusion_signals(value, _html_text(body, allow_empty=True) if body else ""),
         )
     elif document_type == "transparency":
         children, unsupported = _require_attachment_inventory(value)
@@ -599,13 +600,15 @@ def _document_text(value: dict) -> str:
     return _html_text(value["details"].get("body"))
 
 
-def _html_text(fragment: object) -> str:
-    if type(fragment) is not str or not fragment.strip():
+def _html_text(fragment: object, *, allow_empty: bool = False) -> str:
+    if type(fragment) is not str or (not fragment.strip() and not allow_empty):
         raise ValueError("source document body is absent")
+    if not fragment.strip():
+        return ""
     document = html.fragment_fromstring(fragment, create_parent="div")
     if document.xpath(".//script | .//iframe | .//object"):
         raise ValueError("source body requires non-text resources")
     text = " ".join(document.text_content().split())
-    if not text:
+    if not text and not allow_empty:
         raise ValueError("source content is empty")
     return text

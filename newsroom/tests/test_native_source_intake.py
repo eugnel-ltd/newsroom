@@ -1206,3 +1206,29 @@ def test_manual_fetch_failure_settles_workers_before_releasing_owner_fence(monke
     assert shutdown_depths[0] == 2
     assert completion_depths and set(completion_depths) == {2}
     assert not fenced
+
+
+def test_collection_body_rights_notice_vetoes_child_file_fetches(tmp_path, monkeypatch):
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    collection = '/government/collections/data'
+    child = '/government/publications/data'
+    value = json.loads(_parent_with_children('document_collection', collection, ((child, 'Data files'),)))
+    value['details']['body'] = '<p>All rights <em>reserved</em> for the linked files.</p>'
+    bodies = {
+        SOURCE_URLS['UK-01']: _atom_for(collection),
+        'https://www.gov.uk/api/content' + collection: json.dumps(value).encode(),
+    }
+    fetched = []
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-01': _seed_uk01(runtime)},
+            licence=_licence(), dispatch_fence=lambda *_: nullcontext(),
+            fetch=lambda url: (fetched.append(url), (200, bodies[url]))[1],
+            clock=lambda: datetime(2026, 9, 26, 12, tzinfo=UTC),
+        )
+        result = intake.poll()[0]
+    assert result.units == ()
+    assert result.item_holds == (('https://www.gov.uk' + collection, 'SOURCE_ITEM_RIGHTS_EXCLUSION_HOLD'),)
+    assert fetched == list(bodies)

@@ -314,7 +314,7 @@ def test_collection_attachment_requires_every_retained_ancestry_link(tmp_path, m
         invalid = []
         for missing in (SOURCE_URLS['UK-01'], collection_url, parent_url):
             invalid.append({key: value for key, value in observations.items() if value[0] != missing})
-        for kind in ('wrong-url', 'wrong-access', 'wrong-digest', 'undeclared-child', 'rights-exclusion'):
+        for kind in ('wrong-url', 'wrong-access', 'wrong-digest', 'undeclared-child', 'rights-exclusion', 'body-rights-exclusion'):
             changed = dict(observations)
             original = changed.pop(collection_digest)
             if kind == 'wrong-url':
@@ -327,8 +327,10 @@ def test_collection_attachment_requires_every_retained_ancestry_link(tmp_path, m
                 value = json.loads(bodies[collection_url])
                 if kind == 'undeclared-child':
                     value['links']['documents'][0]['base_path'] = '/government/publications/unrelated'
-                else:
+                elif kind == 'rights-exclusion':
                     value['details']['copyright_notice'] = 'All rights reserved'
+                else:
+                    value['details']['body'] = '<p>All rights <em>reserved</em> for the linked files.</p>'
                 raw = json.dumps(value).encode()
                 admission, access = intake._admit_observation('UK-01', raw)
                 replacement = (collection_url, digest_bytes(raw), str(admission.admission_id), str(access.access_decision_id))
