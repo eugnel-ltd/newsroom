@@ -102,9 +102,10 @@ _PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS = frozenset(
     "newsroom.write-admission.v9+newsroom.evid-012.v7+"
     "newsroom.evidence-approval.v8+newsroom.evidence-gates.v2+"
     "newsroom.governed-claim.v7+newsroom.governed-input.v10+"
-    "newsroom.named-entity.v14+newsroom.cont-originality.v3+"
+    f"newsroom.named-entity.v{version}+newsroom.cont-originality.v3+"
     "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v1+"
     "newsroom.qualification-relation.v2"
+    for version in (14, 15)
 }
 QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v3"
 WRITE_ADMISSION_POLICY_VERSION = (
@@ -365,10 +366,11 @@ def _elapsed_official_deadline_is_proven(
     span: str, claim: GovernedClaimEvidence, *, source_context: str,
 ) -> bool:
     """Prove an elapsed deadline, not a predicted/changed date or clipped denial."""
-    if re.fullmatch(
-        r"The (?:deadline|closing date) for [^.;!?\n]{1,180} "
+    match = re.fullmatch(
+        r"The (?:deadline|closing date) for (?P<subject>[^.;!?\n]{1,180}) "
         r"has now (?:passed|expired)\.?", span,
-    ) is None:
+    )
+    if match is None:
         return False
     exact = span.rstrip(".")
     claim_sentences = {
@@ -378,15 +380,29 @@ def _elapsed_official_deadline_is_proven(
     if exact not in claim_sentences:
         return False
     source_sentences = [part.strip() for part in re.split(r"[.!?。！？]+", source_context)]
-    containing = [part for part in source_sentences if exact in part]
+    containing = [index for index, part in enumerate(source_sentences) if exact in part]
     if not containing:
         return False
-    for sentence in containing:
+    subject = re.sub(r"^(?:the )?(?:[0-9]{4} )?", "", match["subject"], flags=re.IGNORECASE)
+    headings = {subject.casefold(), re.sub(r" \([A-Z0-9]{2,12}\)$", "", subject).casefold()}
+    for index in containing:
+        sentence = source_sentences[index]
         # Canonical page text can prepend its heading without punctuation.
         # Keep that full prefix (including line wraps/semicolons) when checking
         # denial, condition and modality; an excerpt must not excise them.
         if not sentence.endswith(exact):
             return False
+        prefix = sentence[:-len(exact)].strip()
+        if prefix:
+            lines = [line.strip().casefold() for line in prefix.splitlines() if line.strip()]
+            if len(lines) > 2 or any(line not in headings for line in lines):
+                return False
+        for neighbour in source_sentences[max(0, index - 1):index] + source_sentences[index + 1:index + 2]:
+            if re.search(r"\b(?:deadline|closing date|statement|claim|assertion|sentence)\b", neighbour, flags=re.IGNORECASE) and (
+                _qualification_text_is_negative(neighbour)
+                or re.search(r"\b(?:if|unless|subject to|conditional(?:ly)?|pending)\b", neighbour, flags=re.IGNORECASE)
+            ):
+                return False
         # This proved official form name is a noun, not a prediction. No other
         # occurrence of forecast/assessment/proposal is exempted.
         checked = re.sub(r"\bbudget forecast return\b", "return", sentence, flags=re.IGNORECASE)
