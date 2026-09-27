@@ -221,7 +221,7 @@ def _spreadsheet_parent(path: str, asset_url: str, asset: bytes, *, pdf=False):
         "url": asset_url,
         "title": "Final funding values",
         "filename": asset_url.rsplit("/", 1)[-1],
-        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "content_type": ("text/csv" if asset_url.endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         "file_size": len(asset),
         "id": "asset-xlsx",
         "locale": "en",
@@ -725,8 +725,9 @@ def test_feed_parent_settles_each_exact_declared_html_child(
     (False, "READY"),
     (True, "HOLD"),
 ])
-def test_declared_xlsx_is_retained_without_hiding_unsupported_peers(
-    tmp_path, monkeypatch, with_pdf, expected_status,
+@pytest.mark.parametrize("suffix", ("xlsx", "csv"))
+def test_declared_table_is_retained_without_hiding_unsupported_peers(
+    tmp_path, monkeypatch, with_pdf, expected_status, suffix,
 ) -> None:
     args = _args(tmp_path, monkeypatch)
     args.update(
@@ -736,9 +737,9 @@ def test_declared_xlsx_is_retained_without_hiding_unsupported_peers(
     parent_path = "/government/publications/funding-values"
     asset_url = (
         "https://assets.publishing.service.gov.uk/media/asset/"
-        "funding-values.xlsx"
+        f"funding-values.{suffix}"
     )
-    asset = _xlsx_asset()
+    asset = _xlsx_asset() if suffix == "xlsx" else b"Provider,Funding\nExample College,125000\n"
     parent = _spreadsheet_parent(
         parent_path, asset_url, asset, pdf=with_pdf,
     )
@@ -770,7 +771,7 @@ def test_declared_xlsx_is_retained_without_hiding_unsupported_peers(
         assert unit.item_key.endswith("|" + asset_url)
         assert unit.observation_digest == digest_bytes(asset)
         assert 'Row 1: A="Provider"' in unit.body
-        assert "Row 2: A=\"Example College\"; B=125000" in unit.body
+        assert ('Row 2: A="Example College"; B=' + ('125000' if suffix == "xlsx" else '"125000"')) in unit.body
         assert len(disposition.observations) == 3
         observations = {item[1]: item for item in disposition.observations}
         evidence_sources = native_evidence_sources(
