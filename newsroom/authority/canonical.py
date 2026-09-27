@@ -6,6 +6,8 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import orjson
+
 MIN_SAFE_INTEGER = -9_007_199_254_740_991
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 DIGEST_ALGORITHM = "sha256"
@@ -57,9 +59,12 @@ def _is_restricted_builtin(value: Any) -> bool:
     return False
 
 
-def _validate_restricted_value(value: Any, path: str = "$") -> None:
-    if not _is_restricted_builtin(value):
+def _validate_restricted_value(value: Any, path: str = "$") -> bool:
+    """Validate fully and identify trees composed only of exact built-ins."""
+    builtin = _is_restricted_builtin(value)
+    if not builtin:
         _validate_restricted_value_with_path(value, path)
+    return builtin
 
 
 def _validate_restricted_value_with_path(value: Any, path: str = "$") -> None:
@@ -97,7 +102,15 @@ def _validate_restricted_value_with_path(value: Any, path: str = "$") -> None:
 def canonical_json_bytes(value: Any) -> bytes:
     """Return deterministic UTF-8 JSON for the restricted authority domain."""
 
-    _validate_restricted_value(value)
+    if _validate_restricted_value(value):
+        try:
+            return orjson.dumps(
+                value, option=orjson.OPT_SORT_KEYS | orjson.OPT_STRICT_INTEGER,
+            )
+        except orjson.JSONEncodeError:
+            # A valid tree may exceed the native encoder's depth limit. Keep
+            # the established stdlib result/error, as for custom collections.
+            pass
     try:
         text = json.dumps(
             value,
