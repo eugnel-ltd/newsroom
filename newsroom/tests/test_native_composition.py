@@ -69,7 +69,7 @@ def test_native_cursor_credential_loads_only_provisioned_key_and_restores_enviro
 @pytest.mark.parametrize(
     "missing_workload",
     (WorkloadClass.NATIVE_RETRIEVAL_EMBEDDING, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
-     "stale-assessor-contract"),
+     "stale-assessor-contract", "stale-assessor-flags", "stale-assessor-reasoning"),
 )
 def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
     tmp_path, monkeypatch, missing_workload,
@@ -103,9 +103,19 @@ def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
     def qualified_policy(**request):
         if request["workload_class"] is missing_workload:
             raise ValueError("qualification is absent")
-        if (missing_workload == "stale-assessor-contract"
+        if (isinstance(missing_workload, str) and missing_workload.startswith("stale-assessor-")
                 and request["workload_class"] is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR):
-            return SimpleNamespace(prompt_contract_version="stale-contract")
+            values = asdict(policies[request["workload_class"]])
+            values.pop("canonical_digest")
+            values.update(
+                prompt_contract_version=("stale-contract" if missing_workload == "stale-assessor-contract"
+                                         else native_assessor.VERSION),
+                reasoning=("low" if missing_workload == "stale-assessor-reasoning"
+                           else native_assessor.REASONING),
+                command_flags=(CONT_PRIMARY_COMMAND_FLAGS if missing_workload == "stale-assessor-flags"
+                               else native_assessor.COMMAND_FLAGS),
+            )
+            return InvocationEfficiencyPolicy.create(**values)
         return policies[request["workload_class"]]
 
     monkeypatch.setattr(native_composition, "ModelUsageService", lambda _: SimpleNamespace(
@@ -122,8 +132,9 @@ def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
         ledger=str(paths.CANONICAL_UNPUBLISHED_STORE), lock=str(root / "hermes.lock"),
         once=False, interval=300, failure_backoff=60,
     ))
-    expected = ("prompt contract differs before authority OPEN"
-                if missing_workload == "stale-assessor-contract" else "qualification is absent")
+    expected = ("profile differs before authority OPEN"
+                if isinstance(missing_workload, str) and missing_workload.startswith("stale-assessor-")
+                else "qualification is absent")
     with pytest.raises(ValueError, match=expected):
         service.run()
 
