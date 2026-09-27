@@ -1336,7 +1336,7 @@ def _native_landed_source_unit(
     from newsroom.control_plane.native_progress import (
         LAND,
         NativeRevisionJournal,
-        _unit,
+        _landed_units,
     )
 
     def decode_landing(
@@ -1346,8 +1346,7 @@ def _native_landed_source_unit(
         raw = str(raw_value)
         payload = _object(raw)
         try:
-            bodies: dict[str, str] = {}
-            units = tuple(_unit(value, bodies) for value in payload.get("units", ()))
+            units = _landed_units(payload)
             NativeRevisionJournal._validate_units(units)
         except (KeyError, TypeError, ValueError) as exc:
             raise ModelUsageIntegrityError(
@@ -1388,10 +1387,7 @@ def _native_landed_source_unit(
         ):
             try:
                 payload = json.loads(str(raw_value))
-                bodies: dict[str, str] = {}
-                units = tuple(
-                    _unit(value, bodies) for value in payload.get("units", ())
-                )
+                units = _landed_units(payload)
             except (AttributeError, KeyError, TypeError, ValueError):
                 continue
             for unit in units:
@@ -1746,7 +1742,7 @@ def _native_embedding_progress_binding(
     from newsroom.control_plane.native_progress import (
         LAND,
         NativeRevisionJournal,
-        _unit,
+        _landed_units,
     )
 
     landed = []
@@ -1756,8 +1752,7 @@ def _native_embedding_progress_binding(
         (LAND, result["revision_id"]),
     ):
         payload = _object(raw)
-        bodies: dict[str, str] = {}
-        units = tuple(_unit(value, bodies) for value in payload.get("units", ()))
+        units = _landed_units(payload)
         NativeRevisionJournal._validate_units(units)
         if (
             raw != canonical_json_bytes(payload).decode("utf-8")

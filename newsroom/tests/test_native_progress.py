@@ -514,3 +514,51 @@ def test_reopen_shares_equal_text_without_aliasing_mutable_facts_or_reordering(t
     assert connection.total_changes == changes
     assert connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall() == rows
     connection.close()
+
+
+def test_multichunk_land_persists_body_once_with_exact_legacy_replay(tmp_path):
+    import json
+    from dataclasses import asdict
+    from newsroom.control_plane.native_progress import LAND
+    from newsroom.control_plane.store import append_ledger
+
+    connection = connect(str(tmp_path / 'shared.sqlite3'))
+    unit = replace(_native(), body='A complete paragraph. ' * 1000, chunk_count=3)
+    units = tuple(replace(unit, chunk_ordinal=i) for i in range(1, 4))
+    journal = NativeRevisionJournal(connection)
+    journal.land(units)
+    raw = connection.execute('SELECT payload_json FROM ledger').fetchone()[0]
+    value = json.loads(raw)
+    assert value['shared_body'] == unit.body
+    assert all('body' not in value for value in value['units'])
+    old = {'revision_id': unit.revision_id, 'units': [asdict(item) for item in units]}
+    assert len(raw) < len(json.dumps(old)) * 0.6
+    assert NativeRevisionJournal(connection).units[unit.revision_id] == units
+    journal.land(units)
+    assert connection.execute('SELECT count(*) FROM ledger').fetchone()[0] == 1
+    legacy = connect(str(tmp_path / 'legacy.sqlite3'))
+    append_ledger(legacy, LAND, old); legacy.commit()
+    assert NativeRevisionJournal(legacy).units == journal.units
+    legacy.close(); connection.close()
+
+
+@pytest.mark.parametrize('mutation', ['mixed', 'missing', 'type'])
+def test_shared_landing_rejects_ambiguous_or_corrupted_body(tmp_path, mutation):
+    import json
+    from newsroom.control_plane.native_progress import LAND
+    from newsroom.control_plane.store import append_ledger
+    connection = connect(str(tmp_path / 'private.sqlite3'))
+    unit = replace(_native(), body='Source text. ' * 1000, chunk_count=2)
+    units = tuple(replace(unit, chunk_ordinal=i) for i in (1, 2))
+    NativeRevisionJournal(connection).land(units)
+    value = json.loads(connection.execute('SELECT payload_json FROM ledger').fetchone()[0])
+    assert 'shared_body' in value
+    if mutation == 'mixed': value['units'][0]['body'] = unit.body
+    elif mutation == 'missing': value.pop('shared_body')
+    elif mutation == 'type': value['shared_body'] = 123
+    # A correct ledger hash does not excuse an ambiguous storage encoding.
+    other = connect(str(tmp_path / 'bad.sqlite3'))
+    append_ledger(other, LAND, value); other.commit()
+    with pytest.raises((ValueError, KeyError, TypeError)):
+        NativeRevisionJournal(other)
+    other.close(); connection.close()

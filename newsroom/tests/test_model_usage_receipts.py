@@ -6412,3 +6412,34 @@ def test_committed_graphiti_transport_marker_is_cycle_dispatch_truth(
     )
     assert service.has_committed_provider_dispatch(cycle_id=envelope.cycle_id) is True
     assert service.has_committed_provider_dispatch(cycle_id="different-cycle") is False
+
+
+@pytest.mark.parametrize("hint", [False, True])
+def test_native_landing_shared_body_decodes_on_both_accounting_read_paths(tmp_path, hint):
+    connection = connect_unpublished_store(str(tmp_path / "private.sqlite3"))
+    first = replace(_native("selected"), chunk_count=2)
+    second = replace(first, chunk_ordinal=2, predecessor_ingest_id=first.ingest_id)
+    NativeRevisionJournal(connection).land((first, second))
+    digest = _digest(asdict(second.effective_revision)) if hint else None
+    assert model_usage_module._native_landed_source_unit(
+        connection, ingest_id=second.ingest_id, effective_revision_digest=digest,
+    ) == second
+    connection.close()
+
+
+def test_native_accounting_rejects_mixed_shared_body_encoding(tmp_path):
+    connection = connect_unpublished_store(str(tmp_path / "private.sqlite3"))
+    first = replace(_native("selected"), chunk_count=2)
+    second = replace(first, chunk_ordinal=2, predecessor_ingest_id=first.ingest_id)
+    # The encoding is malformed even though its ledger hash was correctly made.
+    append_ledger(connection, "NATIVE_REVISION_LANDED", {
+        "revision_id": first.revision_id, "shared_body": first.body,
+        "units": [asdict(first), asdict(second)],
+    })
+    connection.commit()
+    with pytest.raises(ModelUsageIntegrityError, match="source landing differs"):
+        model_usage_module._native_landed_source_unit(
+            connection, ingest_id=second.ingest_id,
+            effective_revision_digest=_digest(asdict(second.effective_revision)),
+        )
+    connection.close()

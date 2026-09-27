@@ -47,6 +47,11 @@ from .govuk_evidence import (
     GovUkContentHold, _api_url, _utc, parse_govuk_content_document,
     parse_govuk_manual_inventory,
 )
+from .govuk_spreadsheet import (
+    declared_spreadsheet,
+    is_spreadsheet_url,
+    parse_govuk_spreadsheet,
+)
 from .native_policies import (
     NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE,
     NATIVE_SOURCE_OBSERVATION_PURPOSE,
@@ -96,6 +101,7 @@ def _fetch_exact(url: str) -> tuple[int, bytes]:
     if (
         url not in SOURCE_URLS.values()
         and not url.startswith("https://www.gov.uk/api/content/")
+        and not is_spreadsheet_url(url)
     ):
         raise ValueError("native source endpoint is not approved")
     request = urllib.request.Request(
@@ -109,14 +115,18 @@ def _fetch_exact(url: str) -> tuple[int, bytes]:
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
             status = int(getattr(response, "status", 200))
+            response_url = response.geturl()
             body = response.read(MAX_BODY_BYTES + 1)
     except urllib.error.HTTPError as exc:
         body = exc.read(MAX_BODY_BYTES + 1) if exc.fp else b""
         status = int(exc.code)
+        response_url = exc.geturl()
     except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
         raise ValueError("native source transport failed") from exc
     if len(body) > MAX_BODY_BYTES:
         raise ValueError("native source response exceeds body bound")
+    if response_url != url:
+        raise ValueError("native source response identity differs")
     return status, body
 
 
@@ -139,6 +149,21 @@ class VerifiedNativeObservation:
     admission_id: ObjectAdmissionId
     access_decision_id: str
     raw: bytes
+
+
+def spreadsheet_asset_url(unit: CorpusIngestUnit) -> str | None:
+    """Return the exact declared asset tail without treating it as citation URL."""
+
+    root_digest, separator, asset_url = unit.item_key.partition("|")
+    try:
+        validate_sha256_digest(root_digest)
+    except (TypeError, ValueError):
+        return None
+    return (
+        asset_url
+        if separator == "|" and is_spreadsheet_url(asset_url)
+        else None
+    )
 
 
 class NativeSourceIntake:
@@ -287,7 +312,7 @@ class NativeSourceIntake:
                 return (), tuple(observations), ((
                     item.canonical_url, "SOURCE_ITEM_RIGHTS_EXCLUSION_HOLD",
                 ),)
-            if not exc.child_items:
+            if not exc.child_items and not exc.unsupported_attachments:
                 return (), tuple(observations), ((item.canonical_url, exc.reason_code),)
             units, holds = [], []
             for child, fetched in self._fetch_manual_sections(
@@ -318,7 +343,54 @@ class NativeSourceIntake:
                         child.canonical_url,
                         getattr(child_exc, "reason_code", "SOURCE_ITEM_RETAIN_FAILED"),
                     ))
-            if exc.unsupported_attachments:
+            spreadsheet_declarations = []
+            unsupported_attachments = []
+            for asset_url, asset_title in exc.unsupported_attachments:
+                try:
+                    spreadsheet_declarations.append(declared_spreadsheet(
+                        item.canonical_url, raw, asset_url, retrieved_at=observed,
+                    ))
+                except (TypeError, ValueError, KeyError, UnicodeError):
+                    unsupported_attachments.append((asset_url, asset_title))
+            for declaration, fetched in self._fetch_spreadsheet_assets(
+                source_id, spreadsheet_declarations,
+            ):
+                try:
+                    asset_url, asset_raw, asset_observed = fetched.result()
+                    asset_admission, asset_access = self._admit_observation(
+                        source_id, asset_raw,
+                    )
+                    asset_digest = digest_bytes(asset_raw)
+                    observations.append((
+                        asset_url, asset_digest,
+                        str(asset_admission.admission_id),
+                        str(asset_access.access_decision_id),
+                    ))
+                    document = parse_govuk_spreadsheet(
+                        item.canonical_url, raw, asset_url, asset_raw,
+                        retrieved_at=asset_observed,
+                    )
+                    asset_item = SourceItem(
+                        source_id, observation_digest + "|" + asset_url,
+                        document.title, document.body_text, item.canonical_url,
+                        _utc(document.publication), _utc(document.updated),
+                        document.body_text,
+                    )
+                    units.extend(self._retain_item(
+                        source_id, definition_id, version_id, version,
+                        asset_item, asset_digest, _utc(asset_observed), rights_id,
+                    ))
+                except VetoError:
+                    raise
+                except Exception as asset_exc:
+                    holds.append((
+                        declaration.asset_url,
+                        getattr(
+                            asset_exc, "reason_code",
+                            "SOURCE_SPREADSHEET_RETAIN_FAILED",
+                        ),
+                    ))
+            if unsupported_attachments:
                 holds.append((item.canonical_url, exc.reason_code))
             return tuple(units), tuple(observations), tuple(holds)
         units = self._retain_item(
@@ -439,6 +511,45 @@ class NativeSourceIntake:
             raise NativeSourceIntakeHold("SOURCE_ITEM_CANONICAL_URL_HOLD") from None
         with self._fence(source_id, url):
             return self._fetch_item_response(item)
+
+    def _fetch_spreadsheet_assets(self, source_id, declarations):
+        declarations = tuple(declarations)
+        if not declarations:
+            return
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for start in range(0, len(declarations), 4):
+                batch = declarations[start:start + 4]
+                with ExitStack() as fences:
+                    for declaration in batch:
+                        fences.enter_context(
+                            self._fence(source_id, declaration.asset_url)
+                        )
+                    try:
+                        pending = tuple(
+                            (
+                                declaration,
+                                pool.submit(
+                                    self._fetch_spreadsheet_response,
+                                    declaration.asset_url,
+                                ),
+                            )
+                            for declaration in batch
+                        )
+                        wait(tuple(future for _item, future in pending))
+                    except BaseException:
+                        pool.shutdown(wait=True, cancel_futures=True)
+                        raise
+                yield from pending
+
+    def _fetch_spreadsheet_response(self, asset_url):
+        if not is_spreadsheet_url(asset_url):
+            raise NativeSourceIntakeHold("SOURCE_SPREADSHEET_URL_HOLD")
+        status, raw = self._fetch(asset_url)
+        if len(raw) > MAX_BODY_BYTES:
+            raise NativeSourceIntakeHold("SOURCE_SPREADSHEET_BODY_TOO_LARGE")
+        if status != 200 or not raw:
+            raise NativeSourceIntakeHold("SOURCE_SPREADSHEET_FETCH_INCOMPLETE")
+        return asset_url, raw, self._clock().astimezone(UTC)
 
     def _fetch_item_response(self, item):
         url = _api_url(item.canonical_url)
@@ -672,7 +783,14 @@ def native_evidence_sources(
             raise hold("NATIVE_SOURCE_CHUNK_BINDING_HOLD")
         try:
             validate_sha256_digest(unit.observation_digest)
-            expected_api_url = SOURCE_URLS[unit.source_id] if weather else _api_url(unit.canonical_url)
+            asset_url = spreadsheet_asset_url(unit)
+            expected_api_url = (
+                SOURCE_URLS[unit.source_id]
+                if weather
+                else asset_url
+                if asset_url is not None
+                else _api_url(unit.canonical_url)
+            )
             observation = observations[unit.observation_digest]
             if (
                 type(observation) is not tuple
@@ -682,8 +800,9 @@ def native_evidence_sources(
             ):
                 raise ValueError("raw observation reference differs")
             root_digest, separator, _child_path = unit.item_key.partition("|")
+            parent_inventory = None
             if separator == "|" and root_digest.startswith("sha256:"):
-                _require_parent_inventory_binding(
+                parent_inventory = _require_parent_inventory_binding(
                     unit=unit, observations=observations, objects=objects,
                     proof=proof,
                 )
@@ -754,9 +873,18 @@ def native_evidence_sources(
                     and items[0].updated_at == unit.updated_at
                 )
             else:
-                document = parse_govuk_content_document(
-                    unit.canonical_url, raw, retrieved_at=retrieved,
-                )
+                if asset_url is not None:
+                    if parent_inventory is None:
+                        raise ValueError("spreadsheet parent inventory is absent")
+                    parent_url, parent_raw = parent_inventory
+                    document = parse_govuk_spreadsheet(
+                        parent_url, parent_raw, asset_url, raw,
+                        retrieved_at=retrieved,
+                    )
+                else:
+                    document = parse_govuk_content_document(
+                        unit.canonical_url, raw, retrieved_at=retrieved,
+                    )
                 matches = (
                     document.title == unit.headline
                     and document.body_text == unit.body
@@ -797,7 +925,7 @@ def _require_parent_inventory_binding(
     *, unit: CorpusIngestUnit,
     observations: Mapping[str, tuple[str, str, str, str]], objects,
     proof: AuthenticationProof,
-) -> None:
+) -> tuple[str, bytes]:
     root_digest, separator, section_path = unit.item_key.partition("|")
     validate_sha256_digest(root_digest)
     root = observations[root_digest]
@@ -848,17 +976,29 @@ def _require_parent_inventory_binding(
                 continue
         if not parent_found:
             raise ValueError("parent is outside its retained feed inventory")
+    parent_url = _canonical_url_from_api(root[0])
     try:
         parse_govuk_content_document(
-            _canonical_url_from_api(root[0]), raw,
+            parent_url, raw,
             retrieved_at=datetime.fromisoformat(unit.observed_at.replace("Z", "+00:00")),
         )
     except GovUkContentHold as exc:
         child_paths = {path for path, _title in exc.child_items}
     else:
         raise ValueError("parent inventory is absent")
-    if section_path not in child_paths:
+    asset_url = spreadsheet_asset_url(unit)
+    if asset_url is not None:
+        if section_path != asset_url or parent_url != unit.canonical_url:
+            raise ValueError("spreadsheet child identity differs")
+        declared_spreadsheet(
+            parent_url, raw, asset_url,
+            retrieved_at=datetime.fromisoformat(
+                unit.observed_at.replace("Z", "+00:00")
+            ),
+        )
+    elif section_path not in child_paths:
         raise ValueError("child is outside its retained parent inventory")
+    return parent_url, raw
 
 
 def _require_observation_access(*, observation, objects, proof):
@@ -917,5 +1057,5 @@ def verified_native_observation(
 __all__ = [
     "NativeSourceDisposition", "NativeSourceIntake", "SOURCE_IDS",
     "VerifiedNativeObservation", "native_evidence_sources",
-    "verified_native_observation",
+    "spreadsheet_asset_url", "verified_native_observation",
 ]

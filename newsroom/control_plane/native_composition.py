@@ -31,6 +31,10 @@ from newsroom.sources import SourceDefinitionId, SourceDefinitionVersionId
 from .admission import QUALIFICATION_RELATION_POLICY_VERSION
 from .evidence import FACTUAL_LOCALISATION_POLICY_VERSION, NAMED_ENTITY_POLICY_VERSION
 from .govuk_evidence import GovUkEvidenceAcquisition, POLICY_DIGEST as GOVUK_TRANSPORT_POLICY
+from .govuk_spreadsheet_evidence import (
+    GovUkSpreadsheetEvidenceAcquisition,
+    POLICY_DIGEST as GOVUK_SPREADSHEET_TRANSPORT_POLICY,
+)
 from .govuk_rights import (
     LICENCE_URL, REUSE_URL, GovUkLicenceEvidence, retain_current_govuk_licence,
 )
@@ -56,7 +60,11 @@ from .native_progress import NativeRevisionJournal
 from .native_publication import NativePublicationContinuation
 from .native_retrieval import NativeRetrievalContinuation, compose_native_documents
 from .native_runtime import open_native_runtime
-from .native_source_intake import NativeSourceIntake, native_evidence_sources
+from .native_source_intake import (
+    NativeSourceIntake,
+    native_evidence_sources,
+    spreadsheet_asset_url,
+)
 from .native_source_rights import (
     NativePortfolioRights, observe_portfolio_terms, retain_rights_snapshot,
 )
@@ -73,8 +81,10 @@ ASSESSMENT_CONTRACT_VERSION = (
 )
 
 TRANSPORT_POLICY = digest_canonical({
-    "version": "hermes-native-independent-evidence-v1",
-    "govuk": GOVUK_TRANSPORT_POLICY, "weather": WEATHER_TRANSPORT_POLICY,
+    "version": "hermes-native-independent-evidence-v2",
+    "govuk": GOVUK_TRANSPORT_POLICY,
+    "govuk_spreadsheet": GOVUK_SPREADSHEET_TRANSPORT_POLICY,
+    "weather": WEATHER_TRANSPORT_POLICY,
 })
 
 
@@ -623,9 +633,34 @@ def open_native_pipeline(
             retained_units=journal.units, observations=journal.observations,
             clock=clock,
         )
+        spreadsheet_acquisition = GovUkSpreadsheetEvidenceAcquisition(
+            sources=runtime.authority.sources,
+            objects=runtime.authority.objects,
+            proof=proof,
+            licence=licence,
+            transport_policy_digest=TRANSPORT_POLICY,
+            dispatch_fence=lambda request: source_fence(
+                request.source_id, request.canonical_url
+            ),
+            retained_units=journal.units,
+            observations=journal.observations,
+            clock=clock,
+        )
 
         def acquire(request):
-            transport = weather_acquisition if request.source_id in {"HK-02", "UK-10"} else govuk_acquisition
+            retained = journal.units.get(request.source_revision_id, ())
+            spreadsheet = bool(retained) and all(
+                spreadsheet_asset_url(unit) is not None
+                and unit.canonical_url == request.canonical_url
+                for unit in retained
+            )
+            transport = (
+                weather_acquisition
+                if request.source_id in {"HK-02", "UK-10"}
+                else spreadsheet_acquisition
+                if spreadsheet
+                else govuk_acquisition
+            )
             return transport(request)
 
         evidence = NativeEvidenceController(

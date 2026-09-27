@@ -91,6 +91,18 @@ def _unit(value: dict, bodies: dict[str, str]) -> CorpusIngestUnit:
     return CorpusIngestUnit(**value)
 
 
+def _landed_units(value: dict) -> tuple[CorpusIngestUnit, ...]:
+    """Decode both retained encodings for journal and selected accounting reads."""
+    bodies: dict[str, str] = {}
+    raw_units = value.get("units", ())
+    if "shared_body" in value:
+        body = value["shared_body"]
+        if type(body) is not str or any("body" in item for item in raw_units):
+            raise ValueError("native progress shared body differs")
+        raw_units = ({**item, "body": body} for item in raw_units)
+    return tuple(_unit(item, bodies) for item in raw_units)
+
+
 class NativeRevisionJournal:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
@@ -118,8 +130,7 @@ class NativeRevisionJournal:
         if kind == LAND:
             # Chunk receipts repeat the full source body. Share exact-equal text
             # in this revision only; retain and validate the original ledger bytes.
-            bodies: dict[str, str] = {}
-            units = tuple(_unit(item, bodies) for item in value["units"])
+            units = _landed_units(value)
             self._validate_units(units)
             revision_id = units[0].revision_id
             if value["revision_id"] != revision_id:
@@ -225,7 +236,17 @@ class NativeRevisionJournal:
             if tuple((unit.ingest_id, unit.authority.representation_id) for unit in prior) != tuple((unit.ingest_id, unit.authority.representation_id) for unit in units):
                 raise ValueError("native progress revision was rebound")
             return
-        self._retain(LAND, {"revision_id": revision_id, "units": [asdict(unit) for unit in units]})
+        value = {"revision_id": revision_id, "units": [asdict(unit) for unit in units]}
+        if len(units) > 1:
+            # A 43-chunk workbook otherwise writes its full body 43 times.
+            # Keep all individual receipts and restore byte-identical logical
+            # units on replay; no historical rows or ledger hashes are rewritten.
+            if any(unit.body != units[0].body for unit in units):
+                raise ValueError("native progress shared body differs")
+            value["shared_body"] = units[0].body
+            for item in value["units"]:
+                del item["body"]
+        self._retain(LAND, value)
 
     def advance(self, revision_id: str, *, stage: str, facts: dict) -> dict:
         if revision_id not in self.units or not stage:

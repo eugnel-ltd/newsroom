@@ -1,6 +1,8 @@
 from contextlib import contextmanager, nullcontext
+import io
 import json
 import sqlite3
+import zipfile
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -180,6 +182,56 @@ def _parent_with_children(document_type, path, children, *, binary=False):
         # The observed circular/corporate-report shape declares the same HTML
         # child in both inventories. Its exact path is still one child.
         value["links"]["children"] = declared
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+def _xlsx_asset() -> bytes:
+    workbook = b'''<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+ <sheets><sheet name="Published" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+    relationships = b'''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>'''
+    worksheet = b'''<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+ <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Provider</t></is></c><c r="B1" t="inlineStr"><is><t>Allocation</t></is></c></row>
+ <row r="2"><c r="A2" t="inlineStr"><is><t>Example College</t></is></c><c r="B2"><v>125000</v></c></row></sheetData>
+</worksheet>'''
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, body in (
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", relationships),
+            ("xl/worksheets/sheet1.xml", worksheet),
+        ):
+            info = zipfile.ZipInfo(name, (2026, 9, 25, 12, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, body)
+    return output.getvalue()
+
+
+def _spreadsheet_parent(path: str, asset_url: str, asset: bytes, *, pdf=False):
+    value = json.loads(_document(path=path, updated="2026-09-25T12:00:00Z"))
+    value.update(document_type="transparency", schema_name="publication")
+    value["details"] = {"attachments": [{
+        "attachment_type": "file",
+        "url": asset_url,
+        "title": "Final funding values",
+        "filename": asset_url.rsplit("/", 1)[-1],
+        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "file_size": len(asset),
+        "id": "asset-xlsx",
+        "locale": "en",
+    }]}
+    if pdf:
+        value["details"]["attachments"].append({
+            "attachment_type": "file",
+            "url": "https://assets.publishing.service.gov.uk/media/report.pdf",
+            "title": "Uncovered report",
+        })
     return json.dumps(value, separators=(",", ":")).encode()
 
 
@@ -481,6 +533,37 @@ def test_native_exact_fetch_rejects_any_endpoint_outside_fixed_portfolio():
         raise AssertionError("unapproved endpoint was fetched")
 
 
+def test_native_exact_asset_fetch_rejects_response_identity_drift(monkeypatch):
+    asset_url = (
+        "https://assets.publishing.service.gov.uk/media/asset/"
+        "funding-values.xlsx"
+    )
+
+    class Response(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+        def geturl(self):
+            return asset_url + "?redirected=1"
+
+    class Opener:
+        def open(self, _request, timeout):
+            assert timeout > 0
+            return Response(b"spreadsheet")
+
+    monkeypatch.setattr(
+        "newsroom.control_plane.native_source_intake.urllib.request.build_opener",
+        lambda *_args: Opener(),
+    )
+    with pytest.raises(ValueError, match="response identity differs"):
+        _fetch_exact(asset_url)
+
+
 def test_native_bno_guide_retains_all_nine_parts_as_one_revision(tmp_path, monkeypatch):
     args = _args(tmp_path, monkeypatch)
     args["principal_id"] = OPERATOR_PRINCIPAL_ID
@@ -636,6 +719,139 @@ def test_feed_parent_settles_each_exact_declared_html_child(
         else:
             assert disposition.status == "READY"
             assert disposition.item_holds == ()
+
+
+@pytest.mark.parametrize(("with_pdf", "expected_status"), [
+    (False, "READY"),
+    (True, "HOLD"),
+])
+def test_declared_xlsx_is_retained_without_hiding_unsupported_peers(
+    tmp_path, monkeypatch, with_pdf, expected_status,
+) -> None:
+    args = _args(tmp_path, monkeypatch)
+    args.update(
+        principal_id=OPERATOR_PRINCIPAL_ID,
+        authority_domain=OPERATOR_AUTHORITY_DOMAIN,
+    )
+    parent_path = "/government/publications/funding-values"
+    asset_url = (
+        "https://assets.publishing.service.gov.uk/media/asset/"
+        "funding-values.xlsx"
+    )
+    asset = _xlsx_asset()
+    parent = _spreadsheet_parent(
+        parent_path, asset_url, asset, pdf=with_pdf,
+    )
+    bodies = {
+        SOURCE_URLS["UK-01"]: _atom_for(parent_path),
+        "https://www.gov.uk/api/content" + parent_path: parent,
+        asset_url: asset,
+    }
+    fetched = []
+    fences = []
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources,
+            objects=runtime.authority.objects,
+            proof=runtime.proof,
+            definition_ids={"UK-01": _seed_uk01(runtime)},
+            licence=_licence(),
+            dispatch_fence=lambda source, url: nullcontext(
+                fences.append((source, url))
+            ),
+            fetch=lambda url: (fetched.append(url), (200, bodies[url]))[1],
+            clock=lambda: datetime(2026, 9, 26, 12, tzinfo=UTC),
+        )
+        disposition = intake.poll()[0]
+        assert disposition.status == expected_status
+        assert len(disposition.units) == 1
+        unit = disposition.units[0]
+        assert unit.canonical_url == "https://www.gov.uk" + parent_path
+        assert unit.item_key.endswith("|" + asset_url)
+        assert unit.observation_digest == digest_bytes(asset)
+        assert 'Row 1: A="Provider"' in unit.body
+        assert "Row 2: A=\"Example College\"; B=125000" in unit.body
+        assert len(disposition.observations) == 3
+        observations = {item[1]: item for item in disposition.observations}
+        evidence_sources = native_evidence_sources(
+            units=disposition.units,
+            sources=runtime.authority.sources,
+            objects=runtime.authority.objects,
+            observations=observations,
+            licence=_licence(),
+            proof=runtime.proof,
+        )
+        assert len(evidence_sources) == 1
+        root_digest = unit.item_key.split("|", 1)[0]
+        tampered = dict(observations)
+        tampered[root_digest] = (
+            "https://www.gov.uk/api/content/government/publications/unrelated",
+            *tampered[root_digest][1:],
+        )
+        with pytest.raises(
+            NativeEvidenceHold, match="NATIVE_SOURCE_AUTHORITY_HOLD"
+        ):
+            native_evidence_sources(
+                units=disposition.units,
+                sources=runtime.authority.sources,
+                objects=runtime.authority.objects,
+                observations=tampered,
+                licence=_licence(),
+                proof=runtime.proof,
+            )
+    assert fetched == [
+        SOURCE_URLS["UK-01"],
+        "https://www.gov.uk/api/content" + parent_path,
+        asset_url,
+    ]
+    assert ("UK-01", asset_url) in fences
+    assert disposition.item_holds == (
+        (("https://www.gov.uk" + parent_path,
+          "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE"),)
+        if with_pdf else ()
+    )
+
+
+def test_declared_spreadsheet_parse_failure_retains_raw_and_parent_hold(
+    tmp_path, monkeypatch,
+) -> None:
+    args = _args(tmp_path, monkeypatch)
+    args.update(
+        principal_id=OPERATOR_PRINCIPAL_ID,
+        authority_domain=OPERATOR_AUTHORITY_DOMAIN,
+    )
+    parent_path = "/government/publications/funding-values"
+    asset_url = (
+        "https://assets.publishing.service.gov.uk/media/asset/"
+        "funding-values.xlsx"
+    )
+    declared = _xlsx_asset()
+    malformed = b"x" * len(declared)
+    bodies = {
+        SOURCE_URLS["UK-01"]: _atom_for(parent_path),
+        "https://www.gov.uk/api/content" + parent_path: _spreadsheet_parent(
+            parent_path, asset_url, declared,
+        ),
+        asset_url: malformed,
+    }
+    with open_native_runtime(**args) as runtime:
+        disposition = NativeSourceIntake(
+            sources=runtime.authority.sources,
+            objects=runtime.authority.objects,
+            proof=runtime.proof,
+            definition_ids={"UK-01": _seed_uk01(runtime)},
+            licence=_licence(),
+            dispatch_fence=lambda *_: nullcontext(),
+            fetch=lambda url: (200, bodies[url]),
+            clock=lambda: datetime(2026, 9, 26, 12, tzinfo=UTC),
+        ).poll()[0]
+    assert disposition.status == "HOLD"
+    assert disposition.units == ()
+    assert disposition.item_holds == ((
+        asset_url, "SOURCE_SPREADSHEET_RETAIN_FAILED",
+    ),)
+    assert any(item[:2] == (asset_url, digest_bytes(malformed))
+               for item in disposition.observations)
 
 
 def test_feed_parent_keeps_failed_and_excluded_children_visible(tmp_path, monkeypatch):
