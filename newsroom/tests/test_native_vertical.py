@@ -284,20 +284,19 @@ def _install_boundaries(monkeypatch, counters):
         counters["assessor"] += 1
         request = json.loads(prompt)
         source = request["sources"][0]
+        assert "body" not in source
+        assert "passages" not in request["base_package"]
+        assert "".join(item["text"] for item in source["segments"])
         headline = counters.get("document_body", "Official deadline changed.")
-        assert headline in source["body"]
-        claim = "Visa rules updated"
+        selected = {item["text"].removesuffix("\n"): item["span_id"]
+                    for item in source["segments"]}
+        assert headline in selected
+        assert "Visa rules updated" in selected
         rendered_headline = (
             "官方限期已經更改。" if headline == "Official deadline changed."
             else "官方限期已更改，截止日期延後。"
         )
         rendered = "簽證規則已更新"
-        identity = digest_bytes(canonical_json_bytes([
-            request["candidate_version"], source["source_id"],
-            source["acquisition_receipt_id"],
-        ]))
-        headline_id = f"native-headline:{identity}"
-        claim_id = f"native-claim:{identity}"
         qualification_span = headline.split(".", 1)[0]
         qualification_facts = {
             "action_class": "OFFICIAL_DEADLINE",
@@ -307,15 +306,12 @@ def _install_boundaries(monkeypatch, counters):
             "reader_action": qualification_span,
         }
 
-        def governed_claim(*, claim_id, text, rendered, role):
+        def governed_claim(*, span_id, rendered, role):
             return {
-                "claim_id": claim_id,
-                "claim": text,
-                "passage_index": 0,
-                "supporting_excerpt": text,
-                "source_ids": [source["source_id"]],
+                "claim_range": {"first_span_id": span_id, "last_span_id": span_id},
+                "support_range": {"first_span_id": span_id, "last_span_id": span_id},
                 "status": "CONFIRMED_FACT",
-                "rendered_assertion_zh_hant_hk": rendered,
+                "rendered_fragments": [rendered],
                 "claim_role": role,
                 "semantic_relation": {
                     "source_modality": "ASSERTED",
@@ -334,20 +330,20 @@ def _install_boundaries(monkeypatch, counters):
             }
 
         package = {
-            "substantive_new_information": [headline, claim],
+            "substantive_claim_indexes": [0, 1],
             "governed_claims": [
                 governed_claim(
-                    claim_id=headline_id, text=headline, rendered=rendered_headline,
+                    span_id=selected[headline], rendered=rendered_headline,
                     role="HEADLINE",
                 ),
                 governed_claim(
-                    claim_id=claim_id, text=claim, rendered=rendered,
+                    span_id=selected["Visa rules updated"], rendered=rendered,
                     role="SUBSTANTIVE",
                 ),
             ],
             "qualification_evidence": [{
                 "test": "OFFICIAL_ACTION_OR_DEADLINE",
-                "governed_claim_id": headline_id,
+                "claim_index": 0,
                 "test_evidence": qualification_facts,
                 "policy_version": EVID_012_POLICY_VERSION,
             }],

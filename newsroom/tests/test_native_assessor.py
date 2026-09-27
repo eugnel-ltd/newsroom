@@ -10,6 +10,7 @@ import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
+from newsroom.control_plane import native_assessor as native_assessor_module
 from newsroom.control_plane.admission import DeterministicWriteAdmission
 from newsroom.control_plane.evidence import (
     EvidencePackage,
@@ -26,6 +27,8 @@ from newsroom.control_plane.native_assessor import (
     INPUT_BOUND_VERSION,
     NativeAssessmentExecution,
     NativeAssessmentUsage,
+    PROVIDER_SCHEMA,
+    PROVIDER_SCHEMA_DIGEST,
     REASSESSABLE_HOLDS,
     SCHEMA,
     SCHEMA_DIGEST,
@@ -59,6 +62,39 @@ from newsroom.tests.test_increment10_ingress import _candidate
 
 
 REVISION = "1" * 40
+
+
+def _use_historical_v16(monkeypatch):
+    """Seed a genuine full-package v16 result; never bypass v17 references."""
+
+    monkeypatch.setattr(
+        native_assessor_module, "VERSION", native_assessor_module._V16_PRODUCER_VERSION
+    )
+    monkeypatch.setattr(native_assessor_module, "SYSTEM", native_assessor_module._V16_SYSTEM)
+    monkeypatch.setattr(
+        native_assessor_module,
+        "PROVIDER_SCHEMA_DIGEST",
+        native_assessor_module.SCHEMA_DIGEST,
+    )
+    monkeypatch.setattr(
+        native_assessor_module,
+        "CONTEXT_MANIFEST_SCHEMA_VERSION",
+        "newsroom.native-evidence-assessor.context-manifest.v2",
+    )
+
+
+def _empty_reference_result(reason="No supported new information."):
+    return {
+        "package": {
+            "substantive_claim_indexes": [],
+            "governed_claims": [],
+            "qualification_evidence": [],
+            "selection_rationale": reason,
+            "geography": [],
+            "categories": [],
+            "explicit_exclusions": [],
+        }
+    }
 
 
 @pytest.mark.parametrize(("changes", "expected"), [
@@ -159,7 +195,7 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     invalid_geography["geography"] = ["Britain"]
     with pytest.raises(ValidationError):
         validator.validate({"package": invalid_geography})
-    assert VERSION == "newsroom.native-evidence-assessor.v16"
+    assert VERSION == "newsroom.native-evidence-assessor.v17"
     assert "ASSESSOR_CLAIM_BINDING_HOLD" in REASSESSABLE_HOLDS
     assert "whitespace, newlines and country labels exactly" in SYSTEM
     assert "unfamiliar official source-bound literal" in SYSTEM
@@ -1089,7 +1125,10 @@ def test_assessor_qualification_witnesses_match_admission_helpers(
             )
 
 
-@pytest.mark.parametrize("prior_contract", ["newsroom.native-evidence-assessor.v7", VERSION])
+@pytest.mark.parametrize(
+    "prior_contract",
+    ["newsroom.native-evidence-assessor.v7", "newsroom.native-evidence-assessor.v16"],
+)
 @pytest.mark.parametrize("cached_only", [False, True])
 @pytest.mark.parametrize("valid", [False, True])
 def test_retained_qualification_validation_controls_existing_fresh_attempt(
@@ -1097,10 +1136,11 @@ def test_retained_qualification_validation_controls_existing_fresh_attempt(
 ):
     from newsroom.control_plane import native_assessor as module
 
+    _use_historical_v16(monkeypatch)
     candidate, base, source, acquired, raw = _qualification_assessor_inputs(
         retained_22589_assessment, kind="deadline" if valid else "retained",
     )
-    current_contract = VERSION
+    current_contract = module._V16_PRODUCER_VERSION
     valid_text = canonical_json_bytes(
         raw if valid else {"package": _model_package_value(base)}
     ).decode()
@@ -1110,7 +1150,6 @@ def test_retained_qualification_validation_controls_existing_fresh_attempt(
         "reasoning_tokens": 0, "context_tokens": 1, "total_tokens": 2,
     })
     monkeypatch.setattr(module, "VERSION", prior_contract)
-    monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", prior_contract)
     service, prior_usage = _usage(tmp_path, monkeypatch)
     # Seed the actual old acceptance shape without invoking an older validator:
     # a settled, exact retained raw result whose structural contract was accepted.
@@ -1129,7 +1168,6 @@ def test_retained_qualification_validation_controls_existing_fresh_attempt(
         ).fetchone()
     assert json.loads(original_allocation[0])["prompt_contract_version"] == prior_contract
     monkeypatch.setattr(module, "VERSION", current_contract)
-    monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", current_contract)
     _, usage = _usage(tmp_path, monkeypatch)
     calls = []
 
@@ -1178,6 +1216,7 @@ def test_retained_qualification_validation_controls_existing_fresh_attempt(
 def test_cached_operational_replacement_revalidates_without_dispatch_or_relabelling(
     tmp_path, monkeypatch, retained_22589_assessment, rendering_valid, source_prefix, old_state,
 ):
+    _use_historical_v16(monkeypatch)
     from newsroom.control_plane.native_assessor import assessment_revalidation_due
     from newsroom.control_plane.native_composition import ASSESSMENT_CONTRACT_VERSION
     from newsroom.control_plane.native_evidence import rights_eligibility_digest
@@ -1257,7 +1296,9 @@ def test_cached_operational_replacement_revalidates_without_dispatch_or_relabell
                     before_dispatch=None, cached_only=True,
                 )
     assert retained_rows() == before
-    assert json.loads(before[0][0][0])["prompt_contract_version"] == VERSION
+    assert json.loads(before[0][0][0])["prompt_contract_version"] == (
+        native_assessor_module._V16_PRODUCER_VERSION
+    )
     facts["assessment_contract_version"] = ASSESSMENT_CONTRACT_VERSION
     assert not assessment_revalidation_due(facts, ASSESSMENT_CONTRACT_VERSION)
 
@@ -1265,6 +1306,7 @@ def test_cached_operational_replacement_revalidates_without_dispatch_or_relabell
 def test_native_assessor_retains_precise_qualification_contract_hold(
     tmp_path, monkeypatch,
 ) -> None:
+    _use_historical_v16(monkeypatch)
     connection, _port, candidate = _candidate(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     package = _model_package_value(base)
@@ -1332,15 +1374,17 @@ def _usage(tmp_path, monkeypatch):
         prior_message_count=0,
         command_semantic_version="1.0.8",
         command_flags=CONT_PRIMARY_COMMAND_FLAGS,
-        context_manifest_schema_version=CONTEXT_MANIFEST_SCHEMA_VERSION,
+        context_manifest_schema_version=(
+            native_assessor_module.CONTEXT_MANIFEST_SCHEMA_VERSION
+        ),
         disabled_capabilities=CONT_DISABLED_CAPABILITIES,
         implementation_revision=REVISION,
         max_prompt_bytes=1_000_000,
         max_context_tokens=100_000,
         max_output_tokens=10_000,
         max_total_tokens=100_000,
-        prompt_contract_version=VERSION,
-        output_schema_digest=SCHEMA_DIGEST,
+        prompt_contract_version=native_assessor_module.VERSION,
+        output_schema_digest=native_assessor_module.PROVIDER_SCHEMA_DIGEST,
         allowed_context_identities=(CONTEXT_IDENTITY,),
         allowed_config_identities=(CONFIG_IDENTITY,),
         hard_estimate_ceiling_tokens=100_000,
@@ -1359,12 +1403,12 @@ def test_native_assessor_input_bound_includes_fixed_input_and_output_reserve(
     policy = usage._policy
     bound = native_assessment_input_bound(policy)
     assert bound['version'] == INPUT_BOUND_VERSION
-    assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v2')
-    assert VERSION.endswith('.v16')
+    assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v3')
+    assert VERSION.endswith('.v17')
     assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
     assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
-    assert bound['schema_digest'] == SCHEMA_DIGEST
-    assert bound['schema_bytes'] == len(canonical_json_bytes(SCHEMA))
+    assert bound['schema_digest'] == PROVIDER_SCHEMA_DIGEST
+    assert bound['schema_bytes'] == len(canonical_json_bytes(PROVIDER_SCHEMA))
     assert bound['framing_reserve_tokens'] == 16_384
     assert bound['output_reserve_tokens'] == policy.max_output_tokens
     fixed = bound['system_bytes'] + bound['schema_bytes'] + 16_384
@@ -1437,6 +1481,45 @@ def test_native_assessor_exact_byte_ceiling_and_plus_one(tmp_path, monkeypatch) 
         connection.close()
 
 
+def test_assessor_rejects_source_lower_bound_before_building_reference_view(
+    tmp_path, monkeypatch,
+) -> None:
+    connection, _port, candidate = _candidate(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    service, usage = _usage(tmp_path, monkeypatch)
+    maximum = native_assessment_input_bound(usage._policy)["max_request_bytes"]
+    oversized = replace(
+        base,
+        passages=("x" * (maximum + 1),),
+        observation_digests=(digest_bytes(b"x" * (maximum + 1)),),
+    )
+    monkeypatch.setattr(
+        native_assessor_module,
+        "build_source_view",
+        lambda *_args: pytest.fail("over-bound source built a reference view"),
+    )
+    assessor = AutonomousNativeEvidenceAssessor(
+        lambda _prompt: pytest.fail("over-bound source dispatched provider"),
+        usage=usage,
+        dispatch_fence=nullcontext,
+    )
+    try:
+        with pytest.raises(NativeEvidenceHold) as held:
+            assessor.assess_with_boundary(
+                candidate, oversized, (), (), before_dispatch=None
+            )
+        assert held.value.reason_code == "ASSESSOR_EXACT_INPUT_BOUND_HOLD"
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute(
+                "SELECT COUNT(*) FROM model_work_envelopes"
+            ).fetchone() == (0,)
+            assert retained.execute(
+                "SELECT COUNT(*) FROM model_invocation_allocations"
+            ).fetchone() == (0,)
+    finally:
+        connection.close()
+
+
 def test_native_assessor_uses_exact_candidate_and_base_without_ambient_context(
     tmp_path, monkeypatch,
 ) -> None:
@@ -1454,9 +1537,7 @@ def test_native_assessor_uses_exact_candidate_and_base_without_ambient_context(
             ).fetchall() == [("DISPATCH_STARTED",)]
         calls.append(prompt)
         return NativeAssessmentExecution(
-            canonical_json_bytes(
-                {"package": _model_package_value(base)}
-            ).decode(),
+            canonical_json_bytes(_empty_reference_result()).decode(),
             {
                 "usage_basis": "PROVIDER_REPORTED",
                 "input_tokens": 1,
@@ -1502,8 +1583,11 @@ def test_native_assessor_uses_exact_candidate_and_base_without_ambient_context(
         request["candidate_version"]["version"]["version_id"]
         == candidate.version_id
     )
-    assert request["base_package"] == evidence_package_value(base)
-    assert request["output_schema_digest"] == SCHEMA_DIGEST
+    expected_base = evidence_package_value(base)
+    expected_base.pop("passages")
+    assert request["base_package"] == expected_base
+    assert request["sources"] == []
+    assert request["output_schema_digest"] == PROVIDER_SCHEMA_DIGEST
     assert result.governed_claims == ()
     with sqlite3.connect(usage_service.path) as retained:
         assert retained.execute(
@@ -1742,7 +1826,7 @@ def test_native_assessor_retains_post_dispatch_failures(
         )
     if outcome == "ASSESSOR_VALIDATION_FAILED":
         assert isinstance(caught.value, NativeEvidenceHold)
-        assert caught.value.reason_code == "ASSESSOR_OUTPUT_CONTRACT_HOLD"
+        assert caught.value.reason_code == "ASSESSOR_SOURCE_REFERENCE_HOLD"
     assert dispatches == 1
 
     with sqlite3.connect(service.path) as retained:
@@ -1759,6 +1843,10 @@ def test_native_assessor_retains_post_dispatch_failures(
             "SELECT payload_json FROM ledger WHERE kind='NATIVE_ASSESSMENT_RESULT'"
         ).fetchall()
         assert len(result_rows) == (0 if output is None else 1)
+        assert retained.execute(
+            "SELECT COUNT(*) FROM ledger "
+            "WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'"
+        ).fetchone() == (0,)
         if output is not None:
             diagnostic = json.loads(result_rows[0][0])
             assert diagnostic["result_text"] == output
@@ -1983,6 +2071,7 @@ def test_inflight_native_assessor_is_not_a_retained_contract_failure(
 def test_retained_assessment_revalidation_reuses_output_without_provider(tmp_path, monkeypatch, new_contract):
     import newsroom.control_plane.native_assessor as module
 
+    _use_historical_v16(monkeypatch)
     if new_contract:
         monkeypatch.setattr(module, "VERSION", "newsroom.native-evidence-assessor.v11")
         monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", module.VERSION)
@@ -2198,6 +2287,7 @@ def test_settled_rendering_failure_supplies_feedback_once_then_reuses_valid_resu
 ):
     from newsroom.control_plane import native_assessor as module
 
+    _use_historical_v16(monkeypatch)
     candidate, base, source, acquired, valid = _qualification_assessor_inputs(
         retained_22589_assessment, kind="deadline",
     )
@@ -2208,7 +2298,7 @@ def test_settled_rendering_failure_supplies_feedback_once_then_reuses_valid_resu
         "cached_read_tokens": 0, "cached_write_tokens": 0,
         "reasoning_tokens": 0, "context_tokens": 1, "total_tokens": 2,
     })
-    current_contract = VERSION
+    current_contract = module._V16_PRODUCER_VERSION
     monkeypatch.setattr(module, "VERSION", "newsroom.native-evidence-assessor.v12")
     monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", module.VERSION)
     service, prior_usage = _usage(tmp_path, monkeypatch)
@@ -2407,6 +2497,7 @@ def test_source_declared_acronym_revalidates_retained_output_without_dispatch(
 ):
     from newsroom.control_plane.native_evidence import rights_eligibility_digest
 
+    _use_historical_v16(monkeypatch)
     candidate, base, source, acquired, raw = _qualification_assessor_inputs(
         retained_22589_assessment,
     )
@@ -2583,15 +2674,23 @@ def test_literal_csv_names_survive_full_assessment_and_governed_records(retained
             AutonomousNativeEvidenceAssessor._validated_execution(NativeAssessmentExecution(canonical_json_bytes(altered).decode(), {}),candidate,base,(source,),(acquired,))
 
 
-def test_v16_literal_guidance_preserves_v15_historical_contract():
-    from newsroom.control_plane.native_assessor import _V15_SYSTEM, _V15_SCHEMA_DIGEST, _V15_SCHEMA_BYTES
-    assert VERSION == 'newsroom.native-evidence-assessor.v16'
+def test_v17_reference_contract_preserves_v15_v16_historical_contracts():
+    from newsroom.control_plane.native_assessor import (
+        _V15_SYSTEM, _V15_SCHEMA_DIGEST, _V15_SCHEMA_BYTES, _V16_SYSTEM,
+    )
+    assert VERSION == 'newsroom.native-evidence-assessor.v17'
     assert digest_bytes(_V15_SYSTEM.encode()) == 'sha256:5788c3e827199e12932d106ad494c80b71b2691e3f9c7e535a44c5d09811d4a6'
     assert len(_V15_SYSTEM.encode()) == 6797
     assert SCHEMA_DIGEST == _V15_SCHEMA_DIGEST
     assert len(canonical_json_bytes(SCHEMA)) == _V15_SCHEMA_BYTES
-    assert SYSTEM.startswith(_V15_SYSTEM)
-    assert 'Illustration only, not evidence for the current candidate:' in SYSTEM
-    assert 'same complete literal Row line' in SYSTEM
-    assert 'CSV JSON delimiter quotes are not attributed speech' in SYSTEM
-    assert 'existing empty governed_claims/qualification_evidence/no-new-information path' in SYSTEM
+    assert _V16_SYSTEM.startswith(_V15_SYSTEM)
+    assert 'Illustration only, not evidence for the current candidate:' in _V16_SYSTEM
+    assert 'same complete literal Row line' in _V16_SYSTEM
+    assert 'CSV JSON delimiter quotes are not attributed speech' in _V16_SYSTEM
+    assert 'existing empty governed_claims/qualification_evidence/no-new-information path' in _V16_SYSTEM
+    assert 'claim_range and support_range' in SYSTEM
+    assert 'N+1 rendered_fragments' in SYSTEM
+    assert PROVIDER_SCHEMA_DIGEST != SCHEMA_DIGEST
+    assert PROVIDER_SCHEMA['properties']['package']['properties'][
+        'governed_claims'
+    ]['items']['properties'].get('claim') is None

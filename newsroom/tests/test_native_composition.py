@@ -34,9 +34,9 @@ NOW = datetime(2026, 9, 8, 14, tzinfo=UTC)
 
 
 def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
-    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v16"
+    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v17"
     assert native_composition.ASSESSMENT_CONTRACT_VERSION == (
-        "newsroom.native-evidence-assessor.v16+newsroom.named-entity.v15+"
+        "newsroom.native-evidence-assessor.v17+newsroom.named-entity.v15+"
         "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v1+"
         "newsroom.qualification-relation.v3+newsroom.retained-assessment.v1"
     )
@@ -361,7 +361,7 @@ def _assessment_policy() -> InvocationEfficiencyPolicy:
         implementation_revision="1" * 40, max_prompt_bytes=1_000_000,
         max_context_tokens=100_000, max_output_tokens=10_000,
         max_total_tokens=100_000, prompt_contract_version=native_assessor.VERSION,
-        output_schema_digest=native_assessor.SCHEMA_DIGEST,
+        output_schema_digest=native_assessor.PROVIDER_SCHEMA_DIGEST,
         allowed_context_identities=(native_assessor.CONTEXT_IDENTITY,),
         allowed_config_identities=(native_assessor.CONFIG_IDENTITY,),
         hard_estimate_ceiling_tokens=100_000,

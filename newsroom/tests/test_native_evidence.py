@@ -38,6 +38,7 @@ from newsroom.control_plane.native_assessor import (
     AutonomousNativeEvidenceAssessor,
     NativeAssessmentExecution,
 )
+from newsroom.control_plane.native_assessor_references import build_source_view
 from newsroom.control_plane.native_publication import NativePublicationController
 from newsroom.control_plane.writer import (
     WriterCopy,
@@ -241,20 +242,61 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
         for item in model_claims
     )
 
+    view = build_source_view((passage,), (source_id,))
+    spans = {
+        view.resolve_range({"first_span_id": segment.span_id,
+                            "last_span_id": segment.span_id})[0]: segment.span_id
+        for segment in view.segments
+    }
+
+    def reference_value(value):
+        claim_indexes = {item["claim_id"]: index
+                         for index, item in enumerate(value["governed_claims"])}
+        claims = []
+        for item in value["governed_claims"]:
+            claim_span = spans.get(item["claim"], "S99L1")
+            support_span = spans.get(item["supporting_excerpt"], "S99L1")
+            if item["source_ids"] != [source_id]:
+                claim_span = "S99L1"
+            claims.append({
+                **{key: field for key, field in item.items() if key not in {
+                    "claim_id", "claim", "passage_index", "supporting_excerpt",
+                    "source_ids", "rendered_assertion_zh_hant_hk",
+                }},
+                "claim_range": {"first_span_id": claim_span, "last_span_id": claim_span},
+                "support_range": {"first_span_id": support_span, "last_span_id": support_span},
+                "rendered_fragments": [item["rendered_assertion_zh_hant_hk"]],
+            })
+        return {"package": {
+            "substantive_claim_indexes": [
+                next((index for index, item in enumerate(value["governed_claims"])
+                      if item["claim"] == text), 99)
+                for text in value["substantive_new_information"]
+            ],
+            "governed_claims": claims,
+            "qualification_evidence": [
+                {**{key: field for key, field in item.items()
+                    if key != "governed_claim_id"},
+                 "claim_index": claim_indexes.get(item["governed_claim_id"], 99)}
+                for item in value["qualification_evidence"]
+            ],
+            "selection_rationale": value["selection_rationale"],
+            "geography": value["geography"], "categories": value["categories"],
+            "explicit_exclusions": value["explicit_exclusions"],
+        }}
+
     def model_assessor(value):
+        def dispatch(prompt):
+            request = json.loads(prompt)
+            assert "body" not in request["sources"][0]
+            assert "passages" not in request["base_package"]
+            assert "".join(segment["text"] for segment in request["sources"][0]["segments"]) == passage
+            return NativeAssessmentExecution(canonical_json_bytes(reference_value(value)).decode(), {})
         return AutonomousNativeEvidenceAssessor(
-            lambda _prompt: NativeAssessmentExecution(
-                canonical_json_bytes({"package": value}).decode(),
-                {},
-            )
+            dispatch
         )
 
-    assessor = AutonomousNativeEvidenceAssessor(
-        lambda _prompt: NativeAssessmentExecution(
-            canonical_json_bytes({"package": model_package}).decode(),
-            {},
-        )
-    )
+    assessor = model_assessor(model_package)
     assessed = assessor(
         version, _base_package(assessed_package), (source,), (acquisition,)
     )
@@ -280,7 +322,7 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
 
     malformed = deepcopy(model_package)
     paraphrased_claim(malformed)
-    with pytest.raises(NativeEvidenceHold, match="ASSESSOR_CLAIM_BINDING_HOLD"):
+    with pytest.raises(EvidencePackageError, match="source references differ"):
         model_assessor(malformed)(
             version,
             _base_package(assessed_package),
@@ -295,25 +337,16 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
             *assessed_package.governed_claims[1:],
         ),
     )
-    with pytest.raises(NativeEvidenceHold, match="ASSESSOR_CLAIM_BINDING_HOLD"):
-        AutonomousNativeEvidenceAssessor(
-            lambda _prompt: NativeAssessmentExecution(
-                canonical_json_bytes(
-                    {"package": _model_package_value(wrong_source)}
-                ).decode(),
-                {},
-            )
-        )(version, _base_package(assessed_package), (source,), (acquisition,))
+    with pytest.raises(EvidencePackageError, match="source references differ"):
+        model_assessor(_model_package_value(wrong_source))(
+            version, _base_package(assessed_package), (source,), (acquisition,))
     missing_claim = _model_package_value(assessed_package)
     missing_claim["qualification_evidence"][0][
         "governed_claim_id"
     ] = "missing-claim"
-    with pytest.raises(EvidencePackageError, match="qualification claim differs"):
-        AutonomousNativeEvidenceAssessor(
-            lambda _prompt: NativeAssessmentExecution(
-                canonical_json_bytes({"package": missing_claim}).decode(), {}
-            )
-        )(version, _base_package(assessed_package), (source,), (acquisition,))
+    with pytest.raises(EvidencePackageError, match="source references differ"):
+        model_assessor(missing_claim)(
+            version, _base_package(assessed_package), (source,), (acquisition,))
 
     def evidence_controller(selected_assessor):
         return NativeEvidenceController(
@@ -332,12 +365,8 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
     negative_value["governed_claims"][0]["semantic_relation"][
         "source_polarity"
     ] = "NEGATED"
-    negative_assessor = AutonomousNativeEvidenceAssessor(
-        lambda _prompt: NativeAssessmentExecution(
-            canonical_json_bytes({"package": negative_value}).decode(), {}
-        )
-    )
-    with pytest.raises(EvidencePackageError, match="semantic relation"):
+    negative_assessor = model_assessor(negative_value)
+    with pytest.raises(EvidencePackageError, match="source references differ"):
         negative_assessor(
             version, _base_package(assessed_package), (source,), (acquisition,)
         )
@@ -443,12 +472,25 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
                 ),
             )
         else:
-            malformed_assessment = model_assessor(malformed)(
-                version,
-                _base_package(assessed_package),
-                (source,),
-                (acquisition,),
-            )
+            # The v17 provider cannot emit these invalid free-text values.
+            # Preserve the separate downstream-admission defence by mutating
+            # the already materialised assessment, never bypassing the positive
+            # current producer path above.
+            if mutation is free_slug_category:
+                malformed_assessment = replace(assessed, categories=("immigration",))
+            elif mutation is invented_substantive_summary:
+                malformed_assessment = replace(
+                    assessed,
+                    substantive_new_information=(
+                        "A summary which is not an exact governed claim.",
+                    ),
+                )
+            elif mutation is unqualified_headline:
+                malformed_assessment = replace(assessed, qualification_evidence=())
+            else:
+                malformed_assessment = replace(
+                    assessed, substantive_new_information=(), qualification_evidence=(),
+                )
         resolved_records = dict(evidence.retained.package.resolved_evidence_records)
         resolved_records.update(
             (

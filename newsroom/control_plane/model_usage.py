@@ -3316,6 +3316,11 @@ class ModelUsageService:
                     "ON ledger(kind,json_extract(payload_json,'$.invocation_id')) "
                     "WHERE kind='NATIVE_ASSESSMENT_RESULT'"
                 )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS model_usage_assessor_materialisation "
+                    "ON ledger(kind,json_extract(payload_json,'$.invocation_id')) "
+                    "WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'"
+                )
             applied_at = _utc_text(datetime.now(tz=UTC))
             connection.executemany(
                 "INSERT OR IGNORE INTO model_usage_migrations("
