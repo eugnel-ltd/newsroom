@@ -47,3 +47,21 @@ def test_licence_policy_never_labels_another_origin_or_source():
     assert all(not item.licence_attributions for item in surfaces)
     with pytest.raises(PublicationError, match="source binding"):
         replace(surfaces[0], licence_attributions=(("missing-source", ATTRIBUTION, LICENCE_URL),))
+
+
+def test_spreadsheet_uses_govuk_landing_page_as_licensed_source_reference():
+    landing = (
+        "https://www.gov.uk/government/publications/"
+        "funding-allocations-to-training-providers-2024-to-2025"
+    )
+    surfaces = _render(
+        _story(),
+        (("UK-05", landing),),
+        (("www.gov.uk", ATTRIBUTION, LICENCE_URL),),
+    )
+    for surface in surfaces:
+        assert surface.source_references == (("UK-05", landing),)
+        assert surface.licence_attributions == (
+            ("UK-05", ATTRIBUTION, LICENCE_URL),
+        )
+        assert "assets.publishing.service.gov.uk" not in surface.canonical_bytes().decode()
