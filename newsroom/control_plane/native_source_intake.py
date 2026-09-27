@@ -285,11 +285,19 @@ class NativeSourceIntake:
                     item.canonical_url,
                     getattr(exc, "reason_code", "SOURCE_ITEM_RETAIN_FAILED"),
                 ))
+        unique_units = {}
+        for unit in units:
+            key = (unit.authority.revision_id, unit.chunk_ordinal)
+            prior = unique_units.get(key)
+            if prior is None:
+                unique_units[key] = unit
+            elif replace(unit, observed_at=prior.observed_at) != prior:
+                raise NativeSourceIntakeHold("SOURCE_REOBSERVATION_CONFLICT")
         status = "HOLD" if item_holds else "READY"
         return NativeSourceDisposition(
             source_id, status,
             "SOURCE_ITEMS_HELD" if item_holds else "GOVERNED_REVISIONS_RETAINED",
-            tuple(units),
+            tuple(unique_units.values()),
             str(raw_admission.admission_id), str(raw_access.access_decision_id),
             tuple(observations),
             tuple(item_holds),
@@ -297,7 +305,7 @@ class NativeSourceIntake:
 
     def _settle_item(
         self, source_id, definition_id, version_id, version, item,
-        item_url, raw, observed, rights_id,
+        item_url, raw, observed, rights_id, *, follow_children=True,
     ):
         admission, access = self._admit_observation(source_id, raw)
         observation_digest = digest_bytes(raw)
@@ -315,27 +323,21 @@ class NativeSourceIntake:
             if not exc.child_items and not exc.unsupported_attachments:
                 return (), tuple(observations), ((item.canonical_url, exc.reason_code),)
             units, holds = [], []
+            if exc.child_items and not follow_children:
+                holds.append((item.canonical_url, exc.reason_code))
             for child, fetched in self._fetch_manual_sections(
-                source_id, observation_digest, exc.child_items,
+                source_id, observation_digest, exc.child_items if follow_children else (),
             ):
                 try:
                     child_url, child_raw, child_observed = fetched.result()
-                    child_admission, child_access = self._admit_observation(
-                        source_id, child_raw,
+                    child_units, child_observations, child_holds = self._settle_item(
+                        source_id, definition_id, version_id, version, child,
+                        child_url, child_raw, child_observed, rights_id,
+                        follow_children=False,
                     )
-                    child_digest = digest_bytes(child_raw)
-                    observations.append((
-                        child_url, child_digest,
-                        str(child_admission.admission_id),
-                        str(child_access.access_decision_id),
-                    ))
-                    complete_child = self._parse_complete_item(
-                        child, child_raw, child_observed,
-                    )
-                    units.extend(self._retain_item(
-                        source_id, definition_id, version_id, version,
-                        complete_child, child_digest, _utc(child_observed), rights_id,
-                    ))
+                    units.extend(child_units)
+                    observations.extend(child_observations)
+                    holds.extend(child_holds)
                 except VetoError:
                     raise
                 except Exception as child_exc:
@@ -962,14 +964,16 @@ def _require_parent_inventory_binding(
                 ), proof=proof).data
                 if digest_bytes(feed_raw) != feed[1]:
                     continue
-                parent_found = any(
-                    item.canonical_url == parent_url
-                    for item in parse_observation(
-                        source_id=unit.source_id,
-                        url=unit.source_definition_url,
-                        body=feed_raw,
-                    )
+                feed_items = parse_observation(
+                    source_id=unit.source_id, url=unit.source_definition_url,
+                    body=feed_raw,
                 )
+                parent_found = any(item.canonical_url == parent_url for item in feed_items)
+                if not parent_found and spreadsheet_asset_url(unit) is not None:
+                    parent_found = _declared_file_parent_in_feed_child(
+                        unit=unit, parent_url=parent_url, feed_items=feed_items,
+                        observations=observations, objects=objects, proof=proof,
+                    )
                 if parent_found:
                     break
             except (TypeError, ValueError, LookupError, KeyError, PermissionError):
@@ -999,6 +1003,42 @@ def _require_parent_inventory_binding(
     elif section_path not in child_paths:
         raise ValueError("child is outside its retained parent inventory")
     return parent_url, raw
+
+
+def _declared_file_parent_in_feed_child(
+    *, unit, parent_url, feed_items, observations, objects, proof,
+) -> bool:
+    """Prove exactly feed -> declared HTML child -> file parent; never crawl."""
+    feed_urls = set()
+    for item in feed_items:
+        try:
+            feed_urls.add(_api_url(item.canonical_url))
+        except ValueError:
+            continue
+    for observation in observations.values():
+        if observation[0] not in feed_urls:
+            continue
+        try:
+            admission_id, access = _require_observation_access(
+                observation=observation, objects=objects, proof=proof,
+            )
+            raw = objects.rehydrate(HydrationRequest(
+                admission_id, NATIVE_SOURCE_OBSERVATION_PURPOSE, 0, access.allowed_bytes,
+            ), proof=proof).data
+            if digest_bytes(raw) != observation[1]:
+                continue
+            try:
+                parse_govuk_content_document(
+                    _canonical_url_from_api(observation[0]), raw,
+                    retrieved_at=datetime.fromisoformat(unit.observed_at.replace("Z", "+00:00")),
+                )
+            except GovUkContentHold as exc:
+                if (not exc.exclusion_signals
+                        and urlsplit(parent_url).path in {path for path, _title in exc.child_items}):
+                    return True
+        except (TypeError, ValueError, LookupError, KeyError, PermissionError):
+            continue
+    return False
 
 
 def _require_observation_access(*, observation, objects, proof):
