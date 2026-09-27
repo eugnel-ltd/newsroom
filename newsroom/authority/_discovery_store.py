@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ._event_store_base import _validation_stage
+from ._foreign_keys import has_foreign_key_violation
 # ruff: noqa: I001 - preserve legacy import layout within bounded change
 # fmt: off - preserve legacy layout and bounded addition within the line cap
 
@@ -286,16 +287,11 @@ def _validate_discovery_domain_reads(
         connection,
         aggregate_types=tuple(spec[0] for spec in _DISCOVERY_RECORD_SPECS.values()),
     )
-    for table, _ in domain_rows:
-        if connection.execute(
-            f'PRAGMA foreign_key_check("{table}")'
-        ).fetchone() is not None:
-            raise AuthoritySchemaError("Discovery foreign-key integrity differs")
-    for table in ("discovery_gate_decision_heads", "lead_disposition_heads"):
-        if connection.execute(
-            f'PRAGMA foreign_key_check("{table}")'
-        ).fetchone() is not None:
-            raise AuthoritySchemaError("Discovery foreign-key integrity differs")
+    if has_foreign_key_violation(connection, table_names=(
+        *(table for table, _ in domain_rows),
+        "discovery_gate_decision_heads", "lead_disposition_heads",
+    )):
+        raise AuthoritySchemaError("Discovery foreign-key integrity differs")
 
 
 def _validate_discovery_reads_in_transaction(

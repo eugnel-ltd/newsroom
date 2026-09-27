@@ -9,19 +9,26 @@ def _identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def has_foreign_key_violation(connection: sqlite3.Connection) -> bool:
+def has_foreign_key_violation(
+    connection: sqlite3.Connection, *, table_names: tuple[str, ...] | None = None,
+) -> bool:
     """Check every FK after the caller has authenticated the authority schema.
 
     Equal, strictly stored types with BINARY collation need no FK affinity
     conversion. Ordered set subtraction scans their covering indexes instead
     of repeatedly fetching wide child rows and random parent pages. A NULL in any
     child key satisfies SQLite's FK rule. Other schemas keep SQLite's checker.
+    An optional table selection restricts child tables only; parent schemas and
+    every FK of each selected table remain checked. The default checks all tables.
     No validation result survives this call and no data or setting is changed.
     """
     tables = dict(connection.execute(
         "SELECT name,sql FROM sqlite_master "
         "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ))
+    selected = tables if table_names is None else table_names
+    if any(name not in tables for name in selected):
+        raise ValueError("unknown foreign-key table selection")
     types = {
         name: {row[1]: row[2] for row in connection.execute(
             f"PRAGMA table_info({_identifier(name)})"
@@ -33,7 +40,7 @@ def has_foreign_key_violation(connection: sqlite3.Connection) -> bool:
         if sql.rstrip().upper().endswith("STRICT")
         and re.search(r"\bCOLLATE\b", sql, re.IGNORECASE) is None
     }
-    for table in tables:
+    for table in selected:
         groups = defaultdict(list)
         for row in connection.execute(f"PRAGMA foreign_key_list({_identifier(table)})"):
             groups[row[0]].append(row)

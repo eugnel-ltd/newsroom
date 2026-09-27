@@ -4544,7 +4544,10 @@ def test_async_controller_terminates_descendants_that_inherit_pipes(
         "import pathlib,subprocess,sys,time; "
         "descendant=subprocess.Popen((sys.executable,'-c',"
         "'import time; time.sleep(30)')); "
-        f"pathlib.Path({str(pid_path)!r}).write_text(str(descendant.pid)); "
+        # Publish readiness atomically: cancellation must not observe an empty
+        # file between open/truncate and write/close of the descendant PID.
+        f"pathlib.Path({str(pid_path.with_suffix('.tmp'))!r}).write_text(str(descendant.pid)); "
+        f"pathlib.Path({str(pid_path.with_suffix('.tmp'))!r}).replace({str(pid_path)!r}); "
         f"{output}"
         "time.sleep(30)"
     )

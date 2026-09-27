@@ -109,3 +109,34 @@ def test_supported_keys_use_set_scan_without_changing_connection_settings():
         assert any(" EXCEPT " in statement for statement in statements)
         assert not any("PRAGMA foreign_key_check" in statement for statement in statements)
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+
+
+def test_selected_tables_keep_native_fk_semantics_and_all_parents():
+    with sqlite3.connect(':memory:') as connection:
+        connection.executescript('''
+            CREATE TABLE parent(id TEXT PRIMARY KEY) STRICT;
+            CREATE TABLE chosen(value TEXT REFERENCES parent(id)) STRICT;
+            CREATE TABLE other(value TEXT REFERENCES parent(id)) STRICT;
+            INSERT INTO parent VALUES('kept');
+            INSERT INTO chosen VALUES('kept');
+            INSERT INTO other VALUES('missing');
+        ''')
+        assert has_foreign_key_violation(connection) is True
+        assert has_foreign_key_violation(connection, table_names=('chosen',)) is False
+        connection.execute("INSERT INTO chosen VALUES('missing')")
+        assert has_foreign_key_violation(connection, table_names=('chosen',)) is True
+        with pytest.raises(ValueError, match='unknown'):
+            has_foreign_key_violation(connection, table_names=('not_a_table',))
+
+
+def test_selected_tables_keep_affinity_and_collation_fallback():
+    with sqlite3.connect(':memory:') as connection:
+        connection.executescript('''
+            CREATE TABLE parent(id TEXT COLLATE NOCASE PRIMARY KEY);
+            CREATE TABLE chosen(value TEXT REFERENCES parent(id));
+            INSERT INTO parent VALUES('Kept');
+            INSERT INTO chosen VALUES('kept');
+        ''')
+        assert has_foreign_key_violation(connection, table_names=('chosen',)) is False
+        connection.execute("INSERT INTO chosen VALUES('missing')")
+        assert has_foreign_key_violation(connection, table_names=('chosen',)) is True
