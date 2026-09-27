@@ -16,16 +16,16 @@ from newsroom.control_plane.govuk_spreadsheet import _Text, _csv
 from newsroom.control_plane.native_assessor import (
     AutonomousNativeEvidenceAssessor,
     NativeAssessmentExecution,
-    SCHEMA, PROVIDER_SCHEMA, VERSION,
+    SCHEMA, PROVIDER_SCHEMA, VERSION, _V17_PROVIDER_SCHEMA,
 )
 from newsroom.control_plane.native_assessor_references import (
     build_source_view,
-    make_provider_schema,
-    materialise, SourceReferenceError,
+    materialise as materialise_v17, SourceReferenceError,
 )
+from newsroom.control_plane.native_assessor_wire import materialise as materialise_v18
 from newsroom.control_plane.native_evidence import NativeEvidenceController, NativeEvidenceHold, rights_eligibility_digest
 from newsroom.tests.test_native_assessor import (
-    _qualification_assessor_inputs, _usage,
+    _qualification_assessor_inputs, _usage, _v18_wire_from_v17,
     retained_22589_assessment,
 )
 
@@ -144,11 +144,13 @@ def _literal_reference_inputs():
 
 def test_reference_result_materialises_then_passes_full_governed_path():
     candidate, base, source, acquired, view, wire, row, body = _literal_reference_inputs()
-    package_value, receipt = materialise(
+    wire = _v18_wire_from_v17(wire)
+    package_value, receipt = materialise_v18(
         canonical_json_bytes(wire),
         view,
         "request-digest",
-        provider_schema=make_provider_schema(SCHEMA),
+        provider_schema=PROVIDER_SCHEMA,
+        v17_schema=_V17_PROVIDER_SCHEMA,
     )
     assert receipt["raw_digest"] == digest_bytes(canonical_json_bytes(wire))
     assert receipt["manifest_digest"] == view.manifest_digest
@@ -211,6 +213,7 @@ _USAGE = {"usage_basis": "PROVIDER_REPORTED", "input_tokens": 1,
 
 def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_override=None):
     candidate, base, source, acquired, view, wire, _row, _body = _literal_reference_inputs()
+    wire = _v18_wire_from_v17(wire)
     service, usage = _usage(tmp_path, monkeypatch)
     # Fixture creates the ledger after the usage schema; exercise normal startup
     # with a pre-existing ledger, as in the private runtime.
@@ -218,7 +221,7 @@ def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_ove
     ModelUsageService(service.path)
     calls = []
     if malformed:
-        wire["package"]["governed_claims"][0]["claim_range"]["first_span_id"] = "S99L1"
+        wire["package"]["governed_claims"][0]["source_range"]["first_span_id"] = "S99L1"
     raw = raw_override if raw_override is not None else canonical_json_bytes(wire).decode()
 
     def dispatch(prompt):
@@ -235,7 +238,7 @@ def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_ove
     return service, usage, assessor, candidate, base, source, acquired, calls, raw, result
 
 
-def test_v17_raw_and_materialised_results_are_retained_once_and_cached(tmp_path, monkeypatch):
+def test_v18_raw_and_materialised_results_are_retained_once_and_cached(tmp_path, monkeypatch):
     service, usage, assessor, candidate, base, source, acquired, calls, raw, result = (
         _run_reference_assessment(tmp_path, monkeypatch)
     )
@@ -273,7 +276,7 @@ def test_v17_raw_and_materialised_results_are_retained_once_and_cached(tmp_path,
 
 
 @pytest.mark.parametrize("mutation", ["raw", "allocation", "context", "body", "text", "missing", "duplicate"])
-def test_v17_retained_materialisation_tamper_never_dispatches(tmp_path, monkeypatch, mutation):
+def test_v18_retained_materialisation_tamper_never_dispatches(tmp_path, monkeypatch, mutation):
     service, usage, assessor, candidate, base, source, acquired, calls, _raw, _result = (
         _run_reference_assessment(tmp_path, monkeypatch)
     )
@@ -311,7 +314,7 @@ def test_v17_retained_materialisation_tamper_never_dispatches(tmp_path, monkeypa
     assert len(calls) == 1
 
 
-def test_v17_bad_reference_is_accounted_and_not_retried(tmp_path, monkeypatch):
+def test_v18_bad_reference_is_accounted_and_not_retried(tmp_path, monkeypatch):
     service, usage, assessor, candidate, base, source, acquired, calls, raw, _result = (
         _run_reference_assessment(tmp_path, monkeypatch, malformed=True)
     )
@@ -338,7 +341,7 @@ def test_reference_expansion_cap_applies_even_when_wire_is_small():
                         "geography": ["UK"], "categories": ["Politics and law"], "explicit_exclusions": []}}
     assert len(canonical_json_bytes(wire)) < 4096
     with pytest.raises(SourceReferenceError, match="materialised package exceeds bound"):
-        materialise(wire, view, "request", provider_schema=PROVIDER_SCHEMA)
+        materialise_v17(wire, view, "request", provider_schema=_V17_PROVIDER_SCHEMA)
 
 
 def test_reference_receipt_replay_is_idempotent_and_conflict_rolls_back(tmp_path, monkeypatch):
@@ -370,11 +373,13 @@ def test_reference_receipt_replay_is_idempotent_and_conflict_rolls_back(tmp_path
         assert connection.execute("SELECT kind,payload_json,payload_digest FROM ledger ORDER BY seq").fetchall() == before
 
 
-def test_current_v17_reads_frozen_v16_full_package_without_relabelling_or_dispatch(tmp_path, monkeypatch):
+def test_current_v18_reads_frozen_v16_full_package_without_relabelling_or_dispatch(tmp_path, monkeypatch):
     from newsroom.tests.test_native_assessor import _use_historical_v16
 
     candidate, base, source, acquired, view, wire, _row, _body = _literal_reference_inputs()
-    package, _receipt = materialise(wire, view, 'historical-request', provider_schema=PROVIDER_SCHEMA)
+    package, _receipt = materialise_v17(
+        wire, view, 'historical-request', provider_schema=_V17_PROVIDER_SCHEMA,
+    )
     historical_execution = NativeAssessmentExecution(canonical_json_bytes(package).decode(), dict(_USAGE))
     with monkeypatch.context() as historical:
         _use_historical_v16(historical)
@@ -387,7 +392,7 @@ def test_current_v17_reads_frozen_v16_full_package_without_relabelling_or_dispat
     _service, current_usage = _usage(tmp_path, monkeypatch)
     assert current_usage._policy.prompt_contract_version == VERSION
     assessor = AutonomousNativeEvidenceAssessor(
-        lambda _request: pytest.fail('cached v16 result must not dispatch v17'),
+        lambda _request: pytest.fail('cached v16 result must not dispatch v18'),
         usage=current_usage, dispatch_fence=nullcontext,
     )
     result = assessor.assess_with_boundary(candidate, base, (source,), (acquired,),
@@ -399,6 +404,67 @@ def test_current_v17_reads_frozen_v16_full_package_without_relabelling_or_dispat
     with sqlite3.connect(service.path) as connection:
         assert connection.execute("SELECT count(*) FROM model_invocation_allocations").fetchone() == (1,)
         assert connection.execute("SELECT count(*) FROM ledger WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'").fetchone() == (0,)
+
+
+def test_current_v18_reads_frozen_v17_materialisation_without_dispatch(
+    tmp_path, monkeypatch,
+):
+    from newsroom.control_plane import native_assessor as module
+
+    candidate, base, source, acquired, view, wire, _row, _body = (
+        _literal_reference_inputs()
+    )
+    raw = canonical_json_bytes(wire).decode()
+    execution = NativeAssessmentExecution(raw, dict(_USAGE))
+    with monkeypatch.context() as historical:
+        historical.setattr(module, "VERSION", module._V17_PRODUCER_VERSION)
+        historical.setattr(module, "SYSTEM", module._V17_SYSTEM)
+        historical.setattr(module, "PROVIDER_SCHEMA", module._V17_PROVIDER_SCHEMA)
+        historical.setattr(
+            module,
+            "PROVIDER_SCHEMA_DIGEST",
+            module._V17_PROVIDER_SCHEMA_DIGEST,
+        )
+        service, old_usage = _usage(tmp_path, historical)
+        allocation = old_usage.begin(
+            candidate, base, "historical v17 request", source_view=view,
+        )
+        package, receipt = materialise_v17(
+            wire, view, allocation.request_digest,
+            provider_schema=_V17_PROVIDER_SCHEMA,
+        )
+        dispatch_at = old_usage.mark_dispatch(allocation)
+        old_usage.retain_result(
+            allocation, execution, dispatch_at=dispatch_at,
+            materialisation=receipt,
+        )
+        old_usage.complete(
+            allocation, outcome="ASSESSOR_ACCEPTED", execution=execution,
+            provider_dispatched=True, dispatch_at=dispatch_at,
+        )
+    _service, current_usage = _usage(tmp_path, monkeypatch)
+    assessor = AutonomousNativeEvidenceAssessor(
+        lambda _request: pytest.fail("cached v17 result dispatched v18"),
+        usage=current_usage, dispatch_fence=nullcontext,
+    )
+    result = assessor.assess_with_boundary(
+        candidate, base, (source,), (acquired,),
+        before_dispatch=None, cached_only=True,
+    )
+    retained, = current_usage.retained_assessments(candidate, base)
+    assert retained.contract_version == module._V17_PRODUCER_VERSION
+    assert retained.execution.text == canonical_json_bytes(package).decode()
+    assert result.governed_claims[1].claim == (
+        package["package"]["governed_claims"][1]["claim"]
+    )
+    with sqlite3.connect(service.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_invocation_allocations"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ledger "
+            "WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'"
+        ).fetchone() == (1,)
 
 
 def test_rehashed_materialisation_cannot_drop_a_provider_selected_claim(tmp_path, monkeypatch):
