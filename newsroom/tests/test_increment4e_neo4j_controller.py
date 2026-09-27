@@ -824,7 +824,12 @@ def test_indexed_reconciliation_keeps_provenance_refusals(tmp_path, monkeypatch,
         store = boundary._store
         family = store.projection_family_definition('graph.increment4.admitted')
         required = store_module._required_event_ids(snapshot.entities, snapshot.relations)
-        target = sorted(required)[0]
+        # The watermark has an independent mandatory lookup; dropping it from
+        # the required set must not masquerade as a missing-witness injection.
+        target = next(
+            event.event_id for event in snapshot.events
+            if event.event_id in required and event.ledger_seq != snapshot.through_ledger_seq
+        )
         if fault == 'missing_witness':
             original = store_module._required_event_ids
             monkeypatch.setattr(store_module, '_required_event_ids', lambda e, r: original(e, r) - {target})
