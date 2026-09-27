@@ -1171,6 +1171,20 @@ def _reported_output_disposed_invocations(connection: sqlite3.Connection) -> set
     return result
 
 
+def reported_output_rejected_ingests(connection: sqlite3.Connection) -> frozenset[str]:
+    """Read authenticated no-retry obligations, not merely circuit eligibility."""
+    invocations = _reported_output_disposed_invocations(connection)
+    if not invocations:
+        return frozenset()
+    return frozenset(
+        str(_object(raw)["ingest_id"])
+        for invocation_id, raw in connection.execute(
+            "SELECT invocation_id,record_json FROM model_usage_reported_output_dispositions"
+        )
+        if invocation_id in invocations
+    )
+
+
 def _native_disposed_invocation_ids(connection: sqlite3.Connection) -> set[str]:
     rows = connection.execute(
         "SELECT invocation_id FROM model_usage_conservative_dispositions "
