@@ -186,7 +186,7 @@ def test_ods_typed_values_are_not_mislabelled(attributes):
 
 def test_text_box_content_is_not_silently_omitted():
     raw = ods('<table:table-cell><frame xmlns="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"><text-box><text:p>A qualification</text:p></text-box></frame></table:table-cell>')
-    with pytest.raises(ValueError, match='non-cell'): parse(raw)
+    with pytest.raises(ValueError, match='text-bearing drawing'): parse(raw)
 
 
 def test_ods_merged_anchor_records_its_extent():
@@ -212,3 +212,47 @@ def test_rights_notice_markup_is_not_hidden_from_exclusion_check():
     value['details']['body'] = '<p>All rights <em>reserved</em></p>'
     with pytest.raises(ValueError, match='rights exclusion'):
         parse(raw, metadata=json.dumps(value).encode())
+
+
+def test_ods_mult_paragraph_and_annotation_expansion_is_cumulatively_bounded():
+    paragraph = '<text:p><text:s text:c="1048576"/></text:p>'
+    for content in (paragraph * 8, '<office:annotation>' + paragraph * 8 + '</office:annotation>',
+                    ('<office:annotation>' + paragraph + '</office:annotation>') * 8):
+        raw = ods('<table:table-cell office:value-type="string">' + content + '</table:table-cell>')
+        # Test the helper boundary itself, not a later row/output rejection.
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            cell = m._xml(z, 'content.xml').find('.//' + m.T + 'table-cell')
+        with pytest.raises(ValueError, match='cell text exceeds bound'):
+            m._ods_cell(cell)
+
+
+def test_ods_sheet_level_text_box_is_not_silently_omitted():
+    raw = ods()
+    with zipfile.ZipFile(io.BytesIO(raw)) as z: parts = {n: z.read(n) for n in z.namelist()}
+    parts['content.xml'] = parts['content.xml'].decode().replace('</table:table>',
+        '<table:shapes><draw:frame xmlns:draw="' + m.D[1:-1] + '"><draw:text-box><text:p>Provisional totals</text:p></draw:text-box></draw:frame></table:shapes></table:table>')
+    with pytest.raises(ValueError, match='text-bearing drawing'): parse(archive(parts))
+
+
+def test_xlsx_header_footer_qualifications_are_retained():
+    raw = xlsx()
+    with zipfile.ZipFile(io.BytesIO(raw)) as z: parts = {n: z.read(n) for n in z.namelist()}
+    parts['xl/worksheets/sheet1.xml'] = parts['xl/worksheets/sheet1.xml'].decode().replace('</worksheet>',
+        '<headerFooter><oddFooter>Provisional totals must not be treated as final allocations</oddFooter></headerFooter></worksheet>')
+    text = parse(archive(parts), url=ASSET.replace('.ods', '.xlsx')).body_text
+    assert 'Header/footer oddFooter="Provisional totals must not be treated as final allocations"' in text
+
+
+@pytest.mark.parametrize('text,held', [('', False), ('Provisional totals', True)])
+def test_xlsx_text_bearing_drawing_is_held_but_graphics_remain_excluded(text, held):
+    raw = xlsx()
+    with zipfile.ZipFile(io.BytesIO(raw)) as z: parts = {n: z.read(n) for n in z.namelist()}
+    parts['xl/worksheets/sheet1.xml'] = parts['xl/worksheets/sheet1.xml'].decode().replace('</worksheet>',
+        f'<drawing xmlns:r="{m.R[1:-1]}" r:id="note"/></worksheet>')
+    parts['xl/worksheets/_rels/sheet1.xml.rels'] = f'<Relationships xmlns="{m.P[1:-1]}"><Relationship Id="note" Type="{m.R[1:-1]}/drawing" Target="../drawings/drawing1.xml"/></Relationships>'
+    parts['xl/drawings/drawing1.xml'] = f'<drawing xmlns:a="{m.A[1:-1]}"><a:t>{text}</a:t></drawing>'
+    if held:
+        with pytest.raises(ValueError, match='text-bearing drawing'):
+            parse(archive(parts), url=ASSET.replace('.ods', '.xlsx'))
+    else:
+        assert 'Funding values' in parse(archive(parts), url=ASSET.replace('.ods', '.xlsx')).body_text

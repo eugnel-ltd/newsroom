@@ -55,6 +55,8 @@ X = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
 S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 P = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+D = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +181,16 @@ class _Text:
             self.line(f"Row {number}: " + "; ".join(f"{_column(col)}={val}" for col, val in cells))
 
 
+def _bounded_join(parts, separator=""):
+    retained, size = [], 0
+    for part in parts:
+        size += len(part.encode()) + (len(separator.encode()) if retained else 0)
+        if size > MAX_BODY_BYTES:
+            raise ValueError("spreadsheet cell text exceeds bound")
+        retained.append(part)
+    return separator.join(retained)
+
+
 def _ods_text(node):
     result = [node.text or ""]
     size = len(result[0])
@@ -201,7 +213,7 @@ def _ods_text(node):
 
 def _ods_cell(cell):
     paragraphs = cell.findall(X + "p")
-    text = "\n".join(_ods_text(p) for p in paragraphs)
+    text = _bounded_join((_ods_text(p) for p in paragraphs), "\n")
     kind = cell.get(O + "value-type")
     formula = cell.get(T + "formula")
     attr = {"float": "value", "percentage": "value", "currency": "value",
@@ -258,7 +270,10 @@ def _ods_cell(cell):
             raise ValueError("spreadsheet non-cell content is unsupported")
     annotations = cell.findall(O + "annotation")
     for annotation in annotations:
-        result += " [note=" + _quoted("\n".join(_ods_text(p) for p in annotation.findall(X + "p"))) + "]"
+        note = _bounded_join((_ods_text(p) for p in annotation.findall(X + "p")), "\n")
+        result = _bounded_join((result, " [note=", _quoted(note), "]"))
+    if len(result.encode()) > MAX_BODY_BYTES:
+        raise ValueError("spreadsheet cell text exceeds bound")
     return result
 
 
@@ -268,6 +283,8 @@ def _ods(archive, output):
     root = _xml(archive, "content.xml")
     if root.tag != O + "document-content":
         raise ValueError("spreadsheet ODS root differs")
+    if any(True for _ in root.iter(D + "text-box")):
+        raise ValueError("spreadsheet text-bearing drawing is unsupported")
     if root.findall("./" + O + "scripts") or root.findall(".//" + T + "table-source"):
         raise ValueError("spreadsheet executable or linked table is unsupported")
     sheets = root.findall("./" + O + "body/" + O + "spreadsheet/" + T + "table")
@@ -386,6 +403,25 @@ def _xlsx(archive, output):
             if not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}:[A-Z]{1,3}[1-9][0-9]{0,6}", area):
                 raise ValueError("spreadsheet merged range differs")
             output.line("Merged cells " + area + " (value at anchor)")
+        for footer in tree.findall("./" + S + "headerFooter/*"):
+            if footer.text:
+                output.line("Header/footer " + etree.QName(footer).localname + "=" + _quoted(footer.text))
+        drawings = tree.findall(S + "drawing")
+        if drawings:
+            folder, filename = posixpath.split(target)
+            sheet_rels = _relationships(archive, folder + "/_rels/" + filename + ".rels")
+            for drawing in drawings:
+                relation = sheet_rels.get(drawing.get(R + "id"))
+                if (relation is None or relation.get("TargetMode", "Internal") != "Internal"
+                        or relation.get("Type") != R[1:-1] + "/drawing"):
+                    raise ValueError("spreadsheet drawing reference differs")
+                location = relation.get("Target", "")
+                location = location.lstrip("/") if location.startswith("/xl/") else posixpath.normpath(folder + "/" + location)
+                if not location.startswith("xl/drawings/"):
+                    raise ValueError("spreadsheet drawing location differs")
+                graphic = _xml(archive, location)
+                if any((n.text or "").strip() for n in graphic.iter(A + "t")):
+                    raise ValueError("spreadsheet text-bearing drawing is unsupported")
         previous_row = 0
         for row in tree.findall("./" + S + "sheetData/" + S + "row"):
             row_number = _bounded_int(row.get("r"), MAX_ROWS)
