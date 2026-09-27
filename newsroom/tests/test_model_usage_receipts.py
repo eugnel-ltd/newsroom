@@ -264,12 +264,14 @@ def test_v1_store_replays_v2_context_manifest_migration_idempotently(
             "model-usage-v4-conservative-disposition",
             "newsroom.model-usage.v4",
         ),
+        ("model-usage-v5-reported-output-disposition", "newsroom.model-usage.v5"),
     ]
     assert "model_invocation_context_manifests" in tables
     assert "model_invocation_context_observations" in tables
     assert "graphiti_internal_requests" in tables
     assert "graphiti_internal_request_refusals" in tables
     assert "model_usage_conservative_dispositions" in tables
+    assert "model_usage_reported_output_dispositions" in tables
     assert "issue_790_graphiti_retry_exclusions" in tables
     assert "issue_790_bounded_canary_consumptions" in tables
     assert "issue_790_bounded_canary_outcomes" in tables
@@ -6322,14 +6324,14 @@ def test_hermes_usage_command_exports_shared_receipts_as_json_and_csv(
 
     assert hermes.main(common) == 0
     json_report = json.loads(capsys.readouterr().out)
-    assert json_report["schema_version"] == "newsroom.model-usage.v4"
+    assert json_report["schema_version"] == "newsroom.model-usage.v5"
     assert json_report["leaf_dispatch_count"] == 1
     assert json_report["observed_total_tokens"] == 125
 
     assert hermes.main([*common, "--usage-format", "leaf-csv"]) == 0
     rows = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
     assert [row["invocation_id"] for row in rows] == [allocation.invocation_id]
-    assert rows[0]["schema_version"] == "newsroom.model-usage.v4"
+    assert rows[0]["schema_version"] == "newsroom.model-usage.v5"
     assert rows[0]["allocation_schema_version"] == "newsroom.model-usage.v3"
 
 
@@ -6365,7 +6367,7 @@ def test_hermes_usage_command_exports_allocation_free_envelope_outcome(
 
     assert hermes.main(common) == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["schema_version"] == "newsroom.model-usage.v4"
+    assert report["schema_version"] == "newsroom.model-usage.v5"
     assert report["leaf_dispatch_count"] == 0
     assert report["envelope_outcome_counts"] == {"HOLD": 1}
     assert report["envelopes"][0]["outcome"] == "HOLD"

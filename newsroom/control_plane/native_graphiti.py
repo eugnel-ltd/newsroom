@@ -37,7 +37,7 @@ from .graphiti_fallback_policy import (
 from .graphiti_requests import load_checked_native_graphiti_call_shape_policy
 from .graphiti_admission import GraphitiAdmissionConsumerError
 from .graphiti_admission_integration import compose_existing_graphiti_admission_consumer
-from .model_usage import ModelUsageService
+from .model_usage import ModelUsageAdmissionError, ModelUsageService
 from .native_cycle import _uuid4_for
 from .store import append_ledger, graphiti_failure_state
 from .veto import OperatorDrainRequested, VetoError
@@ -511,7 +511,40 @@ class NativeGraphitiProcessor:
     ) -> None:
         if self._usage is None:
             return
-        for ingest_id in sorted({unit.ingest_id for unit in units}):
+        units_by_ingest = {unit.ingest_id: unit for unit in units}
+        for ingest_id in sorted(units_by_ingest):
+            output_rejections = self._connection.execute(
+                "SELECT a.invocation_id,a.canonical_digest,t.terminal_digest "
+                "FROM model_work_envelopes e INDEXED BY model_usage_native_graphiti_ingest "
+                "JOIN model_invocation_allocations a ON a.envelope_id=e.envelope_id "
+                "JOIN model_invocation_terminals t ON t.invocation_id=a.invocation_id "
+                "WHERE e.workload_class='GRAPHITI_CHAT_PRIMARY' "
+                "AND json_extract(e.record_json,'$.ingest_id')=? "
+                "AND a.route='GRAPHITI_CHAT_PRIMARY' AND a.provider='cursor-agent-cli' "
+                "AND t.outcome='OUTPUT_LIMIT_EXCEEDED' AND t.usage_status='REPORTED' "
+                "AND t.failure_class IS NULL "
+                "AND EXISTS (SELECT 1 FROM model_work_outcomes o WHERE o.envelope_id=e.envelope_id "
+                "AND o.outcome='GRAPHITI_FAILED') "
+                "AND json_extract(t.record_json,'$.policy_breach')='REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED' "
+                "AND (NOT EXISTS (SELECT 1 FROM model_usage_reported_output_dispositions d "
+                "WHERE d.invocation_id=a.invocation_id) OR a.invocation_id=("
+                "SELECT CASE WHEN state='OPEN' THEN invocation_id END "
+                "FROM model_usage_route_circuit_events WHERE route=a.route "
+                "ORDER BY recorded_at DESC,rowid DESC LIMIT 1))",
+                (ingest_id,),
+            ).fetchall()
+            for invocation_id, allocation_digest, terminal_digest in output_rejections:
+                self._stop_check()
+                try:
+                    self._usage.disposition_native_reported_output_rejection(
+                        invocation_id=invocation_id, revision_id=units_by_ingest[ingest_id].revision_id,
+                        expected_terminal_digest=terminal_digest, expected_allocation_digest=allocation_digest,
+                        observed_at=self._clock(),
+                    )
+                except ModelUsageAdmissionError:
+                    # Ineligible/partially settled work retains its global HOLD.
+                    # Contradictory retained proof still raises IntegrityError.
+                    continue
             rows = self._connection.execute(
                 "SELECT a.invocation_id,a.canonical_digest,t.terminal_digest,e.record_json "
                 "FROM model_work_envelopes e INDEXED BY model_usage_native_graphiti_ingest "
