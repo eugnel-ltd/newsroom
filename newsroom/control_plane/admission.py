@@ -106,7 +106,7 @@ _PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS = frozenset(
     "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v1+"
     "newsroom.qualification-relation.v2"
 }
-QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v2"
+QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v3"
 WRITE_ADMISSION_POLICY_VERSION = (
     "newsroom.write-admission.v9+"
     f"{EVID_012_POLICY_VERSION}+{EVIDENCE_APPROVAL_POLICY_VERSION}+"
@@ -361,6 +361,43 @@ def _operational_replacement_is_proven(
     return not _qualification_text_is_negative(negative_text)
 
 
+def _elapsed_official_deadline_is_proven(
+    span: str, claim: GovernedClaimEvidence, *, source_context: str,
+) -> bool:
+    """Prove an elapsed deadline, not a predicted/changed date or clipped denial."""
+    if re.fullmatch(
+        r"The (?:deadline|closing date) for [^.;!?\n]{1,180} "
+        r"has now (?:passed|expired)\.?", span,
+    ) is None:
+        return False
+    exact = span.rstrip(".")
+    claim_sentences = {
+        part.strip().rstrip(".") for text in (claim.claim, claim.supporting_excerpt)
+        for part in re.split(r"[.!?。！？]+", text)
+    }
+    if exact not in claim_sentences:
+        return False
+    source_sentences = [part.strip() for part in re.split(r"[.!?。！？]+", source_context)]
+    containing = [part for part in source_sentences if exact in part]
+    if not containing:
+        return False
+    for sentence in containing:
+        # Canonical page text can prepend its heading without punctuation.
+        # Keep that full prefix (including line wraps/semicolons) when checking
+        # denial, condition and modality; an excerpt must not excise them.
+        if not sentence.endswith(exact):
+            return False
+        # This proved official form name is a noun, not a prediction. No other
+        # occurrence of forecast/assessment/proposal is exempted.
+        checked = re.sub(r"\bbudget forecast return\b", "return", sentence, flags=re.IGNORECASE)
+        if _qualification_text_is_negative(checked) or re.search(
+            r"\b(?:if|unless|subject to|conditional(?:ly)?|pending)\b", checked,
+            flags=re.IGNORECASE,
+        ):
+            return False
+    return True
+
+
 def _qualification_relation_is_proven(
     qualification: QualificationEvidence, claim: GovernedClaimEvidence, *, source_context: str
 ) -> bool:
@@ -389,6 +426,19 @@ def _qualification_relation_is_proven(
         ].search(span)
     )
     qualification_fields = dict(qualification.test_evidence)
+    deadline_state = (
+        qualification.test is Evid012QualificationTest.LAW_RIGHT_STATUS_POLICY
+        and qualification_fields.get("change_kind") == "OFFICIAL_DEADLINE"
+        and qualification_fields.get("new_state") == span
+    ) or (
+        qualification.test is Evid012QualificationTest.OFFICIAL_ACTION_OR_DEADLINE
+        and qualification_fields.get("action_class") == "OFFICIAL_DEADLINE"
+        and qualification_fields.get("reader_action") == span
+    )
+    if len(spans) == 1 and deadline_state and _elapsed_official_deadline_is_proven(
+        span, claim, source_context=source_context,
+    ):
+        return True
     authority_instruction = re.search(
         r"(?:official|authority|government|department|agency|"
         r"政府|當局|当局|部門|部门|機構|机构|署|局).{0,48}"

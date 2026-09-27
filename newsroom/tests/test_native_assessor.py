@@ -2317,3 +2317,29 @@ def test_weather_record_metadata_failure_revalidates_once_per_consumer_contract(
     assert assessment_revalidation_due(facts, ASSESSMENT_CONTRACT_VERSION)
     facts["assessment_contract_version"] = ASSESSMENT_CONTRACT_VERSION
     assert not assessment_revalidation_due(facts, ASSESSMENT_CONTRACT_VERSION)
+
+
+def test_retained_elapsed_deadline_qualification_preserves_claims_without_new_model_output(
+    retained_22589_assessment,
+):
+    # Facts and classifier are the unchanged accounted result43452. Only the
+    # fixture source/candidate identity replaces live IDs; no provider executes.
+    witness = json.loads((Path(__file__).parent / 'fixtures/native_assessor/deadline-43452.json').read_text())
+    candidate, base, source, acquired, raw = _qualification_assessor_inputs(
+        retained_22589_assessment, kind='policy',
+    )
+    claims = [{**item, 'source_ids': [source.unit.source_id]} for item in witness['governed_claims']]
+    raw['package'].update(
+        governed_claims=claims,
+        substantive_new_information=[item['claim'] for item in claims],
+        qualification_evidence=witness['qualification_evidence'],
+    )
+    body = witness['source_text'].encode()
+    acquired = SimpleNamespace(**{**vars(acquired), 'body': body, 'body_digest': digest_bytes(body)})
+    execution = NativeAssessmentExecution(canonical_json_bytes(raw).decode(), {})
+    result = AutonomousNativeEvidenceAssessor._validated_execution(
+        execution, candidate, base, (source,), (acquired,),
+    )
+    assert [claim.claim for claim in result.governed_claims] == [item['claim'] for item in claims]
+    assert [item.governed_claim_id for item in result.qualification_evidence] == ['c1']
+    assert dict(result.qualification_evidence[0].test_evidence)['change_kind'] == 'OFFICIAL_DEADLINE'
