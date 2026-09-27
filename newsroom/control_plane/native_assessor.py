@@ -109,6 +109,15 @@ def assessment_revalidation_due(facts: dict, contract_version: str | None) -> bo
     )
 
 
+def assessor_admission_recovery_due(facts: dict) -> bool:
+    """Identify only the pre-dispatch assessor admission interruption."""
+    return (
+        facts.get("reason") == "ACQUISITION_RESULT_NOT_RETAINED"
+        and facts.get("failure_class") == "ModelUsageAdmissionError"
+        and not facts.get("assessment_started_at")
+    )
+
+
 def same_assessment_producer(previous: str | None, current: str | None) -> bool:
     return (
         type(previous) is str and type(current) is str
@@ -120,8 +129,10 @@ ROUTE = "NATIVE_EVIDENCE_ASSESSOR"
 CONTEXT_IDENTITY = "native-evidence-exact-acquisition-v1"
 CONFIG_IDENTITY = "native-evidence-assessor-grok-hermetic-command-v1"
 CONTEXT_MANIFEST_SCHEMA_VERSION = (
-    "newsroom.native-evidence-assessor.context-manifest.v1"
+    "newsroom.native-evidence-assessor.context-manifest.v2"
 )
+INPUT_BOUND_VERSION = "newsroom.native-evidence-assessor.input-bound.v1"
+_FRAMING_RESERVE_TOKENS = 16_384
 SYSTEM = (
     "You are a one-turn evidence extraction transform. Use only the supplied "
     "candidate and exact source bytes. Return JSON matching the schema. "
@@ -483,6 +494,35 @@ class RetainedAssessorPreDispatchFailure:
     envelope_inventory_digest: str
 
 
+def native_assessment_input_bound(policy: InvocationEfficiencyPolicy) -> dict[str, object]:
+    """Conservatively admit exact UTF-8 request bytes before provider dispatch.
+
+    A byte ceiling is not a prediction of provider tokenisation; reported
+    provider usage remains subject to the existing context and total limits.
+    """
+    system_bytes = SYSTEM.encode("utf-8")
+    schema_bytes = canonical_json_bytes(SCHEMA)
+    fixed = len(system_bytes) + len(schema_bytes) + _FRAMING_RESERVE_TOKENS
+    record: dict[str, object] = {
+        "version": INPUT_BOUND_VERSION,
+        "system_digest": digest_bytes(system_bytes),
+        "system_bytes": len(system_bytes),
+        "schema_digest": SCHEMA_DIGEST,
+        "schema_bytes": len(schema_bytes),
+        "framing_reserve_tokens": _FRAMING_RESERVE_TOKENS,
+        "output_reserve_tokens": policy.max_output_tokens,
+        "max_context_tokens": policy.max_context_tokens,
+        "max_total_tokens": policy.max_total_tokens,
+        "max_request_bytes": min(
+            policy.max_prompt_bytes,
+            policy.max_context_tokens - fixed,
+            policy.max_total_tokens - fixed - policy.max_output_tokens,
+        ),
+    }
+    record["bound_digest"] = digest_canonical(record)
+    return record
+
+
 class NativeAssessmentUsage:
     """Persist exact native-assessor intent, dispatch and terminal usage."""
 
@@ -533,12 +573,17 @@ class NativeAssessmentUsage:
     def begin(self, candidate, base, prompt: str) -> InvocationAllocation:
         now = self._clock().astimezone(UTC)
         prompt_bytes = prompt.encode()
+        policy = self._policy
+        input_bound = native_assessment_input_bound(policy)
+        if input_bound["max_request_bytes"] <= 0 or len(prompt_bytes) > input_bound["max_request_bytes"]:
+            raise NativeEvidenceHold(
+                "ASSESSOR_EXACT_INPUT_BOUND_HOLD", candidate.candidate_id
+            )
         package_bytes = canonical_json_bytes(evidence_package_value(base))
         command_version = read_grok_command_semantic_version()
         implementation_revision, implementation_clean = (
             cont_writer_implementation_identity()
         )
-        policy = self._policy
         if implementation_clean is not True:
             raise NativeEvidenceHold(
                 "ASSESSOR_IMPLEMENTATION_DIRTY_HOLD", candidate.candidate_id
@@ -557,6 +602,7 @@ class NativeAssessmentUsage:
             "prompt_contract_version": VERSION,
             "prompt_bytes": len(prompt_bytes),
             "prompt_digest": digest_bytes(prompt_bytes),
+            "input_bound": input_bound,
             "schema_digest": SCHEMA_DIGEST,
             "output_schema_digest": SCHEMA_DIGEST,
             "system_digest": digest_bytes(SYSTEM.encode()),
@@ -605,7 +651,7 @@ class NativeAssessmentUsage:
             ingest_id=None,
             graphiti_attempt_id=None,
         )
-        self._service.open_envelope(envelope)
+        envelope = self._service.resume_or_open_native_assessor_envelope(envelope)
         self._service.retain_context_manifest(manifest)
         allocation = InvocationAllocation.create(
             envelope_id=envelope.envelope_id,
@@ -854,7 +900,7 @@ class NativeAssessmentUsage:
                     envelope = _envelope_from_record(envelope_record)
                 except (TypeError, ValueError, ModelUsageIntegrityError):
                     return None
-                if tuple(row[:5]) != (
+                if canonical_json_bytes(envelope_record).decode() != row[5] or tuple(row[:5]) != (
                     envelope.envelope_id,
                     envelope.cycle_id,
                     envelope.workload_class.value,
@@ -866,6 +912,11 @@ class NativeAssessmentUsage:
                     envelope.candidate_id != candidate_id
                     or envelope.hypothesis_digest != hypothesis_digest
                 ):
+                    if envelope.candidate_id == candidate_id and connection.execute(
+                        "SELECT 1 FROM model_invocation_allocations WHERE envelope_id=?",
+                        (envelope.envelope_id,),
+                    ).fetchone() is None:
+                        return None
                     continue
                 if envelope.evidence_package_digest is None:
                     return None
@@ -876,6 +927,19 @@ class NativeAssessmentUsage:
                     "FROM model_invocation_allocations WHERE envelope_id=?",
                     (envelope.envelope_id,),
                 ).fetchall()
+                if not allocation_rows:
+                    # An exact current-version envelope with no allocation
+                    # cannot have dispatched. Its admission may resume; older
+                    # or differently bound envelopes remain unresolved.
+                    if (
+                        base is None
+                        or envelope.evidence_package_digest != base.digest
+                        or envelope.cycle_id != _assessment_cycle_id(
+                            version_id, base.digest, VERSION,
+                        )
+                    ):
+                        return None
+                    continue
                 if len(allocation_rows) != 1:
                     return None
                 allocation_row = allocation_rows[0]
@@ -1168,7 +1232,7 @@ class NativeAssessmentUsage:
     def retained_pre_dispatch_failure(
         self, candidate: object
     ) -> RetainedAssessorPreDispatchFailure | None:
-        """Prove that no assessor envelope existed for this exact Candidate."""
+        """Prove no assessor leaf was ever allocated for this exact Candidate."""
 
         candidate_id = getattr(candidate, "candidate_id", None)
         version_id = getattr(candidate, "version_id", None)
@@ -1184,8 +1248,11 @@ class NativeAssessmentUsage:
             connection.execute("BEGIN")
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 return None
+            if self._service._route_state(connection, ROUTE)["state"] != "CLOSED":
+                return None
             inventory = []
             envelopes = {}
+            candidate_envelopes = set()
             for row in connection.execute(
                 "SELECT envelope_id,cycle_id,workload_class,admitted_at,"
                 "canonical_digest,record_json FROM model_work_envelopes "
@@ -1209,9 +1276,15 @@ class NativeAssessmentUsage:
                     continue
                 inventory.append(envelope.canonical_digest)
                 if envelope.candidate_id == candidate_id:
-                    # The envelope is durably retained before any allocation.
-                    # Its presence makes a historical no-dispatch claim unsafe.
-                    return None
+                    if (
+                        envelope.hypothesis_digest != manifest_digest
+                        or envelope.evidence_package_digest is None
+                        or envelope.cycle_id != _assessment_cycle_id(
+                            version_id, envelope.evidence_package_digest, VERSION,
+                        )
+                    ):
+                        return None
+                    candidate_envelopes.add(envelope.envelope_id)
             allocations = {}
             for row in connection.execute(
                 "SELECT invocation_id,envelope_id,cycle_id,leaf_ordinal,"
@@ -1246,6 +1319,8 @@ class NativeAssessmentUsage:
                 ):
                     return None
                 allocations[allocation.invocation_id] = allocation
+                if allocation.envelope_id in candidate_envelopes:
+                    return None
                 if allocation.workload_class is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR:
                     if (
                         envelopes[allocation.envelope_id].workload_class

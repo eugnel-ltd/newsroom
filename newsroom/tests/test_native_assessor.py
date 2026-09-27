@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
-from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
+from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from newsroom.control_plane.admission import DeterministicWriteAdmission
 from newsroom.control_plane.evidence import (
     EvidencePackage,
@@ -23,6 +23,7 @@ from newsroom.control_plane.native_assessor import (
     CONFIG_IDENTITY,
     CONTEXT_IDENTITY,
     CONTEXT_MANIFEST_SCHEMA_VERSION,
+    INPUT_BOUND_VERSION,
     NativeAssessmentExecution,
     NativeAssessmentUsage,
     REASSESSABLE_HOLDS,
@@ -31,6 +32,8 @@ from newsroom.control_plane.native_assessor import (
     SYSTEM,
     VERSION,
     _MAX_RETAINED_RESULT_BYTES,
+    assessor_admission_recovery_due,
+    native_assessment_input_bound,
 )
 from newsroom.control_plane.native_evidence import (
     EvidenceAssessor,
@@ -56,6 +59,21 @@ from newsroom.tests.test_increment10_ingress import _candidate
 
 
 REVISION = "1" * 40
+
+
+@pytest.mark.parametrize(("changes", "expected"), [
+    ({}, True),
+    ({"reason": "ASSESSOR_TRANSPORT_HOLD"}, False),
+    ({"failure_class": "OtherError"}, False),
+    ({"assessment_started_at": "2026-09-27T10:00:00+00:00"}, False),
+    ({"assessment_started_at": None}, True),
+])
+def test_assessor_admission_recovery_predicate_is_pre_dispatch_only(changes, expected):
+    facts = {
+        "reason": "ACQUISITION_RESULT_NOT_RETAINED",
+        "failure_class": "ModelUsageAdmissionError",
+    }
+    assert assessor_admission_recovery_due(facts | changes) is expected
 
 
 def _model_package_value(package):
@@ -1334,6 +1352,91 @@ def _usage(tmp_path, monkeypatch):
     )
 
 
+def test_native_assessor_input_bound_includes_fixed_input_and_output_reserve(
+    tmp_path, monkeypatch,
+) -> None:
+    _service, usage = _usage(tmp_path, monkeypatch)
+    policy = usage._policy
+    bound = native_assessment_input_bound(policy)
+    assert bound['version'] == INPUT_BOUND_VERSION
+    assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v2')
+    assert VERSION.endswith('.v15')
+    assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
+    assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
+    assert bound['schema_digest'] == SCHEMA_DIGEST
+    assert bound['schema_bytes'] == len(canonical_json_bytes(SCHEMA))
+    assert bound['framing_reserve_tokens'] == 16_384
+    assert bound['output_reserve_tokens'] == policy.max_output_tokens
+    fixed = bound['system_bytes'] + bound['schema_bytes'] + 16_384
+    assert bound['max_request_bytes'] == min(
+        policy.max_prompt_bytes, policy.max_context_tokens - fixed,
+        policy.max_total_tokens - fixed - policy.max_output_tokens,
+    )
+    assert bound['bound_digest'] == digest_canonical({
+        key: value for key, value in bound.items() if key != 'bound_digest'
+    })
+    assert native_assessment_input_bound(policy) == bound
+    assert native_assessment_input_bound(replace(
+        policy, max_context_tokens=policy.max_context_tokens - 1,
+    ))['max_request_bytes'] <= bound['max_request_bytes']
+    assert native_assessment_input_bound(replace(
+        policy, max_total_tokens=policy.max_total_tokens - 1,
+    ))['max_request_bytes'] < bound['max_request_bytes']
+
+
+@pytest.mark.parametrize('request_bytes', [26_051, 19_254, 397_776])
+def test_native_assessor_exact_request_bound_precedes_allocation(
+    tmp_path, monkeypatch, request_bytes,
+) -> None:
+    connection, _port, candidate = _candidate(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    service, usage = _usage(tmp_path, monkeypatch)
+    bound = native_assessment_input_bound(usage._policy)
+    assert 26_051 <= bound['max_request_bytes'] < 397_776
+    try:
+        if request_bytes > bound['max_request_bytes']:
+            with pytest.raises(NativeEvidenceHold) as held:
+                usage.begin(candidate, base, 'x' * request_bytes)
+            assert held.value.reason_code == 'ASSESSOR_EXACT_INPUT_BOUND_HOLD'
+            with sqlite3.connect(service.path) as retained:
+                for table in (
+                    'model_work_envelopes', 'model_invocation_context_manifests',
+                    'model_invocation_allocations', 'model_transport_observations',
+                ):
+                    assert retained.execute(f'SELECT count(*) FROM {table}').fetchone() == (0,)
+        else:
+            allocation = usage.begin(candidate, base, 'x' * request_bytes)
+            assert allocation.prompt_bytes == request_bytes
+            with sqlite3.connect(service.path) as retained:
+                raw, = retained.execute(
+                    'SELECT record_json FROM model_invocation_context_manifests'
+                ).fetchone()
+                manifest = json.loads(raw)
+                assert manifest['input_bound'] == bound
+                assert manifest['schema_version'] == CONTEXT_MANIFEST_SCHEMA_VERSION
+                assert retained.execute('SELECT count(*) FROM model_transport_observations').fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def test_native_assessor_exact_byte_ceiling_and_plus_one(tmp_path, monkeypatch) -> None:
+    connection, _port, candidate = _candidate(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    service, usage = _usage(tmp_path, monkeypatch)
+    maximum = native_assessment_input_bound(usage._policy)['max_request_bytes']
+    try:
+        with pytest.raises(NativeEvidenceHold) as held:
+            usage.begin(candidate, base, 'é' * ((maximum // 2) + 1))
+        assert held.value.reason_code == 'ASSESSOR_EXACT_INPUT_BOUND_HOLD'
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT count(*) FROM model_work_envelopes').fetchone() == (0,)
+        exact = 'é' * (maximum // 2) + ('x' if maximum % 2 else '')
+        allocation = usage.begin(candidate, base, exact)
+        assert allocation.prompt_bytes == maximum
+    finally:
+        connection.close()
+
+
 def test_native_assessor_uses_exact_candidate_and_base_without_ambient_context(
     tmp_path, monkeypatch,
 ) -> None:
@@ -1519,6 +1622,77 @@ def test_native_assessor_pre_dispatch_recovery_requires_zero_exact_envelopes(
         ).fetchone() == (1,)
     assert usage.retained_pre_dispatch_failure(other) is None
     connection.close()
+
+
+def test_native_assessor_resumes_only_exact_empty_envelope_when_route_eligible(
+    tmp_path, monkeypatch,
+) -> None:
+    connection, _port, candidate = _candidate(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    service, usage = _usage(tmp_path, monkeypatch)
+    from newsroom.control_plane.native_assessor import _assessment_cycle_id
+    envelope = WorkEnvelope.create(
+        cycle_id=_assessment_cycle_id(candidate.version_id, base.digest, VERSION),
+        workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+        admitted_at=datetime(2026, 9, 7, tzinfo=UTC),
+        admission_decision_id=None, candidate_id=candidate.candidate_id,
+        hypothesis_digest=candidate.governing_manifest.canonical_digest,
+        evidence_package_digest=base.digest, ingest_id=None, graphiti_attempt_id=None,
+    )
+    service.open_envelope(envelope)
+    try:
+        assert usage.retained_assessments(candidate, base) == ()
+        assert usage.retained_pre_dispatch_failure(candidate) is not None
+        allocation = usage.begin(candidate, base, 'exact resumed request')
+        assert allocation.envelope_id == envelope.envelope_id
+        assert usage.retained_pre_dispatch_failure(candidate) is None
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT count(*) FROM model_work_envelopes').fetchone() == (1,)
+            assert retained.execute('SELECT count(*) FROM model_invocation_allocations').fetchone() == (1,)
+            assert retained.execute('SELECT count(*) FROM model_transport_observations').fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('defect', ['wrong-manifest', 'wrong-cycle', 'route-open', 'different-base'])
+def test_native_assessor_empty_envelope_mismatch_remains_unresolved(
+    tmp_path, monkeypatch, defect,
+) -> None:
+    connection, _port, candidate = _candidate(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    service, usage = _usage(tmp_path, monkeypatch)
+    from newsroom.control_plane.native_assessor import _assessment_cycle_id
+    retained_base_digest = digest_bytes(b'different base') if defect == 'different-base' else base.digest
+    envelope = WorkEnvelope.create(
+        cycle_id=(digest_bytes(b'wrong cycle') if defect == 'wrong-cycle' else
+                  _assessment_cycle_id(candidate.version_id, retained_base_digest, VERSION)),
+        workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+        admitted_at=datetime(2026, 9, 7, tzinfo=UTC),
+        admission_decision_id=None, candidate_id=candidate.candidate_id,
+        hypothesis_digest=(digest_bytes(b'wrong manifest') if defect == 'wrong-manifest' else
+                           candidate.governing_manifest.canonical_digest),
+        evidence_package_digest=retained_base_digest,
+        ingest_id=None, graphiti_attempt_id=None,
+    )
+    service.open_envelope(envelope)
+    if defect == 'route-open':
+        with service._connection() as retained:
+            service._append_route_state(
+                retained, route='NATIVE_EVIDENCE_ASSESSOR', state='OPEN',
+                reason='QUOTA', invocation_id=None,
+                recorded_at=datetime(2026, 9, 7, tzinfo=UTC),
+            )
+    try:
+        if defect in {'wrong-manifest', 'wrong-cycle', 'route-open'}:
+            assert usage.retained_pre_dispatch_failure(candidate) is None
+        else:
+            assert usage.retained_pre_dispatch_failure(candidate) is not None
+        if defect != 'route-open':
+            assert usage.retained_assessments(candidate, base) is None
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT count(*) FROM model_invocation_allocations').fetchone() == (0,)
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
