@@ -1581,8 +1581,8 @@ def test_native_quantum_reports_exact_deferred_ids_and_never_projects_chunk_pref
         ]
         assert not dispatched and not calls
         assert connection.total_changes == before
-        prefix = processor.advance(units, cycle_id="prefix")
-        assert [item.state for item in prefix] == ["EXTRACTION_COMPLETE", "GRAPHITI_HOLD", "GRAPHITI_COMPLETE"]
+        prefix = processor.advance(units, cycle_id="prefix", defer_before_unit=lambda unit: unit.ingest_id == second.ingest_id)
+        assert [item.state for item in prefix] == ["EXTRACTION_COMPLETE", "GRAPHITI_DEFERRED", "GRAPHITI_COMPLETE"]
         assert len([call for call in calls if call[0] == "empty-cohort-build"]) == 0
         complete = processor.advance(units, cycle_id="remainder")
         assert all(item.state == "GRAPHITI_COMPLETE" for item in complete)
@@ -1783,5 +1783,124 @@ def test_operation_local_keys_rederive_replacement_units_and_recheck_rights(
         assert len(reads) == 2 and reads[0] != reads[1]
         assert first.body != second.body
         assert connection.execute("SELECT count(*) FROM ledger").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def _linked_native_units(item, count):
+    from newsroom.control_plane.corpus import MAX_EPISODE_BYTES
+    base = replace(_native(item), body='x' * MAX_EPISODE_BYTES * (count - 1), chunk_count=count)
+    units, predecessor = [], None
+    for ordinal in range(1, count + 1):
+        unit = replace(base, chunk_ordinal=ordinal, predecessor_ingest_id=predecessor)
+        units.append(unit)
+        predecessor = unit.ingest_id
+    return tuple(units)
+
+
+def test_native_refreshes_completed_predecessors_within_one_quantum(tmp_path, monkeypatch):
+    from newsroom.tests.test_graphiti_corpus_ingest import _complete as result
+    from newsroom.control_plane.store import has_graphiti_ingest
+    processor, connection, _calls = _open(tmp_path, monkeypatch, ingest=cycle._ingest)
+    chain = _linked_native_units('chain', 3)
+    independent = _native('independent')
+    dispatched = []
+    def ingest(unit):
+        assert not unit.predecessor_ingest_id or has_graphiti_ingest(connection, unit.predecessor_ingest_id)
+        dispatched.append(unit.ingest_id)
+        return result(unit, proposal_count=0, entity_count=0)
+    processor._runner = SimpleNamespace(ingest=ingest)
+    try:
+        outcomes = processor.advance((*chain, independent), cycle_id='drain')
+        assert all(x.state == 'GRAPHITI_COMPLETE' for x in outcomes)
+        # Ready independent work keeps its place before refreshed successors.
+        assert dispatched == [chain[0].ingest_id, independent.ingest_id, chain[1].ingest_id, chain[2].ingest_id]
+        processor.advance((*chain, independent), cycle_id='replay')
+        assert len(dispatched) == 4
+    finally:
+        connection.close()
+
+
+def test_native_refreshed_successors_obey_existing_quantum_and_resume(tmp_path, monkeypatch):
+    from newsroom.tests.test_graphiti_corpus_ingest import _complete as result
+    processor, connection, calls = _open(tmp_path, monkeypatch, ingest=cycle._ingest)
+    chain = _linked_native_units('chain', 3)
+    dispatched = []
+    processor._runner = SimpleNamespace(ingest=lambda unit: (
+        dispatched.append(unit.ingest_id) or result(unit, proposal_count=0, entity_count=0)
+    ))
+    try:
+        outcomes = processor.advance(chain, cycle_id='one', defer_before_unit=lambda _: len(dispatched) >= 1)
+        assert [x.state for x in outcomes] == ['EXTRACTION_COMPLETE', 'GRAPHITI_DEFERRED', 'GRAPHITI_HOLD']
+        assert not any(name == 'finalise' for name, _ in calls)
+        assert all(x.state == 'GRAPHITI_COMPLETE' for x in processor.advance(chain, cycle_id='rest'))
+        assert dispatched == [u.ingest_id for u in chain]
+    finally:
+        connection.close()
+
+
+def test_native_frontier_refresh_does_not_retry_failure_while_peers_progress(tmp_path, monkeypatch):
+    from newsroom.tests.test_graphiti_corpus_ingest import _complete as result
+    from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
+    from newsroom.control_plane.store import graphiti_failure_state
+    processor, connection, _ = _open(tmp_path, monkeypatch, ingest=cycle._ingest)
+    failed_chain = _linked_native_units('failed', 2)
+    good_chain = _linked_native_units('good', 3)
+    dispatched = []
+    def ingest(unit):
+        dispatched.append(unit.ingest_id)
+        completed = result(unit, proposal_count=0, entity_count=0)
+        if unit.ingest_id != failed_chain[0].ingest_id:
+            return completed
+        raw = dict(completed.raw_receipt)
+        raw.pop('raw_output_digest')
+        raw.update(outcome='FAILED', failure_code='PRODUCER_INTERNAL_ERROR')
+        raw['raw_output_digest'] = digest_bytes(canonical_json_bytes(raw))
+        return replace(completed, outcome='FAILED', failure_code='PRODUCER_INTERNAL_ERROR',
+                       raw_receipt=raw, receipt_digest=raw['raw_output_digest'])
+    processor._runner = SimpleNamespace(ingest=ingest)
+    try:
+        outcomes = processor.advance((*failed_chain, *good_chain), cycle_id='mixed')
+        assert [x.state for x in outcomes[:2]] == ['GRAPHITI_HOLD', 'GRAPHITI_HOLD']
+        assert all(x.state == 'GRAPHITI_COMPLETE' for x in outcomes[2:])
+        assert dispatched == [failed_chain[0].ingest_id, *(x.ingest_id for x in good_chain)]
+        assert graphiti_failure_state(connection, failed_chain[0].ingest_id) == (1, False)
+    finally:
+        connection.close()
+
+
+def test_native_refreshed_successor_rechecks_rights_before_dispatch(tmp_path, monkeypatch):
+    from newsroom.tests.test_graphiti_corpus_ingest import _complete as result
+    chain = _linked_native_units('rights', 2)
+    seen, dispatched = [], []
+    def rights(unit):
+        seen.append(unit.ingest_id)
+        return {'current': True} if unit.chunk_ordinal == 1 else None
+    processor, connection, _ = _open(tmp_path, monkeypatch, ingest=cycle._ingest, rights=rights)
+    processor._runner = SimpleNamespace(ingest=lambda unit: (
+        dispatched.append(unit.ingest_id) or result(unit, proposal_count=0, entity_count=0)
+    ))
+    try:
+        outcomes = processor.advance(chain, cycle_id='rights')
+        assert dispatched == [chain[0].ingest_id]
+        assert seen == [chain[0].ingest_id, chain[0].ingest_id, chain[1].ingest_id]
+        assert [x.state for x in outcomes] == ['EXTRACTION_COMPLETE', 'GRAPHITI_HOLD']
+    finally:
+        connection.close()
+
+
+def test_native_route_hold_stops_refresh_without_starting_new_successor(tmp_path, monkeypatch):
+    from newsroom.tests.test_graphiti_corpus_ingest import _complete as result
+    processor, connection, _ = _open(tmp_path, monkeypatch, ingest=cycle._ingest)
+    chain = _linked_native_units('route', 2)
+    dispatched = []
+    processor._runner = SimpleNamespace(ingest=lambda unit: (
+        dispatched.append(unit.ingest_id) or result(unit, proposal_count=0, entity_count=0)
+    ))
+    monkeypatch.setattr(n, 'graphiti_required_route_holds', lambda *_a, **_k: ('UNKNOWN_USAGE',) if dispatched else ())
+    try:
+        outcomes = processor.advance(chain, cycle_id='held-route')
+        assert dispatched == [chain[0].ingest_id]
+        assert outcomes[1].reason == 'REQUIRED_MODEL_ROUTE_CIRCUIT_OPEN'
     finally:
         connection.close()
