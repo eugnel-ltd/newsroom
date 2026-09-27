@@ -355,9 +355,10 @@ def _document_year_localisation(claim: GovernedClaimEvidence) -> tuple[tuple[str
         return ()
     if re.search(r"[+\-−]\s*" + year, source + "\n" + target):
         return ()
-    match = re.search(
-        r"\bthe " + year + r" (?P<title>(?:[A-Za-z]+[ -]){1,9}(?:return|report)) "
-        r"\((?P<term>[A-Z][A-Za-z]{1,9})\)", source, flags=re.IGNORECASE,
+    match = re.fullmatch(
+        r"The (?:deadline|closing date) for the " + year
+        + r" (?P<title>(?:[A-Za-z]+[ -]){1,9}(?:return|report)) "
+        r"\((?P<term>[A-Z][A-Za-z]{1,9})\) has now (?:passed|expired)\.?", source,
     )
     if match is None or not re.search(r"\b(?:annual|budget|financial|academic)\b", match["title"], flags=re.IGNORECASE):
         return ()
@@ -365,10 +366,19 @@ def _document_year_localisation(claim: GovernedClaimEvidence) -> tuple[tuple[str
     if (term not in claim.rendered_named_entities
             or not any(text == term and kind == "OFFICIAL_TERM" for text, kind, _ in claim.named_entity_evidence)):
         return ()
-    if not re.match(
-        re.escape(year) + r"年[^0-9零〇一二三四五六七八九十百千萬億年月日時分秒%％]{1,80}[（(]"
-        + re.escape(term) + r"[)）]", target.lstrip(),
-    ):
+    rendered = re.fullmatch(
+        re.escape(year) + r"年(?P<title>[^0-9零〇一二三四五六七八九十百千萬億年月日時分秒%％]{1,80})[（(]"
+        + re.escape(term) + r"[)）]的(?:截止日期|限期)現已(?:過|屆滿)\。?", target,
+    )
+    if rendered is None:
+        return ()
+    if re.search(
+        r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+        r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+        r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|"
+        r"billion|trillion|half|quarter|dozen|first|second|third)\b", match["title"],
+        flags=re.IGNORECASE,
+    ) or re.search(r"[半數数幾几首第廿卅]", rendered["title"]):
         return ()
     return ((year, year + "年"),)
 
@@ -378,9 +388,17 @@ def _writer_numeric_localisations(claim: GovernedClaimEvidence) -> tuple[tuple[s
     # Cantonese's indefinite measure phrase is not an invented exact duration.
     # A month/day/hour or any additional numeric fact still faces the ordinary
     # fidelity checks; only this exact source/target phrase is removed.
-    short_periods = tuple(re.finditer(r"\bfor a short period\b", claim.claim, flags=re.IGNORECASE))
-    if len(short_periods) == 1 and claim.rendered_assertion_zh_hant_hk.count("一段短時間") == 1:
-        pairs += ((short_periods[0].group(), "一段短時間"),)
+    short_period = re.fullmatch(
+        r"The form will remain open (?P<period>for a short period)"
+        r"(?P<late> for late submissions)?\.?", claim.claim,
+    )
+    rendered_period = re.fullmatch(
+        r"表格會繼續開放一段短時間(?P<late>，供逾期提交)?。?",
+        claim.rendered_assertion_zh_hant_hk,
+    )
+    if (short_period is not None and rendered_period is not None
+            and bool(short_period["late"]) == bool(rendered_period["late"])):
+        pairs += ((short_period["period"], "一段短時間"),)
     return pairs
 
 

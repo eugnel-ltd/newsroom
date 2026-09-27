@@ -90,3 +90,37 @@ def test_document_year_does_not_erase_number_signs_or_currency(prefix):
     claim = replace(claim, rendered_assertion_zh_hant_hk=prefix + claim.rendered_assertion_zh_hant_hk)
     value = replace(value, governed_claims=(claim, *value.governed_claims[1:]))
     assert checks(value)['NUMERIC_AND_DATE_FIDELITY'] == 'FAIL'
+
+
+@pytest.mark.parametrize('source', [
+    'The form will remain open for a short period of one month for late submissions.',
+    'The form will remain open for a short period of a year for late submissions.',
+    'The form will remain open for a short period lasting one week for late submissions.',
+    'For one month, the form will remain open for a short period.',
+    'The form will remain open for a short period until May.',
+    'From June, the form will remain open for a short period.',
+])
+def test_short_period_does_not_discard_source_precision_or_bounds(source):
+    value = package(); old = value.governed_claims[1]
+    claim = replace(old, claim=source, supporting_excerpt=source)
+    value = replace(value, governed_claims=(value.governed_claims[0], claim, *value.governed_claims[2:]),
+        passages=tuple(p.replace(old.claim, claim.claim) for p in value.passages),
+        substantive_new_information=tuple(claim.claim if x == old.claim else x for x in value.substantive_new_information))
+    assert checks(value)['NUMERIC_AND_DATE_FIDELITY'] == 'FAIL'
+
+
+@pytest.mark.parametrize('extra', [' The deadline expired one day ago.', ' The deadline applies to two schools.'])
+def test_year_equivalence_never_masks_a_second_source_numeric_fact(extra):
+    value = package(); old = value.governed_claims[0]
+    claim = replace(old, claim=old.claim + extra, supporting_excerpt=old.supporting_excerpt + extra)
+    value = replace(value, governed_claims=(claim, *value.governed_claims[1:]),
+        passages=tuple(p.replace(old.claim, claim.claim) for p in value.passages),
+        substantive_new_information=tuple(claim.claim if x == old.claim else x for x in value.substantive_new_information))
+    assert checks(value)['NUMERIC_AND_DATE_FIDELITY'] == 'FAIL'
+
+
+def test_short_period_equivalence_cannot_hide_an_invented_first_period():
+    value = package(); old = value.governed_claims[1]
+    claim = replace(old, rendered_assertion_zh_hant_hk=old.rendered_assertion_zh_hant_hk.replace('一段', '第一段'))
+    value = replace(value, governed_claims=(value.governed_claims[0], claim, *value.governed_claims[2:]))
+    assert checks(value)['NUMERIC_AND_DATE_FIDELITY'] == 'FAIL'
