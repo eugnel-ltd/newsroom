@@ -376,7 +376,11 @@ def _document_year_localisation(claim: GovernedClaimEvidence) -> tuple[tuple[str
         r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
         r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
         r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|"
-        r"billion|trillion|half|quarter|dozen|first|second|third)\b", match["title"],
+        r"billion|trillion|half|quarter|dozen|first|second|third|fourth|fifth|sixth|"
+        r"seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|"
+        r"fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|"
+        r"thirtieth|fortieth|fiftieth|sixtieth|seventieth|eightieth|ninetieth|"
+        r"hundredth|thousandth|millionth|billionth|trillionth)\b", match["title"],
         flags=re.IGNORECASE,
     ) or re.search(r"[半數数幾几首第廿卅]", rendered["title"]):
         return ()

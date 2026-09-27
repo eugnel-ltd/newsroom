@@ -124,3 +124,21 @@ def test_short_period_equivalence_cannot_hide_an_invented_first_period():
     claim = replace(old, rendered_assertion_zh_hant_hk=old.rendered_assertion_zh_hant_hk.replace('一段', '第一段'))
     value = replace(value, governed_claims=(value.governed_claims[0], claim, *value.governed_claims[2:]))
     assert checks(value)['NUMERIC_AND_DATE_FIDELITY'] == 'FAIL'
+
+
+@pytest.mark.parametrize('ordinal', [
+    'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth',
+    'eleventh', 'twelfth', 'thirteenth', 'fourteenth', 'fifteenth',
+    'sixteenth', 'seventeenth', 'eighteenth', 'nineteenth', 'twentieth',
+    'thirtieth', 'fortieth', 'fiftieth', 'sixtieth', 'seventieth',
+    'eightieth', 'ninetieth', 'hundredth', 'thousandth', 'millionth',
+    'billionth', 'trillionth', 'twenty-fourth',
+])
+def test_document_year_equivalence_never_discards_a_source_ordinal(ordinal):
+    value = package(); old = value.governed_claims[0]
+    source = old.claim.replace('2026 academies', f'2026 {ordinal} annual academies')
+    claim = replace(old, claim=source, supporting_excerpt=source)
+    value = replace(value, governed_claims=(claim, *value.governed_claims[1:]),
+        passages=tuple(p.replace(old.claim, claim.claim) for p in value.passages),
+        substantive_new_information=tuple(claim.claim if x == old.claim else x for x in value.substantive_new_information))
+    assert checks(value)['NUMERIC_AND_DATE_FIDELITY'] == 'FAIL'
