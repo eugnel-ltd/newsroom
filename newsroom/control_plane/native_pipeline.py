@@ -12,7 +12,7 @@ from typing import ContextManager
 from newsroom.authority import UtcTimestamp
 
 from .native_cycle import advance_native_cycle
-from .native_assessor import assessment_revalidation_due, same_assessment_producer
+from .native_assessor import assessor_admission_recovery_due, assessment_revalidation_due, same_assessment_producer
 from .native_progress import NativeRevisionJournal
 from .veto import OperatorDrainRequested, VetoError
 
@@ -222,7 +222,10 @@ class NativePipeline:
             previous = self._journal.progress.get(revision_id, {})
             if self._monotonic_clock() >= work_deadline:
                 continue
-            if previous.get("stage") in {"ASSESSMENT_INTERRUPTED", "COPY_CORRECTION_PREPARED"}:
+            if previous.get("stage") in {"ASSESSMENT_INTERRUPTED", "COPY_CORRECTION_PREPARED"} or (
+                previous.get("stage") == "EVIDENCE_HOLD"
+                and assessor_admission_recovery_due(previous.get("facts", {}))
+            ):
                 candidate_version_id = previous.get("facts", {}).get(
                     "candidate_version_id"
                 )

@@ -718,6 +718,7 @@ def test_retained_assessor_contract_failure_becomes_typed_hold(tmp_path) -> None
         ("other-candidate", 0, "ASSESSMENT_INTERRUPTED", False),
     ),
 )
+@pytest.mark.parametrize(("initial_stage", "failure_class"), (("ASSESSMENT_INTERRUPTED", "NativeEvidenceError"), ("EVIDENCE_HOLD", "ModelUsageAdmissionError")))
 def test_retained_zero_dispatch_assessor_failure_requires_exact_candidate(
     tmp_path,
     monkeypatch,
@@ -725,15 +726,17 @@ def test_retained_zero_dispatch_assessor_failure_requires_exact_candidate(
     attempt_count,
     expected_state,
     retryable,
+    initial_stage,
+    failure_class,
 ) -> None:
     unit = _native()
     connection = connect(str(tmp_path / "private.sqlite3"))
     journal = NativeRevisionJournal(connection)
     journal.land((unit,))
-    journal.advance(unit.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+    journal.advance(unit.revision_id, stage=initial_stage, facts={
         "candidate_id": "candidate",
         "candidate_version_id": "candidate-version",
-        "failure_class": "NativeEvidenceError",
+        "failure_class": failure_class,
         "reason": "ACQUISITION_RESULT_NOT_RETAINED",
         "acquisition_attempt_count": attempt_count,
     })
@@ -764,12 +767,13 @@ def test_retained_zero_dispatch_assessor_failure_requires_exact_candidate(
     first = continuation.advance(
         revision_id=unit.revision_id, candidate_version_id="candidate-version"
     )
-    assert first.state == expected_state
     if expected_state == "ASSESSMENT_INTERRUPTED":
-        assert journal.progress[unit.revision_id]["stage"] == "ASSESSMENT_INTERRUPTED"
+        assert first.state == initial_stage
+        assert journal.progress[unit.revision_id]["stage"] == initial_stage
         assert calls == ["checked"]
         connection.close()
         return
+    assert first.state == expected_state
     assert first.reason == "ASSESSOR_PRE_DISPATCH_HOLD"
     assert calls == ["checked"]
     facts = journal.progress[unit.revision_id]["facts"]

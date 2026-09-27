@@ -32,6 +32,7 @@ from newsroom.control_plane.native_evidence import (
     NativeEvidenceSource,
 )
 from newsroom.control_plane.native_assessor import (
+    assessor_admission_recovery_due,
     assessment_revalidation_due,
     same_assessment_producer,
     RetainedAssessorContractFailure,
@@ -624,12 +625,17 @@ class NativePublicationContinuation:
         if revision_id not in self._journal.units:
             raise NativePublicationError("native continuation revision differs")
         progress = self._journal.progress.get(revision_id, {})
+        facts = dict(progress.get("facts", {}))
+        admission_recovery = (
+            progress.get("stage") == "EVIDENCE_HOLD"
+            and assessor_admission_recovery_due(facts)
+        )
         if (
             progress.get("stage") not in {"ASSESSMENT_INTERRUPTED", "ACKNOWLEDGED", "COPY_CORRECTION_PREPARED"}
+            and not admission_recovery
             and revision_id not in self._sources
         ):
             raise NativePublicationError("native continuation revision differs")
-        facts = dict(progress.get("facts", {}))
         if facts.get("candidate_version_id") not in (None, candidate_version_id):
             raise NativePublicationError("native continuation Candidate differs")
         facts["candidate_version_id"] = candidate_version_id
@@ -678,7 +684,7 @@ class NativePublicationContinuation:
                 revision_id, stage="ASSESSMENT_CONTRACT_REVALIDATION", facts=facts
             )
 
-        if progress.get("stage") == "ASSESSMENT_INTERRUPTED":
+        if progress.get("stage") == "ASSESSMENT_INTERRUPTED" or admission_recovery:
             retained_failure = None
             if (
                 facts.get("failure_class") == "EvidencePackageError"
@@ -709,7 +715,7 @@ class NativePublicationContinuation:
                 )
             pre_dispatch = None
             if (
-                facts.get("failure_class") == "NativeEvidenceError"
+                (facts.get("failure_class") == "NativeEvidenceError" or admission_recovery)
                 and self._assessment_pre_dispatch_failure is not None
             ):
                 pre_dispatch = self._assessment_pre_dispatch_failure(version)
@@ -750,7 +756,7 @@ class NativePublicationContinuation:
                     "EVIDENCE_HOLD", facts["reason"], None
                 )
             return NativePublicationContinuationResult(
-                "ASSESSMENT_INTERRUPTED",
+                "EVIDENCE_HOLD" if admission_recovery else "ASSESSMENT_INTERRUPTED",
                 str(facts.get("reason", "ACQUISITION_RESULT_NOT_RETAINED")),
                 None,
             )

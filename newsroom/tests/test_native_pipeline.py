@@ -273,18 +273,19 @@ def test_native_pipeline_checkpoints_candidate_before_operator_drain(
         connection.close()
 
 
+@pytest.mark.parametrize(("initial_stage", "failure_class"), (("ASSESSMENT_INTERRUPTED", "EvidencePackageError"), ("EVIDENCE_HOLD", "ModelUsageAdmissionError")))
 def test_native_pipeline_only_reclassifies_retained_assessment_interruption(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, initial_stage, failure_class,
 ):
     pipeline, journal, connection, units, calls, dispositions = _open(
         tmp_path, monkeypatch,
     )
     dispositions[0] = ()
     journal.land((units[0],))
-    journal.advance(units[0].revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+    journal.advance(units[0].revision_id, stage=initial_stage, facts={
         "candidate_version_id": "candidate:one",
         "graphiti_receipts": [{}],
-        "failure_class": "EvidencePackageError",
+        "failure_class": failure_class,
         "reason": "ACQUISITION_RESULT_NOT_RETAINED",
     })
 
