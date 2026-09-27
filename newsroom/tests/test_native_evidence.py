@@ -49,7 +49,7 @@ from newsroom.increment10.evidence import EvidencePackageError, _base_package
 from newsroom.increment10.ingress import open_evidence_intake_ingress
 from newsroom.increment10.private_serving import open_private_serving_read_port
 from newsroom.sources.record_models import SourceDefinitionVersion
-from newsroom.tests.authority_helpers import proof
+from newsroom.tests.authority_helpers import FIXED_NOW, proof
 from newsroom.tests.test_graphiti_operational_readiness import _rights, _unit
 from newsroom.tests.test_increment10_editorial import _evidence_facade, _ready_package
 from newsroom.tests.test_increment10_ingress import _candidate, _receive
@@ -394,7 +394,7 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
         events=system.events,
         candidate_port=candidate_port,
         evidence_packages=packages,
-        bindings=bindings,
+        bindings=bindings, clock=lambda: FIXED_NOW,
     )
 
     def free_slug_category(value):
@@ -563,8 +563,6 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
         expected_story_version=0,
         expected_publication_version=0,
         expected_delivery_evidence_version=0,
-        applied_at="2026-07-16T11:00:00Z",
-        observed_at="2026-07-16T11:30:00Z",
         proof=proof(),
     )
     reader = open_private_serving_read_port(

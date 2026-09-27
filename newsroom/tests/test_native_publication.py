@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from newsroom.authority import ObjectAdmissionRequest
+from newsroom.authority import ObjectAdmissionRequest, UtcTimestamp
 from newsroom.authority.canonical import canonical_json_bytes
 from newsroom.control_plane.native_publication import (
     NativePublicationBindings,
@@ -66,8 +67,9 @@ def _bindings(tmp_path: Path, registries, hydration, definitions, commands):
     )
 
 
+@pytest.mark.parametrize("failure_boundary", (None, "before_apply", "after_apply", "after_record"))
 @pytest.mark.parametrize("copy_correction", (False, True))
-def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monkeypatch, copy_correction) -> None:
+def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monkeypatch, copy_correction, failure_boundary) -> None:
     candidate_connection, candidate_port, version = _candidate(tmp_path)
     ingress = open_evidence_intake_ingress(tmp_path / "intake.sqlite3")
     acknowledgement = _receive(
@@ -77,8 +79,15 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         version,
         request_id="request-1",
     )
+    instant = [UtcTimestamp.parse("2026-07-16T12:00:00Z").value]
+
+    def effect_clock():
+        sampled = UtcTimestamp(instant[0])
+        instant[0] += timedelta(minutes=1)
+        return sampled
+
     system, registries, hydration, definitions, commands = _open(
-        tmp_path / "objects.sqlite3"
+        tmp_path / "objects.sqlite3", clock=lambda: UtcTimestamp(instant[0]),
     )
     evidence_packages = _evidence_facade(system, ingress, registries)
     passage, package, records = _ready_package(version)
@@ -111,7 +120,7 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         events=system.events,
         candidate_port=candidate_port,
         evidence_packages=evidence_packages,
-        bindings=bindings,
+        bindings=bindings, clock=effect_clock,
     )
     original_builder = controller._editorial._build_story
     if copy_correction:
@@ -123,8 +132,6 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         "expected_story_version": 0,
         "expected_publication_version": 0,
         "expected_delivery_evidence_version": 0,
-        "applied_at": "2026-07-16T11:00:00Z",
-        "observed_at": "2026-07-16T11:30:00Z",
         "proof": proof(),
     }
     with pytest.raises(EditorialHold):
@@ -141,6 +148,20 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
     target.close()
 
     decision = _decision(retained, source.admission_id)
+    if failure_boundary is not None:
+        method = "record" if failure_boundary == "after_record" else "apply"
+        original = getattr(controller._delivery, method)
+
+        def interrupted(*args, **kwargs):
+            if failure_boundary != "before_apply":
+                original(*args, **kwargs)
+            raise RuntimeError("simulated process interruption")
+
+        monkeypatch.setattr(controller._delivery, method, interrupted)
+        with pytest.raises(RuntimeError, match="simulated process interruption"):
+            controller.advance(retained.package_admission_id, decision, **request)
+        monkeypatch.setattr(controller._delivery, method, original)
+        instant[0] = UtcTimestamp.parse("2026-07-16T13:00:00Z").value
     first = controller.advance(retained.package_admission_id, decision, **request)
     assert controller.retained_writer_id(first.story_receipt.event_id, proof=proof()) == first.writer_id
     replay = controller.advance(retained.package_admission_id, decision, **request)
@@ -158,6 +179,12 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         "ARTICLE",
         "FEED_CARD",
     )
+    # Retry keeps the first real effect/ACK, never the pre-story intent time.
+    expected_apply = "2026-07-16T13:00:00.000000Z" if failure_boundary == "before_apply" else "2026-07-16T12:00:00.000000Z"
+    expected_ack = "2026-07-16T13:01:00.000000Z" if failure_boundary in {"before_apply", "after_apply"} else "2026-07-16T12:01:00.000000Z"
+    assert {row.applied_at for row in acknowledged.rows} == {expected_apply}
+    assert acknowledged.acknowledgement.first_private_effect_at == expected_apply
+    assert acknowledged.acknowledgement.target_acknowledged_at == expected_ack
     assert reader._connection.total_changes == 0
     reader.close()
 
@@ -174,8 +201,6 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         assert old_story.copy.writer_id == "newsroom.offline-exact-copy.v2"
         corrected_request = {**request, "expected_story_version": 1,
                              "expected_publication_version": 2,
-                             "applied_at": "2026-07-16T11:35:00Z",
-                             "observed_at": "2026-07-16T11:40:00Z",
                              "correction_of": predecessor}
         corrected = controller.advance(retained.package_admission_id, decision, **corrected_request)
         assert corrected.story_receipt.aggregate_version == 2
@@ -219,7 +244,7 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         events=system.events,
         candidate_port=candidate_port,
         evidence_packages=evidence_packages,
-        bindings=bindings,
+        bindings=bindings, clock=effect_clock,
     )
     assert reopened.advance(retained.package_admission_id, decision, **request) == first
     reopened.close()

@@ -238,7 +238,7 @@ def open_native_runtime(
         publication = NativePublicationController(
             objects=authority.objects, commands=authority.commands,
             events=authority.events, candidate_port=authority.candidate_read_port,
-            evidence_packages=evidence, bindings=policies.publication,
+            evidence_packages=evidence, bindings=policies.publication, clock=clock,
         )
         proof = AuthenticationProof(
             method="STATIC_TOKEN", credential=credential,

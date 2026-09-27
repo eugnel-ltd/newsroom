@@ -183,7 +183,7 @@ def _registries():
     )
 
 
-def _open(path: Path):
+def _open(path: Path, *, clock=None):
     registries, hydration, definitions, commands = _registries()
     scopes = frozenset(
         {
@@ -202,7 +202,7 @@ def _open(path: Path):
         }
     )
     system = open_object_system(
-        path,
+        path, clock=clock,
         policy_registries=registries[0],
         authenticator=StaticAuthenticator(
             credentials={"token-1": StaticPrincipal("principal.alpha")},

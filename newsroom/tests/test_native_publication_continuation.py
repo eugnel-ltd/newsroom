@@ -140,8 +140,9 @@ class _Reader:
         return None
 
 
+@pytest.mark.parametrize("legacy_resume", (False, True))
 def test_continuation_retains_times_and_replays_without_evidence_redispatch(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, legacy_resume
 ) -> None:
     unit = _native()
     connection = connect(str(tmp_path / "private.sqlite3"))
@@ -197,6 +198,22 @@ def test_continuation_retains_times_and_replays_without_evidence_redispatch(
         clock=lambda: next(times),
     )
 
+    if legacy_resume:
+        original = publication.advance
+
+        def interrupted(*_args, **_kwargs):
+            raise RuntimeError("pre-effect interruption")
+
+        monkeypatch.setattr(publication, "advance", interrupted)
+        with pytest.raises(RuntimeError, match="pre-effect interruption"):
+            continuation.advance(revision_id=unit.revision_id, candidate_version_id="candidate-version")
+        legacy = dict(journal.progress[unit.revision_id]["facts"])
+        legacy.pop("publication_started_at")
+        legacy.update(publication_applied_at="2026-09-08T12:04:00.000000Z",
+                      publication_observed_at="2026-09-08T12:05:00.000000Z")
+        journal.advance(unit.revision_id, stage="PUBLICATION_STARTED", facts=legacy)
+        monkeypatch.setattr(publication, "advance", original)
+
     first = continuation.advance(
         revision_id=unit.revision_id, candidate_version_id="candidate-version"
     )
@@ -221,8 +238,15 @@ def test_continuation_retains_times_and_replays_without_evidence_redispatch(
     assert retained["facts"]["editorial_decision"] == json.loads(
         decision.canonical_bytes()
     )
-    assert retained["facts"]["publication_applied_at"] == "2026-09-08T12:04:00.000000Z"
-    assert retained["facts"]["publication_observed_at"] == "2026-09-08T12:05:00.000000Z"
+    if legacy_resume:
+        assert retained["facts"]["publication_applied_at"] == legacy["publication_applied_at"]
+        assert retained["facts"]["publication_observed_at"] == legacy["publication_observed_at"]
+    else:
+        assert retained["facts"]["publication_started_at"] == "2026-09-08T12:04:00.000000Z"
+        assert "publication_applied_at" not in retained["facts"]
+        assert "publication_observed_at" not in retained["facts"]
+    assert all("applied_at" not in request and "observed_at" not in request
+               for request in publication.requests)
     assert retained["facts"]["graphiti_receipts"] == [{}]
     connection.close()
 
