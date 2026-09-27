@@ -245,7 +245,7 @@ def deployed_native_service(args):
             provider=native_assessor.CONT_PRIMARY_PROVIDER, route=native_assessor.ROUTE,
             model=native_assessor.CONT_PRIMARY_MODEL, reasoning=native_assessor.CONT_PRIMARY_REASONING,
             config_identity=native_assessor.CONFIG_IDENTITY,
-            output_schema_digest=native_assessor.SCHEMA_DIGEST,
+            output_schema_digest=native_assessor.PROVIDER_SCHEMA_DIGEST,
         )
         if assessment.prompt_contract_version != native_assessor.VERSION:
             raise ValueError("native assessor prompt contract differs before authority OPEN")
