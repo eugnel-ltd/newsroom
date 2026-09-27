@@ -35,7 +35,7 @@ from newsroom.tests.test_native_source_intake import (
 )
 
 
-def _retained_spreadsheet(tmp_path, monkeypatch):
+def _retained_spreadsheet(tmp_path, monkeypatch, suffix="xlsx"):
     args = _args(tmp_path, monkeypatch)
     args.update(
         principal_id=OPERATOR_PRINCIPAL_ID,
@@ -45,9 +45,9 @@ def _retained_spreadsheet(tmp_path, monkeypatch):
     parent_url = "https://www.gov.uk/api/content" + parent_path
     asset_url = (
         "https://assets.publishing.service.gov.uk/media/asset/"
-        "funding-values.xlsx"
+        f"funding-values.{suffix}"
     )
-    asset = _xlsx_asset()
+    asset = _xlsx_asset() if suffix == "xlsx" else b"Provider,Funding\nExample College,125000\n"
     parent = _spreadsheet_parent(parent_path, asset_url, asset)
     bodies = {
         SOURCE_URLS["UK-01"]: _atom_for(parent_path),
@@ -96,11 +96,12 @@ def _retained_spreadsheet(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("suffix", ("xlsx", "csv"))
 def test_spreadsheet_acquisition_refetches_parent_and_asset_with_exact_binding(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, suffix,
 ) -> None:
     context, runtime, disposition, source, request, bodies, parent_url, asset_url = (
-        _retained_spreadsheet(tmp_path, monkeypatch)
+        _retained_spreadsheet(tmp_path, monkeypatch, suffix)
     )
     fetched = []
     fences = []

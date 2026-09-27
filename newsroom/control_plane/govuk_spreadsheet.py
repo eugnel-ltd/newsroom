@@ -1,4 +1,4 @@
-"""Bounded conversion of declared GOV.UK ODS/XLSX cells to published text.
+"""Bounded conversion of declared GOV.UK ODS/XLSX/CSV cells to published text.
 
 This is not a spreadsheet engine: values are publisher-stored, never evaluated.
 All sheets (including hidden ones), cell coordinates and notes are retained.
@@ -7,6 +7,7 @@ remain governed observations. No links, macros or embedded objects are run.
 """
 from __future__ import annotations
 
+import csv
 import io
 import json
 import posixpath
@@ -25,7 +26,7 @@ from .govuk_evidence import (
     _unique_object, _html_text, parse_govuk_content_document,
 )
 
-VERSION = "hermes-govuk-spreadsheet-text-v1"
+VERSION = "hermes-govuk-spreadsheet-text-v2"
 MAX_EXPANDED_BYTES = 8 * 1_048_576
 MAX_XML_BYTES = 4 * 1_048_576
 MAX_XML_NODES = 200_000
@@ -35,6 +36,7 @@ MAX_SHEETS = 32
 MAX_ROWS = 1_048_576
 MAX_COLUMNS = 16_384
 MIME_TYPES = {
+    ".csv": "text/csv",
     ".ods": "application/vnd.oasis.opendocument.spreadsheet",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
@@ -48,6 +50,9 @@ POLICY_DIGEST = digest_canonical({
     "formulas": "publisher-cached-values-only", "hidden_cells": "included",
     "numeric_formats": "retained-not-executed", "graphics": "excluded-from-text",
     "external_links": "never-followed", "macros": "rejected",
+    "formats": MIME_TYPES,
+    "csv": "utf8-optional-bom-comma-doublequote-strict-literal-cells",
+    "csv_whitespace_empty_multiline": "preserved-no-header-or-type-inference",
 })
 O = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
 T = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
@@ -471,27 +476,50 @@ def _xlsx(archive, output):
             output.row(row_number, cells)
 
 
+def _csv(raw, output):
+    # No dialect/header/type guessing, trimming, formula evaluation or global
+    # csv.field_size_limit mutation. The existing body/output bounds also apply.
+    text = raw.decode("utf-8-sig")
+    if "\x00" in text:
+        raise ValueError("spreadsheet CSV contains NUL")
+    output.line("Published CSV cells: Row and column identify each literal text cell. Whitespace, empty fields, quoted newlines and formula-like text are preserved; nothing is executed. No header or numeric types are inferred.")
+    output.line('Sheet "CSV"')
+    try:
+        for number, row in enumerate(csv.reader(io.StringIO(text, newline=""), strict=True), 1):
+            if number > MAX_ROWS or len(row) > MAX_COLUMNS:
+                raise ValueError("spreadsheet CSV dimensions exceed bounds")
+            if row:
+                output.row(number, [(column, _quoted(value)) for column, value in enumerate(row, 1)])
+            else:
+                output.line(f"Row {number}: [empty record]")
+    except csv.Error as exc:
+        raise ValueError("spreadsheet CSV syntax or field bound differs") from exc
+
+
 def parse_govuk_spreadsheet(parent_url, parent_raw, asset_url, raw, *, retrieved_at):
     declaration = declared_spreadsheet(parent_url, parent_raw, asset_url, retrieved_at=retrieved_at)
     if type(raw) is not bytes or len(raw) != declaration.file_size:
         raise ValueError("spreadsheet observed size differs from declaration")
     output = _Text()
     output.line("Attachment: " + asset_url)
-    output.line("Published cells: Sheet + Row + column identify each cell. ODS types n=number, p=percentage, c=currency, b=boolean, d=date, t=duration; quoted parentheses retain display text. XLSX @sN refers to number style N. [cached] is a publisher-stored formula result, never recalculated. Hidden cells included; graphics excluded.")
-    try:
-        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            infos = archive.infolist()
-            names = [i.filename for i in infos]
-            if (not 0 < len(infos) <= MAX_PARTS or len(set(names)) != len(names)
-                    or sum(i.file_size for i in infos) > MAX_EXPANDED_BYTES
-                    or any(i.flag_bits & 1 or i.compress_type not in {0, 8}
-                           or i.filename.startswith("/") or "\\" in i.filename
-                           or ".." in i.filename.split("/") for i in infos)
-                    or any(any(s in n.lower() for s in ("vbaproject", "activex", "embeddings/", "scripts/")) for n in names)):
-                raise ValueError("spreadsheet archive exceeds supported bounds")
-            (_ods if declaration.filename.endswith(".ods") else _xlsx)(archive, output)
-    except (zipfile.BadZipFile, KeyError, etree.XMLSyntaxError, RuntimeError, OverflowError) as exc:
-        raise ValueError("spreadsheet archive or XML differs") from exc
+    if declaration.filename.endswith(".csv"):
+        _csv(raw, output)
+    else:
+        output.line("Published cells: Sheet + Row + column identify each cell. ODS types n=number, p=percentage, c=currency, b=boolean, d=date, t=duration; quoted parentheses retain display text. XLSX @sN refers to number style N. [cached] is a publisher-stored formula result, never recalculated. Hidden cells included; graphics excluded.")
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                infos = archive.infolist()
+                names = [i.filename for i in infos]
+                if (not 0 < len(infos) <= MAX_PARTS or len(set(names)) != len(names)
+                        or sum(i.file_size for i in infos) > MAX_EXPANDED_BYTES
+                        or any(i.flag_bits & 1 or i.compress_type not in {0, 8}
+                               or i.filename.startswith("/") or "\\" in i.filename
+                               or ".." in i.filename.split("/") for i in infos)
+                        or any(any(s in n.lower() for s in ("vbaproject", "activex", "embeddings/", "scripts/")) for n in names)):
+                    raise ValueError("spreadsheet archive exceeds supported bounds")
+                (_ods if declaration.filename.endswith(".ods") else _xlsx)(archive, output)
+        except (zipfile.BadZipFile, KeyError, etree.XMLSyntaxError, RuntimeError, OverflowError) as exc:
+            raise ValueError("spreadsheet archive or XML differs") from exc
     if not output.cells:
         raise ValueError("spreadsheet has no published cells")
     body = "\n".join(output.lines)
