@@ -116,7 +116,7 @@ class NativePipeline:
         # turn has the existing quantum; an atomic revision may overrun it.
         ordinary.sort(key=lambda item: self._journal.progress.get(item[0], {}).get("stage")
                       not in {"ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
-        self._advance_revisions(
+        deadline_deferred_ready = self._advance_revisions(
             tuple(ordinary),
             work_deadline=self._monotonic_clock() + self._reassessment_quantum,
         )
@@ -199,7 +199,9 @@ class NativePipeline:
             reverse=True,
         )
         self._advance_revisions(
-            tuple(reassessments),
+            # Unattempted canonical work must not starve behind an unresolved
+            # predecessor. Reuse this existing assessment budget, once per unit.
+            deadline_deferred_ready + tuple(reassessments),
             work_deadline=self._monotonic_clock() + self._reassessment_quantum,
         )
         self._drain_between_work()
@@ -213,14 +215,19 @@ class NativePipeline:
 
     def _advance_revisions(
         self, revisions: tuple, *, work_deadline: float,
-    ) -> None:
+    ) -> tuple:
         # Each revision remains in the journal even when it disappears from the
         # next feed page. This is work continuation, not a fresh provider retry.
+        deadline_deferred_ready = []
         for revision_id, units in revisions:
             self._drain_between_work()
             self._check()
             previous = self._journal.progress.get(revision_id, {})
             if self._monotonic_clock() >= work_deadline:
+                if (previous.get("stage") == "GRAPHITI_COMPLETE"
+                        and previous.get("facts", {}).get("graphiti_receipts")
+                        and not previous.get("facts", {}).get("candidate_version_id")):
+                    deadline_deferred_ready.append((revision_id, units))
                 continue
             if previous.get("stage") in {"ASSESSMENT_INTERRUPTED", "COPY_CORRECTION_PREPARED"} or (
                 previous.get("stage") == "EVIDENCE_HOLD"
@@ -316,3 +323,4 @@ class NativePipeline:
                     "reason": getattr(exc, "reason", getattr(exc, "reason_code", type(exc).__name__)),
                 })
         self._drain_between_work()
+        return tuple(deadline_deferred_ready)
