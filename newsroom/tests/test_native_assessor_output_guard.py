@@ -1,5 +1,7 @@
 """Removing the independent assessor output guard preserves immutable failures."""
 
+from __future__ import annotations
+
 import json
 import sqlite3
 from dataclasses import asdict
@@ -85,12 +87,12 @@ def _execution(**changes):
     } | changes)
 
 
-def _fixture(tmp_path, monkeypatch, **usage_changes):
+def _fixture(tmp_path, monkeypatch, *, declared_cli="1.0.10", observed_cli="1.0.10", **usage_changes):
     connection, _port, candidate = _candidate(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     connection.close()
     old = _policy(
-        version="v19", model="grok-4.6", reasoning="medium",
+        version="v19", model="grok-4.6", reasoning="medium", command_semantic_version=declared_cli,
         command_flags=_grok_command_flags("medium", model="grok-4.6"),
         prompt_contract_version=native._V19_PRODUCER_VERSION,
         max_output_tokens=10_000, evidence_digest=digest_bytes(b"qualified-v19"),
@@ -101,6 +103,7 @@ def _fixture(tmp_path, monkeypatch, **usage_changes):
         historical.setattr(native, "REASONING", "medium")
         historical.setattr(native, "COMMAND_FLAGS", old.command_flags)
         service, usage = _usage(tmp_path, historical, old)
+        historical.setattr(native, "read_grok_command_semantic_version", lambda: observed_cli)
         allocation = usage.begin(candidate, base, "original exact request")
         dispatch_at = usage.mark_dispatch(allocation)
         execution = _execution(**usage_changes)
@@ -110,7 +113,7 @@ def _fixture(tmp_path, monkeypatch, **usage_changes):
             provider_dispatched=True, dispatch_at=dispatch_at,
             failure_class="ASSESSMENT_VALIDATION_FAILED",
         )
-    new = _policy()
+    new = _policy(command_semantic_version=declared_cli)
     service.register_policy(new)
     _, current = _usage(tmp_path, monkeypatch, new)
     return service, current, candidate, base, allocation, new
@@ -124,8 +127,9 @@ def _recover(service, allocation, policy):
     )
 
 
-def test_output_guard_requalification_preserves_failure_and_releases_only_future_work(tmp_path, monkeypatch):
-    service, usage, candidate, base, failed, policy = _fixture(tmp_path, monkeypatch)
+@pytest.mark.parametrize("declared_cli,observed_cli", [("1.0.10", "1.0.10"), ("1.0.30", "1.0.42")], ids=["same-version", "observed-newer"])
+def test_output_guard_requalification_preserves_failure_and_releases_only_future_work(tmp_path, monkeypatch, declared_cli, observed_cli):
+    service, usage, candidate, base, failed, policy = _fixture(tmp_path, monkeypatch, declared_cli=declared_cli, observed_cli=observed_cli)
     tables = ("model_invocation_allocations", "model_invocation_terminals", "model_invocation_policies",
               "model_work_envelopes", "model_invocation_context_manifests", "model_provider_telemetry")
     with sqlite3.connect(service.path) as c:
