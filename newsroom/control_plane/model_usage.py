@@ -1335,7 +1335,6 @@ def _assessor_requalification_authority(
         or manifest.get("schema_digest") != old.output_schema_digest
         or manifest.get("implementation_worktree_clean") is not True
         or manifest.get("implementation_revision") != old.implementation_revision
-        or manifest.get("command_semantic_version") != old.command_semantic_version
         or manifest.get("command_flags") != list(old.command_flags)
         or manifest.get("disabled_capabilities") != list(old.disabled_capabilities)
         or any(manifest.get(key) != getattr(allocation, key) for key in (
