@@ -243,12 +243,14 @@ def deployed_native_service(args):
         assessment = usage.qualified_policy(
             workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
             provider=native_assessor.CONT_PRIMARY_PROVIDER, route=native_assessor.ROUTE,
-            model=native_assessor.CONT_PRIMARY_MODEL, reasoning=native_assessor.REASONING,
+            model=native_assessor.MODEL, reasoning=native_assessor.REASONING,
             config_identity=native_assessor.CONFIG_IDENTITY,
             output_schema_digest=native_assessor.PROVIDER_SCHEMA_DIGEST,
         )
-        if (assessment.prompt_contract_version, assessment.reasoning, assessment.command_flags) != (
-            native_assessor.VERSION, native_assessor.REASONING, native_assessor.COMMAND_FLAGS,
+        if (assessment.prompt_contract_version, assessment.model, assessment.reasoning,
+                assessment.command_flags, assessment.max_output_tokens) != (
+            native_assessor.VERSION, native_assessor.MODEL, native_assessor.REASONING,
+            native_assessor.COMMAND_FLAGS, None,
         ):
             raise ValueError("native assessor profile differs before authority OPEN")
         tree = subprocess.check_output(

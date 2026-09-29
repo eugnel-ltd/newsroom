@@ -23,7 +23,7 @@ from newsroom.control_plane.native_assessor_references import (
     materialise as materialise_v17, SourceReferenceError,
 )
 from newsroom.control_plane.native_assessor_wire import materialise as materialise_v18
-from newsroom.control_plane.native_evidence import NativeEvidenceController, NativeEvidenceHold, rights_eligibility_digest
+from newsroom.control_plane.native_evidence import EvidenceAssessor, NativeEvidenceController, NativeEvidenceHold, rights_eligibility_digest
 from newsroom.tests.test_native_assessor import (
     _qualification_assessor_inputs, _usage, _v18_wire_from_v17,
     retained_22589_assessment,
@@ -229,27 +229,34 @@ def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_ove
         return NativeAssessmentExecution(raw, dict(_USAGE))
 
     assessor = AutonomousNativeEvidenceAssessor(dispatch, usage=usage, dispatch_fence=nullcontext)
+    facade = EvidenceAssessor(assessor)
     if malformed or raw_override is not None:
         with pytest.raises(NativeEvidenceHold, match="ASSESSOR_SOURCE_REFERENCE_HOLD"):
-            assessor(candidate, base, (source,), (acquired,))
+            facade.assess(candidate, base, (source,), (acquired,))
         result = None
     else:
-        result = assessor(candidate, base, (source,), (acquired,))
+        result = facade.assess(candidate, base, (source,), (acquired,))
     return service, usage, assessor, candidate, base, source, acquired, calls, raw, result
 
 
-def test_v19_raw_and_materialised_results_are_retained_once_and_cached(tmp_path, monkeypatch):
+def test_v20_raw_and_materialised_results_are_retained_once_and_cached(tmp_path, monkeypatch):
     service, usage, assessor, candidate, base, source, acquired, calls, raw, result = (
         _run_reference_assessment(tmp_path, monkeypatch)
     )
     request = calls[0]
     assert request["contract"] == VERSION
+    assert usage._policy.model == "grok-4.7"
+    assert usage._policy.reasoning == "high"
+    assert usage._policy.max_output_tokens is None
     assert "passages" not in request["base_package"]
     assert "body" not in request["sources"][0]
     assert "".join(item["text"] for item in request["sources"][0]["segments"]) == acquired.body.decode()
     assert assessor(candidate, base, (source,), (acquired,)) == result
     assert assessor.assess_with_boundary(candidate, base, (source,), (acquired,),
                                         before_dispatch=None, cached_only=True) == result
+    assert EvidenceAssessor(assessor).assess(
+        candidate, base, (source,), (acquired,), cached_only=True,
+    ) == result
     assert len(calls) == 1
     retained_result, = usage.retained_assessments(candidate, base)
     assert retained_result.execution.text != raw
@@ -276,7 +283,7 @@ def test_v19_raw_and_materialised_results_are_retained_once_and_cached(tmp_path,
 
 
 @pytest.mark.parametrize("mutation", ["raw", "allocation", "context", "body", "text", "missing", "duplicate"])
-def test_v19_retained_materialisation_tamper_never_dispatches(tmp_path, monkeypatch, mutation):
+def test_v20_retained_materialisation_tamper_never_dispatches(tmp_path, monkeypatch, mutation):
     service, usage, assessor, candidate, base, source, acquired, calls, _raw, _result = (
         _run_reference_assessment(tmp_path, monkeypatch)
     )
@@ -314,7 +321,7 @@ def test_v19_retained_materialisation_tamper_never_dispatches(tmp_path, monkeypa
     assert len(calls) == 1
 
 
-def test_v19_bad_reference_is_accounted_and_not_retried(tmp_path, monkeypatch):
+def test_v20_bad_reference_is_accounted_and_not_retried(tmp_path, monkeypatch):
     service, usage, assessor, candidate, base, source, acquired, calls, raw, _result = (
         _run_reference_assessment(tmp_path, monkeypatch, malformed=True)
     )
@@ -373,7 +380,7 @@ def test_reference_receipt_replay_is_idempotent_and_conflict_rolls_back(tmp_path
         assert connection.execute("SELECT kind,payload_json,payload_digest FROM ledger ORDER BY seq").fetchall() == before
 
 
-def test_current_v19_reads_frozen_v16_full_package_without_relabelling_or_dispatch(tmp_path, monkeypatch):
+def test_current_v20_reads_frozen_v16_full_package_without_relabelling_or_dispatch(tmp_path, monkeypatch):
     from newsroom.tests.test_native_assessor import _use_historical_v16
 
     candidate, base, source, acquired, view, wire, _row, _body = _literal_reference_inputs()
@@ -392,7 +399,7 @@ def test_current_v19_reads_frozen_v16_full_package_without_relabelling_or_dispat
     _service, current_usage = _usage(tmp_path, monkeypatch)
     assert current_usage._policy.prompt_contract_version == VERSION
     assessor = AutonomousNativeEvidenceAssessor(
-        lambda _request: pytest.fail('cached v16 result must not dispatch v19'),
+        lambda _request: pytest.fail('cached v16 result must not dispatch v20'),
         usage=current_usage, dispatch_fence=nullcontext,
     )
     result = assessor.assess_with_boundary(candidate, base, (source,), (acquired,),
@@ -406,8 +413,8 @@ def test_current_v19_reads_frozen_v16_full_package_without_relabelling_or_dispat
         assert connection.execute("SELECT count(*) FROM ledger WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'").fetchone() == (0,)
 
 
-@pytest.mark.parametrize("historical_version", ("v17", "v18"))
-def test_current_v19_reads_frozen_reference_materialisation_without_dispatch(
+@pytest.mark.parametrize("historical_version", ("v17", "v18", "v19"))
+def test_current_v20_reads_frozen_reference_materialisation_without_dispatch(
     tmp_path, monkeypatch, historical_version,
 ):
     from newsroom.control_plane import native_assessor as module
@@ -424,9 +431,9 @@ def test_current_v19_reads_frozen_reference_materialisation_without_dispatch(
             value, source_view, request, provider_schema=historical_schema,
         )
     else:
-        historical_contract = module._V18_PRODUCER_VERSION
-        historical_system = module._V18_SYSTEM
-        historical_schema = module._V18_PROVIDER_SCHEMA
+        historical_contract = getattr(module, f"_{historical_version.upper()}_PRODUCER_VERSION")
+        historical_system = getattr(module, f"_{historical_version.upper()}_SYSTEM")
+        historical_schema = getattr(module, f"_{historical_version.upper()}_PROVIDER_SCHEMA")
         historical_wire = _v18_wire_from_v17(wire)
         materialiser = lambda value, source_view, request: materialise_v18(
             value, source_view, request, provider_schema=historical_schema,
@@ -443,15 +450,17 @@ def test_current_v19_reads_frozen_reference_materialisation_without_dispatch(
             "PROVIDER_SCHEMA_DIGEST",
             digest_canonical(historical_schema),
         )
-        historical.setattr(module, "REASONING", module.CONT_PRIMARY_REASONING)
-        historical.setattr(
-            module, "COMMAND_FLAGS", module.CONT_PRIMARY_COMMAND_FLAGS,
-        )
         service, old_usage = _usage(tmp_path, historical)
+        assert old_usage._policy.model == "grok-4.6"
+        assert old_usage._policy.reasoning == ("medium" if historical_version == "v19" else "low")
+        assert old_usage._policy.max_output_tokens == 10_000
         allocation = old_usage.begin(
             candidate, base, f"historical {historical_version} request",
             source_view=view,
         )
+        assert allocation.model == "grok-4.6"
+        assert allocation.reasoning == old_usage._policy.reasoning
+        assert allocation.max_output_tokens == 10_000
         package, receipt = materialiser(
             historical_wire, view, allocation.request_digest,
         )
@@ -464,16 +473,27 @@ def test_current_v19_reads_frozen_reference_materialisation_without_dispatch(
             allocation, outcome="ASSESSOR_ACCEPTED", execution=execution,
             provider_dispatched=True, dispatch_at=dispatch_at,
         )
+    with sqlite3.connect(service.path) as connection:
+        original_allocations = connection.execute(
+            "SELECT record_json FROM model_invocation_allocations"
+        ).fetchall()
+        original_results = connection.execute(
+            "SELECT kind,payload_json,payload_digest FROM ledger WHERE kind IN "
+            "('NATIVE_ASSESSMENT_RESULT','NATIVE_ASSESSMENT_MATERIALISATION') ORDER BY seq"
+        ).fetchall()
     _service, current_usage = _usage(tmp_path, monkeypatch)
+    assert current_usage._policy.model == "grok-4.7"
+    assert current_usage._policy.reasoning == "high"
+    assert current_usage._policy.max_output_tokens is None
     assessor = AutonomousNativeEvidenceAssessor(
         lambda _request: pytest.fail(
-            f"cached {historical_version} result dispatched v19"
+            f"cached {historical_version} result dispatched v20"
         ),
         usage=current_usage, dispatch_fence=nullcontext,
     )
-    result = assessor.assess_with_boundary(
+    result = EvidenceAssessor(assessor).assess(
         candidate, base, (source,), (acquired,),
-        before_dispatch=None, cached_only=True,
+        cached_only=True,
     )
     retained, = current_usage.retained_assessments(candidate, base)
     assert retained.contract_version == historical_contract
@@ -482,6 +502,13 @@ def test_current_v19_reads_frozen_reference_materialisation_without_dispatch(
         package["package"]["governed_claims"][1]["claim"]
     )
     with sqlite3.connect(service.path) as connection:
+        assert connection.execute(
+            "SELECT record_json FROM model_invocation_allocations"
+        ).fetchall() == original_allocations
+        assert connection.execute(
+            "SELECT kind,payload_json,payload_digest FROM ledger WHERE kind IN "
+            "('NATIVE_ASSESSMENT_RESULT','NATIVE_ASSESSMENT_MATERIALISATION') ORDER BY seq"
+        ).fetchall() == original_results
         assert connection.execute(
             "SELECT COUNT(*) FROM model_invocation_allocations"
         ).fetchone() == (1,)

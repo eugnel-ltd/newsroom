@@ -116,6 +116,16 @@ class WorkloadClass(StrEnum):
     GRAPHITI_EMBEDDING = "GRAPHITI_EMBEDDING"
 
 
+def _nullable_native_assessor_output(
+    workload: WorkloadClass, provider: str, route: str,
+) -> bool:
+    return (
+        workload is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
+        and provider == "grok-build-cli"
+        and route == "NATIVE_EVIDENCE_ASSESSOR"
+    )
+
+
 class UsageStatus(StrEnum):
     REPORTED = "REPORTED"
     ESTIMATED = "ESTIMATED"
@@ -1015,6 +1025,7 @@ def _reported_output_disposition_authority(
         or terminal.dispatch_at is None or terminal.pre_dispatch_zero_proved
         or terminal.subscription_cli_chat_not_cash_debited is not True
         or allocation.prompt_bytes > policy.max_prompt_bytes
+        or allocation.max_output_tokens is None or policy.max_output_tokens is None
         or allocation.max_output_tokens > policy.max_output_tokens
         or components.output_tokens <= allocation.max_output_tokens
         or components.total_tokens != (components.input_tokens + components.output_tokens
@@ -1151,56 +1162,119 @@ def _reported_output_disposition_authority(
 
 
 _ASSESSOR_REQUALIFICATION_KIND = "NATIVE_ASSESSOR_INPUT_REQUALIFICATION"
+_ASSESSOR_OUTPUT_REQUALIFICATION_KIND = "NATIVE_ASSESSOR_OUTPUT_GUARD_REQUALIFICATION"
 
 
-def _assessor_requalification_authority(connection, invocation_id, qualified_policy_digest):
-    """Authenticate one input-bound correction, not forgiveness of actual usage."""
+def _assessor_requalification_authority(
+    connection, invocation_id, qualified_policy_digest, *, output_guard=False,
+):
+    """Authenticate one exact assessor correction without changing old evidence."""
     from .native_assessor import (
         _V15_PRODUCER_VERSION, _V15_SYSTEM, _V15_SCHEMA_DIGEST,
+        _V19_PRODUCER_VERSION, _V19_SYSTEM, _V19_PROVIDER_SCHEMA_DIGEST,
         _ASSESSMENT_RESULT_SCHEMA_VERSION, native_assessment_input_bound,
+        _MAX_RETAINED_RESULT_BYTES,
     )
 
     allocation, terminal = _retained_terminal_allocation(connection, invocation_id)
     old = _policy_for_allocation(connection, allocation)
     new = _policy_for_allocation(connection, replace(
         allocation, invocation_policy_digest=qualified_policy_digest,
+        model="grok-4.7" if output_guard else allocation.model,
     ))
-    bound = native_assessment_input_bound(new)
+    # v20 deliberately retains the frozen v19 wire instructions and schema.
+    bound = native_assessment_input_bound(
+        replace(new, prompt_contract_version=_V19_PRODUCER_VERSION)
+        if output_guard else new
+    )
     components = terminal.components
     unchanged = (
-        "workload_class", "provider", "route", "model", "reasoning", "one_turn",
-        "exact_input", "skills_enabled", "tools_enabled", "mcp_enabled",
-        "prior_message_count", "command_flags", "disabled_capabilities",
-        "max_context_tokens", "max_total_tokens", "max_output_tokens",
-        "prompt_contract_version", "output_schema_digest",
+        "workload_class", "provider", "route", "one_turn", "exact_input",
+        "skills_enabled", "tools_enabled", "mcp_enabled", "prior_message_count",
+        "disabled_capabilities", "max_context_tokens", "max_total_tokens",
         "allowed_context_identities", "allowed_config_identities",
+        "hard_estimate_ceiling_tokens",
     )
     if (
         allocation.workload_class is not WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
+        or allocation.provider != "grok-build-cli"
         or allocation.route != "NATIVE_EVIDENCE_ASSESSOR"
         or allocation.config_identity != "native-evidence-assessor-grok-hermetic-command-v1"
         or allocation.parent_invocation_id is not None or allocation.leaf_ordinal != 1
         or not old.qualified or not new.qualified or old.calibration_only or new.calibration_only
-        or old.context_manifest_schema_version != "newsroom.native-evidence-assessor.context-manifest.v1"
-        or new.context_manifest_schema_version != "newsroom.native-evidence-assessor.context-manifest.v2"
         or any(getattr(old, key) != getattr(new, key) for key in unchanged)
+        or terminal.outcome != "ASSESSOR_VALIDATION_FAILED"
+        or terminal.failure_class != "ASSESSMENT_VALIDATION_FAILED"
+        or terminal.usage_status is not UsageStatus.REPORTED
+        or components.provenance != "PROVIDER_REPORTED"
+        or _invalid_reported_components(terminal) is not None
+        or terminal.dispatch_at is None or terminal.pre_dispatch_zero_proved
+        or terminal.subscription_cli_chat_not_cash_debited is not True
+        or allocation.max_output_tokens is None or old.max_output_tokens is None
+    ):
+        raise ModelUsageAdmissionError("native assessor requalification is ineligible")
+    if output_guard:
+        from .writer import _grok_command_flags
+
+        counters = (
+            "input_tokens", "output_tokens", "cached_read_tokens", "cached_write_tokens",
+            "reasoning_tokens", "context_tokens", "total_tokens",
+        )
+        if (
+            (old.model, old.reasoning) != ("grok-4.6", "medium")
+            or (new.model, new.reasoning) != ("grok-4.7", "high")
+            or old.prompt_contract_version != _V19_PRODUCER_VERSION
+            or new.prompt_contract_version != "newsroom.native-evidence-assessor.v20"
+            or old.output_schema_digest != _V19_PROVIDER_SCHEMA_DIGEST
+            or new.output_schema_digest != _V19_PROVIDER_SCHEMA_DIGEST
+            or old.context_manifest_schema_version != "newsroom.native-evidence-assessor.context-manifest.v3"
+            or old.context_manifest_schema_version != new.context_manifest_schema_version
+            or old.command_flags != _grok_command_flags("medium", model="grok-4.6")
+            or new.command_flags != _grok_command_flags("high", model="grok-4.7")
+            or old.command_semantic_version != new.command_semantic_version
+            or old.max_output_tokens != 10_000 or allocation.max_output_tokens != 10_000
+            or new.max_output_tokens is not None
+            or old.max_context_tokens != 100_000 or old.max_total_tokens != 100_000
+            or not 0 < new.max_prompt_bytes <= old.max_prompt_bytes
+            or new.max_prompt_bytes != 56_464
+            or bound["max_request_bytes"] != new.max_prompt_bytes
+            or allocation.prompt_bytes > native_assessment_input_bound(old)["max_request_bytes"]
+            or terminal.policy_breach not in {
+                "REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED", "MAX_OUTPUT_TOKENS_EXCEEDED",
+            }
+            or any(type(getattr(components, key)) is not int for key in counters)
+            or components.output_tokens <= old.max_output_tokens
+            or components.context_tokens > old.max_context_tokens
+            or components.total_tokens > old.max_total_tokens
+            or components.reasoning_tokens > components.output_tokens
+            or components.total_tokens != (components.input_tokens + components.output_tokens
+                                           + components.cached_read_tokens + components.cached_write_tokens)
+            or allocation.context_identity not in old.allowed_context_identities
+            or allocation.config_identity not in old.allowed_config_identities
+            or any(getattr(allocation, key) != getattr(old, key) for key in (
+                "reasoning", "prompt_contract_version", "output_schema_digest", "one_turn",
+                "exact_input", "skills_enabled", "tools_enabled", "mcp_enabled", "prior_message_count",
+            ))
+            or not old.one_turn or not old.exact_input
+            or old.skills_enabled or old.tools_enabled or old.mcp_enabled or old.prior_message_count != 0
+        ):
+            raise ModelUsageAdmissionError("native assessor output-guard requalification is ineligible")
+    elif (
+        old.context_manifest_schema_version != "newsroom.native-evidence-assessor.context-manifest.v1"
+        or new.context_manifest_schema_version != "newsroom.native-evidence-assessor.context-manifest.v2"
+        or any(getattr(old, key) != getattr(new, key) for key in (
+            "model", "reasoning", "command_flags", "max_output_tokens", "prompt_contract_version", "output_schema_digest",
+        ))
         or old.prompt_contract_version != _V15_PRODUCER_VERSION or old.output_schema_digest != _V15_SCHEMA_DIGEST
         or not 0 < new.max_prompt_bytes < old.max_prompt_bytes
         or new.max_prompt_bytes != bound["max_request_bytes"]
         or allocation.prompt_bytes <= bound["max_request_bytes"]
         or allocation.prompt_bytes > old.max_prompt_bytes
-        or terminal.outcome != "ASSESSOR_VALIDATION_FAILED"
-        or terminal.failure_class != "ASSESSMENT_VALIDATION_FAILED"
-        or terminal.usage_status is not UsageStatus.REPORTED
         or terminal.policy_breach != "MAX_TOTAL_TOKENS_EXCEEDED"
-        or components.provenance != "PROVIDER_REPORTED"
-        or _invalid_reported_components(terminal) is not None
         or type(components.total_tokens) is not int or components.total_tokens <= old.max_total_tokens
         or type(components.context_tokens) is not int or components.context_tokens <= old.max_context_tokens
         or type(components.output_tokens) is not int
         or not components.output_tokens <= allocation.max_output_tokens <= old.max_output_tokens
-        or terminal.dispatch_at is None or terminal.pre_dispatch_zero_proved
-        or not terminal.subscription_cli_chat_not_cash_debited
     ):
         raise ModelUsageAdmissionError("native assessor input requalification is ineligible")
     _require_reported_telemetry(connection, terminal)
@@ -1249,13 +1323,38 @@ def _assessor_requalification_authority(connection, invocation_id, qualified_pol
             or row[4] != _json(manifest) or digest_canonical(unsigned) != manifest_digest
             or manifest_digest != allocation.context_manifest_digest
             or manifest.get("schema_version") != old.context_manifest_schema_version
-            or manifest.get("system_digest") != digest_bytes(_V15_SYSTEM.encode())
+            or manifest.get("system_digest") != digest_bytes((_V19_SYSTEM if output_guard else _V15_SYSTEM).encode())
             or manifest.get("evidence_package_digest") != envelope.evidence_package_digest
             or any(manifest.get(key) != getattr(allocation, key) for key in (
                 "provider", "route", "model", "reasoning", "prompt_bytes", "prompt_digest",
                 "request_digest", "output_schema_digest", "prompt_contract_version",
             ))):
         raise ModelUsageIntegrityError("assessor requalification context differs")
+    if output_guard and (
+        manifest.get("input_bound") != native_assessment_input_bound(old)
+        or manifest.get("schema_digest") != old.output_schema_digest
+        or manifest.get("implementation_worktree_clean") is not True
+        or manifest.get("implementation_revision") != old.implementation_revision
+        or manifest.get("command_semantic_version") != old.command_semantic_version
+        or manifest.get("command_flags") != list(old.command_flags)
+        or manifest.get("disabled_capabilities") != list(old.disabled_capabilities)
+        or any(manifest.get(key) != getattr(allocation, key) for key in (
+            "context_identity", "config_identity", "one_turn", "exact_input", "skills_enabled",
+            "tools_enabled", "mcp_enabled", "prior_message_count",
+        ))
+        or any(type(manifest.get(key)) is not int or manifest[key] != 0 for key in (
+            "skill_count", "tool_count", "mcp_server_count", "mcp_tool_count",
+        ))
+        or digest_canonical({key: manifest.get(key) for key in (
+            "provider", "route", "model", "reasoning", "command_semantic_version",
+            "command_flags", "implementation_revision", "system_digest", "prompt_digest", "output_schema_digest",
+        )}) != allocation.request_digest
+        or connection.execute(
+            "SELECT 1 FROM ledger WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION' "
+            "AND json_extract(payload_json,'$.invocation_id')=?", (invocation_id,),
+        ).fetchone()
+    ):
+        raise ModelUsageIntegrityError("assessor output requalification contract differs")
     results = connection.execute(
         "SELECT payload_digest,payload_json FROM ledger WHERE kind='NATIVE_ASSESSMENT_RESULT' "
         "AND json_extract(payload_json,'$.invocation_id')=?", (invocation_id,),
@@ -1270,13 +1369,17 @@ def _assessor_requalification_authority(connection, invocation_id, qualified_pol
             or result.get("invocation_policy_digest") != old.canonical_digest
             or result.get("request_digest") != allocation.request_digest
             or result.get("retention_outcome") != "RETAINED" or type(text) is not str
+            or len(text.encode()) > _MAX_RETAINED_RESULT_BYTES
             or result.get("result_bytes") != len(text.encode())
             or result.get("result_digest") != digest_bytes(text.encode())
             or _instant(str(result.get("dispatch_at"))) != terminal.dispatch_at
             or not terminal.dispatch_at <= _instant(str(result.get("observed_at"))) <= terminal.completed_at):
         raise ModelUsageIntegrityError("assessor requalification failed result differs")
     return {
-        "schema_version": "newsroom.native-assessor-input-requalification.v1",
+        "schema_version": (
+            "newsroom.native-assessor-output-guard-requalification.v1" if output_guard
+            else "newsroom.native-assessor-input-requalification.v1"
+        ),
         "invocation_id": invocation_id, "allocation_digest": allocation.canonical_digest,
         "terminal_digest": terminal.terminal_digest, "telemetry_digest": terminal.provider_telemetry_digest,
         "context_manifest_digest": allocation.context_manifest_digest,
@@ -1293,24 +1396,26 @@ def _requalified_assessor_invocations(connection):
     if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='ledger'").fetchone():
         return set()
     result = set()
-    for digest, raw in connection.execute(
-        "SELECT payload_digest,payload_json FROM ledger WHERE kind=?", (_ASSESSOR_REQUALIFICATION_KIND,),
-    ):
-        record = _object(raw)
-        try:
-            expected = _assessor_requalification_authority(
-                connection, str(record.get("invocation_id")), str(record.get("qualified_policy_digest")),
-            )
-        except ModelUsageAdmissionError as exc:
-            raise ModelUsageIntegrityError("retained assessor requalification is ineligible") from exc
-        at = _instant(str(record.get("recorded_at")))
-        if at < _instant(expected["failure_settled_at"]):
-            raise ModelUsageIntegrityError("assessor requalification precedes failure")
-        expected["recorded_at"] = _utc_text(at)
-        expected["requalification_digest"] = digest_canonical(expected)
-        if record != expected or raw != _json(record) or digest_bytes(raw.encode()) != digest or record["invocation_id"] in result:
-            raise ModelUsageIntegrityError("assessor input requalification differs")
-        result.add(record["invocation_id"])
+    for kind in (_ASSESSOR_REQUALIFICATION_KIND, _ASSESSOR_OUTPUT_REQUALIFICATION_KIND):
+        for digest, raw in connection.execute(
+            "SELECT payload_digest,payload_json FROM ledger WHERE kind=?", (kind,),
+        ):
+            record = _object(raw)
+            try:
+                expected = _assessor_requalification_authority(
+                    connection, str(record.get("invocation_id")), str(record.get("qualified_policy_digest")),
+                    output_guard=kind == _ASSESSOR_OUTPUT_REQUALIFICATION_KIND,
+                )
+            except ModelUsageAdmissionError as exc:
+                raise ModelUsageIntegrityError("retained assessor requalification is ineligible") from exc
+            at = _instant(str(record.get("recorded_at")))
+            if at < _instant(expected["failure_settled_at"]):
+                raise ModelUsageIntegrityError("assessor requalification precedes failure")
+            expected["recorded_at"] = _utc_text(at)
+            expected["requalification_digest"] = digest_canonical(expected)
+            if record != expected or raw != _json(record) or digest_bytes(raw.encode()) != digest or record["invocation_id"] in result:
+                raise ModelUsageIntegrityError("assessor requalification differs")
+            result.add(record["invocation_id"])
     return result
 
 
@@ -1827,6 +1932,7 @@ def _native_graphiti_fallback_cancellation_authority(
         or terminal.pre_dispatch_zero_proved
         or terminal.subscription_cli_chat_not_cash_debited is not True
         or allocation.prompt_bytes > policy.max_prompt_bytes
+        or allocation.max_output_tokens is None or policy.max_output_tokens is None
         or allocation.max_output_tokens > policy.max_output_tokens
         or allocation.context_identity not in policy.allowed_context_identities
         or allocation.config_identity not in policy.allowed_config_identities
@@ -1905,6 +2011,7 @@ def _native_graphiti_embedding_cancellation_authority(
         or terminal.subscription_cli_chat_not_cash_debited
         or terminal.od_011_reference != "OD-011:EVALUATION_GRAPHITI_EMBEDDING"
         or allocation.prompt_bytes > policy.max_prompt_bytes
+        or allocation.max_output_tokens is None or policy.max_output_tokens is None
         or allocation.max_output_tokens > policy.max_output_tokens
         or allocation.context_identity not in policy.allowed_context_identities
         or allocation.config_identity not in policy.allowed_config_identities
@@ -2304,7 +2411,7 @@ class InvocationEfficiencyPolicy:
     allowed_candidate_ids: tuple[str, ...]
     max_prompt_bytes: int
     max_context_tokens: int
-    max_output_tokens: int
+    max_output_tokens: int | None
     max_total_tokens: int
     prompt_contract_version: str
     output_schema_digest: str
@@ -2364,12 +2471,16 @@ class InvocationEfficiencyPolicy:
         for name in (
             "max_prompt_bytes",
             "max_context_tokens",
-            "max_output_tokens",
             "max_total_tokens",
         ):
             value = getattr(self, name)
             if not _is_int(value) or value <= 0:
                 raise ModelUsageIntegrityError(f"{name} must be positive")
+        if self.max_output_tokens is None:
+            if not _nullable_native_assessor_output(self.workload_class, self.provider, self.route):
+                raise ModelUsageIntegrityError("unbounded output is outside native assessor")
+        elif not _is_int(self.max_output_tokens) or self.max_output_tokens <= 0:
+            raise ModelUsageIntegrityError("max_output_tokens must be positive or assessor-only null")
         if not isinstance(self.one_turn, bool) or not isinstance(
             self.exact_input, bool
         ):
@@ -2417,7 +2528,7 @@ class InvocationEfficiencyPolicy:
             raise ModelUsageIntegrityError(
                 "qualified invocation policy must be one-turn exact-input"
             )
-        if self.max_total_tokens < self.max_output_tokens:
+        if self.max_output_tokens is not None and self.max_total_tokens < self.max_output_tokens:
             raise ModelUsageIntegrityError("policy total is below output maximum")
         if not self.allowed_context_identities or len(
             set(self.allowed_context_identities)
@@ -2627,7 +2738,7 @@ class InvocationAllocation:
     prompt_digest: str
     request_digest: str
     output_schema_digest: str
-    max_output_tokens: int
+    max_output_tokens: int | None
     context_manifest_digest: str
     context_identity: str
     config_identity: str
@@ -2723,7 +2834,10 @@ class InvocationAllocation:
             raise ModelUsageIntegrityError("leaf ordinal must be positive")
         if not _is_int(self.prompt_bytes) or self.prompt_bytes < 0:
             raise ModelUsageIntegrityError("prompt bytes must be non-negative")
-        if not _is_int(self.max_output_tokens) or self.max_output_tokens <= 0:
+        if self.max_output_tokens is None:
+            if not _nullable_native_assessor_output(self.workload_class, self.provider, self.route):
+                raise ModelUsageIntegrityError("unbounded allocation output is outside native assessor")
+        elif not _is_int(self.max_output_tokens) or self.max_output_tokens <= 0:
             raise ModelUsageIntegrityError("max output tokens must be positive")
         for name in (
             "one_turn",
@@ -3310,6 +3424,11 @@ class ModelUsageService:
                     "CREATE INDEX IF NOT EXISTS model_usage_assessor_requalification "
                     "ON ledger(kind,json_extract(payload_json,'$.invocation_id')) "
                     "WHERE kind='NATIVE_ASSESSOR_INPUT_REQUALIFICATION'"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS model_usage_assessor_output_requalification "
+                    "ON ledger(kind,json_extract(payload_json,'$.invocation_id')) "
+                    "WHERE kind='NATIVE_ASSESSOR_OUTPUT_GUARD_REQUALIFICATION'"
                 )
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS model_usage_assessor_result "
@@ -4735,7 +4854,9 @@ class ModelUsageService:
             or allocation.reasoning != policy.reasoning
             or allocation.prompt_contract_version != policy.prompt_contract_version
             or allocation.output_schema_digest != policy.output_schema_digest
-            or allocation.max_output_tokens > policy.max_output_tokens
+            or (allocation.max_output_tokens is None) != (policy.max_output_tokens is None)
+            or (allocation.max_output_tokens is not None and policy.max_output_tokens is not None
+                and allocation.max_output_tokens > policy.max_output_tokens)
             or allocation.one_turn != policy.one_turn
             or allocation.exact_input != policy.exact_input
             or allocation.skills_enabled != policy.skills_enabled
@@ -4976,9 +5097,7 @@ class ModelUsageService:
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT a.route,a.workload_class,p.record_json,"
-                "json_extract(a.record_json,'$.context_manifest_digest'),"
-                "json_extract(a.record_json,'$.max_output_tokens') "
+                "SELECT a.route,a.workload_class,p.record_json,a.record_json "
                 "FROM model_invocation_allocations a "
                 "JOIN model_invocation_policies p ON p.canonical_digest=a.policy_digest "
                 "WHERE a.invocation_id=?",
@@ -4996,8 +5115,9 @@ class ModelUsageService:
                 if _has_exact_dispatch(connection, terminal):
                     raise ModelUsageIntegrityError("pre-dispatch zero contradicts committed dispatch")
             route, workload = str(row[0]), WorkloadClass(str(row[1]))
-            context_manifest_digest = str(row[3])
-            requested_max_output_tokens = int(row[4])
+            allocation = _allocation_from_record(_object(row[3]))
+            context_manifest_digest = allocation.context_manifest_digest
+            requested_max_output_tokens = allocation.max_output_tokens
             policy = _policy_from_record(_object(row[2]))
             retained = terminal
             if provider_telemetry is not None:
@@ -5171,8 +5291,16 @@ class ModelUsageService:
         workload: WorkloadClass,
         policy: InvocationEfficiencyPolicy,
         *,
-        requested_max_output_tokens: int,
+        requested_max_output_tokens: int | None,
     ) -> str | None:
+        policy._validate()
+        if (
+            (requested_max_output_tokens is None) != (policy.max_output_tokens is None)
+            or (requested_max_output_tokens is not None and (
+                not _is_int(requested_max_output_tokens) or requested_max_output_tokens <= 0
+            ))
+        ):
+            raise ModelUsageIntegrityError("terminal output guard differs from policy")
         components = terminal.components
         total = components.total_tokens
         if terminal.pre_dispatch_zero_proved:
@@ -5224,9 +5352,9 @@ class ModelUsageService:
         if context is not None and context > policy.max_context_tokens:
             return "MAX_CONTEXT_TOKENS_EXCEEDED"
         output = components.output_tokens
-        if output is not None and output > requested_max_output_tokens:
+        if requested_max_output_tokens is not None and output is not None and output > requested_max_output_tokens:
             return "REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED"
-        if output is not None and output > policy.max_output_tokens:
+        if policy.max_output_tokens is not None and output is not None and output > policy.max_output_tokens:
             return "MAX_OUTPUT_TOKENS_EXCEEDED"
         return terminal.policy_breach
 
@@ -6436,7 +6564,8 @@ class ModelUsageService:
                     if components.context_tokens is not None
                     and components.context_tokens > policy.max_context_tokens
                     else "MAX_OUTPUT_TOKENS_EXCEEDED"
-                    if components.output_tokens is not None
+                    if policy.max_output_tokens is not None
+                    and components.output_tokens is not None
                     and components.output_tokens > policy.max_output_tokens
                     else None
                 ),
@@ -6595,18 +6724,39 @@ class ModelUsageService:
         self, *, invocation_id: str, qualified_policy_digest: str, recorded_at: datetime,
     ) -> str:
         """Release only a proved, corrected assessor input-bound failure."""
+        return self._requalify_native_assessor(
+            invocation_id, qualified_policy_digest, recorded_at, _ASSESSOR_REQUALIFICATION_KIND,
+        )
+
+    def requalify_native_assessor_output_guard(
+        self, *, invocation_id: str, qualified_policy_digest: str, recorded_at: datetime,
+    ) -> str:
+        """Exempt one fully accounted v19 output rejection for future v20 work."""
+        return self._requalify_native_assessor(
+            invocation_id, qualified_policy_digest, recorded_at, _ASSESSOR_OUTPUT_REQUALIFICATION_KIND,
+        )
+
+    def _requalify_native_assessor(
+        self, invocation_id: str, qualified_policy_digest: str, recorded_at: datetime, kind: str,
+    ) -> str:
         from .store import append_ledger
 
         connection = self._connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            authority = _assessor_requalification_authority(connection, invocation_id, qualified_policy_digest)
+            authority = _assessor_requalification_authority(
+                connection, invocation_id, qualified_policy_digest,
+                output_guard=kind == _ASSESSOR_OUTPUT_REQUALIFICATION_KIND,
+            )
             if invocation_id in _requalified_assessor_invocations(connection):
                 raw = connection.execute(
                     "SELECT payload_json FROM ledger WHERE kind=? AND json_extract(payload_json,'$.invocation_id')=?",
-                    (_ASSESSOR_REQUALIFICATION_KIND, invocation_id),
+                    (kind, invocation_id),
                 ).fetchone()[0]
-                return str(_object(raw)["requalification_digest"])
+                record = _object(raw)
+                if record["qualified_policy_digest"] != qualified_policy_digest:
+                    raise ModelUsageIntegrityError("assessor requalification replay policy differs")
+                return str(record["requalification_digest"])
             route = "NATIVE_EVIDENCE_ASSESSOR"
             state = self._route_state(connection, route)
             if (state["state"] != "OPEN" or state["invocation_id"] != invocation_id
@@ -6622,7 +6772,7 @@ class ModelUsageService:
             authority["recorded_at"] = _utc_text(recorded_at)
             digest = digest_canonical(authority)
             authority["requalification_digest"] = digest
-            append_ledger(connection, _ASSESSOR_REQUALIFICATION_KIND, authority)
+            append_ledger(connection, kind, authority)
             if route in _usage_blocking_routes(connection):
                 raise ModelUsageAdmissionError("assessor requalification leaves another usage blocker")
             self._append_route_state(
@@ -8300,7 +8450,7 @@ def _object(value: object) -> dict[str, object]:
 
 
 def _policy_from_record(record: Mapping[str, object]) -> InvocationEfficiencyPolicy:
-    return InvocationEfficiencyPolicy(
+    policy = InvocationEfficiencyPolicy(
         policy_id=str(record["policy_id"]),
         version=str(record["version"]),
         workload_class=WorkloadClass(str(record["workload_class"])),
@@ -8333,7 +8483,9 @@ def _policy_from_record(record: Mapping[str, object]) -> InvocationEfficiencyPol
         ),
         max_prompt_bytes=_record_int(record, "max_prompt_bytes"),
         max_context_tokens=_record_int(record, "max_context_tokens"),
-        max_output_tokens=_record_int(record, "max_output_tokens"),
+        max_output_tokens=(None if "max_output_tokens" in record
+                           and record["max_output_tokens"] is None
+                           else _record_int(record, "max_output_tokens")),
         max_total_tokens=_record_int(record, "max_total_tokens"),
         prompt_contract_version=str(record["prompt_contract_version"]),
         output_schema_digest=str(record["output_schema_digest"]),
@@ -8354,6 +8506,8 @@ def _policy_from_record(record: Mapping[str, object]) -> InvocationEfficiencyPol
         qualified=bool(record["qualified"]),
         canonical_digest=str(record["canonical_digest"]),
     )
+    policy._validate()
+    return policy
 
 
 def _envelope_from_record(record: Mapping[str, object]) -> WorkEnvelope:
@@ -8397,7 +8551,9 @@ def _allocation_from_record(record: Mapping[str, object]) -> InvocationAllocatio
         prompt_digest=str(record["prompt_digest"]),
         request_digest=str(record["request_digest"]),
         output_schema_digest=str(record["output_schema_digest"]),
-        max_output_tokens=_record_int(record, "max_output_tokens"),
+        max_output_tokens=(None if "max_output_tokens" in record
+                           and record["max_output_tokens"] is None
+                           else _record_int(record, "max_output_tokens")),
         context_manifest_digest=str(record["context_manifest_digest"]),
         context_identity=str(record["context_identity"]),
         config_identity=str(record["config_identity"]),
@@ -8468,7 +8624,7 @@ def _terminal_from_record(record: Mapping[str, object]) -> InvocationTerminal:
 
 
 def _record_int(record: Mapping[str, object], field: str) -> int:
-    value = record[field]
+    value = record.get(field)
     if not _is_int(value):
         raise ModelUsageIntegrityError(f"retained policy {field} is invalid")
     return value

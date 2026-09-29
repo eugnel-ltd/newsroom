@@ -56,7 +56,9 @@ from newsroom.increment10.evidence import EvidencePackageError, _base_package
 from newsroom.control_plane.writer import (
     CONT_DISABLED_CAPABILITIES,
     CONT_PRIMARY_COMMAND_FLAGS,
+    CONT_PRIMARY_MODEL,
     CONT_PRIMARY_REASONING,
+    _grok_command_flags,
 )
 from newsroom.tests.test_increment10_editorial import _ready_package
 from newsroom.tests.test_increment10_ingress import _candidate
@@ -81,6 +83,9 @@ def _use_historical_v16(monkeypatch):
         native_assessor_module,
         "CONTEXT_MANIFEST_SCHEMA_VERSION",
         "newsroom.native-evidence-assessor.context-manifest.v2",
+    )
+    monkeypatch.setattr(
+        native_assessor_module, "MODEL", CONT_PRIMARY_MODEL,
     )
     monkeypatch.setattr(
         native_assessor_module, "REASONING", CONT_PRIMARY_REASONING,
@@ -256,7 +261,7 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     invalid_geography["geography"] = ["Britain"]
     with pytest.raises(ValidationError):
         validator.validate({"package": invalid_geography})
-    assert VERSION == "newsroom.native-evidence-assessor.v19"
+    assert VERSION == "newsroom.native-evidence-assessor.v20"
     assert "ASSESSOR_CLAIM_BINDING_HOLD" in REASSESSABLE_HOLDS
     legacy = native_assessor_module._V17_SYSTEM
     assert "whitespace, newlines and country labels exactly" in legacy
@@ -1431,6 +1436,20 @@ def test_native_assessor_retains_precise_qualification_contract_hold(
 
 
 def _usage(tmp_path, monkeypatch):
+    current = (
+        native_assessor_module.VERSION == native_assessor_module._REFERENCE_PRODUCER_VERSION
+    )
+    if not current:
+        # Historical fixtures retain their model, reasoning and output ceiling.
+        reasoning = (
+            "medium" if native_assessor_module.VERSION == native_assessor_module._V19_PRODUCER_VERSION
+            else CONT_PRIMARY_REASONING
+        )
+        monkeypatch.setattr(native_assessor_module, "MODEL", CONT_PRIMARY_MODEL)
+        monkeypatch.setattr(native_assessor_module, "REASONING", reasoning)
+        monkeypatch.setattr(
+            native_assessor_module, "COMMAND_FLAGS", _grok_command_flags(reasoning),
+        )
     monkeypatch.setattr(
         "newsroom.control_plane.native_assessor.read_grok_command_semantic_version",
         lambda **_kwargs: "1.0.8",
@@ -1447,7 +1466,7 @@ def _usage(tmp_path, monkeypatch):
         workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
         provider="grok-build-cli",
         route="NATIVE_EVIDENCE_ASSESSOR",
-        model="grok-4.6",
+        model=native_assessor_module.MODEL,
         reasoning=native_assessor_module.REASONING,
         one_turn=True,
         exact_input=True,
@@ -1464,7 +1483,7 @@ def _usage(tmp_path, monkeypatch):
         implementation_revision=REVISION,
         max_prompt_bytes=1_000_000,
         max_context_tokens=100_000,
-        max_output_tokens=10_000,
+        max_output_tokens=None if current else 10_000,
         max_total_tokens=100_000,
         prompt_contract_version=native_assessor_module.VERSION,
         output_schema_digest=native_assessor_module.PROVIDER_SCHEMA_DIGEST,
@@ -1479,7 +1498,7 @@ def _usage(tmp_path, monkeypatch):
     )
 
 
-def test_native_assessor_input_bound_includes_fixed_input_and_output_reserve(
+def test_native_assessor_input_bound_has_planning_headroom_not_an_output_limit(
     tmp_path, monkeypatch,
 ) -> None:
     _service, usage = _usage(tmp_path, monkeypatch)
@@ -1487,18 +1506,25 @@ def test_native_assessor_input_bound_includes_fixed_input_and_output_reserve(
     bound = native_assessment_input_bound(policy)
     assert bound['version'] == INPUT_BOUND_VERSION
     assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v3')
-    assert VERSION.endswith('.v19')
+    assert VERSION.endswith('.v20')
     assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
     assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
     assert bound['schema_digest'] == PROVIDER_SCHEMA_DIGEST
     assert bound['schema_bytes'] == len(canonical_json_bytes(PROVIDER_SCHEMA))
     assert bound['framing_reserve_tokens'] == 16_384
-    assert bound['output_reserve_tokens'] == policy.max_output_tokens
+    assert policy.max_output_tokens is None
+    assert bound['output_reserve_tokens'] == 10_000
+    assert bound['output_limit_enforced'] is False
+    assert bound['output_reserve_basis'] == 'PLANNING_ONLY'
     fixed = bound['system_bytes'] + bound['schema_bytes'] + 16_384
     assert bound['max_request_bytes'] == min(
         policy.max_prompt_bytes, policy.max_context_tokens - fixed,
-        policy.max_total_tokens - fixed - policy.max_output_tokens,
+        policy.max_total_tokens - fixed - bound['output_reserve_tokens'],
     )
+    assert bound['max_request_bytes'] == 61_650
+    assert native_assessment_input_bound(replace(
+        policy, max_prompt_bytes=56_464,
+    ))['max_request_bytes'] == 56_464
     assert bound['bound_digest'] == digest_canonical({
         key: value for key, value in bound.items() if key != 'bound_digest'
     })
@@ -2777,13 +2803,14 @@ def test_literal_csv_names_survive_full_assessment_and_governed_records(retained
             AutonomousNativeEvidenceAssessor._validated_execution(NativeAssessmentExecution(canonical_json_bytes(altered).decode(), {}),candidate,base,(source,),(acquired,))
 
 
-def test_v19_reasoning_profile_preserves_v15_v16_v17_v18_contracts():
+def test_v20_profile_preserves_v15_v16_v17_v18_v19_contracts():
     from newsroom.control_plane.native_assessor import (
         _V15_SYSTEM, _V15_SCHEMA_DIGEST, _V15_SCHEMA_BYTES, _V16_SYSTEM,
         _V17_SYSTEM, _V17_PROVIDER_SCHEMA_DIGEST,
         _V18_SYSTEM, _V18_PROVIDER_SCHEMA,
+        _V19_SYSTEM, _V19_PROVIDER_SCHEMA, _V19_PROVIDER_SCHEMA_DIGEST,
     )
-    assert VERSION == 'newsroom.native-evidence-assessor.v19'
+    assert VERSION == 'newsroom.native-evidence-assessor.v20'
     assert digest_bytes(_V15_SYSTEM.encode()) == 'sha256:5788c3e827199e12932d106ad494c80b71b2691e3f9c7e535a44c5d09811d4a6'
     assert len(_V15_SYSTEM.encode()) == 6797
     assert SCHEMA_DIGEST == _V15_SCHEMA_DIGEST
@@ -2800,7 +2827,11 @@ def test_v19_reasoning_profile_preserves_v15_v16_v17_v18_contracts():
     assert _V17_PROVIDER_SCHEMA_DIGEST != PROVIDER_SCHEMA_DIGEST
     assert SYSTEM == _V18_SYSTEM
     assert PROVIDER_SCHEMA == _V18_PROVIDER_SCHEMA
-    assert native_assessor_module.REASONING == 'medium'
+    assert SYSTEM == _V19_SYSTEM
+    assert PROVIDER_SCHEMA == _V19_PROVIDER_SCHEMA
+    assert PROVIDER_SCHEMA_DIGEST == _V19_PROVIDER_SCHEMA_DIGEST
+    assert native_assessor_module.MODEL == 'grok-4.7'
+    assert native_assessor_module.REASONING == 'high'
     assert native_assessor_module.COMMAND_FLAGS != CONT_PRIMARY_COMMAND_FLAGS
     assert PROVIDER_SCHEMA_DIGEST != SCHEMA_DIGEST
     assert PROVIDER_SCHEMA['properties']['package']['properties'][

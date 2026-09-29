@@ -34,9 +34,9 @@ NOW = datetime(2026, 9, 8, 14, tzinfo=UTC)
 
 
 def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
-    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v19"
+    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v20"
     assert native_composition.ASSESSMENT_CONTRACT_VERSION == (
-        "newsroom.native-evidence-assessor.v19+newsroom.named-entity.v15+"
+        "newsroom.native-evidence-assessor.v20+newsroom.named-entity.v15+"
         "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v1+"
         "newsroom.qualification-relation.v3+newsroom.retained-assessment.v1"
     )
@@ -69,7 +69,8 @@ def test_native_cursor_credential_loads_only_provisioned_key_and_restores_enviro
 @pytest.mark.parametrize(
     "missing_workload",
     (WorkloadClass.NATIVE_RETRIEVAL_EMBEDDING, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
-     "stale-assessor-contract", "stale-assessor-flags", "stale-assessor-reasoning"),
+     "stale-assessor-contract", "stale-assessor-flags", "stale-assessor-reasoning",
+     "stale-assessor-model", "stale-assessor-output-limit"),
 )
 def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
     tmp_path, monkeypatch, missing_workload,
@@ -114,6 +115,10 @@ def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
                            else native_assessor.REASONING),
                 command_flags=(CONT_PRIMARY_COMMAND_FLAGS if missing_workload == "stale-assessor-flags"
                                else native_assessor.COMMAND_FLAGS),
+                model=("grok-4.6" if missing_workload == "stale-assessor-model"
+                       else native_assessor.MODEL),
+                max_output_tokens=(10_000 if missing_workload == "stale-assessor-output-limit"
+                                   else None),
             )
             return InvocationEfficiencyPolicy.create(**values)
         return policies[request["workload_class"]]
@@ -363,7 +368,7 @@ def _assessment_policy() -> InvocationEfficiencyPolicy:
         policy_id="native-composition-assessment", version="v1",
         workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
         provider="grok-build-cli", route=native_assessor.ROUTE,
-        model="grok-4.6", reasoning=native_assessor.REASONING,
+        model=native_assessor.MODEL, reasoning=native_assessor.REASONING,
         one_turn=True, exact_input=True,
         skills_enabled=False, tools_enabled=False, mcp_enabled=False,
         prior_message_count=0, command_semantic_version="1.0.8",
@@ -371,7 +376,7 @@ def _assessment_policy() -> InvocationEfficiencyPolicy:
         context_manifest_schema_version=native_assessor.CONTEXT_MANIFEST_SCHEMA_VERSION,
         disabled_capabilities=CONT_DISABLED_CAPABILITIES,
         implementation_revision="1" * 40, max_prompt_bytes=1_000_000,
-        max_context_tokens=100_000, max_output_tokens=10_000,
+        max_context_tokens=100_000, max_output_tokens=None,
         max_total_tokens=100_000, prompt_contract_version=native_assessor.VERSION,
         output_schema_digest=native_assessor.PROVIDER_SCHEMA_DIGEST,
         allowed_context_identities=(native_assessor.CONTEXT_IDENTITY,),

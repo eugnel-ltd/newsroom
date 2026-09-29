@@ -39,6 +39,10 @@ def _fixture(tmp_path, monkeypatch):
     connection, _port, candidate = _candidate(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
+    assert usage._policy.model == 'grok-4.6'
+    assert usage._policy.reasoning == 'low'
+    assert usage._policy.max_output_tokens == 10_000
+    assert native_assessment_input_bound(usage._policy)['version'].endswith('.v1')
     allocation = usage.begin(candidate, base, 'small request')
     old = _changed_policy(usage._policy, context_manifest_schema_version='newsroom.native-evidence-assessor.context-manifest.v1')
     service.register_policy(old)
