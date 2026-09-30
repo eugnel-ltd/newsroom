@@ -1231,3 +1231,111 @@ def test_deferred_ready_work_honours_stop_and_drain_before_continuation(tmp_path
         ]
     finally:
         connection.close()
+
+
+def _overrunning_ready_spill(tmp_path, monkeypatch):
+    pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+    dispositions[0] = ()
+    interrupted = _native("permanent-interrupted")
+    journal.land((interrupted,))
+    journal.advance(interrupted.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+        "graphiti_receipts": [{"retained": True}], "candidate_version_id": "candidate:interrupted",
+    })
+    original = pipeline._publish
+
+    def publish(**kwargs):
+        if kwargs["revision_id"] == interrupted.revision_id:
+            calls.append(("recover", interrupted.revision_id))
+        else:
+            original.advance(**kwargs)
+        now[0] += 301
+
+    pipeline._publish = NS(advance=publish)
+    return pipeline, journal, connection, calls, now
+
+
+@pytest.mark.parametrize("fresh_seconds", [0, 301])
+def test_ready_spill_alternates_current_and_archive_despite_fresh_turns(tmp_path, monkeypatch, fresh_seconds):
+    pipeline, journal, connection, calls, now = _overrunning_ready_spill(tmp_path, monkeypatch)
+    archives = tuple(replace(_native(f"archive-{index}"), published_at=f"201{index}-01-01T00:00:00Z") for index in range(3))
+    weekly = replace(_native("weekly"), published_at="2024-05-10T00:00:00Z", updated_at="2026-09-29T13:28:01Z")
+    for unit in (*archives, weekly):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage="GRAPHITI_COMPLETE", facts={"graphiti_receipts": [{"retained": True}]})
+    retained = {key: dict(value) for key, value in journal.progress.items()}
+    incoming = [None]
+    pipeline._intake = NS(poll=lambda: (NS(source_id=incoming[0].source_id, status="READY", reason_code="RETAINED", units=(incoming[0],)),))
+
+    def graphiti(selected, **kwargs):
+        now[0] += fresh_seconds
+        return tuple(NativeGraphitiOutcome(unit.ingest_id, "GRAPHITI_COMPLETE", unit.digest, None) for unit in selected)
+
+    pipeline._graphiti = NS(advance=graphiti)
+    fresh = tuple(replace(_native(f"incoming-{index}"), updated_at=f"2026-10-0{index + 1}T00:00:00Z") for index in range(6))
+    spill_turns = []
+    try:
+        for index, unit in enumerate(fresh):
+            incoming[0] = unit
+            start = len(calls)
+            pipeline.tick(cycle_id=f"fair-spill-{index}")
+            publications = [revision for kind, revision in calls[start:] if kind == "publish"]
+            assert len(publications) == len(set(publications))
+            spill_turns.append(publications[-1])
+        assert spill_turns[:2] == [weekly.revision_id, archives[0].revision_id]
+        assert all(journal.progress[unit.revision_id]["stage"] == "ACKNOWLEDGED" for unit in archives)
+        if fresh_seconds:
+            assert spill_turns[2::2] == [fresh[1].revision_id, fresh[3].revision_id]
+        for unit in (*archives, weekly):
+            assert journal.progress[unit.revision_id]["facts"]["graphiti_receipts"] == retained[unit.revision_id]["facts"]["graphiti_receipts"]
+        interrupted = next(key for key, value in retained.items() if value["stage"] == "ASSESSMENT_INTERRUPTED")
+        assert journal.progress[interrupted] == retained[interrupted]
+    finally:
+        connection.close()
+
+
+def test_ready_spill_empty_quantum_does_not_consume_current_turn(tmp_path, monkeypatch):
+    pipeline, journal, connection, calls, now = _overrunning_ready_spill(tmp_path, monkeypatch)
+    units = tuple(replace(_native(f"ready-{index}"), updated_at=f"202{index}-01-01T00:00:00Z") for index in range(2))
+    for unit in units:
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage="GRAPHITI_COMPLETE", facts={"graphiti_receipts": [{}]})
+    original, turns = pipeline._advance_revisions, [0]
+
+    def advance(revisions, **kwargs):
+        turns[0] += 1
+        if turns[0] == 3:
+            now[0] += 301
+        return original(revisions, **kwargs)
+
+    pipeline._advance_revisions = advance
+    try:
+        pipeline.tick(cycle_id="expired-before-spill")
+        assert not any(kind == "publish" for kind, _ in calls)
+        assert all(journal.progress[unit.revision_id]["stage"] == "GRAPHITI_COMPLETE" for unit in units)
+        pipeline.tick(cycle_id="first-real-spill")
+        pipeline.tick(cycle_id="archive-spill")
+        assert [revision for kind, revision in calls if kind == "publish"] == [units[1].revision_id, units[0].revision_id]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("dates,first", [
+    (((None, "2021-01-01T00:00:00Z"), ("2026-01-01T00:00:00Z", "2020-01-01T00:00:00Z")), 1),
+    (((None, "2021-01-01T00:00:00Z"), ("malformed", "2026-01-01T00:00:00Z")), 1),
+    ((("2024-01-01T00:00:00Z", None), ("2024-01-01T00:00:00Z", None)), 0),
+    (((None, None), ("malformed", None)), 0),
+])
+def test_ready_spill_source_dates_fall_back_without_using_observation_time(tmp_path, monkeypatch, dates, first):
+    pipeline, journal, connection, calls, _ = _overrunning_ready_spill(tmp_path, monkeypatch)
+    units = tuple(replace(_native(f"dated-{index}"), updated_at=updated, published_at=published,
+                          observed_at=f"2026-09-{index + 1:02}T00:00:00Z") for index, (updated, published) in enumerate(dates))
+    for unit in units:
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage="GRAPHITI_COMPLETE", facts={"graphiti_receipts": [{}]})
+    try:
+        pipeline.tick(cycle_id="source-dated-spill")
+        assert [revision for kind, revision in calls if kind == "publish"] == [units[first].revision_id]
+    finally:
+        connection.close()

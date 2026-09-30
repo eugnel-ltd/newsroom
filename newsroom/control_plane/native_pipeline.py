@@ -17,6 +17,16 @@ from .native_progress import NativeRevisionJournal
 from .veto import OperatorDrainRequested, VetoError
 
 
+def _source_update_time(item: tuple) -> tuple:
+    unit = item[1][0]
+    for value in (unit.updated_at, unit.published_at):
+        try:
+            return True, UtcTimestamp.parse(value).value
+        except ValueError:
+            continue
+    return False, None
+
+
 @dataclass(frozen=True, slots=True)
 class NativePipelineReport:
     sources: tuple[dict, ...]
@@ -62,6 +72,7 @@ class NativePipeline:
         self._assessment_contract_version = assessment_contract_version
         self._reassessment_quantum = reassessment_quantum_seconds
         self._monotonic_clock = monotonic_clock
+        self._spill_archive_turn = False
         self.runtime_identity_digest: str | None = None
 
     def _drain_between_work(self) -> None:
@@ -198,12 +209,19 @@ class NativePipeline:
             key=lambda item: max(UtcTimestamp.parse(unit.observed_at).value for unit in item[1]),
             reverse=True,
         )
-        self._advance_revisions(
+        ready_spill = deadline_deferred_ready
+        if not self._spill_archive_turn:
+            ready_spill = tuple(sorted(ready_spill, key=_source_update_time, reverse=True))
+        deferred = self._advance_revisions(
             # Unattempted canonical work must not starve behind an unresolved
             # predecessor. Reuse this existing assessment budget, once per unit.
-            deadline_deferred_ready + tuple(reassessments),
+            ready_spill + tuple(reassessments),
             work_deadline=self._monotonic_clock() + self._reassessment_quantum,
         )
+        if len(deferred) < len(ready_spill):
+            # Alternate news recency with LAND/FIFO only after an actual spill
+            # turn. Restart resets this preference, never retained work.
+            self._spill_archive_turn = not self._spill_archive_turn
         self._drain_between_work()
         states = Counter(
             self._journal.progress.get(revision_id, {}).get("stage", "QUEUED")
