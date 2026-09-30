@@ -1,6 +1,9 @@
 """Assessor-only reasoning profile; writer defaults and old profiles stay exact."""
 
 import json
+import sqlite3
+import subprocess
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,3 +141,60 @@ def test_actual_dispatch_argv_selects_assessor_profile_or_unchanged_writer_defau
     command, = commands
     assert command[command.index("-m") + 1] == ("grok-4.7" if assessor else "grok-4.6")
     assert command[command.index("--reasoning-effort") + 1] == ("high" if assessor else "low")
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_type"),
+    (("timeout", "CliTimeoutError"), ("empty", "CliEmptyOutputError")),
+)
+def test_cli_failure_type_survives_assessor_without_changing_unknown_accounting(
+    tmp_path, monkeypatch, failure, expected_type,
+):
+    connection, _port, candidate = _candidate(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    service, usage = _usage(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(writer, "_minimal_grok_auth_bytes", lambda: b"{}")
+    monkeypatch.setattr(writer, "_prove_grok_hermetic_capabilities", lambda _auth: None)
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert kwargs["timeout"] == 300
+        assert command[command.index("-m") + 1] == "grok-4.7"
+        assert command[command.index("--reasoning-effort") + 1] == "high"
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(
+                command, 300, output=b"partial-secret-output", stderr=b"private-diagnostic",
+            )
+        return SimpleNamespace(returncode=0, stdout=" \n", stderr="private-diagnostic")
+
+    monkeypatch.setattr(writer.subprocess, "run", run)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            native_assessor.AutonomousNativeEvidenceAssessor(
+                native_assessor._dispatch_grok, usage=usage, dispatch_fence=nullcontext,
+            )(candidate, base, (), ())
+        assert type(caught.value).__name__ == expected_type
+        assert str(caught.value).endswith(
+            "writer timed out" if failure == "timeout" else "writer returned empty stdout"
+        )
+        assert len(calls) == 1
+        with sqlite3.connect(service.path) as retained:
+            terminal = json.loads(retained.execute(
+                "SELECT record_json FROM model_invocation_terminals"
+            ).fetchone()[0])
+            assert terminal["outcome"] == "ASSESSOR_PROVIDER_FAILED"
+            assert terminal["failure_class"] == "UNKNOWN_PROVIDER_FAILURE"
+            assert terminal["usage_status"] == "ESTIMATED"
+            assert terminal["pre_dispatch_zero_proved"] is False
+            assert terminal["dispatch_at"] is not None
+            assert retained.execute(
+                "SELECT count(*) FROM ledger WHERE kind IN "
+                "('NATIVE_ASSESSMENT_RESULT','NATIVE_ASSESSMENT_MATERIALISATION')"
+            ).fetchone() == (0,)
+            assert not any(
+                "partial-secret-output" in (raw or "") or "private-diagnostic" in (raw or "")
+                for raw, in retained.execute("SELECT payload_json FROM ledger")
+            )
+    finally:
+        connection.close()
