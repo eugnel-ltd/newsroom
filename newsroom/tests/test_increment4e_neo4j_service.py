@@ -126,7 +126,8 @@ def test_actual_guard_restores_multiple_pages_and_duplicate_targets() -> None:
                 )
                 await guard.restore_preexisting()
                 nodes, _, _ = await query(
-                    "MATCH (n) WHERE n.uuid IN $ids "
+                    "MATCH (n) WHERE n.uuid IN $ids AND NOT n:NewsroomSnapshotNode "
+                    "AND NOT n:NewsroomSnapshotRelationship AND NOT n:NewsroomIngestMarker "
                     "RETURN properties(n) AS props,labels(n) AS labels",
                     ids=identifiers,
                 )
@@ -187,7 +188,7 @@ def test_actual_guard_expiry_keeps_generation_owned_until_recovery() -> None:
             await query("CREATE (:Entity {uuid:$id,group_id:$group,name:'original'})", id=suffix, group=group)
             first = guard(episode)
             await first.begin()
-            await query("MATCH (n {uuid:$id}) SET n.name='partial'", id=suffix)
+            await query("MATCH (n:Entity {uuid:$id}) SET n.name='partial'", id=suffix)
             await query(
                 "MATCH (m:NewsroomIngestMarker {episode_uuid:$episode}) "
                 "SET m.claim_expires_at=datetime()-duration('PT16M')",
@@ -204,7 +205,7 @@ def test_actual_guard_expiry_keeps_generation_owned_until_recovery() -> None:
                 embedding_usage={"usage_basis": "NO_EMBEDDING_CALL", "request_count": 0},
                 reason="ACTUAL_EXPIRED_OWNER_RECOVERY",
             )
-            rows, _, _ = await query("MATCH (n {uuid:$id}) RETURN n.name AS name", id=suffix)
+            rows, _, _ = await query("MATCH (n:Entity {uuid:$id}) RETURN n.name AS name", id=suffix)
             assert rows[0]["name"] == "original"
             assert (await competitor.begin()).state is GuardState.CREATED
             await competitor.rollback_pending(

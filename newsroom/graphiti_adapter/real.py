@@ -876,14 +876,17 @@ async def _add_episode(
             restore_result(dict(completed), telemetry)
             return SimpleNamespace(episode=None, nodes=(), edges=())
 
-        _retained, state = await _ensure_episode(
-            graphiti=graphiti,
-            runtime=runtime,
-            episode_id=episode_id,
-            name=name,
-            body=body,
-            reference_time=reference_time,
-        )
+        # Recheck the exact owner before this deterministic graph write; release
+        # the generation lock before any provider leaf.
+        async with guard.fenced_graph_mutation():
+            _retained, state = await _ensure_episode(
+                graphiti=graphiti,
+                runtime=runtime,
+                episode_id=episode_id,
+                name=name,
+                body=body,
+                reference_time=reference_time,
+            )
         if state != "CREATED" and not (
             fresh_retry and state == "RETAINED"
         ):

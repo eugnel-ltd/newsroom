@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -115,6 +116,12 @@ def _combined_runtime_inputs(
     return attempt.configuration, replace(revision, episode_uuid=episode_id)
 
 
+@asynccontextmanager
+async def _uncontended_generation_fence(_guard: object):
+    """Uncontended fixture; stale ownership has a separate direct regression."""
+    yield
+
+
 def _provider_free_pipeline(**values: object) -> object:
     import newsroom.graphiti_adapter.real as real
 
@@ -144,6 +151,91 @@ def _provider_free_pipeline(**values: object) -> object:
         chat_receipt=lambda: list(graphiti.clients.llm_client.invocations),
         embedding_receipt=graphiti.clients.embedder.receipt,
     )
+
+
+@pytest.mark.parametrize("stale_owner", (False, True))
+def test_episode_creation_requires_current_generation_owner_before_provider(
+    monkeypatch: pytest.MonkeyPatch, stale_owner: bool,
+) -> None:
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.graphiti_adapter.neo4j_guard import GuardError
+
+    events: list[str] = []
+    fenced = False
+
+    class Guard:
+        @asynccontextmanager
+        async def fenced_graph_mutation(self):
+            nonlocal fenced
+            if stale_owner:
+                raise GuardError("Graphiti generation mutation lost its pending claim")
+            fenced = True
+            try:
+                yield
+            finally:
+                fenced = False
+
+    class Pipeline:
+        recovery_marker = None
+
+        async def _prepare_attempt(self):
+            # A paused after begin; recovery and B have replaced its owner token.
+            events.append("prepared")
+            return None
+
+    class Graphiti:
+        def __init__(self, *_args: object, **_values: object) -> None:
+            self.driver = object()
+
+        async def close(self) -> None:
+            events.append("close")
+
+    delegate = SimpleNamespace(
+        client=SimpleNamespace(embeddings=SimpleNamespace(), close=AsyncMock()),
+        config=SimpleNamespace(embedding_model="model", embedding_dim=2),
+    )
+    runtime = SimpleNamespace(
+        Graphiti=Graphiti, OpenAIEmbedder=lambda **_values: delegate,
+        OpenAIEmbedderConfig=lambda **values: SimpleNamespace(**values),
+        MeteredOpenAIEmbedder=real.MeteredOpenAIEmbedder,
+        IdentityCrossEncoder=lambda: object(), EpisodeType=SimpleNamespace(text="text"),
+        EpisodicNode=lambda **values: SimpleNamespace(**values),
+        MutationGuard=lambda *_args, **_values: Guard(),
+    )
+
+    async def save_episode(**_values: object):
+        assert fenced, "episode write must hold the current generation fence"
+        events.append("save")
+        return SimpleNamespace(uuid="episode-id"), "CREATED"
+
+    async def provider(*_args: object, **_values: object):
+        assert not fenced, "provider work must not hold the database lock"
+        events.append("provider")
+        return SimpleNamespace(
+            outcome=real.CombinedTemporalOutcome.TERMINAL_SUCCESS_ZERO_PROPOSALS,
+            nodes=(), edges=(),
+        )
+
+    monkeypatch.setattr(real, "_load_graphiti", lambda: runtime)
+    monkeypatch.setattr(real, "build_cli_llm_client", lambda: SimpleNamespace(invocations=[]))
+    monkeypatch.setattr(real, "combined_temporal_pipeline_for", lambda **_values: Pipeline())
+    monkeypatch.setattr(real, "_ensure_episode", save_episode)
+    monkeypatch.setattr(real, "extract_combined_temporal_async", provider)
+    configuration, revision = _combined_runtime_inputs("Body", "episode-id")
+    call = real._add_episode(
+        api_key="key", password="password", body="Body", name="episode-id",
+        episode_id="episode-id", reference_time=datetime(2026, 8, 20, tzinfo=UTC),
+        telemetry=real._EpisodeTelemetry(), attempt_number=1,
+        validate_result=lambda *_args: {}, restore_result=lambda *_args: None,
+        configuration=configuration, revision=revision,
+    )
+    if stale_owner:
+        with pytest.raises(GuardError, match="lost its pending claim"):
+            asyncio.run(call)
+        assert events == ["prepared", "close"]
+    else:
+        asyncio.run(call)
+        assert events == ["prepared", "save", "provider", "close"]
 
 
 def _digest(label: str) -> str:
@@ -987,6 +1079,8 @@ def test_episode_uses_default_database_and_validates_before_complete(
             return None
 
     class Guard:
+        fenced_graph_mutation = _uncontended_generation_fence
+
         async def begin(self) -> object:
             guard_events.append("begin")
             return real.GuardMarker(
@@ -1199,6 +1293,8 @@ def test_only_proven_pipeline_rollback_is_classified_complete(
             events.append("close")
 
     class Guard:
+        fenced_graph_mutation = _uncontended_generation_fence
+
         async def begin(self) -> GuardMarker:
             return GuardMarker(
                 state=GuardState.CREATED,
@@ -1309,6 +1405,8 @@ def test_cancelled_episode_cleanup_is_ordered_and_bounded(
                 await asyncio.Event().wait()
 
     class Guard:
+        fenced_graph_mutation = _uncontended_generation_fence
+
         async def begin(self) -> GuardMarker:
             return GuardMarker(
                 state=GuardState.CREATED,
@@ -2761,6 +2859,9 @@ def test_zero_dispatch_failure_opens_attempt_marker_and_replays_it(
     async def complete(guard: object, raw: dict[str, object]) -> None:
         markers[guard._marker_episode_uuid] = dict(raw)
 
+    monkeypatch.setattr(
+        real.Neo4jMutationGuard, "fenced_graph_mutation", _uncontended_generation_fence
+    )
     monkeypatch.setattr(real.Neo4jMutationGuard, "marker_exists", marker_exists)
     monkeypatch.setattr(
         real.Neo4jMutationGuard, "completed_raw_or_none", completed_raw_or_none
