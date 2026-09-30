@@ -111,3 +111,99 @@ def test_licence_fence_veto_propagates_before_partial_retention(monkeypatch, sto
     with pytest.raises(VetoError, match="owner stop"):
         rights.retain_current_govuk_licence(objects=objects, proof=object(), dispatch_fence=fence)
     assert len(calls) == stop_at - 1
+
+
+def test_nonce_only_licence_refresh_reuses_semantic_assessment_but_retains_exact_observation(tmp_path, monkeypatch):
+    import json
+    from newsroom.authority import HydrationRequest
+    from newsroom.authority.types import ObjectAdmissionId
+    from newsroom.control_plane import native_source_rights
+
+    responses = {url: b'<html><head><meta name="csp-nonce" content="one"></head><body><main>Reviewed fixture terms.</main></body></html>'
+                 for url in (rights.REUSE_URL, rights.LICENCE_URL)}
+    monkeypatch.setattr(rights, 'REVIEWED_TEXT', {url: rights.licence_text_digest(raw) for url, raw in responses.items()})
+    fetches = []
+    class Response(io.BytesIO):
+        status = 200
+        def __init__(self, url):
+            super().__init__(responses[url]); self.url = url
+        def geturl(self): return self.url
+    class Opener:
+        def open(self, request, timeout):
+            fetches.append(request.full_url); return Response(request.full_url)
+    monkeypatch.setattr(rights.urllib.request, 'build_opener', lambda *_: Opener())
+    args = _args(tmp_path, monkeypatch)
+    with open_native_runtime(**args) as runtime:
+        objects, proof = runtime.authority.objects, runtime.proof
+        params = dict(objects=objects, proof=proof, dispatch_fence=nullcontext)
+        first = rights.retain_current_govuk_licence(**params, clock=lambda: datetime(2026, 9, 8, 10, tzinfo=UTC))
+        source = dict(source_id='UK-01', definition_url='https://www.gov.uk/feed')
+        first_assessment = first.for_source(**source)
+        def snapshot(licence, assessment):
+            return native_source_rights.retain_rights_snapshot(
+                objects=objects, proof=proof, **source, assessment=assessment,
+                observed_at=licence.observed_at, reason='REVIEWED_REUSE_PERMITTED',
+                observations=tuple((url, digest, str(admission), '') for url, digest, admission in zip(
+                    (rights.REUSE_URL, rights.LICENCE_URL), licence.raw_digests, licence.admission_ids, strict=True)),
+                govuk_semantic_evidence=rights._govuk_semantic_evidence(**source),
+            )
+        one = snapshot(first, first_assessment)
+        responses.update({url: raw.replace(b'content="one"', b'content="two"') for url, raw in responses.items()})
+        second = rights.retain_current_govuk_licence(**params, clock=lambda: datetime(2026, 9, 8, 11, tzinfo=UTC))
+        second_assessment = second.for_source(**source)
+        two = snapshot(second, second_assessment)
+        assert first.raw_digests != second.raw_digests and first.admission_ids != second.admission_ids
+        assert first_assessment == second_assessment
+        assert one.assessment_admission_id == two.assessment_admission_id
+        assert one.assessment_blob_digest == two.assessment_blob_digest
+        assert one.observation_admission_id != two.observation_admission_id
+        assert len(fetches) == 4
+        second.require_retained(objects=objects, proof=proof)
+        data = objects.rehydrate(HydrationRequest(ObjectAdmissionId.parse(two.assessment_admission_id), 'evidence.source'), proof=proof).data
+        document = json.loads(data)
+        assert document['schema'] == 'hermes-native-rights-assessment-v2'
+        assert document['record_id'] == second_assessment.record_id
+        assert document['evidence_digest'] == second_assessment.evidence_digest
+        assert 'evidence' not in document
+        observed = json.loads(objects.rehydrate(HydrationRequest(ObjectAdmissionId.parse(two.observation_admission_id), 'evidence.source'), proof=proof).data)
+        assert [item[1] for item in observed['observations']] == list(second.raw_digests)
+        assert [item[2] for item in observed['observations']] == [str(x) for x in second.admission_ids]
+        assert first.for_source(source_id='UK-02', definition_url=source['definition_url']).record_id != first_assessment.record_id
+        assert first.for_source(source_id='UK-01', definition_url='https://www.gov.uk/other').record_id != first_assessment.record_id
+
+
+@pytest.mark.parametrize('fault', ['current_credential', 'revoked_raw', 'cas_bytes', 'reviewed_terms', 'stale_policy'])
+def test_semantic_identity_does_not_replace_current_retained_licence_checks(tmp_path, monkeypatch, fault):
+    from dataclasses import replace
+    from newsroom.authority import AuthenticationError, ObjectAdmissionDenied, ObjectAdmissionRequest, ObjectIntegrityError
+    from newsroom.authority.canonical import digest_bytes
+
+    raw = b'<main>Reviewed fixture terms.</main>'
+    monkeypatch.setattr(rights, 'REVIEWED_TEXT', {url: rights.licence_text_digest(raw) for url in (rights.REUSE_URL, rights.LICENCE_URL)})
+    args = _args(tmp_path, monkeypatch)
+    with open_native_runtime(**args) as runtime:
+        objects, proof = runtime.authority.objects, runtime.proof
+        admissions = tuple(objects.admit(ObjectAdmissionRequest('evidence.source', f'fixture-raw-{index}'), raw, proof=proof).admission for index in range(2))
+        licence = rights.GovUkLicenceEvidence(tuple(x.admission_id for x in admissions), (digest_bytes(raw),)*2, '2026-09-08T10:00:00Z', rights.POLICY_DIGEST)
+        assessment = licence.for_source(source_id='UK-01', definition_url='https://www.gov.uk/feed')
+        assert assessment.decision == 'PERMITTED'
+        if fault == 'current_credential':
+            proof = replace(proof, credential='not-the-current-credential')
+            error = AuthenticationError
+        elif fault == 'revoked_raw':
+            objects.revoke(admissions[0].admission_id, reason_code='REVOKED', idempotency_key='revoke-fixture-licence', proof=proof)
+            error = ObjectAdmissionDenied
+        elif fault == 'cas_bytes':
+            digest = admissions[0].blob.blob_digest.split(':', 1)[1]
+            path = args['object_root'] / 'objects' / digest[:2] / digest
+            path.chmod(0o600); path.write_bytes(raw.replace(b'Reviewed', b'Tampered')); path.chmod(0o400)
+            error = ObjectIntegrityError
+        elif fault == 'reviewed_terms':
+            monkeypatch.setattr(rights, 'REVIEWED_TEXT', {url: 'sha256:'+'0'*64 for url in (rights.REUSE_URL, rights.LICENCE_URL)})
+            error = NativeEvidenceHold
+        else:
+            licence = replace(licence, policy_digest='sha256:'+'0'*64)
+            assert licence.for_source(source_id='UK-01', definition_url='https://www.gov.uk/feed').decision == 'HOLD'
+            error = NativeEvidenceHold
+        with pytest.raises(error):
+            licence.require_retained(objects=objects, proof=proof)
