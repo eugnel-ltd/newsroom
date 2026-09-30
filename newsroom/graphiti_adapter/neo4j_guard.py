@@ -23,6 +23,7 @@ _MARKER_CLAIM_LEASE = "PT15M"
 # ponytail: fixed conservative write bounds; tune only against retained service evidence.
 _PAGE_TARGET_LIMIT = 64
 _PAGE_PROPERTY_BYTES = 8 * 1024 * 1024
+_INVENTORY_BYTES = 8 * 1024 * 1024
 _UNRESOLVED_STATES = ('SNAPSHOTTING', 'PENDING', 'ROLLING_BACK', 'RECOVERING')
 _SCHEMA_QUERIES = (
     f"""
@@ -109,6 +110,7 @@ class Neo4jMutationGuard:
         "_group_id",
         "_input_digest",
         "_marker_episode_uuid",
+        "_owned_recovery_stop_check",
         "_snapshot_id",
     )
 
@@ -126,6 +128,7 @@ class Neo4jMutationGuard:
         self._claim_token: str | None = None
         self._fence_transaction: Any | None = None
         self._snapshot_cleanup_pending = False
+        self._owned_recovery_stop_check: Callable[[], None] | None = None
         self._generation_key = "generation-owner:v1:" + digest_bytes(group_id.encode("utf-8"))
         self._group_id = group_id
         self._episode_uuid = episode_uuid
@@ -153,6 +156,8 @@ class Neo4jMutationGuard:
         return self._input_digest
 
     async def _query(self, query: str, **parameters: object) -> list[object]:
+        if self._owned_recovery_stop_check is not None:
+            self._owned_recovery_stop_check()
         records, _, _ = await self._driver.execute_query(
             query, params=parameters, routing_="w"
         )
@@ -164,6 +169,8 @@ class Neo4jMutationGuard:
         **parameters: object,
     ) -> None:
         async def consume(transaction: Any) -> None:
+            if self._owned_recovery_stop_check is not None:
+                self._owned_recovery_stop_check()
             # Reinitialise coverage on every managed transaction attempt. MATCH
             # avoids correlated full scans, but omitted originals must still fail.
             count_result = await transaction.run(
@@ -180,6 +187,8 @@ class Neo4jMutationGuard:
             covered: set[str] = set()
             records = await transaction.run(query, **parameters)
             async for record in records:
+                if self._owned_recovery_stop_check is not None and len(covered) % _PAGE_TARGET_LIMIT == 0:
+                    self._owned_recovery_stop_check()
                 validate(record)
                 identity = _record_value(record, "snapshot_identity")
                 if not isinstance(identity, str) or not identity:
@@ -237,6 +246,65 @@ class Neo4jMutationGuard:
             else None
         )
 
+    @staticmethod
+    async def owned_pending_identity(
+        driver: Any, *, group_id: str,
+    ) -> tuple[str, str, int] | None:
+        """Read an expired exact durable owner, never create or claim a marker."""
+        records, _, _ = await driver.execute_query(
+            f"""
+            MATCH (g:{_MARKER} {{episode_uuid: $generation_key}})
+            MATCH (m:{_MARKER} {{episode_uuid: g.owner_marker_uuid}})
+            WHERE g.group_id = $group_id AND m.group_id = $group_id
+              AND g.snapshot_id = m.snapshot_id AND g.claim_token = m.claim_token
+              AND m.state IN ['PENDING', 'ROLLING_BACK']
+              AND (m.claim_expires_at IS NULL OR m.claim_expires_at <= datetime())
+            RETURN m.episode_uuid AS marker_episode_uuid,
+                   m.snapshot_id AS snapshot_id, m.attempt_number AS attempt_number
+            """,
+            params={"generation_key": "generation-owner:v1:" + digest_bytes(group_id.encode()),
+                    "group_id": group_id}, routing_="w",
+        )
+        if not records:
+            return None
+        marker_uuid = _record_value(records[0], "marker_episode_uuid")
+        snapshot = _record_value(records[0], "snapshot_id")
+        attempt = _record_value(records[0], "attempt_number")
+        if (not isinstance(marker_uuid, str) or not marker_uuid
+            or not isinstance(snapshot, str) or type(attempt) is not int or attempt < 1):
+            raise GuardError("Graphiti owned compensation identity is malformed")
+        episode, separator, ordinal = snapshot.rpartition(":")
+        if not separator or not episode or ordinal != str(attempt):
+            raise GuardError("Graphiti owned compensation snapshot is malformed")
+        return episode, marker_uuid, attempt
+
+    async def recover_owned_pending(
+        self, *, owner_stop_check: Callable[[], None] | None = None,
+    ) -> GuardMarker | None:
+        """Compensate this exact expired owner without a fresh snapshot or leaf."""
+        if owner_stop_check is not None:
+            owner_stop_check()
+        identity = await self.owned_pending_identity(self._driver, group_id=self._group_id)
+        if identity != (self._episode_uuid, self._marker_episode_uuid, self._attempt_number):
+            return None
+        raw = await self._marker()
+        if raw is None or str(raw.get("state")) not in {"PENDING", "ROLLING_BACK"}:
+            return None
+        marker = self._bind_marker(raw)
+        self._owned_recovery_stop_check = owner_stop_check
+        try:
+            taken_over = await self._take_over(raw, state=marker.state.value)
+            if taken_over is None:
+                return None
+            await self.rollback_pending(
+                chat_invocations=[dict(item) for item in marker.chat_invocations],
+                embedding_usage=dict(marker.embedding_usage or {}),
+                reason="EXACT_OWNED_COMPENSATION",
+            )
+            return await self.recovered_ambiguous_marker_or_none()
+        finally:
+            self._owned_recovery_stop_check = None
+
     def _generation_lock(self) -> str:
         # All coordinated writers acquire generation before episode. The WHERE
         # follows the dependent SET, so ownership is read after the write lock.
@@ -263,6 +331,8 @@ class Neo4jMutationGuard:
                     input_digest=self._input_digest, claim_token=self._claim_token)
 
     async def _owned_query(self, query: str, **parameters: object) -> list[object]:
+        if self._owned_recovery_stop_check is not None:
+            self._owned_recovery_stop_check()
         parameters = self._ownership_parameters() | parameters
         if self._fence_transaction is None:
             return await self._query(query, **parameters)
@@ -641,6 +711,7 @@ class Neo4jMutationGuard:
             if str(retained.get("claim_token") or "") != self._claim_token:
                 raise GuardError("Graphiti rollback is owned by another claim")
         async with self.fenced_graph_mutation():
+            inventories = await self._restoration_inventories()
             await self._query(
                 f"""
                 MATCH (a)-[r]->(b)
@@ -674,7 +745,7 @@ class Neo4jMutationGuard:
                 group_id=self._group_id,
                 snapshot_id=self._snapshot_id,
             )
-            await self._restore_properties()
+            await self._restore_properties(inventories=inventories)
             await self.assert_preexisting_unchanged()
             recovered = await self._owned_query(
                 self._owned_match(("ROLLING_BACK",)) + """
@@ -740,30 +811,115 @@ class Neo4jMutationGuard:
         if not written or _record_value(written[0], "written") != len(page):
             raise GuardError("Graphiti bounded property write lost an actual target")
 
-    def _snapshot_sources(self, label: str) -> str:
-        return f"""
-            MATCH (s:{label} {{_newsroom_snapshot_id: $snapshot_id}})
-            WHERE elementId(s) >= $cursor_source
-            WITH s, elementId(s) AS source_identity
-            ORDER BY source_identity LIMIT $limit
-        """
+    async def _identity_inventory(
+        self, query: str, *, snapshot_label: str,
+    ) -> list[tuple[str, str]]:
+        """Stream identities once; reject incomplete or oversized inventories."""
+        async def consume(transaction: Any) -> list[tuple[str, str]]:
+            count_result = await transaction.run(
+                f"MATCH (s:{snapshot_label} {{_newsroom_snapshot_id:$snapshot_id}}) "
+                "RETURN count(s) AS snapshot_count", snapshot_id=self._snapshot_id,
+            )
+            count = _record_value(await count_result.single(strict=True), "snapshot_count")
+            if type(count) is not int or count < 0:
+                raise GuardError("Graphiti snapshot coverage count is invalid")
+            identities: list[tuple[str, str]] = []
+            pairs: set[tuple[str, str]] = set()
+            covered: set[str] = set()
+            size = 256
+            records = await transaction.run(query, snapshot_id=self._snapshot_id)
+            async for record in records:
+                if self._owned_recovery_stop_check is not None and len(identities) % _PAGE_TARGET_LIMIT == 0:
+                    self._owned_recovery_stop_check()
+                source = _record_value(record, "source_identity")
+                target = _record_value(record, "target_identity")
+                if not isinstance(source, str) or not source or not isinstance(target, str) or not target:
+                    raise GuardError("Graphiti inventory identity is absent")
+                pair = (source, target)
+                if pair in pairs:
+                    raise GuardError("Graphiti inventory has a duplicate actual pair")
+                # Includes retained strings, pair/list/set overhead and coverage.
+                size += 320 + len(source.encode()) + len(target.encode())
+                if source not in covered:
+                    size += 192 + len(source.encode())
+                if size > _INVENTORY_BYTES:
+                    raise GuardError("Graphiti identity inventory exceeds its byte bound")
+                identities.append(pair)
+                pairs.add(pair)
+                covered.add(source)
+            if len(covered) != count:
+                raise GuardError("Graphiti identity inventory omits a pre-existing target")
+            identities.sort()
+            return identities
+        async with self._driver.session() as session:
+            return await session.execute_write(consume)
 
-    def _node_matches(self) -> str:
-        return self._snapshot_sources(_SNAPSHOT_NODE) + f"""
+    async def _inventory_pages(
+        self, inventory: list[tuple[str, str]], query: str,
+    ) -> AsyncIterator[list[object]]:
+        for start in range(0, len(inventory), _PAGE_TARGET_LIMIT):
+            expected = inventory[start:start + _PAGE_TARGET_LIMIT]
+            identities = [{"source_identity": source, "target_identity": target}
+                          for source, target in expected]
+            records = await self._query(query, identities=identities, snapshot_id=self._snapshot_id)
+            actual = [(_record_value(row, "source_identity"), _record_value(row, "target_identity"))
+                      for row in records]
+            if actual != expected:
+                raise GuardError("Graphiti property read lost an inventoried actual pair")
+            page: list[object] = []
+            size = 0
+            for row in records:
+                row_size = sum(_property_bytes(_record_value(row, key)) for key in (
+                    "source_properties", "target_properties", "expected", "actual",
+                ))
+                if row_size > _PAGE_PROPERTY_BYTES:
+                    raise GuardError("Graphiti target exceeds the full property byte bound")
+                if page and size + row_size > _PAGE_PROPERTY_BYTES:
+                    yield page
+                    page, size = [], 0
+                page.append(row)
+                size += row_size
+            if page:
+                yield page
+
+    async def _restoration_inventories(self) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        nodes = await self._identity_inventory(
+            f"""
+            MATCH (s:{_SNAPSHOT_NODE} {{_newsroom_snapshot_id:$snapshot_id}})
             MATCH (n {{uuid: s._newsroom_source_uuid}})
             WHERE NOT n:{_SNAPSHOT_NODE} AND NOT n:{_SNAPSHOT_RELATIONSHIP} AND NOT n:{_MARKER}
-              AND (elementId(s) > $cursor_source OR
-                   (elementId(s) = $cursor_source AND elementId(n) > $cursor_target))
-            WITH s, n, elementId(s) AS source_identity, elementId(n) AS target_identity
-            ORDER BY source_identity, target_identity LIMIT $limit
-        """
+            RETURN elementId(s) AS source_identity, elementId(n) AS target_identity
+            """, snapshot_label=_SNAPSHOT_NODE,
+        )
+        relationships = await self._identity_inventory(
+            f"""
+            MATCH (s:{_SNAPSHOT_RELATIONSHIP} {{_newsroom_snapshot_id:$snapshot_id}})
+            MATCH (a {{uuid: s._newsroom_source_uuid}})
+                  -[r {{uuid: s._newsroom_relationship_uuid}}]->(b {{uuid: s._newsroom_target_uuid}})
+            WHERE type(r) = s._newsroom_relationship_type
+              AND NOT a:{_SNAPSHOT_NODE} AND NOT b:{_SNAPSHOT_NODE}
+              AND NOT a:{_SNAPSHOT_RELATIONSHIP} AND NOT b:{_SNAPSHOT_RELATIONSHIP}
+              AND NOT a:{_MARKER} AND NOT b:{_MARKER}
+            RETURN elementId(s) AS source_identity, elementId(r) AS target_identity
+            """, snapshot_label=_SNAPSHOT_RELATIONSHIP,
+        )
+        return nodes, relationships
 
-    async def _restore_properties(self) -> None:
-        async for records in self._pages(
-            self._node_matches() + """
-            RETURN source_identity, target_identity, properties(s) AS source_properties,
-                   properties(n) AS target_properties,
+    async def _restore_properties(
+        self, *, inventories: tuple[list[tuple[str, str]], list[tuple[str, str]]] | None = None,
+    ) -> None:
+        nodes, relationships = await self._restoration_inventories() if inventories is None else inventories
+        async for records in self._inventory_pages(
+            nodes, f"""
+            UNWIND $identities AS row
+            MATCH (s:{_SNAPSHOT_NODE}) WHERE elementId(s) = row.source_identity
+              AND s._newsroom_snapshot_id = $snapshot_id
+            MATCH (n) WHERE elementId(n) = row.target_identity AND n.uuid = s._newsroom_source_uuid
+              AND NOT n:{_SNAPSHOT_NODE} AND NOT n:{_SNAPSHOT_RELATIONSHIP} AND NOT n:{_MARKER}
+            RETURN elementId(s) AS source_identity, elementId(n) AS target_identity,
+                   properties(s) AS source_properties, properties(n) AS target_properties,
                    s._newsroom_source_labels AS expected, labels(n) AS actual
+            ORDER BY source_identity, target_identity
             """,
         ):
             await self._write_page(
@@ -779,32 +935,34 @@ class Neo4jMutationGuard:
                 """, records,
             )
             await self._restore_page_labels(records)
-        await self._write_pages(
-            self._snapshot_sources(_SNAPSHOT_RELATIONSHIP) + f"""
-            MATCH (a {{uuid: s._newsroom_source_uuid}})
-                  -[r {{uuid: s._newsroom_relationship_uuid}}]->(b {{uuid: s._newsroom_target_uuid}})
-            WHERE type(r) = s._newsroom_relationship_type
+        async for records in self._inventory_pages(
+            relationships, f"""
+            UNWIND $identities AS row
+            MATCH (s:{_SNAPSHOT_RELATIONSHIP}) WHERE elementId(s) = row.source_identity
+              AND s._newsroom_snapshot_id = $snapshot_id
+            MATCH (a)-[r]->(b) WHERE elementId(r) = row.target_identity
+              AND r.uuid = s._newsroom_relationship_uuid AND type(r) = s._newsroom_relationship_type
+              AND a.uuid = s._newsroom_source_uuid AND b.uuid = s._newsroom_target_uuid
               AND NOT a:{_SNAPSHOT_NODE} AND NOT b:{_SNAPSHOT_NODE}
               AND NOT a:{_SNAPSHOT_RELATIONSHIP} AND NOT b:{_SNAPSHOT_RELATIONSHIP}
               AND NOT a:{_MARKER} AND NOT b:{_MARKER}
-              AND (elementId(s) > $cursor_source OR
-                   (elementId(s) = $cursor_source AND elementId(r) > $cursor_target))
-            WITH s, r, elementId(s) AS source_identity, elementId(r) AS target_identity
-            ORDER BY source_identity, target_identity LIMIT $limit
-            RETURN source_identity, target_identity, properties(s) AS source_properties,
-                   properties(r) AS target_properties
+            RETURN elementId(s) AS source_identity, elementId(r) AS target_identity,
+                   properties(s) AS source_properties, properties(r) AS target_properties
+            ORDER BY source_identity, target_identity
             """,
-            f"""
-            UNWIND $page AS row
-            MATCH (s:{_SNAPSHOT_RELATIONSHIP}) WHERE elementId(s) = row.source_identity
-              AND s._newsroom_snapshot_id = $snapshot_id
-            MATCH ()-[r]->() WHERE elementId(r) = row.target_identity
-            SET r = properties(s)
-            REMOVE r._newsroom_snapshot_id, r._newsroom_relationship_uuid,
-                   r._newsroom_source_uuid, r._newsroom_target_uuid, r._newsroom_relationship_type
-            RETURN count(r) AS written
-            """,
-        )
+        ):
+            await self._write_page(
+                f"""
+                UNWIND $page AS row
+                MATCH (s:{_SNAPSHOT_RELATIONSHIP}) WHERE elementId(s) = row.source_identity
+                  AND s._newsroom_snapshot_id = $snapshot_id
+                MATCH ()-[r]->() WHERE elementId(r) = row.target_identity
+                SET r = properties(s)
+                REMOVE r._newsroom_snapshot_id, r._newsroom_relationship_uuid,
+                       r._newsroom_source_uuid, r._newsroom_target_uuid, r._newsroom_relationship_type
+                RETURN count(r) AS written
+                """, records,
+            )
 
     async def _restore_page_labels(self, records: list[object]) -> None:
         for record in records:

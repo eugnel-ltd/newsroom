@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, ContextManager
 
 from newsroom.authority.canonical import (
     canonical_json_bytes,
@@ -246,6 +246,105 @@ def _utc_deadline_text(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _episode_input_digest(
+    *, episode_id: str, name: str, body: str, reference_time: datetime,
+) -> str:
+    return digest_canonical({
+        "episode_uuid": episode_id, "name": name, "body": body,
+        "reference_time": reference_time.astimezone(UTC).isoformat(),
+        "group_id": GRAPHITI_WORKSPACE_GROUP,
+    })
+
+
+def _open_compensation_driver() -> Any:
+    # Construct outside asyncio.run: the pinned driver would otherwise schedule
+    # schema/index writes automatically. Recovery never bootstraps a fresh graph.
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise GraphitiAdapterContractError("compensation driver needs a synchronous boundary")
+    try:
+        from graphiti_core.driver.neo4j_driver import Neo4jDriver
+    except ImportError as exc:
+        raise GraphitiAdapterContractError(
+            "graphiti extra is required for owned Graphiti compensation",
+            reason_code=GRAPHITI_EXTRA_REQUIRED,
+        ) from exc
+    if importlib.metadata.version("graphiti-core") != _GRAPHITI_CORE_VERSION:
+        raise GraphitiAdapterContractError(
+            "owned Graphiti compensation requires graphiti-core 0.29.3",
+            reason_code=GRAPHITI_CORE_RELEASE_MISMATCH,
+        )
+    return Neo4jDriver(
+        f"bolt://{NEO4J_BOLT_HOST}:{NEO4J_BOLT_PORT}",
+        _NEO4J_USER, neo4j_community_password(),
+    )
+
+
+def recover_owned_pending(
+    *,
+    authenticated_input: Callable[[str, int], ContextManager[str | None]],
+    owner_stop_check: Callable[[], None],
+    deadline: datetime,
+    clock: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
+) -> GuardMarker | None:
+    """Compensate only the expired generation owner, without provider setup."""
+    owner_stop_check()
+    if deadline.tzinfo is None or deadline.utcoffset() is None:
+        raise GraphitiAdapterContractError("compensation deadline needs an explicit offset")
+    remaining = (deadline.astimezone(UTC) - clock().astimezone(UTC)).total_seconds()
+    if remaining <= 0:
+        return None
+    driver = _open_compensation_driver()
+
+    async def recover() -> GuardMarker | None:
+        identity = await Neo4jMutationGuard.owned_pending_identity(
+            driver, group_id=GRAPHITI_WORKSPACE_GROUP,
+        )
+        owner_stop_check()
+        if identity is None:
+            return None
+        episode_id, marker_id, attempt_number = identity
+        with authenticated_input(episode_id, attempt_number) as input_digest:
+            if input_digest is None:
+                return None
+            owner_stop_check()
+            guard = Neo4jMutationGuard(
+                driver, group_id=GRAPHITI_WORKSPACE_GROUP,
+                episode_uuid=episode_id, marker_episode_uuid=marker_id,
+                attempt_number=attempt_number, input_digest=input_digest,
+            )
+            marker = await guard.recover_owned_pending(owner_stop_check=owner_stop_check)
+            if marker is not None and (
+                marker.state is not GuardState.RECOVERED_AMBIGUOUS
+                or marker.attempt_number != attempt_number
+                or marker.input_digest != input_digest
+            ):
+                raise GuardError("owned Graphiti compensation returned a different marker")
+            return marker
+
+    async def bounded_recovery() -> GuardMarker | None:
+        try:
+            return await asyncio.wait_for(recover(), timeout=remaining)
+        except TimeoutError:
+            # Cancellation retains the owned journal; no completed marker is
+            # fabricated and a later native tick may resume after lease expiry.
+            return None
+        finally:
+            try:
+                await asyncio.wait_for(
+                    driver.close(), timeout=GRAPHITI_CLEANUP_TIMEOUT_MS / 1_000,
+                )
+            except TimeoutError:
+                # Closing a connection changes neither retained graph state nor
+                # the verified recovery result; preserve an owner stop as well.
+                pass
+
+    return asyncio.run(bounded_recovery())
 
 
 def _load_graphiti() -> SimpleNamespace:
@@ -653,16 +752,8 @@ async def _add_episode(
         embedder=embedder,
         cross_encoder=runtime.IdentityCrossEncoder(),
     )
-    input_digest = digest_bytes(
-        canonical_json_bytes(
-            {
-                "episode_uuid": episode_id,
-                "name": name,
-                "body": body,
-                "reference_time": reference_time.astimezone(UTC).isoformat(),
-                "group_id": GRAPHITI_WORKSPACE_GROUP,
-            }
-        )
+    input_digest = _episode_input_digest(
+        episode_id=episode_id, name=name, body=body, reference_time=reference_time,
     )
     guard = runtime.MutationGuard(
         graphiti.driver,

@@ -202,13 +202,8 @@ def test_actual_guard_expiry_keeps_generation_owned_until_recovery() -> None:
             with pytest.raises(GuardError):
                 await competitor.begin()
             recovery = guard(episode)
-            retained = await recovery.begin()
-            assert retained.state in {GuardState.PENDING, GuardState.ROLLING_BACK}
-            assert await recovery.rollback_pending(
-                chat_invocations=[],
-                embedding_usage={"usage_basis": "NO_EMBEDDING_CALL", "request_count": 0},
-                reason="ACTUAL_EXPIRED_OWNER_RECOVERY",
-            )
+            retained = await recovery.recover_owned_pending()
+            assert retained is not None and retained.state is GuardState.RECOVERED_AMBIGUOUS
             rows, _, _ = await query("MATCH (n:Entity {uuid:$id}) RETURN n.name AS name", id=suffix)
             assert rows[0]["name"] == "original"
             assert (await competitor.begin()).state is GuardState.CREATED

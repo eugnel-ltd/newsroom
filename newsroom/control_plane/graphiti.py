@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Protocol, runtime_checkable
+from typing import ContextManager, Protocol, runtime_checkable
 
 from newsroom.authority.extraction_facade import GovernedExtractionRecords
 from newsroom.authority.graphiti_adapter_facade import (
@@ -1129,6 +1130,135 @@ class EvaluationGraphitiRunner:
         self._authenticated_recovered_gaps: dict[tuple[str, int], object] = {}
 
     @staticmethod
+    def _attempt_for_unit(
+        unit: CorpusIngestUnit, *, recovered_progression=None, extraction_previous=None,
+    ):
+        from newsroom.graphiti_adapter.evaluation_attempt import evaluation_attempt_for_body
+
+        return evaluation_attempt_for_body(
+            episode_body=unit.episode_body,
+            ingest_id=unit.ingest_id,
+            proving_run_id=unit.proving_run_id,
+            source_id=unit.source_id,
+            item_key=unit.item_key,
+            observation_digest=unit.observation_digest,
+            published_at=unit.published_at,
+            updated_at=unit.updated_at,
+            effective_revision=unit.effective_revision,
+            canonical_url=unit.canonical_url,
+            revision_digest=unit.revision_digest,
+            representation_digest=unit.representation_digest,
+            authority_ids=(
+                None
+                if unit.authority is None
+                else (
+                    unit.authority.admission_id,
+                    unit.authority.access_decision_id,
+                    unit.authority.definition_id,
+                    unit.authority.definition_version_id,
+                    unit.authority.item_id,
+                    unit.authority.revision_id,
+                    unit.authority.representation_id,
+                )
+            ),
+            attempt_number=unit.attempt_number,
+            predecessor_episode_uuid=unit.predecessor_ingest_id,
+            recovered_ambiguous_progression=recovered_progression,
+            extraction_previous_version_number=(
+                None
+                if extraction_previous is None
+                else extraction_previous.version_number
+            ),
+            extraction_previous_run_version_id=(
+                None
+                if extraction_previous is None
+                else extraction_previous.run_version_id
+            ),
+        )
+
+    def recover_owned_pending(
+        self, *, connection: sqlite3.Connection,
+        owner_stop_check: Callable[[], None],
+        rights_fence: Callable[[CorpusIngestUnit], ContextManager[object | None]],
+        defer_before_unit: Callable[[CorpusIngestUnit], bool],
+        deadline: datetime,
+    ) -> object | None:
+        """Recover the exact retained native owner without retry or accounting."""
+        if self._proposal_adapter is None or self._extraction_records is None or self._proof is None:
+            return None
+        from newsroom.control_plane.model_usage import _native_landed_source_unit
+        from newsroom.graphiti_adapter.identity import attempt_ids
+        from newsroom.graphiti_adapter.neo4j_guard import GuardError
+        from newsroom.graphiti_adapter.real import _episode_input_digest, recover_owned_pending
+        from newsroom.graphiti_adapter.types import GraphitiAdapterRightsDenied, GraphitiAdapterStateError
+        from newsroom.control_plane.broker import BrokerError
+
+        @contextmanager
+        def authenticated_input(episode_id: str, attempt_number: int):
+            owner_stop_check()
+            attempt_id, workspace_id, _ = attempt_ids(episode_id, attempt_number)
+            try:
+                attempt = self._proposal_adapter.attempt(attempt_id, proof=self._proof)
+                manifest = self._proposal_adapter.manifest_for_attempt(attempt_id, proof=self._proof)
+                metadata = self._extraction_records.metadata(attempt.run_version_id, proof=self._proof)
+            except (AuthorizationDenied, GraphitiAdapterRightsDenied, GraphitiAdapterStateError):
+                yield None
+                return
+            unit = _native_landed_source_unit(
+                connection, ingest_id=episode_id, revision_id_hint=str(manifest.revision_id),
+            )
+            if unit is None or unit.authority is None or unit.proving_run_id != "native-source:" + unit.observation_digest:
+                yield None
+                return
+            expected = self._attempt_for_unit(replace(unit, attempt_number=attempt_number))
+            expected_manifest = replace(expected.manifest,
+                requested_run_version_id=metadata.run_version_id,
+                requested_version_number=metadata.version_number)
+            if (
+                attempt.outcome is GraphitiAdapterOutcome.COMPLETE
+                or connection.execute(
+                    "SELECT 1 FROM unpublished_graphiti_ingest WHERE ingest_id=? AND outcome='COMPLETE'",
+                    (episode_id,),
+                ).fetchone() is not None
+                or attempt.attempt_id != attempt_id or attempt.attempt_number != attempt_number
+                or attempt.workspace_id != workspace_id or attempt.run_id != expected.manifest.run_id
+                or attempt.run_version_id != metadata.run_version_id
+                or attempt.manifest_id != manifest.manifest_id
+                or attempt.configuration_id != expected.configuration.configuration_id
+                or attempt.configuration_digest != expected.configuration.canonical_digest
+                or metadata.run_id != attempt.run_id
+                or metadata.input_binding_digest != expected.manifest.input_binding_digest
+                or manifest.canonical_digest != expected_manifest.canonical_digest
+            ):
+                yield None
+                return
+            owner_stop_check()
+            if defer_before_unit(unit):
+                yield None
+                return
+            with rights_fence(unit) as active_authority:
+                if active_authority is None:
+                    yield None
+                    return
+                active_authority.owner_stop_check()
+                owner_stop_check()
+                yield _episode_input_digest(
+                    episode_id=episode_id, name=episode_id,
+                    body=" ".join(unit.episode_body.split()),
+                    reference_time=unit.temporal().reference_time.value,
+                )
+
+        try:
+            return recover_owned_pending(
+                authenticated_input=authenticated_input,
+                owner_stop_check=owner_stop_check, deadline=deadline, clock=self._clock,
+            )
+        except (BrokerError, GuardError, GraphitiAdapterContractError):
+            # Missing/mismatched/live ownership remains a group HOLD. Recovery
+            # does not fabricate a receipt, settle spend or create a successor.
+            return None
+
+    @staticmethod
     def _exact_private_receipt_ledger_row(
         connection: sqlite3.Connection,
         *,
@@ -1490,9 +1620,6 @@ class EvaluationGraphitiRunner:
         deadline: datetime | None,
         invocation_observer: object | None = None,
     ) -> GraphitiCycleResult:
-        from newsroom.graphiti_adapter.evaluation_attempt import (
-            evaluation_attempt_for_body,
-        )
         from newsroom.graphiti_adapter.real import RealGraphitiAdapter
 
         temporal = unit.temporal()
@@ -1523,45 +1650,9 @@ class EvaluationGraphitiRunner:
                         GRAPHITI_RESULT_STAGE_ADAPTER_EXECUTION
                     )
                 extraction_previous = history[0]
-        attempt = evaluation_attempt_for_body(
-            episode_body=unit.episode_body,
-            ingest_id=unit.ingest_id,
-            proving_run_id=unit.proving_run_id,
-            source_id=unit.source_id,
-            item_key=unit.item_key,
-            observation_digest=unit.observation_digest,
-            published_at=unit.published_at,
-            updated_at=unit.updated_at,
-            effective_revision=unit.effective_revision,
-            canonical_url=unit.canonical_url,
-            revision_digest=unit.revision_digest,
-            representation_digest=unit.representation_digest,
-            authority_ids=(
-                None
-                if unit.authority is None
-                else (
-                    unit.authority.admission_id,
-                    unit.authority.access_decision_id,
-                    unit.authority.definition_id,
-                    unit.authority.definition_version_id,
-                    unit.authority.item_id,
-                    unit.authority.revision_id,
-                    unit.authority.representation_id,
-                )
-            ),
-            attempt_number=unit.attempt_number,
-            predecessor_episode_uuid=unit.predecessor_ingest_id,
-            recovered_ambiguous_progression=recovered_progression,
-            extraction_previous_version_number=(
-                None
-                if extraction_previous is None
-                else extraction_previous.version_number
-            ),
-            extraction_previous_run_version_id=(
-                None
-                if extraction_previous is None
-                else extraction_previous.run_version_id
-            ),
+        attempt = self._attempt_for_unit(
+            unit, recovered_progression=recovered_progression,
+            extraction_previous=extraction_previous,
         )
         if self._proposal_adapter is not None:
             assert self._extraction_records is not None

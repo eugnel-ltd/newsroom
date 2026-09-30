@@ -247,6 +247,16 @@ class _JournalDriver:
     def apply(self, query, params):
         self.queries.append(query)
         marker = self.markers.get(params.get("episode_uuid"))
+        if "AS marker_episode_uuid" in query:
+            retained = self.markers.get(self.owner.get("owner_marker_uuid"))
+            if (retained is None or retained.get("active")
+                or retained.get("state") not in {"PENDING", "ROLLING_BACK"}
+                or retained.get("snapshot_id") != self.owner.get("snapshot_id")
+                or retained.get("claim_token") != self.owner.get("claim_token")):
+                return []
+            return [{"marker_episode_uuid": self.owner["owner_marker_uuid"],
+                     "snapshot_id": retained["snapshot_id"],
+                     "attempt_number": retained["attempt_number"]}]
         if "SET g.lock_tick" in query:
             assert query.index("SET g.lock_tick") < min(query.index(term) for term in ("MATCH (m:", "MERGE (m:") if term in query)
             if "MERGE (m:" in query:
@@ -377,7 +387,10 @@ class _JournalGuard(Neo4jMutationGuard):
     async def _snapshot(self):
         pass
 
-    async def _restore_properties(self):
+    async def _restoration_inventories(self):
+        return [], []
+
+    async def _restore_properties(self, **_values):
         self.driver.events.append("properties")
 
     async def assert_preexisting_unchanged(self):
@@ -455,6 +468,53 @@ def test_fresh_internal_marker_cannot_reuse_unresolved_legacy_snapshot(legacy_gr
     asyncio.run(exercise())
 
 
+def test_exact_owned_compensation_releases_generation_without_a_fresh_snapshot():
+    async def exercise():
+        driver = _JournalDriver()
+        await _journal_guard(driver).begin()
+        driver.markers["episode-a"].update(state="ROLLING_BACK", active=False)
+        driver.events.clear()
+        identity = await Neo4jMutationGuard.owned_pending_identity(driver, group_id="group-id")
+        assert identity == ("episode-a", "episode-a", 1)
+        recovery = _journal_guard(driver)
+        marker = await recovery.recover_owned_pending()
+        assert marker.state.value == "RECOVERED_AMBIGUOUS"
+        assert not driver.owner
+        assert driver.events.index("verified") < driver.events.index("terminal") < driver.events.index("snapshot-deleted")
+        assert not any("MERGE (m:" in query for query in driver.queries[3:])
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("defect", ["unowned", "active", "snapshot", "input", "stopped"])
+def test_owned_compensation_refuses_without_mutating_retained_history(defect):
+    async def exercise():
+        driver = _JournalDriver()
+        await _journal_guard(driver).begin()
+        driver.markers["episode-a"].update(state="ROLLING_BACK", active=False)
+        if defect == "unowned":
+            driver.owner = {}
+        elif defect == "active":
+            driver.markers["episode-a"]["active"] = True
+        elif defect == "snapshot":
+            driver.owner["snapshot_id"] = "other-snapshot"
+        recovery = _journal_guard(driver)
+        if defect == "input":
+            recovery = _JournalGuard(driver, group_id="group-id", episode_uuid="episode-a",
+                                     attempt_number=1, input_digest="sha256:" + "1" * 64)
+        before = copy.deepcopy((driver.markers, driver.owner))
+        driver.events.clear()
+        def stopped():
+            raise asyncio.CancelledError()
+        if defect in {"input", "stopped"}:
+            with pytest.raises(GuardError if defect == "input" else asyncio.CancelledError):
+                await recovery.recover_owned_pending(owner_stop_check=stopped if defect == "stopped" else None)
+        else:
+            assert await recovery.recover_owned_pending() is None
+        assert (driver.markers, driver.owner) == before
+        assert "properties" not in driver.events and "terminal" not in driver.events
+    asyncio.run(exercise())
+
+
 def test_generation_takeover_binds_snapshot_and_token_and_has_one_claimant():
     async def exercise():
         driver = _JournalDriver()
@@ -495,6 +555,12 @@ class _PageGuard(Neo4jMutationGuard):
         self.writes = []
         self.reads = []
         self.label_writes = []
+        self.inventory_reads = []
+
+    async def _identity_inventory(self, query, *, snapshot_label):
+        self.inventory_reads.append(query)
+        rows = self.rows if snapshot_label == "NewsroomSnapshotNode" else []
+        return [(row["source_identity"], row["target_identity"]) for row in rows]
 
     async def _query(self, query, **params):
         if "unsafe_nodes" in query or "unsafe_relationships" in query:
@@ -508,6 +574,10 @@ class _PageGuard(Neo4jMutationGuard):
             assert "elementId(n) = $target_identity" in query
             self.label_writes.append(params["target_identity"])
             return [{"written": 1}]
+        if "identities" in params:
+            self.reads.append(params)
+            selected = {(row["source_identity"], row["target_identity"]) for row in params["identities"]}
+            return [row for row in self.rows if (row["source_identity"], row["target_identity"]) in selected]
         assert "ORDER BY source_identity" in query and "LIMIT $limit" in query
         assert "elementId(" in query and "uuid >" not in query
         self.reads.append(params)
@@ -529,8 +599,8 @@ def test_property_pages_cover_all_actual_duplicate_targets_and_page_boundary():
     asyncio.run(guard._restore_properties())
     assert [len(page) for page in guard.writes] == [64, 1]
     assert [item["target_identity"] for page in guard.writes for item in page] == [row["target_identity"] for row in rows]
-    assert guard.reads[1]["cursor_source"] == "snapshot-1"
-    assert guard.reads[1]["cursor_target"] == "target-0063"
+    assert len(guard.inventory_reads) == 2
+    assert guard.reads[1]["identities"] == [{"source_identity": "snapshot-1", "target_identity": "target-0064"}]
 
 
 def test_property_page_full_bytes_bound_splits_before_write_and_rejects_single_oversize(monkeypatch):
@@ -556,11 +626,13 @@ def test_native_vector_fixture_uses_full_target_pages_under_conservative_byte_bo
     assert [len(page) for page in guard.writes] == [64, 1]
 
 
-def test_restore_limits_snapshot_sources_before_matching_actual_targets():
-    query = _PageGuard([])._node_matches()
-    assert query.index("LIMIT $limit") < query.index("MATCH (n")
-    assert "elementId(s) >= $cursor_source" in query
-    assert query.count("LIMIT $limit") == 2
+def test_restore_inventory_matches_identities_once_without_property_values():
+    guard = _PageGuard([_page_row("snapshot-1", "target-1")])
+    asyncio.run(guard._restore_properties())
+    assert len(guard.inventory_reads) == 2
+    assert all("properties(" not in query for query in guard.inventory_reads)
+    assert "uuid: s._newsroom_source_uuid" in guard.inventory_reads[0]
+    assert "type(r) = s._newsroom_relationship_type" in guard.inventory_reads[1]
 
 
 def test_label_pages_repair_each_actual_identity_including_unlabelled_duplicates():
@@ -570,7 +642,7 @@ def test_label_pages_repair_each_actual_identity_including_unlabelled_duplicates
     ])
     asyncio.run(guard._restore_properties())
     assert guard.label_writes == ["target-a", "target-a", "target-b"]
-    assert len(guard.reads) == 3, "label repair must reuse property-page identities"
+    assert len(guard.reads) == 1, "label repair must reuse property-page identities"
 
 
 def test_snapshot_pages_commit_stable_original_element_identities():
@@ -583,7 +655,7 @@ def test_snapshot_pages_commit_stable_original_element_identities():
 
 def test_committed_rollback_page_crash_retains_durable_owner_until_exact_recovery():
     class InterruptedGuard(_JournalGuard):
-        async def _restore_properties(self):
+        async def _restore_properties(self, **_values):
             self.driver.events.append("property-page-committed")
             raise asyncio.CancelledError()
 
@@ -644,3 +716,61 @@ def test_snapshot_refuses_relationship_properties_that_collide_with_guard_metada
     with pytest.raises(GuardError, match="reserved guard properties"):
         asyncio.run(guard._snapshot())
     assert not guard.writes
+
+
+class _InventoryDriver:
+    def __init__(self, rows, count):
+        self.rows, self.count = rows, count
+        self.queries = []
+
+    def session(self):
+        driver = self
+        class Result:
+            def __init__(self, rows):
+                self.rows = rows
+            async def single(self, **_kwargs):
+                return self.rows[0]
+            def __aiter__(self):
+                async def iterate():
+                    for row in self.rows:
+                        yield row
+                return iterate()
+        class Transaction:
+            async def run(self, query, **_parameters):
+                driver.queries.append(query)
+                return Result([{"snapshot_count": driver.count}] if "count(s)" in query else driver.rows)
+        class Session:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                pass
+            async def execute_write(self, callback):
+                return await callback(Transaction())
+        return Session()
+
+
+def test_streamed_inventory_preserves_all_duplicate_targets_without_property_values():
+    rows = [{"source_identity": "snapshot-1", "target_identity": f"target-{i:04}"} for i in range(65)]
+    driver = _InventoryDriver(list(reversed(rows)), 1)
+    guard = Neo4jMutationGuard(driver, group_id="group-id", episode_uuid="episode-a",
+                               attempt_number=1, input_digest="sha256:" + "0" * 64)
+    inventory = asyncio.run(guard._identity_inventory("RETURN identities", snapshot_label="NewsroomSnapshotNode"))
+    assert inventory == [(row["source_identity"], row["target_identity"]) for row in rows]
+    assert len(driver.queries) == 2
+
+
+@pytest.mark.parametrize("defect", ["coverage", "duplicate", "absent", "bytes", "count"])
+def test_inventory_refuses_missing_duplicate_or_oversized_identities(defect, monkeypatch):
+    import newsroom.graphiti_adapter.neo4j_guard as module
+    row = {"source_identity": "snapshot-1", "target_identity": "target-1"}
+    rows = [row, row] if defect == "duplicate" else [row]
+    if defect == "absent":
+        rows = [{"source_identity": "snapshot-1", "target_identity": None}]
+    if defect == "bytes":
+        monkeypatch.setattr(module, "_INVENTORY_BYTES", 300)
+    count = 2 if defect == "coverage" else (True if defect == "count" else 1)
+    guard = Neo4jMutationGuard(_InventoryDriver(rows, count), group_id="group-id",
+                               episode_uuid="episode-a", attempt_number=1,
+                               input_digest="sha256:" + "0" * 64)
+    with pytest.raises(GuardError):
+        asyncio.run(guard._identity_inventory("RETURN identities", snapshot_label="NewsroomSnapshotNode"))
