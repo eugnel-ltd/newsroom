@@ -1062,7 +1062,8 @@ def test_actual_service_active_suffix_reopen_and_replay(tmp_path, monkeypatch):
             assert second.generation.generation_id == first_id
             assert second.promotion == first.promotion
             assert len(calls) == 1
-            assert _event_count(state.extraction.database) - before == 2
+            # One authorised optional-prefix record, APPLIED and validation.
+            assert _event_count(state.extraction.database) - before == 3
             system.increment4.reconcile_active(proof=extraction_proof())
         calls.clear()
         before = _event_count(state.extraction.database)
