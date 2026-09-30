@@ -254,6 +254,8 @@ class _JournalDriver:
                     return []
                 if not self.owner.get("owner_marker_uuid") and any(
                     item["state"] in {"SNAPSHOTTING", "PENDING", "ROLLING_BACK", "RECOVERING"}
+                    and ("(unresolved:NewsroomIngestMarker {group_id: $group_id})" not in query
+                         or item["group_id"] == params["group_id"])
                     and ("unresolved.snapshot_id = $snapshot_id" not in query
                          or item["snapshot_id"] == params["snapshot_id"])
                     for item in self.markers.values()
@@ -378,9 +380,6 @@ class _JournalGuard(Neo4jMutationGuard):
     async def _restore_properties(self):
         self.driver.events.append("properties")
 
-    async def _restore_labels(self):
-        self.driver.events.append("labels")
-
     async def assert_preexisting_unchanged(self):
         self.driver.events.append("verified")
 
@@ -437,11 +436,12 @@ def test_generation_refuses_legacy_unowned_unresolved_marker(state):
     asyncio.run(exercise())
 
 
-def test_fresh_internal_marker_cannot_reuse_unresolved_legacy_snapshot():
+@pytest.mark.parametrize("legacy_group", ("group-id", "foreign-group"))
+def test_fresh_internal_marker_cannot_reuse_unresolved_legacy_snapshot(legacy_group):
     async def exercise():
         driver = _JournalDriver()
         driver.markers["episode-a"] = {
-            "group_id": "group-id", "input_digest": "sha256:" + "0" * 64,
+            "group_id": legacy_group, "input_digest": "sha256:" + "0" * 64,
             "attempt_number": 2, "snapshot_id": "episode-a:2", "state": "PENDING",
             "claim_token": "expired", "active": False,
         }
@@ -568,8 +568,9 @@ def test_label_pages_repair_each_actual_identity_including_unlabelled_duplicates
         _page_row("snapshot-1", "target-a", expected=["Entity"], actual=["Changed"]),
         _page_row("snapshot-1", "target-b", expected=["Entity"], actual=[]),
     ])
-    asyncio.run(guard._restore_labels())
+    asyncio.run(guard._restore_properties())
     assert guard.label_writes == ["target-a", "target-a", "target-b"]
+    assert len(guard.reads) == 3, "label repair must reuse property-page identities"
 
 
 def test_snapshot_pages_commit_stable_original_element_identities():

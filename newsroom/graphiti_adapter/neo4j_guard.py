@@ -276,7 +276,7 @@ class Neo4jMutationGuard:
             WHERE (
                 g.owner_marker_uuid IS NULL AND retained IS NULL
                 AND NOT EXISTS {{
-                    MATCH (unresolved:{_MARKER} {{group_id: $group_id}})
+                    MATCH (unresolved:{_MARKER})
                     WHERE unresolved.state IN {list(_UNRESOLVED_STATES)!r}
                       AND unresolved.snapshot_id = $snapshot_id
                 }}
@@ -328,7 +328,7 @@ class Neo4jMutationGuard:
                    AND g.snapshot_id = m.snapshot_id AND g.claim_token = m.claim_token)
                   OR (NOT $require_expired AND m.state = 'RECOVERED_AMBIGUOUS'
                       AND g.owner_marker_uuid IS NULL AND NOT EXISTS {{
-                          MATCH (unresolved:{_MARKER} {{group_id: $group_id}})
+                          MATCH (unresolved:{_MARKER})
                           WHERE unresolved.state IN {list(_UNRESOLVED_STATES)!r}
                             AND unresolved.snapshot_id = $snapshot_id
                       }})
@@ -608,7 +608,6 @@ class Neo4jMutationGuard:
 
         async with self.fenced_graph_mutation():
             await self._restore_properties()
-            await self._restore_labels()
             await self.assert_preexisting_unchanged()
 
     async def rollback_pending(
@@ -673,7 +672,6 @@ class Neo4jMutationGuard:
                 snapshot_id=self._snapshot_id,
             )
             await self._restore_properties()
-            await self._restore_labels()
             await self.assert_preexisting_unchanged()
             recovered = await self._owned_query(
                 self._owned_match(("ROLLING_BACK",)) + """
@@ -729,12 +727,15 @@ class Neo4jMutationGuard:
 
     async def _write_pages(self, read_query: str, write_query: str) -> None:
         async for records in self._pages(read_query):
-            page = [{key: _record_value(record, key) for key in (
-                "source_identity", "target_identity",
-            )} for record in records]
-            written = await self._query(write_query, page=page, snapshot_id=self._snapshot_id)
-            if not written or _record_value(written[0], "written") != len(page):
-                raise GuardError("Graphiti bounded property write lost an actual target")
+            await self._write_page(write_query, records)
+
+    async def _write_page(self, write_query: str, records: list[object]) -> None:
+        page = [{key: _record_value(record, key) for key in (
+            "source_identity", "target_identity",
+        )} for record in records]
+        written = await self._query(write_query, page=page, snapshot_id=self._snapshot_id)
+        if not written or _record_value(written[0], "written") != len(page):
+            raise GuardError("Graphiti bounded property write lost an actual target")
 
     def _snapshot_sources(self, label: str) -> str:
         return f"""
@@ -755,12 +756,15 @@ class Neo4jMutationGuard:
         """
 
     async def _restore_properties(self) -> None:
-        await self._write_pages(
+        async for records in self._pages(
             self._node_matches() + """
             RETURN source_identity, target_identity, properties(s) AS source_properties,
-                   properties(n) AS target_properties
+                   properties(n) AS target_properties,
+                   s._newsroom_source_labels AS expected, labels(n) AS actual
             """,
-            f"""
+        ):
+            await self._write_page(
+                f"""
             UNWIND $page AS row
             MATCH (s:{_SNAPSHOT_NODE}) WHERE elementId(s) = row.source_identity
               AND s._newsroom_snapshot_id = $snapshot_id
@@ -769,8 +773,9 @@ class Neo4jMutationGuard:
             SET n = properties(s)
             REMOVE n._newsroom_snapshot_id, n._newsroom_source_uuid, n._newsroom_source_labels
             RETURN count(n) AS written
-            """,
-        )
+                """, records,
+            )
+            await self._restore_page_labels(records)
         await self._write_pages(
             self._snapshot_sources(_SNAPSHOT_RELATIONSHIP) + f"""
             MATCH (a {{uuid: s._newsroom_source_uuid}})
@@ -798,29 +803,25 @@ class Neo4jMutationGuard:
             """,
         )
 
-    async def _restore_labels(self) -> None:
-        async for records in self._pages(self._node_matches() + """
-            RETURN source_identity, target_identity, s._newsroom_source_labels AS expected,
-                   labels(n) AS actual
-        """):
-            for record in records:
-                target = str(_record_value(record, "target_identity") or "")
-                expected = {str(item) for item in (_record_value(record, "expected") or [])}
-                actual = {str(item) for item in (_record_value(record, "actual") or [])}
-                if not target or any(_LABEL.fullmatch(item) is None for item in expected | actual):
-                    raise GuardError("Graphiti generation contains an unsafe dynamic label")
-                for operation, labels in (("REMOVE", actual - expected), ("SET", expected - actual)):
-                    for label in sorted(labels):
-                        written = await self._query(
-                            f"""
-                            MATCH (n) WHERE elementId(n) = $target_identity
-                              AND NOT n:{_SNAPSHOT_NODE} AND NOT n:{_SNAPSHOT_RELATIONSHIP} AND NOT n:{_MARKER}
-                            {operation} n:`{label}` RETURN count(n) AS written
-                            """,
-                            target_identity=target,
-                        )
-                        if not written or _record_value(written[0], "written") != 1:
-                            raise GuardError("Graphiti label repair lost an actual target")
+    async def _restore_page_labels(self, records: list[object]) -> None:
+        for record in records:
+            target = str(_record_value(record, "target_identity") or "")
+            expected = {str(item) for item in (_record_value(record, "expected") or [])}
+            actual = {str(item) for item in (_record_value(record, "actual") or [])}
+            if not target or any(_LABEL.fullmatch(item) is None for item in expected | actual):
+                raise GuardError("Graphiti generation contains an unsafe dynamic label")
+            for operation, labels in (("REMOVE", actual - expected), ("SET", expected - actual)):
+                for label in sorted(labels):
+                    written = await self._query(
+                        f"""
+                        MATCH (n) WHERE elementId(n) = $target_identity
+                          AND NOT n:{_SNAPSHOT_NODE} AND NOT n:{_SNAPSHOT_RELATIONSHIP} AND NOT n:{_MARKER}
+                        {operation} n:`{label}` RETURN count(n) AS written
+                        """,
+                        target_identity=target,
+                    )
+                    if not written or _record_value(written[0], "written") != 1:
+                        raise GuardError("Graphiti label repair lost an actual target")
 
     async def assert_preexisting_unchanged(self) -> None:
         def validate_node(record: object) -> None:

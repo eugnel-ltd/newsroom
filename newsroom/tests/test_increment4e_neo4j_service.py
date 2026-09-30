@@ -226,7 +226,7 @@ def test_actual_guard_expiry_keeps_generation_owned_until_recovery() -> None:
                 "CREATE (:NewsroomSnapshotNode {uuid:$id,group_id:$group,name:'legacy-snapshot',"
                 "_newsroom_snapshot_id:$snapshot,_newsroom_source_uuid:$id,"
                 "_newsroom_source_labels:['Entity']})",
-                episode=legacy_episode, group=group, id=suffix,
+                episode=legacy_episode, group="foreign-" + group, id=suffix,
                 snapshot=legacy_snapshot, digest="sha256:" + "1" * 64,
             )
             fresh = guard(f"fresh-{suffix}")
