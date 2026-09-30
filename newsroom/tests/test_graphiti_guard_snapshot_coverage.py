@@ -224,3 +224,381 @@ def test_guard_rejects_invalid_snapshot_coverage_count(count: object) -> None:
     guard, _ = _guard(nodes=[_NODE], expected_nodes=count)
     with pytest.raises(GuardError, match="coverage count is invalid"):
         asyncio.run(guard.assert_preexisting_unchanged())
+
+
+class _JournalResult:
+    def __init__(self, records):
+        self.records = records
+
+    async def single(self, **_kwargs):
+        return self.records[0] if self.records else None
+
+
+class _JournalDriver:
+    """Model committed marker state and the generation-only transaction lock."""
+
+    def __init__(self):
+        self.markers = {}
+        self.owner = {}
+        self.lock = asyncio.Lock()
+        self.queries = []
+        self.events = []
+
+    def apply(self, query, params):
+        self.queries.append(query)
+        marker = self.markers.get(params.get("episode_uuid"))
+        if "SET g.lock_tick" in query:
+            assert query.index("SET g.lock_tick") < min(query.index(term) for term in ("MATCH (m:", "MERGE (m:") if term in query)
+            if "MERGE (m:" in query:
+                if self.owner.get("owner_marker_uuid") not in (None, params["episode_uuid"]):
+                    return []
+                if not self.owner.get("owner_marker_uuid") and any(
+                    item["state"] in {"SNAPSHOTTING", "PENDING", "ROLLING_BACK", "RECOVERING"}
+                    for item in self.markers.values()
+                ):
+                    return []
+                claimed = marker is None
+                if claimed:
+                    marker = {key: params[key] for key in (
+                        "group_id", "attempt_number", "input_digest", "snapshot_id", "claim_token",
+                    )}
+                    marker.update(state="SNAPSHOTTING", active=True)
+                    self.markers[params["episode_uuid"]] = marker
+                    self.owner = {"owner_marker_uuid": params["episode_uuid"],
+                                  "snapshot_id": marker["snapshot_id"], "claim_token": marker["claim_token"]}
+                elif (self.owner.get("snapshot_id"), self.owner.get("claim_token")) != (
+                    marker["snapshot_id"], marker["claim_token"],
+                ):
+                    return []
+                return [{"marker": dict(marker), "claimed": claimed, "active": marker.get("active", False)}]
+            if "SET m.state = $state" in query:
+                if marker is None or marker.get("active") or self.owner.get("owner_marker_uuid") != params["episode_uuid"]:
+                    return []
+                if (marker["state"], marker["snapshot_id"], marker["claim_token"]) != (
+                    params["retained_state"], params["snapshot_id"], params["retained_claim_token"],
+                ) or (self.owner.get("snapshot_id"), self.owner.get("claim_token")) != (
+                    marker["snapshot_id"], marker["claim_token"],
+                ):
+                    return []
+                marker.update(state=params["state"], claim_token=params["claim_token"], active=True)
+                self.owner["claim_token"] = params["claim_token"]
+                return [{"marker": dict(marker)}]
+            if (marker is None or self.owner.get("owner_marker_uuid") != params["episode_uuid"]
+                or self.owner.get("snapshot_id") != params["snapshot_id"]
+                or self.owner.get("claim_token") != params["claim_token"]
+                or marker["claim_token"] != params["claim_token"]):
+                return []
+            if "SET m.state = 'PENDING'" in query:
+                marker["state"] = "PENDING"
+                return [{"state": "PENDING"}]
+            if "SET m.state = 'ROLLING_BACK'" in query:
+                if marker["state"] != "PENDING":
+                    return []
+                marker["state"] = "ROLLING_BACK"
+                self.events.append("rollback-committed")
+                return [{"state": "ROLLING_BACK"}]
+            for terminal in ("COMPLETE", "RECOVERED_AMBIGUOUS"):
+                if f"SET m.state = '{terminal}'" in query:
+                    marker["state"] = terminal
+                    self.owner = {}
+                    self.events.append("terminal")
+                    return [{"state": terminal}]
+            return [{"claim_token": marker["claim_token"]}]
+        if "RETURN properties(m) AS marker" in query:
+            return [] if marker is None else [{"marker": dict(marker)}]
+        # A legacy implementation is intentionally modelled faithfully: it has
+        # no generation owner, and lets another episode claim after lease expiry.
+        if "MERGE (m:" in query:
+            claimed = marker is None
+            if claimed:
+                marker = {key: params[key] for key in (
+                    "group_id", "attempt_number", "input_digest", "snapshot_id", "claim_token",
+                )}
+                marker.update(state="SNAPSHOTTING", active=True)
+                self.markers[params["episode_uuid"]] = marker
+            return [{"marker": dict(marker), "claimed": claimed, "active": marker.get("active", False)}]
+        if "RETURN m.state AS state" in query:
+            for state in ("PENDING", "ROLLING_BACK", "COMPLETE", "RECOVERED_AMBIGUOUS"):
+                if f"SET m.state = '{state}'" in query and marker is not None:
+                    marker["state"] = state
+                    return [{"state": state}]
+        return []
+
+    async def execute_query(self, query, *, params, routing_):
+        assert routing_ == "w"
+        if "SET g.lock_tick" in query:
+            async with self.lock:
+                return self.apply(query, params), None, None
+        return self.apply(query, params), None, None
+
+    def session(self):
+        driver = self
+
+        class Transaction:
+            held = False
+
+            async def run(self, query, **params):
+                assert "SET m.claim_expires_at" not in query, "the long fence must not lock the episode marker"
+                if "SET g.lock_tick" in query and not self.held:
+                    await driver.lock.acquire()
+                    self.held = True
+                    driver.events.append("fence")
+                return _JournalResult(driver.apply(query, params))
+
+            async def commit(self):
+                driver.events.append("commit")
+                if self.held:
+                    driver.lock.release()
+                    self.held = False
+
+            async def rollback(self):
+                if self.held:
+                    driver.lock.release()
+                    self.held = False
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def begin_transaction(self):
+                return Transaction()
+
+        return Session()
+
+
+class _JournalGuard(Neo4jMutationGuard):
+    async def _snapshot(self):
+        pass
+
+    async def _restore_properties(self):
+        self.driver.events.append("properties")
+
+    async def _restore_labels(self):
+        self.driver.events.append("labels")
+
+    async def assert_preexisting_unchanged(self):
+        self.driver.events.append("verified")
+
+    async def _delete_snapshot(self):
+        self.driver.events.append("snapshot-deleted")
+
+
+def _journal_guard(driver, episode="episode-a"):
+    return _JournalGuard(driver, group_id="group-id", episode_uuid=episode,
+                         attempt_number=1, input_digest="sha256:" + "0" * 64)
+
+
+def test_generation_owner_survives_crash_and_expiry_and_blocks_another_episode():
+    async def exercise():
+        driver = _JournalDriver()
+        guard = _journal_guard(driver)
+        await guard.begin()
+        driver.markers["episode-a"].update(state="ROLLING_BACK", active=False)
+        with pytest.raises(GuardError, match="generation"):
+            await _journal_guard(driver, "episode-b").begin()
+        assert "episode-b" not in driver.markers
+        recovery = _journal_guard(driver)
+        retained = await recovery.begin()
+        assert retained.state.value == "ROLLING_BACK"
+        assert driver.owner["claim_token"] == recovery._claim_token
+        await recovery.rollback_pending(chat_invocations=[], embedding_usage={}, reason="CRASH")
+        assert driver.markers["episode-a"]["state"] == "RECOVERED_AMBIGUOUS"
+        assert not driver.owner
+        assert driver.events.index("verified") < driver.events.index("terminal") < driver.events.index("snapshot-deleted")
+        assert (await _journal_guard(driver, "episode-b").begin()).state.value == "CREATED"
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("state", ["SNAPSHOTTING", "PENDING", "ROLLING_BACK", "RECOVERING"])
+def test_generation_refuses_legacy_unowned_unresolved_marker(state):
+    async def exercise():
+        driver = _JournalDriver()
+        driver.markers["episode-a"] = {
+            "group_id": "group-id", "input_digest": "sha256:" + "0" * 64,
+            "attempt_number": 1, "snapshot_id": "episode-a:1", "state": state,
+            "claim_token": "expired", "active": False,
+        }
+        with pytest.raises(GuardError, match="generation"):
+            await _journal_guard(driver).begin()
+        with pytest.raises(GuardError, match="generation"):
+            await _journal_guard(driver, "episode-b").begin()
+        assert driver.markers["episode-a"]["state"] == state
+        assert "snapshot-deleted" not in driver.events
+
+    asyncio.run(exercise())
+
+
+def test_generation_takeover_binds_snapshot_and_token_and_has_one_claimant():
+    async def exercise():
+        driver = _JournalDriver()
+        await _journal_guard(driver).begin()
+        driver.markers["episode-a"]["active"] = False
+        driver.owner["snapshot_id"] = "another-snapshot"
+        with pytest.raises(GuardError, match="generation"):
+            await _journal_guard(driver).begin()
+        driver.owner["snapshot_id"] = "episode-a:1"
+        results = await asyncio.gather(*(_journal_guard(driver).begin() for _ in range(2)), return_exceptions=True)
+        assert sum(isinstance(result, GuardError) for result in results) == 1
+        assert sum(getattr(result, "state", None) == "PENDING" for result in results) == 1
+
+    asyncio.run(exercise())
+
+
+def test_generation_fence_terminal_uses_same_transaction_without_deadlock():
+    async def exercise():
+        driver = _JournalDriver()
+        guard = _journal_guard(driver)
+        await guard.begin()
+        driver.events.clear()
+        async with guard.fenced_graph_mutation():
+            assert driver.lock.locked()
+            await guard.complete({"provider_attempt_number": 1})
+            assert driver.lock.locked()
+            assert "snapshot-deleted" not in driver.events
+        assert driver.events == ["fence", "terminal", "commit", "snapshot-deleted"]
+
+    asyncio.run(asyncio.wait_for(exercise(), 1))
+
+
+class _PageGuard(Neo4jMutationGuard):
+    def __init__(self, rows):
+        super().__init__(None, group_id="group-id", episode_uuid="episode-id",
+                         attempt_number=1, input_digest="sha256:" + "0" * 64)
+        self.rows = rows
+        self.writes = []
+        self.reads = []
+        self.label_writes = []
+
+    async def _query(self, query, **params):
+        if "unsafe_nodes" in query or "unsafe_relationships" in query:
+            return []
+        if "UNWIND $page AS row" in query:
+            assert "LIMIT" not in query, "only preselected bounded actual identities may reach SET"
+            assert 0 < len(params["page"]) <= 64
+            self.writes.append(params["page"])
+            return [{"written": len(params["page"])}]
+        if "REMOVE n:`" in query or "SET n:`" in query:
+            assert "elementId(n) = $target_identity" in query
+            self.label_writes.append(params["target_identity"])
+            return [{"written": 1}]
+        assert "ORDER BY source_identity" in query and "LIMIT $limit" in query
+        assert "elementId(" in query and "uuid >" not in query
+        self.reads.append(params)
+        rows = [] if "MATCH (s:NewsroomSnapshotRelationship" in query or "MATCH (a)-[r]->(b)" in query else self.rows
+        cursor = (params["cursor_source"], params["cursor_target"])
+        return [row for row in rows if (row["source_identity"], row["target_identity"]) > cursor][:params["limit"]]
+
+
+def _page_row(source, target, *, size=1, expected=(), actual=()):
+    return {"source_identity": source, "target_identity": target,
+            "source_properties": {"uuid": "duplicate", "vector": [1.0] * size},
+            "target_properties": {"uuid": "duplicate", "extra": "remove"},
+            "expected": list(expected), "actual": list(actual)}
+
+
+def test_property_pages_cover_all_actual_duplicate_targets_and_page_boundary():
+    rows = [_page_row("snapshot-1", f"target-{index:04}") for index in range(65)]
+    guard = _PageGuard(rows)
+    asyncio.run(guard._restore_properties())
+    assert [len(page) for page in guard.writes] == [64, 1]
+    assert [item["target_identity"] for page in guard.writes for item in page] == [row["target_identity"] for row in rows]
+    assert guard.reads[1]["cursor_source"] == "snapshot-1"
+    assert guard.reads[1]["cursor_target"] == "target-0063"
+
+
+def test_property_page_full_bytes_bound_splits_before_write_and_rejects_single_oversize():
+    rows = [_page_row("snapshot-1", f"target-{index}", size=20000) for index in range(8)]
+    guard = _PageGuard(rows)
+    asyncio.run(guard._restore_properties())
+    assert len(guard.writes) > 1
+    assert sum(map(len, guard.writes)) == len(rows)
+    oversized = _PageGuard([_page_row("snapshot-1", "target-1", size=200000)])
+    with pytest.raises(GuardError, match="property byte bound"):
+        asyncio.run(oversized._restore_properties())
+    assert not oversized.writes
+
+
+def test_label_pages_repair_each_actual_identity_including_unlabelled_duplicates():
+    guard = _PageGuard([
+        _page_row("snapshot-1", "target-a", expected=["Entity"], actual=["Changed"]),
+        _page_row("snapshot-1", "target-b", expected=["Entity"], actual=[]),
+    ])
+    asyncio.run(guard._restore_labels())
+    assert guard.label_writes == ["target-a", "target-a", "target-b"]
+
+
+def test_snapshot_pages_commit_stable_original_element_identities():
+    rows = [_page_row(f"original-{index:04}", "") for index in range(65)]
+    guard = _PageGuard(rows)
+    asyncio.run(guard._snapshot())
+    assert [len(page) for page in guard.writes] == [64, 1]
+    assert guard.reads[1]["cursor_source"] == "original-0063"
+
+
+def test_committed_rollback_page_crash_retains_durable_owner_until_exact_recovery():
+    class InterruptedGuard(_JournalGuard):
+        async def _restore_properties(self):
+            self.driver.events.append("property-page-committed")
+            raise asyncio.CancelledError()
+
+    async def exercise():
+        driver = _JournalDriver()
+        guard = InterruptedGuard(driver, group_id="group-id", episode_uuid="episode-a",
+                                 attempt_number=1, input_digest="sha256:" + "0" * 64)
+        await guard.begin()
+        driver.events.clear()
+        with pytest.raises(asyncio.CancelledError):
+            await guard.rollback_pending(chat_invocations=[], embedding_usage={}, reason="CRASH")
+        assert driver.markers["episode-a"]["state"] == "ROLLING_BACK"
+        assert driver.owner["owner_marker_uuid"] == "episode-a"
+        assert driver.events.index("rollback-committed") < driver.events.index("property-page-committed")
+        assert "terminal" not in driver.events and "snapshot-deleted" not in driver.events
+        driver.markers["episode-a"]["active"] = False
+        with pytest.raises(GuardError, match="generation"):
+            await _journal_guard(driver, "episode-b").begin()
+        recovery = _journal_guard(driver)
+        await recovery.begin()
+        await recovery.rollback_pending(chat_invocations=[], embedding_usage={}, reason="RECOVERY")
+        assert not driver.owner
+        assert driver.events.index("verified") < driver.events.index("terminal") < driver.events.index("snapshot-deleted")
+
+    asyncio.run(exercise())
+
+
+def test_terminal_marker_readers_remain_available_during_another_generation_owner():
+    async def exercise():
+        driver = _JournalDriver()
+        guard = _journal_guard(driver)
+        await guard.begin()
+        await guard.complete({"provider_attempt_number": 1})
+        await _journal_guard(driver, "episode-b").begin()
+        assert (await _journal_guard(driver).begin()).state.value == "COMPLETE"
+        assert driver.owner["owner_marker_uuid"] == "episode-b"
+
+    asyncio.run(exercise())
+
+
+def test_property_bound_measures_native_vectors_without_truncated_display():
+    from neo4j.vector import Vector
+    from newsroom.graphiti_adapter.neo4j_guard import _property_bytes
+
+    vector = Vector.from_bytes(b"\0" * (1024 * 1024), "f64")
+    assert _property_bytes(vector) > 1024 * 1024
+
+
+def test_snapshot_refuses_relationship_properties_that_collide_with_guard_metadata():
+    class ReservedRelationshipGuard(_PageGuard):
+        async def _query(self, query, **params):
+            if "unsafe_relationships" in query:
+                unsafe = "keys(r)" in query and params.get("reserved_prefix") == "_newsroom_"
+                return [{"unsafe_relationships": int(unsafe)}]
+            return await super()._query(query, **params)
+
+    guard = ReservedRelationshipGuard([])
+    with pytest.raises(GuardError, match="reserved guard properties"):
+        asyncio.run(guard._snapshot())
+    assert not guard.writes
