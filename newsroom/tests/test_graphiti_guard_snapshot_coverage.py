@@ -390,6 +390,9 @@ class _JournalGuard(Neo4jMutationGuard):
     async def _restoration_inventories(self):
         return [], []
 
+    async def _snapshot_uuids(self, inventory, *, snapshot_label):
+        return []
+
     async def _restore_properties(self, **_values):
         self.driver.events.append("properties")
 
@@ -819,3 +822,89 @@ def test_owned_recovery_phase_callback_is_reset_when_guard_or_stop_interrupts(fa
         assert driver.owner
         assert "terminal" not in driver.events
     asyncio.run(exercise())
+
+
+def test_rollback_deletion_reads_bounded_uuid_inventory_once_before_each_delete():
+    class Guard(_JournalGuard):
+        async def _snapshot_uuids(self, inventory, *, snapshot_label):
+            self.driver.events.append(snapshot_label)
+            return ["original", True, 1, [1, 2]]
+
+    async def exercise():
+        driver = _JournalDriver()
+        guard = Guard(driver, group_id="group-id", episode_uuid="episode-a", attempt_number=1,
+                      input_digest="sha256:" + "0" * 64)
+        await guard.begin()
+        driver.queries.clear()
+        await guard.rollback_pending(chat_invocations=[], embedding_usage={}, reason="FIXTURE")
+        deletes = [query for query in driver.queries if "DELETE r" in query or "DETACH DELETE n" in query]
+        assert len(deletes) == 2
+        assert all("NOT EXISTS" not in query and "MATCH (s:" not in query for query in deletes)
+        assert "r.uuid IS NULL OR NOT r.uuid IN $retained_uuids" in deletes[0]
+        assert "a.group_id = $group_id OR b.group_id = $group_id" in deletes[0]
+        assert "n.uuid IS NULL OR NOT n.uuid IN $retained_uuids" in deletes[1]
+        assert all(f"NOT n:{label}" in deletes[1] for label in (
+            "NewsroomSnapshotNode", "NewsroomSnapshotRelationship", "NewsroomIngestMarker",
+        ))
+        assert driver.events.index("NewsroomSnapshotNode") < driver.events.index("properties")
+        assert driver.events.index("NewsroomSnapshotRelationship") < driver.events.index("properties")
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("defect", (None, "bytes", "coverage", "duplicate", "null", "fetch"))
+def test_retained_uuid_stream_is_fetch_one_bounded_and_preserves_native_values(defect, monkeypatch):
+    import newsroom.graphiti_adapter.neo4j_guard as module
+
+    values = ["original", "original", True, 1, [1, 2]]
+    if defect == "bytes":
+        values = ["x" * 4096] * 200
+        monkeypatch.setattr(module, "_INVENTORY_BYTES", 1024)
+    rows = [{"source_identity": f"snapshot-{index}", "retained_uuid": value}
+            for index, value in enumerate(values)]
+    inventory = [(row["source_identity"], f"actual-{index}") for index, row in enumerate(rows)]
+    if defect == "coverage":
+        inventory.append(("snapshot-missing", "actual-missing"))
+    elif defect == "duplicate":
+        rows.append(rows[0])
+    elif defect == "null":
+        rows[0]["retained_uuid"] = None
+    yielded, configurations = [], []
+    class Result:
+        async def __aiter__(self):
+            for row in rows:
+                yielded.append(row)
+                yield row
+    class Transaction:
+        async def run(self, query, **parameters):
+            assert configurations[-1].fetch_size == 1
+            assert parameters == {"snapshot_id": "episode-a:1"}
+            assert query.count("MATCH (s:NewsroomSnapshotNode") == 1
+            assert "s._newsroom_source_uuid AS retained_uuid" in query
+            assert "properties(s)" not in query and "uuid:" not in query
+            return Result()
+    class Session:
+        def __init__(self):
+            if defect != "fetch":
+                self._config = SimpleNamespace(fetch_size=1000)
+                configurations.append(self._config)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_args):
+            pass
+        async def execute_write(self, callback):
+            return await callback(Transaction())
+    guard = Neo4jMutationGuard(SimpleNamespace(session=Session), group_id="group-id",
+                               episode_uuid="episode-a", attempt_number=1,
+                               input_digest="sha256:" + "0" * 64)
+    if defect is not None:
+        with pytest.raises(GuardError):
+            asyncio.run(guard._snapshot_uuids(inventory, snapshot_label="NewsroomSnapshotNode"))
+        if defect == "bytes":
+            assert len(yielded) == 1
+        elif defect == "fetch":
+            assert not yielded
+    else:
+        retained = asyncio.run(guard._snapshot_uuids(inventory, snapshot_label="NewsroomSnapshotNode"))
+        assert all(actual is expected for actual, expected in zip(retained, values, strict=True))
+        assert len(retained) == len(values)
+        assert type(retained[2]) is bool and type(retained[3]) is int

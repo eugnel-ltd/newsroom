@@ -759,21 +759,18 @@ class Neo4jMutationGuard:
         async with self.fenced_graph_mutation():
             self._observe_owned_recovery_phase("INVENTORY")
             inventories = await self._restoration_inventories()
+            node_uuids = await self._snapshot_uuids(inventories[0], snapshot_label=_SNAPSHOT_NODE)
+            relationship_uuids = await self._snapshot_uuids(inventories[1], snapshot_label=_SNAPSHOT_RELATIONSHIP)
             self._observe_owned_recovery_phase("DELETE_NEW_RELATIONSHIPS")
             await self._query(
-                f"""
+                """
                 MATCH (a)-[r]->(b)
                 WHERE (a.group_id = $group_id OR b.group_id = $group_id)
-                  AND NOT EXISTS {{
-                      MATCH (s:{_SNAPSHOT_RELATIONSHIP} {{
-                          _newsroom_snapshot_id: $snapshot_id,
-                          _newsroom_relationship_uuid: r.uuid
-                      }})
-                  }}
+                  AND (r.uuid IS NULL OR NOT r.uuid IN $retained_uuids)
                 DELETE r
                 """,
                 group_id=self._group_id,
-                snapshot_id=self._snapshot_id,
+                retained_uuids=relationship_uuids,
             )
             self._observe_owned_recovery_phase("DELETE_NEW_NODES")
             await self._query(
@@ -783,16 +780,11 @@ class Neo4jMutationGuard:
                   AND NOT n:{_SNAPSHOT_NODE}
                   AND NOT n:{_SNAPSHOT_RELATIONSHIP}
                   AND NOT n:{_MARKER}
-                  AND NOT EXISTS {{
-                      MATCH (s:{_SNAPSHOT_NODE} {{
-                          _newsroom_snapshot_id: $snapshot_id,
-                          _newsroom_source_uuid: n.uuid
-                      }})
-                  }}
+                  AND (n.uuid IS NULL OR NOT n.uuid IN $retained_uuids)
                 DETACH DELETE n
                 """,
                 group_id=self._group_id,
-                snapshot_id=self._snapshot_id,
+                retained_uuids=node_uuids,
             )
             self._observe_owned_recovery_phase("RESTORE")
             await self._restore_properties(inventories=inventories)
@@ -862,6 +854,47 @@ class Neo4jMutationGuard:
         written = await self._query(write_query, page=page, snapshot_id=self._snapshot_id)
         if not written or _record_value(written[0], "written") != len(page):
             raise GuardError("Graphiti bounded property write lost an actual target")
+
+    async def _snapshot_uuids(
+        self, inventory: list[tuple[str, str]], *, snapshot_label: str,
+    ) -> list[object]:
+        """Read native UUID values once, within the existing retained byte bound."""
+        field = {_SNAPSHOT_NODE: "_newsroom_source_uuid",
+                 _SNAPSHOT_RELATIONSHIP: "_newsroom_relationship_uuid"}[snapshot_label]
+        expected = {source for source, _ in inventory}
+        async def consume(transaction: Any) -> list[object]:
+            values: list[object] = []
+            seen: set[str] = set()
+            size = 256 + sum(192 + len(source.encode()) for source in expected)
+            records = await transaction.run(
+                f"MATCH (s:{snapshot_label} {{_newsroom_snapshot_id:$snapshot_id}}) "
+                f"RETURN elementId(s) AS source_identity, s.{field} AS retained_uuid",
+                snapshot_id=self._snapshot_id,
+            )
+            async for record in records:
+                if self._owned_recovery_stop_check is not None and len(values) % _PAGE_TARGET_LIMIT == 0:
+                    self._owned_recovery_stop_check()
+                source, value = _record_value(record, "source_identity"), _record_value(record, "retained_uuid")
+                if type(source) is not str or source not in expected or value is None:
+                    raise GuardError("Graphiti guard snapshot identity is malformed")
+                if source in seen:
+                    raise GuardError("Graphiti inventory has a duplicate actual pair")
+                size += 192 + _property_bytes(source) + _property_bytes(value)
+                if size > _INVENTORY_BYTES:
+                    raise GuardError("Graphiti identity inventory exceeds its byte bound")
+                seen.add(source)
+                values.append(value)
+            if seen != expected:
+                raise GuardError("Graphiti identity inventory omits a pre-existing target")
+            return values
+        async with self._driver.session() as session:
+            try:
+                session._config.fetch_size = 1
+                if session._config.fetch_size != 1:
+                    raise AttributeError
+            except AttributeError:
+                raise GuardError("Graphiti UUID inventory requires bounded fetch") from None
+            return await session.execute_write(consume)
 
     async def _identity_inventory(
         self, query: str, *, snapshot_label: str,
