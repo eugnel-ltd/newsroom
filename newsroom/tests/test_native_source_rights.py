@@ -439,3 +439,33 @@ def test_retained_rights_read_rechecks_current_authority_and_exact_content(
         with pytest.raises(error):
             portfolio.require_retained(objects=objects, proof=proof)
         assert _source_read_audit_counts(args["authority_path"]) == before
+
+
+@pytest.mark.parametrize('fault', ['source_id', 'source_url', 'reviewed_text', 'assessment_digest'])
+def test_govuk_v2_semantic_input_mismatch_refuses_before_retention(fault):
+    from newsroom.control_plane import govuk_rights
+    from newsroom.control_plane.native_evidence import PublicationRightsAssessment
+    from types import SimpleNamespace
+    from newsroom.authority.canonical import digest_canonical
+
+    source = dict(source_id='UK-01', definition_url='https://www.gov.uk/feed')
+    semantic = govuk_rights._govuk_semantic_evidence(**source)
+    assessment = PublicationRightsAssessment.create(
+        decision='PERMITTED', permitted_use='PUBLICATION_EVIDENCE', policy_digest=govuk_rights.POLICY_DIGEST,
+        evidence_digest=digest_canonical(semantic),
+    )
+    supplied = dict(semantic)
+    if fault == 'source_id': supplied['source_id'] = 'UK-02'
+    elif fault == 'source_url': supplied['definition_url'] = 'https://www.gov.uk/other'
+    elif fault == 'reviewed_text': supplied['reviewed_text'] = {}
+    else: assessment = PublicationRightsAssessment.create(
+        decision='PERMITTED', permitted_use='PUBLICATION_EVIDENCE', policy_digest=govuk_rights.POLICY_DIGEST,
+        evidence_digest='sha256:'+'0'*64,
+    )
+    objects = SimpleNamespace(admit=lambda *a, **kw: pytest.fail('invalid semantic input must not persist'))
+    with pytest.raises(ValueError, match='GOV.UK semantic rights binding differs'):
+        rights.retain_rights_snapshot(
+            objects=objects, proof=object(), **source, assessment=assessment,
+            observed_at='2026-09-08T12:00:00Z', reason='REVIEWED_REUSE_PERMITTED', observations=(),
+            govuk_semantic_evidence=supplied,
+        )

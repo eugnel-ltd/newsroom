@@ -37,6 +37,7 @@ from .govuk_spreadsheet_evidence import (
 )
 from .govuk_rights import (
     LICENCE_URL, REUSE_URL, GovUkLicenceEvidence, retain_current_govuk_licence,
+    _govuk_semantic_evidence,
 )
 from .graphiti_operational_readiness import OPERATOR_AUTHORITY_DOMAIN, OPERATOR_PRINCIPAL_ID
 from .model_usage import InvocationEfficiencyPolicy, ModelUsageService
@@ -442,6 +443,7 @@ def open_native_pipeline(
                 )
                 snapshots = {}
                 for source_id, definition_url in SOURCE_URLS.items():
+                    assessment = current.for_source(source_id=source_id, definition_url=definition_url)
                     source_evidence = evidence.get(source_id)
                     if source_evidence is not None:
                         observed_at = source_evidence.observed_at
@@ -464,11 +466,14 @@ def open_native_pipeline(
                     snapshots[source_id] = retain_rights_snapshot(
                         objects=runtime.authority.objects, proof=proof,
                         source_id=source_id, definition_url=definition_url,
-                        assessment=current.for_source(
-                            source_id=source_id, definition_url=definition_url,
-                        ),
+                        assessment=assessment,
                         observed_at=observed_at, reason=reason,
                         observations=observations,
+                        govuk_semantic_evidence=(
+                            _govuk_semantic_evidence(source_id=source_id, definition_url=definition_url)
+                            if govuk is not None and source_evidence is None and assessment.decision == "PERMITTED"
+                            else None
+                        ),
                     )
                 return govuk, govuk_reason, evidence, snapshots
 

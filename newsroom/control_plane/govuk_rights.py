@@ -45,6 +45,18 @@ POLICY_DIGEST = digest_canonical({
 })
 
 
+def _govuk_semantic_evidence(*, source_id: str, definition_url: str) -> dict:
+    if (source_id not in {"UK-01", "UK-02", "UK-03", "UK-05"}
+            or urlsplit(definition_url).scheme != "https"
+            or urlsplit(definition_url).netloc != "www.gov.uk"):
+        raise ValueError("GOV.UK semantic rights source scope differs")
+    return {
+        "schema": "hermes-govuk-semantic-rights-v2",
+        "source_id": source_id, "definition_url": definition_url,
+        "reviewed_text": dict(REVIEWED_TEXT), "policy_digest": POLICY_DIGEST,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class GovUkLicenceEvidence:
     admission_ids: tuple[ObjectAdmissionId, ObjectAdmissionId]
@@ -73,7 +85,9 @@ class GovUkLicenceEvidence:
         return PublicationRightsAssessment.create(
             decision="PERMITTED" if permitted else "HOLD",
             permitted_use="PUBLICATION_EVIDENCE", policy_digest=POLICY_DIGEST,
-            evidence_digest=digest_canonical({
+            evidence_digest=digest_canonical(_govuk_semantic_evidence(
+                source_id=source_id, definition_url=definition_url,
+            ) if permitted else {
                 "source_id": source_id, "definition_url": definition_url,
                 "admission_ids": [str(item) for item in self.admission_ids],
                 "raw_digests": self.raw_digests,

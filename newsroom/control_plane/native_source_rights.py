@@ -144,8 +144,17 @@ def retain_rights_snapshot(
     *, objects, proof, source_id: str, definition_url: str,
     assessment: PublicationRightsAssessment, observed_at: str,
     reason: str, observations: tuple[tuple[str, str, str, str], ...],
+    govuk_semantic_evidence: dict | None = None,
 ) -> RightsSnapshotReference:
     """Retain the current observation and its stable semantic assessment."""
+    if govuk_semantic_evidence is not None:
+        from .govuk_rights import POLICY_DIGEST as GOVUK_POLICY, _govuk_semantic_evidence
+        expected = _govuk_semantic_evidence(source_id=source_id, definition_url=definition_url)
+        if (govuk_semantic_evidence != expected or type(assessment) is not PublicationRightsAssessment
+                or assessment.decision != "PERMITTED" or assessment.permitted_use != "PUBLICATION_EVIDENCE"
+                or assessment.policy_digest != GOVUK_POLICY
+                or assessment.evidence_digest != digest_canonical(expected)):
+            raise ValueError("GOV.UK semantic rights binding differs")
     observation_bytes = canonical_json_bytes({
         "schema": "hermes-native-rights-observation-v1",
         "source_id": source_id, "definition_url": definition_url,
@@ -155,7 +164,7 @@ def retain_rights_snapshot(
     observation = objects.admit(ObjectAdmissionRequest(
         "evidence.source", f"native-rights-observation:{digest_bytes(observation_bytes)}",
     ), observation_bytes, proof=proof).admission
-    assessment_bytes = canonical_json_bytes({
+    assessment_value = {
         "schema": "hermes-native-rights-assessment-v1",
         "source_id": source_id, "definition_url": definition_url,
         "record_id": assessment.record_id, "decision": assessment.decision,
@@ -166,7 +175,12 @@ def retain_rights_snapshot(
         "evidence": tuple(
             (url, digest, admission) for url, digest, admission, _access in observations
         ),
-    })
+    }
+    if govuk_semantic_evidence is not None:
+        assessment_value["schema"] = "hermes-native-rights-assessment-v2"
+        del assessment_value["evidence"]
+        assessment_value["semantic_evidence"] = govuk_semantic_evidence
+    assessment_bytes = canonical_json_bytes(assessment_value)
     retained = objects.admit(ObjectAdmissionRequest(
         "evidence.source", f"native-rights-assessment:{assessment.record_id}",
     ), assessment_bytes, proof=proof).admission
