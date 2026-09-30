@@ -599,8 +599,35 @@ class NativeSourceIntake:
         access = self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, raw)
         return admission, access
 
+    def _manual_item_key(self, source_id, version_id, item):
+        root, separator, path = item.item_key.partition("|")
+        if separator != "|" or not path.startswith("/") or item.canonical_url != "https://www.gov.uk" + path:
+            return item.item_key
+        try:
+            validate_sha256_digest(root)
+        except ValueError:
+            return item.item_key
+        # Journal LAND order supplies the first admitted namespace. A parent
+        # update is not a new child; keep its exact original ancestry proof.
+        for units in self._retained_units.values():
+            unit = units[0]
+            if (unit.source_id != source_id or unit.authority is None
+                    or unit.authority.definition_version_id != str(version_id)
+                    or unit.canonical_url != item.canonical_url):
+                continue
+            prior_root, separator, prior_path = unit.item_key.partition("|")
+            if separator != "|" or prior_path != path:
+                continue
+            try:
+                validate_sha256_digest(prior_root)
+            except ValueError:
+                continue
+            return unit.item_key
+        return item.item_key
+
     def _retain_item(self, source_id, definition_id, version_id, version, item,
                      observation_digest, observed_at, rights_id):
+        item = replace(item, item_key=self._manual_item_key(source_id, version_id, item))
         item_id = deterministic_uuid4(
             SourceItemId, namespace=f"{VERSION}:item",
             semantic_value=[str(version_id), source_id, item.item_key],
