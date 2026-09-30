@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from newsroom.increment4 import Increment4Neo4jCurrentBuildRequest, Increment4Neo4jActiveReadRequest
-from newsroom.projection import ProjectionGenerationId, ProjectionStateError
+from newsroom.projection import ProjectionDeliveryOutcome, ProjectionGenerationId, ProjectionStateError
 from newsroom.projection.neo4j import Neo4jAuthorityCommitPending, Neo4jIdentityConflict
 from newsroom.relations import EditorialRelationDecisionAction, EditorialRelationTemporalScope
 
@@ -86,7 +86,7 @@ def test_suffix_only_and_exact_historical_replay_after_later_validation(initial)
     assert second.promotion.promotion_digest == first.promotion.promotion_digest
     assert adapter.apply_count - applies == 1
     assert adapter.cleanup_count == cleanups
-    assert commands(state) - before == 2
+    assert commands(state) - before == 3  # One optional-prefix delivery, APPLIED and validation.
     third = build(state, adapter, request(G3, 'no-new-graph'))
     assert third.generation.generation_id == G1
     assert adapter.apply_count - applies == 1
@@ -121,8 +121,10 @@ def test_graph_commit_before_sqlite_delivery_recovers_one_exact_pending_suffix(i
     from newsroom.authority._projection_system import _ProjectionBoundary
     original = _ProjectionBoundary._commit_delivery
 
-    def interrupted(*args, **kwargs):
-        raise RuntimeError('injected SQLite delivery commit failure')
+    def interrupted(self, grant, delivery):
+        if delivery.outcome is ProjectionDeliveryOutcome.APPLIED:
+            raise RuntimeError('injected SQLite delivery commit failure')
+        return original(self, grant, delivery)
 
     monkeypatch.setattr(_ProjectionBoundary, '_commit_delivery', interrupted)
     with pytest.raises(Neo4jAuthorityCommitPending):
@@ -244,3 +246,71 @@ def test_initial_validation_commit_before_promotion_resumes_exact_request(tmp_pa
     assert result.generation.state.value == 'ACTIVE'
     assert result.validation.validation_version == 1
     assert result.validation.source_snapshot_digest == result.source_snapshot_digest
+
+
+def test_optional_prefix_over_retained_gap_cap_is_recorded_before_graph_suffix(tmp_path, monkeypatch):
+    from newsroom.authority import AggregateId
+    from newsroom.authority._projection_system import _ProjectionBoundary
+    from newsroom.increment4 import contracts
+    from .authority_helpers import command
+
+    original_family = contracts.increment4_admitted_family_v1
+    monkeypatch.setattr(contracts, 'increment4_admitted_family_v1',
+                        lambda *args: replace(original_family(*args), max_gap_span=2))
+    state = seed_increment4_graphiti_path(tmp_path)
+    admit_increment4_graphiti_path(state)
+    adapter = MemoryNeo4jAdapter()
+    first = build(state, adapter, request())
+    with open_graphiti_path_increment4_neo4j_system(state.relation, adapter) as system:
+        for ordinal in range(3):
+            system.commands.execute(command(
+                key=f'optional-prefix-{ordinal}',
+                aggregate_id=AggregateId.parse('00000000-0000-4000-8000-000000008109'),
+                expected_version=ordinal,
+            ), proof=extraction_proof())
+    add_suffix(state)
+    observed = []
+    original_commit = _ProjectionBoundary._commit_delivery
+    original_apply = adapter.apply
+    def committed(self, grant, delivery):
+        observed.append(('delivery', delivery.ledger_seq, delivery.outcome, delivery.expected_authority_version))
+        result = original_commit(self, grant, delivery)
+        if delivery.outcome is ProjectionDeliveryOutcome.IGNORED_OPTIONAL:
+            metadata = self._store.projection_generation_metadata(delivery.generation_id)
+            observed[-1] += (metadata.contiguous_ledger_seq,)
+        return result
+    def applied(batch):
+        observed.append(('graph', batch.ledger_seq))
+        return original_apply(batch)
+    monkeypatch.setattr(_ProjectionBoundary, '_commit_delivery', committed)
+    monkeypatch.setattr(adapter, 'apply', applied)
+    result = build(state, adapter, request(G2, 'long-optional-prefix'))
+    assert result.generation.generation_id == G1
+    assert result.projected_batch_count == first.projected_batch_count + 1
+    assert observed[0][0] == 'delivery' and observed[0][2] is ProjectionDeliveryOutcome.IGNORED_OPTIONAL
+    assert observed[1][0] == 'graph'
+    assert observed[2][0] == 'delivery' and observed[2][2] is ProjectionDeliveryOutcome.APPLIED
+    assert observed[1][1] - observed[0][1] > 2
+    assert observed[0][4] >= observed[1][1]  # Optional SKIP does not replace APPLIED authority.
+    assert observed[2][3] == observed[0][3] + 1
+    assert len([row for row in observed if row[0] == 'graph']) == 1
+    before = commands(state), adapter.apply_count
+    assert build(state, adapter, request(G2, 'long-optional-prefix')).validation == result.validation
+    assert (commands(state), adapter.apply_count) == before
+
+
+def test_optional_prefix_authority_refusal_precedes_graph_apply(initial, monkeypatch):
+    from newsroom.authority._projection_system import _ProjectionBoundary
+
+    state, adapter, first = initial
+    add_suffix(state)
+    original = _ProjectionBoundary._commit_delivery
+    def refused(self, grant, delivery):
+        if delivery.outcome is ProjectionDeliveryOutcome.IGNORED_OPTIONAL:
+            raise ProjectionStateError('fixture optional-prefix authority refused')
+        return original(self, grant, delivery)
+    monkeypatch.setattr(_ProjectionBoundary, '_commit_delivery', refused)
+    before = commands(state), adapter.apply_count, adapter.cleanup_count
+    with pytest.raises(ProjectionStateError, match='optional-prefix authority refused'):
+        build(state, adapter, request(G2, 'prefix-refused'))
+    assert (commands(state), adapter.apply_count, adapter.cleanup_count) == before

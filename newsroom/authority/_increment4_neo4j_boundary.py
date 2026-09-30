@@ -1063,6 +1063,17 @@ class _Increment4Neo4jBoundary:
             )
         for batch in pending:
             metadata = self._store.projection_generation_metadata(generation_id)
+            if metadata.contiguous_ledger_seq < batch.ledger_seq - 1:
+                checkpoint = metadata.contiguous_ledger_seq
+                self._record_ignored(
+                    generation_id=generation_id, ledger_seq=checkpoint + 1,
+                    expected_authority_version=metadata.generation.authority_aggregate_version,
+                    idempotency_key=self._operation_key(request.idempotency_key, "active-prefix", {
+                        "generation_id": str(generation_id), "batch_digest": batch.batch_digest,
+                        "checkpoint_ledger_seq": checkpoint,
+                    }), proof=proof,
+                )
+                metadata = self._store.projection_generation_metadata(generation_id)
             self._apply_and_record(
                 batch=batch,
                 expected_authority_version=metadata.generation.authority_aggregate_version,
