@@ -5680,3 +5680,119 @@ def test_owned_recovery_logger_failure_preserves_exact_result_or_owner_stop(monk
     else:
         assert real.recover_owned_pending(**arguments) is (marker if outcome == "recovered" else None)
     driver.close.assert_awaited_once()
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("logger_fault", [False, True])
+@pytest.mark.parametrize("late_rollback", [False, True])
+def test_validation_budget_diagnostic_survives_wrapping_without_changing_outcome(
+    monkeypatch, caplog, wrapped, logger_fault, late_rollback,
+):
+    import logging
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.extraction.types import ExtractionContractError
+
+    caplog.set_level(logging.WARNING, logger=real.__name__)
+    async def over_budget(**values):
+        values["telemetry"].embedding_usage = {
+            "usage_basis": "PROVIDER_REPORTED", "request_count": 1,
+            "embedding_tokens": 1, "cost_usd_microunits": 500_001, "requests": [],
+        }
+        result = SimpleNamespace(episode=SimpleNamespace(uuid=values["episode_id"]), nodes=(), edges=())
+        try:
+            values["validate_result"](result, values["telemetry"])
+        except ExtractionContractError as error:
+            if not wrapped:
+                raise
+            pipeline = real.CombinedTemporalPipelineError(
+                "fixture wrapped validation", graph_effect_attempted=True, rollback_completed=not late_rollback,
+            )
+            if late_rollback:
+                values["telemetry"].recovery_classification = real.GraphitiRecoveryClassification.ROLLED_BACK_AMBIGUOUS_EFFECT
+            pipeline.__cause__ = error
+            raise real.AmbiguousEpisodeEffect("fixture ambiguous") from pipeline
+        raise AssertionError("Expected budget failure")
+    monkeypatch.setattr(real, "_load_graphiti", lambda: SimpleNamespace())
+    monkeypatch.setattr(real, "openrouter_api_key", lambda: "fixture")
+    monkeypatch.setattr(real, "neo4j_community_password", lambda: "fixture")
+    monkeypatch.setattr(real, "_add_episode", over_budget)
+    if logger_fault:
+        def broken(*args, **kwargs):
+            raise RuntimeError("fixture logger failure")
+        monkeypatch.setattr(real._LOGGER, "warning", broken)
+    produced = RealGraphitiAdapter()._produce(
+        evaluation_attempt_for(("A retained source passage.",)),
+        UtcTimestamp.parse("2026-08-20T00:00:00.000000Z"),
+    )
+    assert produced.outcome is (ExtractionOutcome.RETRYABLE_FAILURE if wrapped else ExtractionOutcome.INVALID_OUTPUT)
+    if not logger_fault:
+        records = [r.getMessage() for r in caplog.records if "graphiti_validation" in r.getMessage()]
+        assert len(records) == 1
+        assert "phase=BUDGET" in records[0]
+        assert "reason=BUDGET_EXCEEDED" in records[0]
+        assert "exceeded=cost_microunits" in records[0]
+        assert ("rollback=COMPLETE" if wrapped else "rollback=UNOBSERVED") in records[0]
+        assert len(records[0].encode()) <= 300
+
+@pytest.mark.parametrize("private_message", ["PRIVATE_SOURCE_SECRET", "PRIVATE_SOURCE_SECRET" * 1000], ids=["private", "oversized"])
+def test_validation_contract_diagnostic_never_emits_private_error_text(monkeypatch, caplog, private_message):
+    import logging
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.extraction.types import ExtractionContractError
+
+    caplog.set_level(logging.WARNING, logger=real.__name__)
+    class PRIVATE_SOURCE_SECRET(ExtractionContractError):
+        pass
+    original = PRIVATE_SOURCE_SECRET(private_message)
+    def invalid_proposals(*args):
+        raise original
+    async def rejected(**values):
+        result = SimpleNamespace(episode=SimpleNamespace(uuid=values["episode_id"]), nodes=(), edges=())
+        try:
+            values["validate_result"](result, values["telemetry"])
+        except ExtractionContractError as error:
+            assert error is original
+            pipeline = real.CombinedTemporalPipelineError("fixture", graph_effect_attempted=True, rollback_completed=False)
+            pipeline.__cause__ = error
+            raise real.AmbiguousEpisodeEffect("fixture") from pipeline
+    monkeypatch.setattr(real, "entity_proposals", invalid_proposals)
+    monkeypatch.setattr(real, "_load_graphiti", lambda: SimpleNamespace())
+    monkeypatch.setattr(real, "openrouter_api_key", lambda: "fixture")
+    monkeypatch.setattr(real, "neo4j_community_password", lambda: "fixture")
+    monkeypatch.setattr(real, "_add_episode", rejected)
+    produced = RealGraphitiAdapter()._produce(
+        evaluation_attempt_for(("A retained source passage.",)), UtcTimestamp.parse("2026-08-20T00:00:00.000000Z"),
+    )
+    assert produced.failure_code is ExtractionFailureCode.AMBIGUOUS_EFFECT
+    records = [r.getMessage() for r in caplog.records if "graphiti_validation" in r.getMessage()]
+    assert len(records) == 1 and "phase=ENTITY_PROPOSALS" in records[0] and "reason=CONTRACT_INVALID" in records[0]
+    assert "rollback=INCOMPLETE" in records[0]
+    assert "PRIVATE_SOURCE_SECRET" not in records[0] and len(records[0].encode()) <= 300
+
+@pytest.mark.parametrize("termination", ["guard", "timeout"])
+def test_validation_cause_is_observed_when_secondary_rollback_terminates(monkeypatch, caplog, termination):
+    import logging
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.extraction.types import ExtractionContractError
+    caplog.set_level(logging.WARNING, logger=real.__name__)
+    def invalid_proposals(*args):
+        raise ExtractionContractError("PRIVATE_SOURCE_SECRET")
+    async def interrupted(**values):
+        result = SimpleNamespace(episode=SimpleNamespace(uuid=values["episode_id"]), nodes=(), edges=())
+        try:
+            values["validate_result"](result, values["telemetry"])
+        except ExtractionContractError:
+            if termination == "guard":
+                raise real.GuardError("fixture secondary rollback failure")
+            raise asyncio.TimeoutError
+    monkeypatch.setattr(real, "entity_proposals", invalid_proposals)
+    monkeypatch.setattr(real, "_load_graphiti", lambda: SimpleNamespace())
+    monkeypatch.setattr(real, "openrouter_api_key", lambda: "fixture")
+    monkeypatch.setattr(real, "neo4j_community_password", lambda: "fixture")
+    monkeypatch.setattr(real, "_add_episode", interrupted)
+    produced = RealGraphitiAdapter()._produce(
+        evaluation_attempt_for(("A retained source passage.",)), UtcTimestamp.parse("2026-08-20T00:00:00.000000Z"),
+    )
+    assert produced.failure_code is (ExtractionFailureCode.PRODUCER_INTERNAL_ERROR if termination == "guard" else ExtractionFailureCode.EXECUTION_TIMEOUT)
+    records = [r.getMessage() for r in caplog.records if "graphiti_validation" in r.getMessage()]
+    assert len(records) == 1 and "phase=ENTITY_PROPOSALS" in records[0] and "rollback=UNOBSERVED" in records[0]
+    assert "PRIVATE_SOURCE_SECRET" not in records[0]
