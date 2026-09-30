@@ -1232,3 +1232,126 @@ def test_collection_body_rights_notice_vetoes_child_file_fetches(tmp_path, monke
     assert result.units == ()
     assert result.item_holds == (('https://www.gov.uk' + collection, 'SOURCE_ITEM_RIGHTS_EXCLUSION_HOLD'),)
     assert fetched == list(bodies)
+
+
+@contextmanager
+def _changing_manual_child(tmp_path, monkeypatch, source_id="UK-01"):
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    parent_path = "/guidance/immigration-rules" if source_id == "UK-03" else "/government/collections/visa-guidance"
+    child_path = parent_path + "/part-1" if source_id == "UK-03" else "/government/publications/factsheets"
+    parent_url, child_url = ("https://www.gov.uk/api/content" + path for path in (parent_path, child_path))
+    parent = _parent_with_children(
+        "manual" if source_id == "UK-03" else "document_collection",
+        parent_path, ((child_path, "Declared child"),),
+    )
+    bodies = {SOURCE_URLS[source_id]: _atom_for(parent_path), parent_url: parent,
+              child_url: _document(path=child_path)}
+    retained, fetched = {}, []
+    instant = [datetime(2026, 9, 8, 12, tzinfo=UTC)]
+    with open_native_runtime(**args) as runtime:
+        definition = _seed_missing(runtime, source_id) if source_id == "UK-03" else _seed_uk01(runtime)
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={source_id: definition},
+            licence=_licence(), dispatch_fence=lambda *_: nullcontext(),
+            fetch=lambda url: (fetched.append(url), (200, bodies[url]))[1],
+            retained_units=retained, clock=lambda: instant[0],
+        )
+        first = intake.poll()[SOURCE_IDS.index(source_id)]
+        assert first.status == "READY" and len(first.units) == 1
+        retained[first.units[0].revision_id] = first.units
+        instant[0] = datetime(2026, 9, 8, 14, tzinfo=UTC)
+        changed = json.loads(parent)
+        changed["title"] += " — revised parent inventory"
+        bodies[parent_url] = json.dumps(changed).encode()
+        yield runtime, intake, bodies, child_url, retained, fetched, first
+
+
+@pytest.mark.parametrize("source_id", ["UK-01", "UK-03"])
+def test_manual_child_parent_changes_reuse_retained_identity(tmp_path, monkeypatch, source_id):
+    with _changing_manual_child(tmp_path, monkeypatch, source_id) as case:
+        runtime, intake, _, _, _, _, first = case
+        replay = intake.poll()[SOURCE_IDS.index(source_id)]
+        assert replay.status == "READY"
+        assert replay.units == first.units
+        assert replay.units[0] is first.units[0]
+        assert replay.units[0].ingest_id == first.units[0].ingest_id
+        observations = {item[1]: item for result in (first, replay) for item in result.observations}
+        assert len(observations) > len(first.observations)
+        assert native_evidence_sources(
+            units=replay.units, sources=runtime.authority.sources,
+            objects=runtime.authority.objects, observations=observations,
+            licence=_licence(), proof=runtime.proof,
+        )
+        original_root = first.units[0].item_key.split("|", 1)[0]
+        observations.pop(original_root)
+        with pytest.raises(NativeEvidenceHold, match="NATIVE_SOURCE_AUTHORITY_HOLD"):
+            native_evidence_sources(
+                units=replay.units, sources=runtime.authority.sources,
+                objects=runtime.authority.objects, observations=observations,
+                licence=_licence(), proof=runtime.proof,
+            )
+
+
+@pytest.mark.parametrize("change", ["updated", "conflict", "removed"])
+def test_manual_child_updates_keep_namespace_and_current_coverage(tmp_path, monkeypatch, change):
+    with _changing_manual_child(tmp_path, monkeypatch) as case:
+        runtime, intake, bodies, child_url, _, fetched, first = case
+        old = first.units[0]
+        if change == "removed":
+            parent_url = next(url for url in bodies if "/api/content/government/collections/" in url)
+            value = json.loads(bodies[parent_url])
+            value["links"]["documents"] = []
+            bodies[parent_url] = json.dumps(value).encode()
+        else:
+            bodies[child_url] = _document(
+                path=old.canonical_url.removeprefix("https://www.gov.uk"),
+                body="The child now contains a substantively different rule.",
+                updated="2026-09-08T13:00:00Z" if change == "updated" else "2026-09-08T11:00:00Z",
+            )
+        result = intake.poll()[0]
+        if change == "updated":
+            assert result.status == "READY" and len(result.units) == 1
+            new = result.units[0]
+            assert new.item_key == old.item_key
+            assert new.authority.item_id == old.authority.item_id
+            assert new.revision_id != old.revision_id and new.ingest_id != old.ingest_id
+            revision = runtime.authority.sources.revision(SourceRevisionId.parse(new.revision_id), proof=runtime.proof)
+            assert str(revision.request.prior_revision_id) == old.revision_id
+        elif change == "conflict":
+            assert result.units == ()
+            assert result.item_holds == ((old.canonical_url, "SOURCE_NATIVE_REVISION_CONFLICT"),)
+        else:
+            assert not any(unit.canonical_url == old.canonical_url for unit in result.units)
+            assert fetched.count(child_url) == 1
+
+
+@pytest.mark.parametrize("mismatch", [None, "source", "version", "path", "url", "invalid-root", "file", "tagged"])
+def test_manual_item_key_reuses_only_exact_retained_namespace(mismatch):
+    from newsroom.control_plane.items import SourceItem
+
+    path = "/government/publications/factsheets"
+    old_key, current_key = "sha256:" + "1" * 64 + "|" + path, "sha256:" + "2" * 64 + "|" + path
+    old = SimpleNamespace(source_id="UK-01", item_key=old_key, canonical_url="https://www.gov.uk" + path,
+                          authority=SimpleNamespace(definition_version_id="version-1"))
+    if mismatch == "source":
+        old.source_id = "UK-03"
+    elif mismatch == "version":
+        old.authority.definition_version_id = "version-2"
+    elif mismatch == "path":
+        old.item_key = old_key + "-other"
+    elif mismatch == "url":
+        old.canonical_url += "-other"
+    elif mismatch == "invalid-root":
+        old.item_key = "sha256:invalid|" + path
+    elif mismatch == "file":
+        current_key = "sha256:" + "2" * 64 + "|https://assets.publishing.service.gov.uk/file.xlsx"
+    elif mismatch == "tagged":
+        current_key = "govuk-child-v1|" + path
+    later = SimpleNamespace(**{**vars(old), "item_key": "sha256:" + "3" * 64 + "|" + path})
+    intake = NativeSourceIntake(sources=None, objects=None, proof=None, definition_ids={}, licence=None,
+                               dispatch_fence=lambda *_: nullcontext(),
+                               retained_units={"first-land": (old,), "later-land": (later,)} if mismatch is None else {"first-land": (old,)})
+    item = SourceItem("UK-01", current_key, "Factsheets", "Retained body", "https://www.gov.uk" + path)
+    assert intake._manual_item_key("UK-01", "version-1", item) == (old_key if mismatch is None else current_key)
