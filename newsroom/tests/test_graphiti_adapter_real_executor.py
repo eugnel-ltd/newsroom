@@ -8,9 +8,9 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -5234,3 +5234,154 @@ def test_sync_fallback_timeout_survives_process_exit_race(
         )
 
     assert caught.value.evidence["termination"] == "PROCESS_EXIT_RACE"
+
+
+@pytest.mark.parametrize("identity", (None, ("retained-episode", "retained-episode", 1)))
+def test_owned_compensation_uses_only_bare_driver_and_exact_retained_guard(
+    monkeypatch, identity,
+):
+    import newsroom.graphiti_adapter.real as real
+
+    events = []
+    driver = SimpleNamespace(close=AsyncMock())
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    digest = digest_canonical({"retained": "exact original input"})
+    marker = GuardMarker(GuardState.RECOVERED_AMBIGUOUS, 1, digest)
+    active = False
+
+    class Guard:
+        @staticmethod
+        async def owned_pending_identity(observed_driver, *, group_id):
+            assert observed_driver is driver
+            assert group_id == GRAPHITI_WORKSPACE_GROUP
+            events.append("identity")
+            return identity
+
+        def __init__(self, observed_driver, **values):
+            assert active
+            assert observed_driver is driver
+            assert values == dict(
+                group_id=GRAPHITI_WORKSPACE_GROUP,
+                episode_uuid="retained-episode", marker_episode_uuid="retained-episode",
+                attempt_number=1, input_digest=digest,
+            )
+            events.append("guard")
+
+        async def recover_owned_pending(self, *, owner_stop_check):
+            assert active
+            owner_stop_check()
+            events.append("compensate")
+            return marker
+
+    @contextmanager
+    def authenticated_input(episode_uuid, attempt_number):
+        nonlocal active
+        assert (episode_uuid, attempt_number) == ("retained-episode", 1)
+        active = True
+        events.append("fence")
+        try:
+            yield digest
+        finally:
+            active = False
+            events.append("unfence")
+
+    monkeypatch.setattr(real, "_open_compensation_driver", lambda: driver, raising=False)
+    monkeypatch.setattr(real, "Neo4jMutationGuard", Guard)
+    for name in ("_load_graphiti", "openrouter_api_key", "build_cli_llm_client", "_bootstrap_graphiti_schema"):
+        monkeypatch.setattr(real, name, lambda *a, **kw: pytest.fail("provider/setup boundary"))
+    result = real.recover_owned_pending(
+        authenticated_input=authenticated_input,
+        owner_stop_check=lambda: events.append("stop"),
+        deadline=now + timedelta(seconds=180), clock=lambda: now,
+    )
+    assert result is (marker if identity is not None else None)
+    assert [event for event in events if event != "stop"] == (
+        ["identity", "fence", "guard", "compensate", "unfence"]
+        if identity is not None else ["identity"]
+    )
+    driver.close.assert_awaited_once()
+    assert not active
+
+
+@pytest.mark.parametrize("boundary", ("input_missing", "stop", "timeout", "expired"))
+def test_owned_compensation_preserves_pending_state_when_boundary_refuses(monkeypatch, boundary):
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.control_plane.veto import VetoError
+
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    events = []
+    driver = SimpleNamespace(close=AsyncMock())
+
+    class Guard:
+        @staticmethod
+        async def owned_pending_identity(*_args, **_values):
+            events.append("identity")
+            return "episode", "episode", 1
+
+        def __init__(self, *_args, **_values):
+            events.append("guard")
+
+        async def recover_owned_pending(self, *, owner_stop_check):
+            owner_stop_check()
+            events.append("compensate")
+            await asyncio.sleep(1)
+            pytest.fail("timeout must leave durable pending recovery")
+
+    @contextmanager
+    def authenticated_input(*_args):
+        events.append("fence")
+        try:
+            yield None if boundary == "input_missing" else digest_canonical({"input": 1})
+        finally:
+            events.append("unfence")
+
+    def stop():
+        if boundary == "stop" and "identity" in events:
+            raise VetoError("owner emergency stop")
+
+    monkeypatch.setattr(real, "_open_compensation_driver", lambda: events.append("driver") or driver, raising=False)
+    monkeypatch.setattr(real, "Neo4jMutationGuard", Guard)
+    if boundary == "stop":
+        with pytest.raises(VetoError):
+            real.recover_owned_pending(
+                authenticated_input=authenticated_input, owner_stop_check=stop,
+                deadline=now + timedelta(seconds=180), clock=lambda: now,
+            )
+    else:
+        result = real.recover_owned_pending(
+            authenticated_input=authenticated_input, owner_stop_check=stop,
+            deadline=now + timedelta(seconds=0.01 if boundary == "timeout" else -1 if boundary == "expired" else 180),
+            clock=lambda: now,
+        )
+        assert result is None
+    if boundary == "expired":
+        assert not events
+        driver.close.assert_not_awaited()
+    else:
+        driver.close.assert_awaited_once()
+    assert events.count("fence") == events.count("unfence")
+    assert events.count("compensate") == int(boundary == "timeout")
+
+
+def test_owned_compensation_driver_never_schedules_schema_or_provider_setup(monkeypatch):
+    import newsroom.graphiti_adapter.real as real
+
+    events = []
+    class Driver:
+        def __init__(self, uri, user, password):
+            with pytest.raises(RuntimeError, match="no running event loop"):
+                asyncio.get_running_loop()
+            assert (uri, user, password) == (f"bolt://{real.NEO4J_BOLT_HOST}:{real.NEO4J_BOLT_PORT}", "neo4j", "fixture")
+            events.append("driver")
+
+    monkeypatch.setitem(sys.modules, "graphiti_core.driver.neo4j_driver", SimpleNamespace(Neo4jDriver=Driver))
+    monkeypatch.setattr(real.importlib.metadata, "version", lambda _: "0.29.3")
+    monkeypatch.setattr(real, "neo4j_community_password", lambda: "fixture")
+    monkeypatch.setattr(real, "_load_graphiti", lambda: pytest.fail("provider runtime"))
+    assert isinstance(real._open_compensation_driver(), Driver)
+
+    async def forbidden_async_boundary():
+        with pytest.raises(GraphitiAdapterContractError, match="synchronous boundary"):
+            real._open_compensation_driver()
+    asyncio.run(forbidden_async_boundary())
+    assert events == ["driver"]

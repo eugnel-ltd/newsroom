@@ -1904,3 +1904,173 @@ def test_native_route_hold_stops_refresh_without_starting_new_successor(tmp_path
         assert outcomes[1].reason == 'REQUIRED_MODEL_ROUTE_CIRCUIT_OPEN'
     finally:
         connection.close()
+
+
+def test_owned_compensation_precedes_terminal_filter_without_reusing_spend(tmp_path, monkeypatch):
+    from newsroom.graphiti_adapter.types import GraphitiAdapterOutcome
+    from newsroom.control_plane.store import reserve_graphiti_spend
+
+    events, queued = [], []
+    processor, connection, _calls = _open(
+        tmp_path, monkeypatch,
+        ingest=lambda _connection, **kwargs: queued.extend(kwargs["units"]),
+    )
+    unit, distinct = _native("owned-pending"), _native("distinct-fresh")
+    head = SimpleNamespace(outcome=GraphitiAdapterOutcome.AMBIGUOUS_EFFECT, failure_code="AMBIGUOUS_EFFECT")
+    def history(run_id, **_kwargs):
+        events.append("terminal-filter")
+        return (head,) if run_id == n.typed_id(n.ExtractionRunId, "run", unit.ingest_id) else ()
+    processor._system.graphiti.attempt_history = history
+    processor._runner = SimpleNamespace(
+        recover_owned_pending=lambda **kwargs: events.append("compensate")
+    )
+    reserve_graphiti_spend(
+        connection, spend_id=f"{unit.ingest_id}:1", ingest_id=unit.ingest_id,
+        attempt_number=1, proving_run_id=unit.proving_run_id,
+        generation_id=cycle.GRAPHITI_GENERATION_ID, reserved_gbp_microunits=500_000,
+        ceiling_gbp_microunits=None,
+    )
+    connection.execute("UPDATE unpublished_graphiti_spend SET status='RECONCILED' WHERE ingest_id=?", (unit.ingest_id,))
+    connection.commit()
+    before = tuple(connection.execute("SELECT * FROM unpublished_graphiti_spend"))
+    try:
+        outcomes = processor.advance((unit, distinct), cycle_id="owned-compensation")
+        assert events[0] == "compensate"
+        assert queued == [distinct]
+        assert outcomes[0].reason == "AMBIGUOUS_EFFECT:AMBIGUOUS_EFFECT"
+        assert tuple(connection.execute("SELECT * FROM unpublished_graphiti_spend")) == before
+        assert connection.execute("SELECT count(*) FROM unpublished_graphiti_attempt_receipts").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("boundary", (
+    "exact_old_owner", "missing_attempt", "missing_landing", "workspace", "attempt_number",
+    "manifest", "extraction_input", "landing_corrupt", "current_rights", "quantum", "owner_stop",
+    "authoritative_complete", "accepted_complete",
+))
+def test_owned_compensation_authenticates_immutable_original_input_and_existing_fence(
+    tmp_path, monkeypatch, boundary,
+):
+    import newsroom.control_plane.graphiti as graphiti
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.control_plane.native_progress import NativeRevisionJournal
+    from newsroom.graphiti_adapter.evaluation_attempt import evaluation_attempt_for_body
+    from newsroom.graphiti_adapter.neo4j_guard import GuardMarker, GuardState
+    from newsroom.graphiti_adapter.types import GraphitiAdapterOutcome, GraphitiAdapterStateError, GraphitiWorkspaceId
+    from newsroom.authority.canonical import digest_canonical
+
+    connection = connect(str(tmp_path / "compensation-auth.sqlite3"))
+    unit = _native("retained-owner-no-longer-latest")
+    authority = unit.authority
+    attempt = evaluation_attempt_for_body(
+        episode_body=unit.episode_body, ingest_id=unit.ingest_id, proving_run_id=unit.proving_run_id,
+        source_id=unit.source_id, item_key=unit.item_key, observation_digest=unit.observation_digest,
+        published_at=unit.published_at, updated_at=unit.updated_at, effective_revision=unit.effective_revision,
+        canonical_url=unit.canonical_url, revision_digest=unit.revision_digest,
+        representation_digest=unit.representation_digest,
+        authority_ids=(authority.admission_id, authority.access_decision_id, authority.definition_id,
+            authority.definition_version_id, authority.item_id, authority.revision_id, authority.representation_id),
+    )
+    retained = SimpleNamespace(
+        attempt_id=attempt.attempt_id, attempt_number=1, workspace_id=attempt.workspace_id,
+        run_id=attempt.extraction_request.run_id, run_version_id=attempt.extraction_request.run_version_id,
+        manifest_id=attempt.manifest.manifest_id, configuration_id=attempt.configuration.configuration_id,
+        configuration_digest=attempt.configuration.canonical_digest,
+        outcome=GraphitiAdapterOutcome.TIMEOUT,
+    )
+    manifest = attempt.manifest
+    metadata = SimpleNamespace(
+        run_id=retained.run_id, run_version_id=retained.run_version_id, version_number=1,
+        input_binding_digest=manifest.input_binding_digest,
+    )
+    if boundary != "missing_landing":
+        NativeRevisionJournal(connection).land((unit,))
+    if boundary == "landing_corrupt":
+        connection.execute("UPDATE ledger SET payload_digest=? WHERE kind='NATIVE_REVISION_LANDED'", ("sha256:" + "0" * 64,))
+        connection.commit()
+    elif boundary == "workspace":
+        retained.workspace_id = GraphitiWorkspaceId.parse("00000000-0000-4000-8000-000000004990")
+    elif boundary == "attempt_number":
+        retained.attempt_number = 2
+    elif boundary == "manifest":
+        manifest = replace(manifest, input_binding_digest=digest_canonical({"different": "input"}))
+    elif boundary == "extraction_input":
+        metadata.input_binding_digest = digest_canonical({"different": "input"})
+    elif boundary == "authoritative_complete":
+        retained.outcome = GraphitiAdapterOutcome.COMPLETE
+    elif boundary == "accepted_complete":
+        _complete(connection, units=(unit,))
+    events, active = [], False
+
+    def retained_attempt(attempt_id, **_kwargs):
+        events.append("retained-attempt")
+        assert attempt_id == attempt.attempt_id
+        if boundary == "missing_attempt":
+            raise GraphitiAdapterStateError("attempt is absent")
+        return retained
+
+    @contextmanager
+    def fence(current):
+        nonlocal active
+        assert current == unit
+        events.append("fence")
+        active = True
+        try:
+            yield None if boundary == "current_rights" else SimpleNamespace(owner_stop_check=lambda: events.append("active-fence"))
+        finally:
+            active = False
+            events.append("unfence")
+
+    def compensate(**kwargs):
+        # Neo4j identity names the old attempt, not the newer terminal head.
+        with kwargs["authenticated_input"](unit.ingest_id, 1) as input_digest:
+            if input_digest is None:
+                return None
+            assert active
+            assert input_digest == digest_canonical({
+                "episode_uuid": unit.ingest_id, "name": unit.ingest_id,
+                "body": " ".join(unit.episode_body.split()),
+                "reference_time": unit.temporal().reference_time.value.isoformat(),
+                "group_id": cycle.GRAPHITI_WORKSPACE_GROUP,
+            })
+            events.append("compensate")
+            return GuardMarker(GuardState.RECOVERED_AMBIGUOUS, 1, input_digest)
+
+    runner = graphiti.EvaluationGraphitiRunner()
+    runner._proof = object()
+    runner._proposal_adapter = SimpleNamespace(
+        attempt=retained_attempt,
+        manifest_for_attempt=lambda *a, **kw: manifest,
+        attempt_history=lambda *a, **kw: pytest.fail("latest-head lookup loses the original owner"),
+        execute_attempt=lambda *a, **kw: pytest.fail("provider attempt"),
+    )
+    runner._extraction_records = SimpleNamespace(metadata=lambda *a, **kw: metadata)
+    monkeypatch.setattr(real, "recover_owned_pending", compensate)
+    before = connection.total_changes
+
+    def stop():
+        if boundary == "owner_stop":
+            raise VetoError("owner emergency stop")
+
+    try:
+        arguments = dict(
+            connection=connection, owner_stop_check=stop, rights_fence=fence,
+            defer_before_unit=lambda _: boundary == "quantum",
+            deadline=datetime(2026, 9, 26, tzinfo=UTC),
+        )
+        if boundary == "owner_stop":
+            with pytest.raises(VetoError):
+                runner.recover_owned_pending(**arguments)
+        elif boundary == "landing_corrupt":
+            with pytest.raises(graphiti.ModelUsageIntegrityError):
+                runner.recover_owned_pending(**arguments)
+        else:
+            marker = runner.recover_owned_pending(**arguments)
+            assert (marker is not None) == (boundary == "exact_old_owner")
+        assert events.count("compensate") == int(boundary == "exact_old_owner")
+        assert events.count("fence") == events.count("unfence")
+        assert not active
+        assert connection.total_changes == before
+    finally:
+        connection.close()

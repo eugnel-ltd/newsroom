@@ -23,6 +23,7 @@ from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, dig
 from newsroom.authority.hermes_native_system import HermesNativeAuthoritySystem
 from newsroom.extraction.types import ExtractionRunId
 from newsroom.graphiti_adapter.identity import typed_id
+from newsroom.graphiti_adapter.evaluation_packet import GRAPHITI_EXTRACTION_TIMEOUT_MS
 from newsroom.graphiti_adapter.types import GraphitiAdapterOutcome, GraphitiAdapterRightsDenied
 from newsroom.increment4.contracts import INCREMENT4_ADMITTED_FAMILY_ID
 from newsroom.increment4.neo4j import Increment4Neo4jCurrentBuildRequest
@@ -154,6 +155,15 @@ class NativeGraphitiProcessor:
                     or any(units_by_ingest[ingest_id].chunk_count != chunk_count for ingest_id in members)):
                 raise ValueError("native Graphiti revision chunk coverage differs")
         self._stop_check()
+        recover_owned = getattr(self._runner, "recover_owned_pending", None)
+        if callable(recover_owned):
+            recover_owned(
+                connection=self._connection,
+                owner_stop_check=self._stop_check,
+                rights_fence=self._fence,
+                defer_before_unit=defer_before_unit,
+                deadline=self._clock() + timedelta(milliseconds=GRAPHITI_EXTRACTION_TIMEOUT_MS),
+            )
         # Resolve retained accounting before considering another provider call.
         self._settle_missing_subscription_usage(units)
         terminal_holds = {
