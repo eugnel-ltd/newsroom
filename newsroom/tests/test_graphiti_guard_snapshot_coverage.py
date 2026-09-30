@@ -774,3 +774,48 @@ def test_inventory_refuses_missing_duplicate_or_oversized_identities(defect, mon
                                input_digest="sha256:" + "0" * 64)
     with pytest.raises(GuardError):
         asyncio.run(guard._identity_inventory("RETURN identities", snapshot_label="NewsroomSnapshotNode"))
+
+
+def test_owned_recovery_observes_only_coarse_phases_and_clears_callback_afterwards():
+    async def exercise():
+        driver = _JournalDriver()
+        initial = _journal_guard(driver)
+        phases = []
+        await initial.begin()
+        driver.markers["episode-a"].update(state="ROLLING_BACK", active=False)
+        recovery = _journal_guard(driver)
+        marker = await recovery.recover_owned_pending(phase_observer=phases.append)
+        assert marker.state.value == "RECOVERED_AMBIGUOUS"
+        assert phases == [
+            "OWNERSHIP", "INVENTORY", "DELETE_NEW_RELATIONSHIPS", "DELETE_NEW_NODES",
+            "RESTORE", "FULL_VERIFY", "TERMINAL", "SNAPSHOT_CLEANUP", "TERMINAL",
+        ]
+        assert recovery._owned_recovery_phase_observer is None
+        assert not driver.owner
+        assert driver.events.index("verified") < driver.events.index("terminal")
+        phases.clear()
+        await _journal_guard(driver, "episode-b").begin()
+        assert not phases
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failed_phase", ("INVENTORY", "DELETE_NEW_RELATIONSHIPS", "RESTORE", "FULL_VERIFY"))
+def test_owned_recovery_phase_callback_is_reset_when_guard_or_stop_interrupts(failed_phase):
+    async def exercise():
+        driver = _JournalDriver()
+        await _journal_guard(driver).begin()
+        driver.markers["episode-a"].update(state="ROLLING_BACK", active=False)
+        recovery = _journal_guard(driver)
+        phases = []
+        def observe(phase):
+            phases.append(phase)
+            if phase == failed_phase:
+                raise GuardError("fixture boundary failure")
+        with pytest.raises(GuardError, match="fixture boundary failure"):
+            await recovery.recover_owned_pending(phase_observer=observe)
+        assert phases[-1] == failed_phase
+        assert recovery._owned_recovery_phase_observer is None
+        assert driver.markers["episode-a"]["state"] == "ROLLING_BACK"
+        assert driver.owner
+        assert "terminal" not in driver.events
+    asyncio.run(exercise())

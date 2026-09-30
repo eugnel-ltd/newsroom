@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import logging
 import os
 import time
 from collections.abc import Mapping
@@ -31,6 +32,7 @@ from newsroom.control_plane.broker import (
     neo4j_community_password,
     openrouter_api_key,
 )
+from newsroom.control_plane.veto import OperatorDrainRequested, VetoError
 from newsroom.extraction.models import ProducedExtraction, ProposalDraft
 from newsroom.extraction.types import (
     ExtractionContractError,
@@ -94,6 +96,8 @@ from newsroom.graphiti_adapter.recovery_vocabulary import (
     GraphitiRecoveryClassification,
 )
 from newsroom.graphiti_adapter.neo4j_guard import (
+    _OWNED_RECOVERY_PHASES,
+    _owned_recovery_guard_reason,
     GuardError,
     GuardMarker,
     GuardState,
@@ -120,6 +124,7 @@ from .types import (
 from .workspace import DisposableProposalWorkspace
 
 _GRAPHITI_CORE_VERSION = "0.29.3"
+_LOGGER = logging.getLogger(__name__)
 _NEO4J_USER = "neo4j"
 _GRAPHITI_SCHEMA_BOOTSTRAPPED = False
 _REASON_BY_OUTCOME = {
@@ -299,15 +304,38 @@ def recover_owned_pending(
     remaining = (deadline.astimezone(UTC) - clock().astimezone(UTC)).total_seconds()
     if remaining <= 0:
         return None
-    driver = _open_compensation_driver()
+    started = time.monotonic()
+    phase, status, failure_class, reason_code = "OWNERSHIP", "NO_OWNER", "NONE", "NONE"
+    selected = False
+
+    def diagnostic() -> None:
+        _LOGGER.warning(
+            "owned_graphiti_recovery status=%s phase=%s failure_class=%s reason_code=%s elapsed_ms=%d deadline_ms=%d",
+            status, phase, failure_class, reason_code,
+            round((time.monotonic() - started) * 1_000), round(remaining * 1_000),
+        )
+
+    def observe_phase(value: str) -> None:
+        nonlocal phase
+        phase = value if value in _OWNED_RECOVERY_PHASES else "UNOBSERVED"
+
+    try:
+        driver = _open_compensation_driver()
+    except Exception as exc:
+        phase, status, failure_class = "SETUP", "FAILED", type(exc).__name__
+        reason_code = "SETUP_ERROR"
+        diagnostic()
+        raise
 
     async def recover() -> GuardMarker | None:
+        nonlocal phase, status, selected
         identity = await Neo4jMutationGuard.owned_pending_identity(
             driver, group_id=GRAPHITI_WORKSPACE_GROUP,
         )
         owner_stop_check()
         if identity is None:
             return None
+        selected, status, phase = True, "REFUSED", "AUTHENTICATION"
         episode_id, marker_id, attempt_number = identity
         with authenticated_input(episode_id, attempt_number) as input_digest:
             if input_digest is None:
@@ -318,22 +346,35 @@ def recover_owned_pending(
                 episode_uuid=episode_id, marker_episode_uuid=marker_id,
                 attempt_number=attempt_number, input_digest=input_digest,
             )
-            marker = await guard.recover_owned_pending(owner_stop_check=owner_stop_check)
+            phase = "OWNERSHIP"
+            marker = await guard.recover_owned_pending(
+                owner_stop_check=owner_stop_check, phase_observer=observe_phase,
+            )
             if marker is not None and (
                 marker.state is not GuardState.RECOVERED_AMBIGUOUS
                 or marker.attempt_number != attempt_number
                 or marker.input_digest != input_digest
             ):
                 raise GuardError("owned Graphiti compensation returned a different marker")
+            if marker is not None:
+                status = "RECOVERED"
             return marker
 
     async def bounded_recovery() -> GuardMarker | None:
+        nonlocal phase, status, failure_class, reason_code
         try:
             return await asyncio.wait_for(recover(), timeout=remaining)
         except TimeoutError:
             # Cancellation retains the owned journal; no completed marker is
             # fabricated and a later native tick may resume after lease expiry.
+            status, failure_class = "TIMEOUT", "TimeoutError"
+            reason_code = "DEADLINE"
             return None
+        except BaseException as exc:
+            status = "STOPPED" if isinstance(exc, (VetoError, OperatorDrainRequested, asyncio.CancelledError)) else "FAILED"
+            failure_class = type(exc).__name__
+            reason_code = _owned_recovery_guard_reason(exc) if isinstance(exc, GuardError) else "OWNER_STOP" if status == "STOPPED" else "EXCEPTION"
+            raise
         finally:
             try:
                 await asyncio.wait_for(
@@ -342,7 +383,19 @@ def recover_owned_pending(
             except TimeoutError:
                 # Closing a connection changes neither retained graph state nor
                 # the verified recovery result; preserve an owner stop as well.
-                pass
+                if failure_class == "NONE":
+                    phase, failure_class = "CONNECTION_CLEANUP", "TimeoutError"
+                    reason_code = "DEADLINE"
+                    status += "_CLEANUP_TIMEOUT"
+            except BaseException as exc:
+                if failure_class == "NONE":
+                    phase, failure_class = "CONNECTION_CLEANUP", type(exc).__name__
+                    reason_code = _owned_recovery_guard_reason(exc) if isinstance(exc, GuardError) else "EXCEPTION"
+                    status += "_CLEANUP_FAILED"
+                raise
+            finally:
+                if selected or failure_class != "NONE":
+                    diagnostic()
 
     return asyncio.run(bounded_recovery())
 
