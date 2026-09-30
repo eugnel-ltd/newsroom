@@ -78,6 +78,189 @@ def test_database_bound_driver_streaming_session_uses_configured_database() -> N
     driver.session.assert_called_once_with(database="guard-test-database")
 
 
+def test_actual_guard_restores_multiple_pages_and_duplicate_targets() -> None:
+    from newsroom.graphiti_adapter.neo4j_guard import Neo4jMutationGuard
+
+    async def exercise() -> None:
+        config = _service_config()
+        suffix = str(uuid.uuid4())
+        group = f"newsroom-paged-guard-{suffix}"
+        identifiers = [f"paged-{suffix}-{index}" for index in range(257)]
+        driver = _DatabaseBoundAsyncDriver(
+            AsyncGraphDatabase.driver(config.uri, auth=(config.username, config.password)),
+            database=config.database,
+        )
+
+        async def query(cypher: str, **parameters: object) -> EagerResult:
+            return await driver.execute_query(cypher, params=parameters, routing_="w")
+
+        try:
+            await query(
+                "UNWIND $ids AS id CREATE (:Entity {uuid:id,group_id:$group,name:'original',"
+                "vector:[0.125,0.25,0.5],counter:7})",
+                ids=identifiers, group=group,
+            )
+            await query(
+                "UNWIND range(0,size($ids)-2) AS i "
+                "MATCH (a {uuid:$ids[i]}),(b {uuid:$ids[i+1]}) "
+                "CREATE (a)-[:REL {uuid:$ids[i]+'-edge',fact:'original',counter:7}]->(b)",
+                ids=identifiers,
+            )
+            guard = Neo4jMutationGuard(
+                driver, group_id=group, episode_uuid=f"episode-{suffix}",
+                attempt_number=1, input_digest="sha256:" + "1" * 64,
+            )
+            await guard.begin()
+            async with guard.fenced_graph_mutation():
+                await query(
+                    "MATCH (n:Entity {group_id:$group}) "
+                    "SET n.name='changed',n.extra='remove',n.group_id='changed-'+$group "
+                    "REMOVE n:Entity SET n:Changed",
+                    group=group,
+                )
+                await query(
+                    "MATCH (a {uuid:$id})-[r:REL]->() SET r.fact='changed',r.extra='remove' "
+                    "WITH count(r) AS changed UNWIND range(1,65) AS i "
+                    "CREATE (:Changed {uuid:$id,name:'duplicate',group_id:'foreign-'+$group})",
+                    id=identifiers[0], group=group,
+                )
+                await query(
+                    "CREATE (:Entity {uuid:$new,group_id:$group,name:'retained-new'})",
+                    new=f"new-{suffix}", group=group,
+                )
+                await guard.restore_preexisting()
+                nodes, _, _ = await query(
+                    "MATCH (n) WHERE n.uuid IN $ids AND NOT n:NewsroomSnapshotNode "
+                    "AND NOT n:NewsroomSnapshotRelationship AND NOT n:NewsroomIngestMarker "
+                    "RETURN properties(n) AS props,labels(n) AS labels",
+                    ids=identifiers,
+                )
+                assert len(nodes) == 322
+                for row in nodes:
+                    assert row["props"] == {
+                        "uuid": row["props"]["uuid"], "group_id": group,
+                        "name": "original", "vector": [0.125, 0.25, 0.5], "counter": 7,
+                    }
+                    assert row["labels"] == ["Entity"]
+                relationships, _, _ = await query(
+                    "MATCH (a)-[r:REL]->(b) WHERE r.uuid IN $edges "
+                    "RETURN properties(r) AS props,a.uuid AS source,b.uuid AS target",
+                    edges=[identifier + "-edge" for identifier in identifiers[:-1]],
+                )
+                assert len(relationships) == 256
+                for row in relationships:
+                    assert row["props"] == {"uuid": row["source"] + "-edge", "fact": "original", "counter": 7}
+                new, _, _ = await query(
+                    "MATCH (n {uuid:$id}) RETURN n.name AS name", id=f"new-{suffix}",
+                )
+                assert new[0]["name"] == "retained-new"
+            await guard.complete({"provider_attempt_number": 1})
+        finally:
+            await query(
+                "MATCH (n) WHERE n.group_id=$group OR n.uuid IN $ids OR n.uuid=$new "
+                "OR n.episode_uuid=$episode OR n._newsroom_snapshot_id=$snapshot DETACH DELETE n",
+                group=group, ids=identifiers, new=f"new-{suffix}",
+                episode=f"episode-{suffix}", snapshot=f"episode-{suffix}:1",
+            )
+            await driver.close()
+
+    asyncio.run(exercise())
+
+
+def test_actual_guard_expiry_keeps_generation_owned_until_recovery() -> None:
+    from newsroom.graphiti_adapter.neo4j_guard import GuardError, GuardState, Neo4jMutationGuard
+
+    async def exercise() -> None:
+        config = _service_config()
+        suffix = str(uuid.uuid4())
+        group, episode = f"newsroom-exclusive-guard-{suffix}", f"episode-{suffix}"
+        driver = _DatabaseBoundAsyncDriver(
+            AsyncGraphDatabase.driver(config.uri, auth=(config.username, config.password)),
+            database=config.database,
+        )
+
+        async def query(cypher: str, **parameters: object) -> EagerResult:
+            return await driver.execute_query(cypher, params=parameters, routing_="w")
+
+        def guard(selected_episode: str) -> Neo4jMutationGuard:
+            return Neo4jMutationGuard(
+                driver, group_id=group, episode_uuid=selected_episode,
+                attempt_number=1, input_digest="sha256:" + "1" * 64,
+            )
+
+        try:
+            await query("CREATE (:Entity {uuid:$id,group_id:$group,name:'original'})", id=suffix, group=group)
+            first = guard(episode)
+            await first.begin()
+            await query("MATCH (n:Entity {uuid:$id}) SET n.name='partial'", id=suffix)
+            await query(
+                "MATCH (m:NewsroomIngestMarker {episode_uuid:$episode}) "
+                "SET m.claim_expires_at=datetime()-duration('PT16M')",
+                episode=episode,
+            )
+            competitor = guard(f"competing-{suffix}")
+            with pytest.raises(GuardError):
+                await competitor.begin()
+            recovery = guard(episode)
+            retained = await recovery.begin()
+            assert retained.state in {GuardState.PENDING, GuardState.ROLLING_BACK}
+            assert await recovery.rollback_pending(
+                chat_invocations=[],
+                embedding_usage={"usage_basis": "NO_EMBEDDING_CALL", "request_count": 0},
+                reason="ACTUAL_EXPIRED_OWNER_RECOVERY",
+            )
+            rows, _, _ = await query("MATCH (n:Entity {uuid:$id}) RETURN n.name AS name", id=suffix)
+            assert rows[0]["name"] == "original"
+            assert (await competitor.begin()).state is GuardState.CREATED
+            await competitor.rollback_pending(
+                chat_invocations=[],
+                embedding_usage={"usage_basis": "NO_EMBEDDING_CALL", "request_count": 0},
+                reason="ACTUAL_COMPETITOR_CLEANUP",
+            )
+            legacy_episode = f"legacy-{suffix}"
+            legacy_snapshot = legacy_episode + ":1"
+            await query(
+                "CREATE (:NewsroomIngestMarker {episode_uuid:$episode,group_id:$group,"
+                "attempt_number:1,input_digest:$digest,snapshot_id:$snapshot,state:'PENDING',"
+                "claim_token:'legacy',claim_expires_at:datetime()-duration('PT16M')}) "
+                "CREATE (:NewsroomSnapshotNode {uuid:$id,group_id:$group,name:'legacy-snapshot',"
+                "_newsroom_snapshot_id:$snapshot,_newsroom_source_uuid:$id,"
+                "_newsroom_source_labels:['Entity']})",
+                episode=legacy_episode, group="foreign-" + group, id=suffix,
+                snapshot=legacy_snapshot, digest="sha256:" + "1" * 64,
+            )
+            fresh = guard(f"fresh-{suffix}")
+            assert (await fresh.begin()).state is GuardState.CREATED
+            await fresh.restore_preexisting()
+            await fresh.complete({"provider_attempt_number": 1})
+            with pytest.raises(GuardError):
+                await guard(legacy_episode).begin()
+            alias = Neo4jMutationGuard(
+                driver, group_id=group, episode_uuid=legacy_episode, attempt_number=1,
+                marker_episode_uuid=legacy_episode + ":attempt:1",
+                input_digest="sha256:" + "1" * 64,
+            )
+            with pytest.raises(GuardError):
+                await alias.begin()
+            legacy, _, _ = await query(
+                "MATCH (s:NewsroomSnapshotNode {_newsroom_snapshot_id:$snapshot}) "
+                "RETURN s.name AS name", snapshot=legacy_snapshot,
+            )
+            assert [row["name"] for row in legacy] == ["legacy-snapshot"]
+        finally:
+            await query(
+                "MATCH (n) WHERE n.group_id=$group OR n.uuid=$id "
+                "OR n.episode_uuid=$legacy "
+                "OR n._newsroom_snapshot_id IN $snapshots DETACH DELETE n",
+                group=group, id=suffix,
+                legacy=f"legacy-{suffix}",
+                snapshots=[episode + ":1", f"competing-{suffix}:1"],
+            )
+            await driver.close()
+
+    asyncio.run(exercise())
+
+
 @lru_cache(maxsize=1)
 def _service_config() -> Neo4jProjectorConfig:
     if os.environ.get(_REQUIRED_FLAG) != "1":

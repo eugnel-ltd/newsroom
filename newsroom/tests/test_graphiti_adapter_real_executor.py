@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -115,6 +116,12 @@ def _combined_runtime_inputs(
     return attempt.configuration, replace(revision, episode_uuid=episode_id)
 
 
+@asynccontextmanager
+async def _uncontended_generation_fence(_guard: object):
+    """Uncontended fixture; stale ownership has a separate direct regression."""
+    yield
+
+
 def _provider_free_pipeline(**values: object) -> object:
     import newsroom.graphiti_adapter.real as real
 
@@ -144,6 +151,91 @@ def _provider_free_pipeline(**values: object) -> object:
         chat_receipt=lambda: list(graphiti.clients.llm_client.invocations),
         embedding_receipt=graphiti.clients.embedder.receipt,
     )
+
+
+@pytest.mark.parametrize("stale_owner", (False, True))
+def test_episode_creation_requires_current_generation_owner_before_provider(
+    monkeypatch: pytest.MonkeyPatch, stale_owner: bool,
+) -> None:
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.graphiti_adapter.neo4j_guard import GuardError
+
+    events: list[str] = []
+    fenced = False
+
+    class Guard:
+        @asynccontextmanager
+        async def fenced_graph_mutation(self):
+            nonlocal fenced
+            if stale_owner:
+                raise GuardError("Graphiti generation mutation lost its pending claim")
+            fenced = True
+            try:
+                yield
+            finally:
+                fenced = False
+
+    class Pipeline:
+        recovery_marker = None
+
+        async def _prepare_attempt(self):
+            # A paused after begin; recovery and B have replaced its owner token.
+            events.append("prepared")
+            return None
+
+    class Graphiti:
+        def __init__(self, *_args: object, **_values: object) -> None:
+            self.driver = object()
+
+        async def close(self) -> None:
+            events.append("close")
+
+    delegate = SimpleNamespace(
+        client=SimpleNamespace(embeddings=SimpleNamespace(), close=AsyncMock()),
+        config=SimpleNamespace(embedding_model="model", embedding_dim=2),
+    )
+    runtime = SimpleNamespace(
+        Graphiti=Graphiti, OpenAIEmbedder=lambda **_values: delegate,
+        OpenAIEmbedderConfig=lambda **values: SimpleNamespace(**values),
+        MeteredOpenAIEmbedder=real.MeteredOpenAIEmbedder,
+        IdentityCrossEncoder=lambda: object(), EpisodeType=SimpleNamespace(text="text"),
+        EpisodicNode=lambda **values: SimpleNamespace(**values),
+        MutationGuard=lambda *_args, **_values: Guard(),
+    )
+
+    async def save_episode(**_values: object):
+        assert fenced, "episode write must hold the current generation fence"
+        events.append("save")
+        return SimpleNamespace(uuid="episode-id"), "CREATED"
+
+    async def provider(*_args: object, **_values: object):
+        assert not fenced, "provider work must not hold the database lock"
+        events.append("provider")
+        return SimpleNamespace(
+            outcome=real.CombinedTemporalOutcome.TERMINAL_SUCCESS_ZERO_PROPOSALS,
+            nodes=(), edges=(),
+        )
+
+    monkeypatch.setattr(real, "_load_graphiti", lambda: runtime)
+    monkeypatch.setattr(real, "build_cli_llm_client", lambda: SimpleNamespace(invocations=[]))
+    monkeypatch.setattr(real, "combined_temporal_pipeline_for", lambda **_values: Pipeline())
+    monkeypatch.setattr(real, "_ensure_episode", save_episode)
+    monkeypatch.setattr(real, "extract_combined_temporal_async", provider)
+    configuration, revision = _combined_runtime_inputs("Body", "episode-id")
+    call = real._add_episode(
+        api_key="key", password="password", body="Body", name="episode-id",
+        episode_id="episode-id", reference_time=datetime(2026, 8, 20, tzinfo=UTC),
+        telemetry=real._EpisodeTelemetry(), attempt_number=1,
+        validate_result=lambda *_args: {}, restore_result=lambda *_args: None,
+        configuration=configuration, revision=revision,
+    )
+    if stale_owner:
+        with pytest.raises(GuardError, match="lost its pending claim"):
+            asyncio.run(call)
+        assert events == ["prepared", "close"]
+    else:
+        asyncio.run(call)
+        assert events == ["prepared", "save", "provider", "close"]
 
 
 def _digest(label: str) -> str:
@@ -987,6 +1079,8 @@ def test_episode_uses_default_database_and_validates_before_complete(
             return None
 
     class Guard:
+        fenced_graph_mutation = _uncontended_generation_fence
+
         async def begin(self) -> object:
             guard_events.append("begin")
             return real.GuardMarker(
@@ -1199,6 +1293,8 @@ def test_only_proven_pipeline_rollback_is_classified_complete(
             events.append("close")
 
     class Guard:
+        fenced_graph_mutation = _uncontended_generation_fence
+
         async def begin(self) -> GuardMarker:
             return GuardMarker(
                 state=GuardState.CREATED,
@@ -1309,6 +1405,8 @@ def test_cancelled_episode_cleanup_is_ordered_and_bounded(
                 await asyncio.Event().wait()
 
     class Guard:
+        fenced_graph_mutation = _uncontended_generation_fence
+
         async def begin(self) -> GuardMarker:
             return GuardMarker(
                 state=GuardState.CREATED,
@@ -1407,6 +1505,78 @@ def test_cancelled_episode_cleanup_is_ordered_and_bounded(
         assert telemetry.timeout_diagnostics == []
 
 
+def _guard_fixture_session(driver, lock: asyncio.Lock | None = None):
+    """Adapt query-shaped fixtures to the explicit generation-fence API."""
+
+    class Result:
+        def __init__(self, records: list[dict[str, object]]) -> None:
+            self.records = records
+
+        async def single(self, *, strict: bool = False):
+            if strict:
+                assert len(self.records) == 1
+            return self.records[0] if self.records else None
+
+        async def data(self) -> list[dict[str, object]]:
+            return self.records
+
+        async def __aiter__(self):
+            for record in self.records:
+                yield record
+
+    class Transaction:
+        held = False
+
+        async def run(self, query: str, **params: object) -> Result:
+            if lock is not None and "SET g.lock_tick" in query and not self.held:
+                await lock.acquire()
+                self.held = True
+            execute = driver._execute_query if self.held else driver.execute_query
+            records, _, _ = await execute(query, params=params, routing_="w")
+            return Result(records)
+
+        async def commit(self) -> None:
+            if self.held:
+                self.held = False
+                lock.release()
+
+        async def rollback(self) -> None:
+            await self.commit()
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def begin_transaction(self) -> Transaction:
+            return Transaction()
+
+        async def execute_write(self, callback):
+            return await callback(Transaction())
+
+    return Session()
+
+
+def _guard_fixture_owner(marker: dict[str, object]) -> dict[str, object]:
+    return {
+        "owner_marker_uuid": "episode-id",
+        "snapshot_id": marker["snapshot_id"],
+        "claim_token": marker["claim_token"],
+    }
+
+
+def _guard_fixture_is_owned(owner, marker, params) -> bool:
+    return marker is not None and owner == {
+        "owner_marker_uuid": params["episode_uuid"],
+        "snapshot_id": params["snapshot_id"],
+        "claim_token": params["claim_token"],
+    } and all(marker.get(key) == params[key] for key in (
+        "group_id", "input_digest", "snapshot_id", "claim_token",
+    ))
+
+
 def test_pending_guard_recovery_uses_retained_attempt_snapshot() -> None:
     from newsroom.graphiti_adapter.neo4j_guard import Neo4jMutationGuard
 
@@ -1419,42 +1589,13 @@ def test_pending_guard_recovery_uses_retained_attempt_snapshot() -> None:
         "snapshot_id": "episode-id:1",
         "chat_invocations_json": "[]",
         "embedding_usage_json": "null",
+        "claim_token": "expired",
     }
+    owner = _guard_fixture_owner(marker)
 
     class Driver:
         def session(self):
-            driver = self
-
-            class Result:
-                def __init__(self, records: list[dict[str, object]]) -> None:
-                    self.records = records
-
-                async def single(self, *, strict: bool) -> dict[str, object]:
-                    assert strict and len(self.records) == 1
-                    return self.records[0]
-
-                async def __aiter__(self):
-                    for record in self.records:
-                        yield record
-
-            class Transaction:
-                async def run(self, query: str, **params: object) -> Result:
-                    records, _, _ = await driver.execute_query(
-                        query, params=params, routing_="w",
-                    )
-                    return Result(records)
-
-            class Session:
-                async def __aenter__(self):
-                    return self
-
-                async def __aexit__(self, *_args: object) -> None:
-                    return None
-
-                async def execute_write(self, callback):
-                    await callback(Transaction())
-
-            return Session()
+            return _guard_fixture_session(self)
 
         async def execute_query(
             self,
@@ -1473,23 +1614,34 @@ def test_pending_guard_recovery_uses_retained_attempt_snapshot() -> None:
             if "CREATE CONSTRAINT" in query:
                 return ([], None, None)
             if "MERGE (m:NewsroomIngestMarker" in query:
+                assert owner == _guard_fixture_owner(marker)
                 return (
                     [{"marker": marker, "claimed": False, "active": False}],
                     None,
                     None,
                 )
             if "SET m.state = $state" in query:
+                assert owner == _guard_fixture_owner(marker)
+                assert marker["claim_token"] == params["retained_claim_token"]
                 marker["state"] = params["state"]
                 marker["claim_token"] = params["claim_token"]
+                owner.update(_guard_fixture_owner(marker))
                 return ([{"marker": marker}], None, None)
             if "RETURN properties(m) AS marker" in query:
                 return ([{"marker": marker}], None, None)
+            if "SET g.lock_tick" in query:
+                assert _guard_fixture_is_owned(owner, marker, params)
+            if "RETURN m.claim_token AS claim_token" in query:
+                return ([{"claim_token": marker["claim_token"]}], None, None)
             if "SET m.state = 'ROLLING_BACK'" in query:
                 marker["state"] = "ROLLING_BACK"
                 return ([{"state": "ROLLING_BACK"}], None, None)
             if "SET m.state = 'RECOVERED_AMBIGUOUS'" in query:
                 marker["state"] = "RECOVERED_AMBIGUOUS"
+                owner.clear()
                 return ([{"state": "RECOVERED_AMBIGUOUS"}], None, None)
+            if "NewsroomSnapshot" in query and "DELETE s" in query:
+                return ([{"deleted": 0}], None, None)
             if "RETURN count(s) AS snapshot_count" in query:
                 return ([{"snapshot_count": 0}], None, None)
             return ([], None, None)
@@ -1510,6 +1662,7 @@ def test_pending_guard_recovery_uses_retained_attempt_snapshot() -> None:
             reason="RECOVERED_PENDING_PROCESS_DEATH",
         )
     )
+    assert not owner
     assert snapshot_ids
     assert set(snapshot_ids) == {"episode-id:1"}
 
@@ -1528,11 +1681,16 @@ def test_guard_retry_resets_snapshot_after_retained_attempt_cleanup(
         "snapshot_id": "episode-id:1",
         "chat_invocations_json": "[]",
         "embedding_usage_json": "null",
+        "claim_token": "expired",
     }
+    owner = _guard_fixture_owner(marker) if state == "SNAPSHOTTING" else {}
     deleted_snapshots: list[str] = []
     created_snapshots: list[str] = []
 
     class Driver:
+        def session(self):
+            return _guard_fixture_session(self)
+
         async def execute_query(
             self,
             query: str,
@@ -1554,13 +1712,17 @@ def test_guard_retry_resets_snapshot_after_retained_attempt_cleanup(
                         "snapshot_id": params["snapshot_id"],
                         "chat_invocations_json": "[]",
                         "embedding_usage_json": "null",
+                        "claim_token": params["claim_token"],
                     }
+                    assert not owner
+                    owner.update(_guard_fixture_owner(marker))
                     created_snapshots.append(str(params["snapshot_id"]))
                     return (
                         [{"marker": marker, "claimed": True, "active": False}],
                         None,
                         None,
                     )
+                assert owner == _guard_fixture_owner(marker)
                 return (
                     [{"marker": marker, "claimed": False, "active": False}],
                     None,
@@ -1568,10 +1730,21 @@ def test_guard_retry_resets_snapshot_after_retained_attempt_cleanup(
                 )
             if "SET m.state = $state" in query:
                 assert marker is not None
+                assert marker["claim_token"] == params["retained_claim_token"]
+                assert owner == _guard_fixture_owner(marker) or (
+                    not owner and marker["state"] == "RECOVERED_AMBIGUOUS"
+                    and not params["require_expired"]
+                )
                 marker["state"] = params["state"]
                 marker["claim_token"] = params["claim_token"]
+                owner.update(_guard_fixture_owner(marker))
                 return ([{"marker": marker}], None, None)
+            if "SET g.lock_tick" in query:
+                assert _guard_fixture_is_owned(owner, marker, params)
+            if "RETURN m.claim_token AS claim_token" in query:
+                return ([{"claim_token": marker["claim_token"]}], None, None)
             if "DELETE m" in query and "RETURN episode_uuid" in query:
+                owner.clear()
                 marker = None
                 return ([{"episode_uuid": "episode-id"}], None, None)
             if "SET m.state = 'PENDING'" in query:
@@ -1582,6 +1755,7 @@ def test_guard_retry_resets_snapshot_after_retained_attempt_cleanup(
                 return ([] if marker is None else [{"marker": marker}], None, None)
             if "NewsroomSnapshot" in query and "DELETE s" in query:
                 deleted_snapshots.append(str(params["snapshot_id"]))
+                return ([{"deleted": 0}], None, None)
             if "MATCH (m:NewsroomIngestMarker" in query and "DELETE m" in query:
                 marker = None
             return ([], None, None)
@@ -1607,12 +1781,13 @@ def test_concurrent_guard_begin_has_one_atomic_marker_claim() -> None:
     )
 
     marker: dict[str, object] | None = None
+    owner: dict[str, object] = {}
     lock = asyncio.Lock()
     claims = 0
     constraints = 0
 
     class Driver:
-        async def execute_query(
+        async def _execute_query(
             self,
             query: str,
             *,
@@ -1626,35 +1801,56 @@ def test_concurrent_guard_begin_has_one_atomic_marker_claim() -> None:
                 assert "REQUIRE m.episode_uuid IS UNIQUE" in query
                 return ([], None, None)
             if "MERGE (m:NewsroomIngestMarker" in query:
-                async with lock:
-                    if marker is None:
-                        await asyncio.sleep(0.01)
-                        claims += 1
-                        marker = {
-                            "state": "SNAPSHOTTING",
-                            "group_id": params["group_id"],
-                            "attempt_number": params["attempt_number"],
-                            "input_digest": params["input_digest"],
-                            "snapshot_id": params["snapshot_id"],
-                            "chat_invocations_json": "[]",
-                            "embedding_usage_json": "null",
-                            "claim_token": params["claim_token"],
-                        }
-                        return (
-                            [{"marker": marker, "claimed": True, "active": False}],
-                            None,
-                            None,
-                        )
+                if marker is None:
+                    claims += 1
+                    marker = {
+                        "state": "SNAPSHOTTING",
+                        "group_id": params["group_id"],
+                        "attempt_number": params["attempt_number"],
+                        "input_digest": params["input_digest"],
+                        "snapshot_id": params["snapshot_id"],
+                        "chat_invocations_json": "[]",
+                        "embedding_usage_json": "null",
+                        "claim_token": params["claim_token"],
+                    }
+                    assert not owner
+                    owner.update(_guard_fixture_owner(marker))
                     return (
-                        [{"marker": marker, "claimed": False, "active": True}],
+                        [{"marker": marker, "claimed": True, "active": False}],
                         None,
                         None,
                     )
+                assert owner == _guard_fixture_owner(marker)
+                return (
+                    [{"marker": marker, "claimed": False, "active": True}],
+                    None,
+                    None,
+                )
+            if "RETURN properties(m) AS marker" in query:
+                return ([] if marker is None else [{"marker": dict(marker)}], None, None)
+            if "SET g.lock_tick" in query:
+                if not _guard_fixture_is_owned(owner, marker, params):
+                    return ([], None, None)
+            if "RETURN m.claim_token AS claim_token" in query:
+                return ([{"claim_token": marker["claim_token"]}], None, None)
+            if "NewsroomSnapshot" in query and "DELETE s" in query:
+                return ([{"deleted": 0}], None, None)
             if "SET m.state = 'PENDING'" in query:
                 assert marker is not None
                 marker["state"] = "PENDING"
                 return ([{"state": "PENDING"}], None, None)
             return ([], None, None)
+
+        async def execute_query(self, query: str, *, params, routing_):
+            if "SET g.lock_tick" in query:
+                async with lock:
+                    if "MERGE (m:NewsroomIngestMarker" in query:
+                        await asyncio.sleep(0.01)
+                    return await self._execute_query(query, params=params, routing_=routing_)
+            return await self._execute_query(query, params=params, routing_=routing_)
+
+        def session(self):
+            return _guard_fixture_session(self, lock)
 
     driver = Driver()
     guards = [
@@ -1989,11 +2185,12 @@ def test_concurrent_expired_marker_takeover_is_fenced() -> None:
         "claim_token": "expired",
         "active": False,
     }
+    owner = _guard_fixture_owner(marker)
     lock = asyncio.Lock()
     claims = 0
 
     class Driver:
-        async def execute_query(
+        async def _execute_query(
             self,
             query: str,
             *,
@@ -2005,55 +2202,68 @@ def test_concurrent_expired_marker_takeover_is_fenced() -> None:
             if "CREATE CONSTRAINT" in query:
                 return ([], None, None)
             if "MERGE (m:NewsroomIngestMarker" in query:
-                async with lock:
-                    if marker is None:
-                        claims += 1
-                        marker = {
-                            "state": "SNAPSHOTTING",
-                            "group_id": params["group_id"],
-                            "attempt_number": params["attempt_number"],
-                            "input_digest": params["input_digest"],
-                            "snapshot_id": params["snapshot_id"],
-                            "chat_invocations_json": "[]",
-                            "embedding_usage_json": "null",
-                            "claim_token": params["claim_token"],
-                            "active": True,
-                        }
-                        return (
-                            [{"marker": marker, "claimed": True, "active": False}],
-                            None,
-                            None,
-                        )
+                if marker is None:
+                    claims += 1
+                    marker = {
+                        "state": "SNAPSHOTTING",
+                        "group_id": params["group_id"],
+                        "attempt_number": params["attempt_number"],
+                        "input_digest": params["input_digest"],
+                        "snapshot_id": params["snapshot_id"],
+                        "chat_invocations_json": "[]",
+                        "embedding_usage_json": "null",
+                        "claim_token": params["claim_token"],
+                        "active": True,
+                    }
+                    assert not owner
+                    owner.update(_guard_fixture_owner(marker))
                     return (
-                        [
-                            {
-                                "marker": marker,
-                                "claimed": False,
-                                "active": marker["active"],
-                            }
-                        ],
+                        [{"marker": marker, "claimed": True, "active": False}],
                         None,
                         None,
                     )
+                assert owner == _guard_fixture_owner(marker)
+                return (
+                    [
+                        {
+                            "marker": marker,
+                            "claimed": False,
+                            "active": marker["active"],
+                        }
+                    ],
+                    None,
+                    None,
+                )
             if "SET m.state = $state" in query:
-                async with lock:
-                    if (
-                        marker is None
-                        or marker["state"] != params["retained_state"]
-                        or marker["claim_token"] != params["retained_claim_token"]
-                        or marker["active"]
-                    ):
-                        return ([], None, None)
-                    marker["state"] = params["state"]
-                    marker["claim_token"] = params["claim_token"]
-                    marker["active"] = True
-                    return ([{"marker": marker}], None, None)
+                if (
+                    marker is None
+                    or marker["state"] != params["retained_state"]
+                    or marker["claim_token"] != params["retained_claim_token"]
+                    or marker["active"]
+                ):
+                    return ([], None, None)
+                assert owner == _guard_fixture_owner(marker)
+                marker["state"] = params["state"]
+                marker["claim_token"] = params["claim_token"]
+                marker["active"] = True
+                owner.update(_guard_fixture_owner(marker))
+                return ([{"marker": marker}], None, None)
             if "DELETE m" in query and "RETURN episode_uuid" in query:
-                async with lock:
-                    if marker is None or marker["claim_token"] != params["claim_token"]:
-                        return ([], None, None)
-                    marker = None
-                    return ([{"episode_uuid": "episode-id"}], None, None)
+                if marker is None or marker["claim_token"] != params["claim_token"]:
+                    return ([], None, None)
+                assert _guard_fixture_is_owned(owner, marker, params)
+                owner.clear()
+                marker = None
+                return ([{"episode_uuid": "episode-id"}], None, None)
+            if "RETURN properties(m) AS marker" in query:
+                return ([] if marker is None else [{"marker": dict(marker)}], None, None)
+            if "SET g.lock_tick" in query:
+                if not _guard_fixture_is_owned(owner, marker, params):
+                    return ([], None, None)
+            if "RETURN m.claim_token AS claim_token" in query:
+                return ([{"claim_token": marker["claim_token"]}], None, None)
+            if "NewsroomSnapshot" in query and "DELETE s" in query:
+                return ([{"deleted": 0}], None, None)
             if "SET m.state = 'PENDING'" in query:
                 assert marker is not None
                 if marker["claim_token"] != params["claim_token"]:
@@ -2061,6 +2271,15 @@ def test_concurrent_expired_marker_takeover_is_fenced() -> None:
                 marker["state"] = "PENDING"
                 return ([{"state": "PENDING"}], None, None)
             return ([], None, None)
+
+        async def execute_query(self, query: str, *, params, routing_):
+            if "SET g.lock_tick" in query:
+                async with lock:
+                    return await self._execute_query(query, params=params, routing_=routing_)
+            return await self._execute_query(query, params=params, routing_=routing_)
+
+        def session(self):
+            return _guard_fixture_session(self, lock)
 
     driver = Driver()
     guards = [
@@ -2101,7 +2320,9 @@ def test_guard_rejects_mismatched_retained_snapshot_identity() -> None:
         "snapshot_id": "episode-id:2",
         "chat_invocations_json": "[]",
         "embedding_usage_json": "null",
+        "claim_token": "expired",
     }
+    owner = _guard_fixture_owner(marker)
 
     class Driver:
         async def execute_query(
@@ -2114,7 +2335,10 @@ def test_guard_rejects_mismatched_retained_snapshot_identity() -> None:
             assert routing_ == "w"
             if "CREATE CONSTRAINT" in query:
                 return ([], None, None)
+            if "RETURN properties(m) AS marker" in query and "MERGE (m:" not in query:
+                return ([{"marker": marker}], None, None)
             assert "MERGE (m:NewsroomIngestMarker" in query
+            assert owner == _guard_fixture_owner(marker)
             assert params["episode_uuid"] == "episode-id"
             return (
                 [{"marker": marker, "claimed": False, "active": False}],
@@ -2168,6 +2392,7 @@ def test_complete_guard_recovery_cleans_crash_window_snapshot() -> None:
                 return ([{"marker": marker}], None, None)
             if "NewsroomSnapshot" in query and "DELETE s" in query:
                 deleted_snapshots.append(str(params["snapshot_id"]))
+                return ([{"deleted": 0}], None, None)
             return ([], None, None)
 
     guard = Neo4jMutationGuard(
@@ -2309,8 +2534,17 @@ def test_guard_completion_checks_the_committed_transition() -> None:
     from newsroom.graphiti_adapter.neo4j_guard import Neo4jMutationGuard
 
     queries: list[str] = []
+    marker = {
+        "state": "PENDING", "group_id": GRAPHITI_WORKSPACE_GROUP,
+        "input_digest": "sha256:" + "0" * 64,
+        "snapshot_id": "episode-id:1", "claim_token": "owner",
+    }
+    owner = _guard_fixture_owner(marker)
 
     class Driver:
+        def session(self):
+            return _guard_fixture_session(self)
+
         async def execute_query(
             self,
             query: str,
@@ -2318,10 +2552,21 @@ def test_guard_completion_checks_the_committed_transition() -> None:
             params: dict[str, object],
             routing_: str,
         ) -> tuple[list[dict[str, object]], None, None]:
-            del params, routing_
+            assert routing_ == "w"
             queries.append(query)
-            records = [{"state": "COMPLETE"}] if "RETURN m.state" in query else []
-            return records, None, None
+            if "SET g.lock_tick" in query:
+                assert _guard_fixture_is_owned(owner, marker, params)
+                assert marker["state"] == "PENDING"
+            if "RETURN m.claim_token AS claim_token" in query:
+                return ([{"claim_token": marker["claim_token"]}], None, None)
+            if "SET m.state = 'COMPLETE'" in query:
+                marker["state"] = "COMPLETE"
+                owner.clear()
+                return ([{"state": "COMPLETE"}], None, None)
+            if "NewsroomSnapshot" in query and "DELETE s" in query:
+                assert marker["state"] == "COMPLETE" and not owner
+                return ([{"deleted": 0}], None, None)
+            return ([], None, None)
 
     guard = Neo4jMutationGuard(
         Driver(),
@@ -2330,6 +2575,7 @@ def test_guard_completion_checks_the_committed_transition() -> None:
         attempt_number=1,
         input_digest="sha256:" + "0" * 64,
     )
+    guard._claim_token = "owner"  # type: ignore[attr-defined]
     asyncio.run(guard.complete({"provider_attempt_number": 1}))
     assert any("SET m.state = 'COMPLETE'" in query for query in queries)
     assert any("NewsroomSnapshot" in query and "DELETE s" in query for query in queries)
@@ -2339,6 +2585,12 @@ def test_complete_marker_blocks_cancellation_rollback_deletion() -> None:
     from newsroom.graphiti_adapter.neo4j_guard import Neo4jMutationGuard
 
     queries: list[str] = []
+    marker = {
+        "state": "COMPLETE", "group_id": GRAPHITI_WORKSPACE_GROUP,
+        "input_digest": "sha256:" + "0" * 64, "attempt_number": 1,
+        "snapshot_id": "episode-id:1", "claim_token": "owner",
+        "chat_invocations_json": "[]", "embedding_usage_json": "null",
+    }
 
     class Driver:
         async def execute_query(
@@ -2353,7 +2605,9 @@ def test_complete_marker_blocks_cancellation_rollback_deletion() -> None:
             if "SET m.state = 'ROLLING_BACK'" in query:
                 return [], None, None
             if "RETURN properties(m) AS marker" in query:
-                return [{"marker": {"state": "COMPLETE"}}], None, None
+                return [{"marker": marker}], None, None
+            if "NewsroomSnapshot" in query and "DELETE s" in query:
+                return ([{"deleted": 0}], None, None)
             return [], None, None
 
     guard = Neo4jMutationGuard(
@@ -2605,6 +2859,9 @@ def test_zero_dispatch_failure_opens_attempt_marker_and_replays_it(
     async def complete(guard: object, raw: dict[str, object]) -> None:
         markers[guard._marker_episode_uuid] = dict(raw)
 
+    monkeypatch.setattr(
+        real.Neo4jMutationGuard, "fenced_graph_mutation", _uncontended_generation_fence
+    )
     monkeypatch.setattr(real.Neo4jMutationGuard, "marker_exists", marker_exists)
     monkeypatch.setattr(
         real.Neo4jMutationGuard, "completed_raw_or_none", completed_raw_or_none
