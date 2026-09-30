@@ -1355,3 +1355,48 @@ def test_manual_item_key_reuses_only_exact_retained_namespace(mismatch):
                                retained_units={"first-land": (old,), "later-land": (later,)} if mismatch is None else {"first-land": (old,)})
     item = SourceItem("UK-01", current_key, "Factsheets", "Retained body", "https://www.gov.uk" + path)
     assert intake._manual_item_key("UK-01", "version-1", item) == (old_key if mismatch is None else current_key)
+
+
+def test_feed_collection_retains_declared_publication_html_leaves_with_ancestry(tmp_path, monkeypatch):
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    collection = '/government/collections/dfe-update'
+    publication = '/government/publications/dfe-update-current'
+    leaves = tuple((publication + '/' + kind, kind.title()) for kind in ('education', 'academies', 'authorities'))
+    bodies = {
+        SOURCE_URLS['UK-05']: _atom_for(collection),
+        'https://www.gov.uk/api/content' + collection: _parent_with_children('document_collection', collection, ((publication, 'DfE publication'),)),
+        'https://www.gov.uk/api/content' + publication: _parent_with_children('correspondence', publication, leaves),
+        **{'https://www.gov.uk/api/content' + path: _document(path=path) for path, title in leaves},
+    }
+    fetched = []
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects, proof=runtime.proof,
+            definition_ids={'UK-05': _seed_missing(runtime, 'UK-05')}, licence=_licence(),
+            dispatch_fence=lambda *_: nullcontext(),
+            fetch=lambda url: (fetched.append(url), (200, bodies[url]))[1],
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC),
+        )
+        result = next(value for value in intake.poll() if value.source_id == 'UK-05')
+        assert result.status == 'READY' and not result.item_holds
+        assert {unit.canonical_url for unit in result.units} == {'https://www.gov.uk' + path for path, _ in leaves}
+        assert len(result.observations) == 6
+        observations = {value[1]: value for value in result.observations}
+        sources = native_evidence_sources(
+            units=result.units, sources=runtime.authority.sources, objects=runtime.authority.objects,
+            observations=observations, licence=_licence(), proof=runtime.proof,
+        )
+        assert len(sources) == 3
+        # The publication itself is not a feed item; its collection proof is necessary.
+        missing_collection = {key: value for key, value in observations.items()
+                              if value[0] != 'https://www.gov.uk/api/content' + collection}
+        with pytest.raises(NativeEvidenceHold, match='NATIVE_SOURCE_AUTHORITY_HOLD'):
+            native_evidence_sources(
+                units=result.units, sources=runtime.authority.sources, objects=runtime.authority.objects,
+                observations=missing_collection, licence=_licence(), proof=runtime.proof,
+            )
+        before = len(fetched)
+        replay = next(value for value in intake.poll() if value.source_id == 'UK-05')
+        assert [unit.ingest_id for unit in replay.units] == [unit.ingest_id for unit in result.units]
+        assert len(fetched) > before  # Fresh current observation is still acquired.
