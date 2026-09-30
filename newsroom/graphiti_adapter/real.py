@@ -290,6 +290,18 @@ def _open_compensation_driver() -> Any:
     )
 
 
+def _owned_recovery_failure_class(error: BaseException) -> str:
+    for kind, name in (
+        (TimeoutError, "TimeoutError"), (GuardError, "GuardError"),
+        (VetoError, "VetoError"), (OperatorDrainRequested, "OperatorDrainRequested"),
+        (BrokerError, "BrokerError"), (GraphitiAdapterContractError, "GraphitiAdapterContractError"),
+        (asyncio.CancelledError, "CancelledError"), (RuntimeError, "RuntimeError"),
+    ):
+        if isinstance(error, kind):
+            return name
+    return "OTHER_ERROR"
+
+
 def recover_owned_pending(
     *,
     authenticated_input: Callable[[str, int], ContextManager[str | None]],
@@ -309,11 +321,15 @@ def recover_owned_pending(
     selected = False
 
     def diagnostic() -> None:
-        _LOGGER.warning(
-            "owned_graphiti_recovery status=%s phase=%s failure_class=%s reason_code=%s elapsed_ms=%d deadline_ms=%d",
-            status, phase, failure_class, reason_code,
-            round((time.monotonic() - started) * 1_000), round(remaining * 1_000),
-        )
+        try:
+            _LOGGER.warning(
+                "owned_graphiti_recovery status=%s phase=%s failure_class=%s reason_code=%s elapsed_ms=%d deadline_ms=%d",
+                status, phase, failure_class, reason_code,
+                round((time.monotonic() - started) * 1_000), round(remaining * 1_000),
+            )
+        except Exception:
+            # Observation must not replace a verified result or an owner stop.
+            pass
 
     def observe_phase(value: str) -> None:
         nonlocal phase
@@ -322,7 +338,7 @@ def recover_owned_pending(
     try:
         driver = _open_compensation_driver()
     except Exception as exc:
-        phase, status, failure_class = "SETUP", "FAILED", type(exc).__name__
+        phase, status, failure_class = "SETUP", "FAILED", _owned_recovery_failure_class(exc)
         reason_code = "SETUP_ERROR"
         diagnostic()
         raise
@@ -372,7 +388,7 @@ def recover_owned_pending(
             return None
         except BaseException as exc:
             status = "STOPPED" if isinstance(exc, (VetoError, OperatorDrainRequested, asyncio.CancelledError)) else "FAILED"
-            failure_class = type(exc).__name__
+            failure_class = _owned_recovery_failure_class(exc)
             reason_code = _owned_recovery_guard_reason(exc) if isinstance(exc, GuardError) else "OWNER_STOP" if status == "STOPPED" else "EXCEPTION"
             raise
         finally:
@@ -389,7 +405,7 @@ def recover_owned_pending(
                     status += "_CLEANUP_TIMEOUT"
             except BaseException as exc:
                 if failure_class == "NONE":
-                    phase, failure_class = "CONNECTION_CLEANUP", type(exc).__name__
+                    phase, failure_class = "CONNECTION_CLEANUP", _owned_recovery_failure_class(exc)
                     reason_code = _owned_recovery_guard_reason(exc) if isinstance(exc, GuardError) else "EXCEPTION"
                     status += "_CLEANUP_FAILED"
                 raise
