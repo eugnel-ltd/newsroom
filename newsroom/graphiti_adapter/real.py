@@ -39,6 +39,7 @@ from newsroom.extraction.types import (
     ExtractionFailureCode,
     ExtractionOutcome,
     ExtractionOutputValidation,
+    ExtractionUsage,
 )
 from newsroom.graphiti_adapter.cli_client import build_cli_llm_client
 from newsroom.graphiti_adapter.cli_process import (
@@ -1463,6 +1464,42 @@ class RealGraphitiAdapter:
             predecessor_episode_uuid=attempt.predecessor_episode_uuid
         )
         validated: dict[str, ProducedExtraction] = {}
+        validation_phase = "ENTITY_PROPOSALS"
+        validation_error: ExtractionContractError | None = None
+        validation_usage: ExtractionUsage | None = None
+
+        def validation_diagnostic(rollback: str) -> None:
+            if validation_error is None:
+                return
+            try:
+                message = validation_error.args[0] if len(validation_error.args) == 1 and type(validation_error.args[0]) is str else None
+                reason = {
+                    "extraction usage exceeds the fixed budget": "BUDGET_EXCEEDED",
+                    "extraction usage exceeds the fixed timeout": "TIMEOUT_EXCEEDED",
+                    "proposal local identities must be unique": "PROPOSAL_ID_DUPLICATE",
+                    "produced proposals must be sorted": "PROPOSAL_ORDER",
+                    "produced proposals must be typed": "PROPOSAL_TYPE",
+                }.get(message, "CONTRACT_INVALID")
+                exceeded = []
+                if validation_usage is not None:
+                    budget = attempt.extraction_request.budget
+                    for field, maximum in (
+                        ("elapsed_ms", "timeout_ms"), ("input_bytes", "max_input_bytes"),
+                        ("output_bytes", "max_output_bytes"), ("proposal_count", "max_proposals"),
+                        ("evidence_range_count", "max_evidence_ranges"),
+                        ("request_tokens", "max_request_tokens"),
+                        ("response_tokens", "max_response_tokens"),
+                        ("cost_microunits", "max_cost_microunits"),
+                    ):
+                        if getattr(validation_usage, field) > getattr(budget, maximum):
+                            exceeded.append(field)
+                _LOGGER.warning(
+                    "graphiti_validation phase=%s reason=%s exceeded=%s rollback=%s",
+                    validation_phase, reason, ",".join(exceeded) or "NONE", rollback,
+                )
+            except Exception:
+                # Observation must not replace the original failure or outcome.
+                pass
 
         def timeout_result(*, phase: str, termination: str) -> ProducedExtraction:
             last_progress = (
@@ -1502,20 +1539,18 @@ class RealGraphitiAdapter:
                 attempt_receipt=raw,
             )
 
-        def validate_result(
+        def validate_result_value(
             result: Any,
             current_telemetry: _EpisodeTelemetry,
             combined_receipt: Mapping[str, object] | None = None,
         ) -> dict[str, object]:
-            proposals = tuple(
-                sorted(
-                    (
-                        *entity_proposals(result, attempt),
-                        *relation_proposals(result, attempt),
-                    ),
-                    key=lambda item: item.local_id,
-                )
-            )
+            nonlocal validation_phase, validation_usage
+            validation_phase = "ENTITY_PROPOSALS"
+            entities = entity_proposals(result, attempt)
+            validation_phase = "RELATION_PROPOSALS"
+            relations = relation_proposals(result, attempt)
+            proposals = tuple(sorted((*entities, *relations), key=lambda item: item.local_id))
+            validation_phase = "RAW_RECEIPT"
             raw = _raw_receipt(
                 attempt,
                 started_at=started_at,
@@ -1527,6 +1562,7 @@ class RealGraphitiAdapter:
             if combined_receipt is not None:
                 raw["combined_temporal_receipt"] = dict(combined_receipt)
             raw["raw_output_digest"] = digest_bytes(canonical_json_bytes(raw))
+            validation_phase = "PRODUCED_RESULT"
             produced = produced_extraction(
                 attempt,
                 outcome=ExtractionOutcome.SUCCESS,
@@ -1536,6 +1572,8 @@ class RealGraphitiAdapter:
                 proposals=proposals,
                 embedding_usage=current_telemetry.embedding_usage,
             )
+            validation_phase = "BUDGET"
+            validation_usage = produced.usage
             try:
                 produced.usage.require_within(attempt.extraction_request.budget)
             except ExtractionContractError:
@@ -1563,6 +1601,18 @@ class RealGraphitiAdapter:
                 raise
             validated["produced"] = produced
             return raw
+
+        def validate_result(
+            result: Any, current_telemetry: _EpisodeTelemetry,
+            combined_receipt: Mapping[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal validation_error, validation_usage
+            validation_error, validation_usage = None, None
+            try:
+                return validate_result_value(result, current_telemetry, combined_receipt)
+            except ExtractionContractError as error:
+                validation_error = error
+                raise
 
         def validate_failure(
             combined_receipt: dict[str, object],
@@ -1753,11 +1803,17 @@ class RealGraphitiAdapter:
         except (BrokerError, GraphitiAdapterContractError):
             raise
         except ExtractionContractError:
+            validation_diagnostic("UNOBSERVED")
             produced = validated.get("produced")
             if produced is None:
                 raise
             return produced
-        except AmbiguousEpisodeEffect:
+        except AmbiguousEpisodeEffect as error:
+            pipeline_error = error.__cause__
+            rollback = "UNOBSERVED"
+            if isinstance(pipeline_error, CombinedTemporalPipelineError) and pipeline_error.__cause__ is validation_error:
+                rollback = "COMPLETE" if pipeline_error.rollback_completed else "INCOMPLETE"
+            validation_diagnostic(rollback)
             produced = validated.get("produced")
             if (
                 produced is not None
