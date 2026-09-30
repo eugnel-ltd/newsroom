@@ -250,8 +250,10 @@ def test_actual_guard_expiry_keeps_generation_owned_until_recovery() -> None:
         finally:
             await query(
                 "MATCH (n) WHERE n.group_id=$group OR n.uuid=$id "
+                "OR n.episode_uuid=$legacy "
                 "OR n._newsroom_snapshot_id IN $snapshots DETACH DELETE n",
                 group=group, id=suffix,
+                legacy=f"legacy-{suffix}",
                 snapshots=[episode + ":1", f"competing-{suffix}:1"],
             )
             await driver.close()
