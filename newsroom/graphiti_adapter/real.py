@@ -1812,7 +1812,11 @@ class RealGraphitiAdapter:
             pipeline_error = error.__cause__
             rollback = "UNOBSERVED"
             if isinstance(pipeline_error, CombinedTemporalPipelineError) and pipeline_error.__cause__ is validation_error:
-                rollback = "COMPLETE" if pipeline_error.rollback_completed else "INCOMPLETE"
+                rollback_completed = pipeline_error.rollback_completed or (
+                    telemetry.recovery_classification
+                    == GraphitiRecoveryClassification.ROLLED_BACK_AMBIGUOUS_EFFECT
+                )
+                rollback = "COMPLETE" if rollback_completed else "INCOMPLETE"
             validation_diagnostic(rollback)
             produced = validated.get("produced")
             if (

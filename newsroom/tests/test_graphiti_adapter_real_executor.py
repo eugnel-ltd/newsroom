@@ -5683,8 +5683,9 @@ def test_owned_recovery_logger_failure_preserves_exact_result_or_owner_stop(monk
 
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("logger_fault", [False, True])
+@pytest.mark.parametrize("late_rollback", [False, True])
 def test_validation_budget_diagnostic_survives_wrapping_without_changing_outcome(
-    monkeypatch, caplog, wrapped, logger_fault,
+    monkeypatch, caplog, wrapped, logger_fault, late_rollback,
 ):
     import logging
     import newsroom.graphiti_adapter.real as real
@@ -5703,8 +5704,10 @@ def test_validation_budget_diagnostic_survives_wrapping_without_changing_outcome
             if not wrapped:
                 raise
             pipeline = real.CombinedTemporalPipelineError(
-                "fixture wrapped validation", graph_effect_attempted=True, rollback_completed=True,
+                "fixture wrapped validation", graph_effect_attempted=True, rollback_completed=not late_rollback,
             )
+            if late_rollback:
+                values["telemetry"].recovery_classification = real.GraphitiRecoveryClassification.ROLLED_BACK_AMBIGUOUS_EFFECT
             pipeline.__cause__ = error
             raise real.AmbiguousEpisodeEffect("fixture ambiguous") from pipeline
         raise AssertionError("Expected budget failure")
