@@ -11,8 +11,6 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from neo4j.vector import Vector
-
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
 
 
@@ -77,8 +75,13 @@ def _property_bytes(value: object) -> int:
         return 64 + len(value.encode("utf-8") if isinstance(value, str) else value)
     if value is None or isinstance(value, (bool, int, float)):
         return 16
-    if isinstance(value, Vector):
-        return 64 + len(value.raw())
+    # Native vectors expose their full raw bytes; their display may truncate.
+    # Use the value protocol without importing the optional graph runtime here.
+    raw = getattr(value, "raw", None)
+    if callable(raw):
+        buffer = raw()
+        if isinstance(buffer, (bytes, bytearray, memoryview)):
+            return 64 + memoryview(buffer).nbytes
     # Neo4j temporal/spatial scalars are retained server-side, not serialised back.
     return 64 + len(str(value).encode("utf-8"))
 

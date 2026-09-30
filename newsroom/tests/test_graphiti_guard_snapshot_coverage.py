@@ -629,7 +629,7 @@ def test_property_bound_measures_native_vectors_without_truncated_display():
     from newsroom.graphiti_adapter.neo4j_guard import _property_bytes
 
     vector = Vector.from_bytes(b"\0" * (1024 * 1024), "f64")
-    assert _property_bytes(vector) > 1024 * 1024
+    assert _property_bytes(vector) == 64 + 1024 * 1024
 
 
 def test_snapshot_refuses_relationship_properties_that_collide_with_guard_metadata():
