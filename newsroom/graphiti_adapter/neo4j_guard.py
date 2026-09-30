@@ -24,7 +24,7 @@ _MARKER = "NewsroomIngestMarker"
 _MARKER_CLAIM_LEASE = "PT15M"
 # ponytail: fixed conservative write bounds; tune only against retained service evidence.
 _PAGE_TARGET_LIMIT = 64
-_PAGE_PROPERTY_BYTES = 1024 * 1024
+_PAGE_PROPERTY_BYTES = 8 * 1024 * 1024
 _UNRESOLVED_STATES = ('SNAPSHOTTING', 'PENDING', 'ROLLING_BACK', 'RECOVERING')
 _SCHEMA_QUERIES = (
     f"""
@@ -278,6 +278,7 @@ class Neo4jMutationGuard:
                 AND NOT EXISTS {{
                     MATCH (unresolved:{_MARKER} {{group_id: $group_id}})
                     WHERE unresolved.state IN {list(_UNRESOLVED_STATES)!r}
+                      AND unresolved.snapshot_id = $snapshot_id
                 }}
             ) OR (
                 g.owner_marker_uuid = $episode_uuid
@@ -329,6 +330,7 @@ class Neo4jMutationGuard:
                       AND g.owner_marker_uuid IS NULL AND NOT EXISTS {{
                           MATCH (unresolved:{_MARKER} {{group_id: $group_id}})
                           WHERE unresolved.state IN {list(_UNRESOLVED_STATES)!r}
+                            AND unresolved.snapshot_id = $snapshot_id
                       }})
               )
               AND (NOT $require_expired OR m.claim_expires_at IS NULL
@@ -734,9 +736,16 @@ class Neo4jMutationGuard:
             if not written or _record_value(written[0], "written") != len(page):
                 raise GuardError("Graphiti bounded property write lost an actual target")
 
-    def _node_matches(self) -> str:
+    def _snapshot_sources(self, label: str) -> str:
         return f"""
-            MATCH (s:{_SNAPSHOT_NODE} {{_newsroom_snapshot_id: $snapshot_id}})
+            MATCH (s:{label} {{_newsroom_snapshot_id: $snapshot_id}})
+            WHERE elementId(s) >= $cursor_source
+            WITH s, elementId(s) AS source_identity
+            ORDER BY source_identity LIMIT $limit
+        """
+
+    def _node_matches(self) -> str:
+        return self._snapshot_sources(_SNAPSHOT_NODE) + f"""
             MATCH (n {{uuid: s._newsroom_source_uuid}})
             WHERE NOT n:{_SNAPSHOT_NODE} AND NOT n:{_SNAPSHOT_RELATIONSHIP} AND NOT n:{_MARKER}
               AND (elementId(s) > $cursor_source OR
@@ -763,8 +772,7 @@ class Neo4jMutationGuard:
             """,
         )
         await self._write_pages(
-            f"""
-            MATCH (s:{_SNAPSHOT_RELATIONSHIP} {{_newsroom_snapshot_id: $snapshot_id}})
+            self._snapshot_sources(_SNAPSHOT_RELATIONSHIP) + f"""
             MATCH (a {{uuid: s._newsroom_source_uuid}})
                   -[r {{uuid: s._newsroom_relationship_uuid}}]->(b {{uuid: s._newsroom_target_uuid}})
             WHERE type(r) = s._newsroom_relationship_type

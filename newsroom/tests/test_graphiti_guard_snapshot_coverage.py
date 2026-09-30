@@ -254,6 +254,8 @@ class _JournalDriver:
                     return []
                 if not self.owner.get("owner_marker_uuid") and any(
                     item["state"] in {"SNAPSHOTTING", "PENDING", "ROLLING_BACK", "RECOVERING"}
+                    and ("unresolved.snapshot_id = $snapshot_id" not in query
+                         or item["snapshot_id"] == params["snapshot_id"])
                     for item in self.markers.values()
                 ):
                     return []
@@ -424,11 +426,32 @@ def test_generation_refuses_legacy_unowned_unresolved_marker(state):
         }
         with pytest.raises(GuardError, match="generation"):
             await _journal_guard(driver).begin()
-        with pytest.raises(GuardError, match="generation"):
-            await _journal_guard(driver, "episode-b").begin()
-        assert driver.markers["episode-a"]["state"] == state
+        before = dict(driver.markers["episode-a"])
+        assert (await _journal_guard(driver, "episode-b").begin()).state.value == "CREATED"
+        assert driver.markers["episode-a"] == before
         assert "snapshot-deleted" not in driver.events
+        with pytest.raises(GuardError, match="generation"):
+            await _journal_guard(driver).begin()
+        assert driver.markers["episode-a"] == before
 
+    asyncio.run(exercise())
+
+
+def test_fresh_internal_marker_cannot_reuse_unresolved_legacy_snapshot():
+    async def exercise():
+        driver = _JournalDriver()
+        driver.markers["episode-a"] = {
+            "group_id": "group-id", "input_digest": "sha256:" + "0" * 64,
+            "attempt_number": 2, "snapshot_id": "episode-a:2", "state": "PENDING",
+            "claim_token": "expired", "active": False,
+        }
+        fresh = _JournalGuard(driver, group_id="group-id", episode_uuid="episode-a",
+                              attempt_number=2, marker_episode_uuid="episode-a:attempt:2",
+                              input_digest="sha256:" + "0" * 64)
+        with pytest.raises(GuardError, match="generation"):
+            await fresh.begin()
+        assert "episode-a:attempt:2" not in driver.markers
+        assert "snapshot-deleted" not in driver.events
     asyncio.run(exercise())
 
 
@@ -510,7 +533,9 @@ def test_property_pages_cover_all_actual_duplicate_targets_and_page_boundary():
     assert guard.reads[1]["cursor_target"] == "target-0063"
 
 
-def test_property_page_full_bytes_bound_splits_before_write_and_rejects_single_oversize():
+def test_property_page_full_bytes_bound_splits_before_write_and_rejects_single_oversize(monkeypatch):
+    import newsroom.graphiti_adapter.neo4j_guard as module
+    monkeypatch.setattr(module, "_PAGE_PROPERTY_BYTES", 1024 * 1024)
     rows = [_page_row("snapshot-1", f"target-{index}", size=20000) for index in range(8)]
     guard = _PageGuard(rows)
     asyncio.run(guard._restore_properties())
@@ -520,6 +545,22 @@ def test_property_page_full_bytes_bound_splits_before_write_and_rejects_single_o
     with pytest.raises(GuardError, match="property byte bound"):
         asyncio.run(oversized._restore_properties())
     assert not oversized.writes
+
+
+def test_native_vector_fixture_uses_full_target_pages_under_conservative_byte_bound():
+    rows = [_page_row("snapshot-1", f"target-{index:04}", size=1536) for index in range(65)]
+    for row in rows:
+        row["target_properties"]["vector"] = [1.0] * 1536
+    guard = _PageGuard(rows)
+    asyncio.run(guard._restore_properties())
+    assert [len(page) for page in guard.writes] == [64, 1]
+
+
+def test_restore_limits_snapshot_sources_before_matching_actual_targets():
+    query = _PageGuard([])._node_matches()
+    assert query.index("LIMIT $limit") < query.index("MATCH (n")
+    assert "elementId(s) >= $cursor_source" in query
+    assert query.count("LIMIT $limit") == 2
 
 
 def test_label_pages_repair_each_actual_identity_including_unlabelled_duplicates():
