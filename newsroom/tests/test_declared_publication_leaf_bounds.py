@@ -91,6 +91,32 @@ def test_terminal_html_leaf_does_not_follow_children_or_spreadsheet(monkeypatch)
     assert fetched == [API + PUBLICATION, API + LEAF]
 
 
+@pytest.mark.parametrize("inventory", ["children", "attachments"])
+def test_complete_html_leaf_with_deeper_inventory_is_held(monkeypatch, inventory):
+    terminal = json.loads(_document(path=LEAF))
+    terminal["document_type"] = "html_publication"
+    if inventory == "children":
+        terminal["links"]["children"] = [{"base_path": LEAF + "/deeper", "title": "Deeper child"}]
+    else:
+        terminal["details"]["attachments"] = [{
+            "attachment_type": "html", "url": LEAF + "/deeper", "title": "Deeper child",
+        }]
+    intake, fetched = _stubbed_intake(monkeypatch, {
+        API + PUBLICATION: (200, _parent_with_children(
+            "correspondence", PUBLICATION, ((LEAF, "Leaf"),),
+        )),
+        API + LEAF: (200, json.dumps(terminal).encode()),
+    })
+    units, observations, holds = _settle_collection(intake)
+    assert units == ()
+    assert len(observations) == 3
+    assert len(holds) == 1 and holds[0][0] == "https://www.gov.uk" + LEAF
+    assert holds[0][1] in {
+        "SOURCE_ITEM_CHILD_COVERAGE_INCOMPLETE", "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE",
+    }
+    assert fetched == [API + PUBLICATION, API + LEAF]
+
+
 @pytest.mark.parametrize("failure, expected_hold", [
     ("fetch", "SOURCE_ITEM_FETCH_INCOMPLETE"),
     ("exclusion", "SOURCE_ITEM_RIGHTS_EXCLUSION_HOLD"),
@@ -138,9 +164,19 @@ def test_publication_leaf_stop_fence_precedes_fetch(monkeypatch):
     assert fenced == [API + PUBLICATION, API + LEAF]
 
 
-@pytest.mark.parametrize("mismatch", ["unlisted-leaf", "unlisted-publication", "manual-parent"])
+@pytest.mark.parametrize("mismatch", [
+    "unlisted-leaf", "unlisted-publication", "manual-parent",
+    "mixed-self", "mixed-ancestor", "mixed-non-descendant",
+])
 def test_additional_leaf_inventory_binding_rejects_unlisted_and_manual_parent(monkeypatch, mismatch):
-    publication = _parent_with_children("correspondence", PUBLICATION, ((LEAF, "Leaf"),))
+    publication_children = ((LEAF, "Leaf"),)
+    invalid_path = {
+        "mixed-self": PUBLICATION, "mixed-ancestor": COLLECTION,
+        "mixed-non-descendant": PUBLICATION + "-unrelated/education",
+    }.get(mismatch)
+    if invalid_path is not None:
+        publication_children += ((invalid_path, "Invalid leaf"),)
+    publication = _parent_with_children("correspondence", PUBLICATION, publication_children)
     collection = _parent_with_children(
         "manual" if mismatch == "manual-parent" else "document_collection",
         COLLECTION,

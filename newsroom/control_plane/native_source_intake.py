@@ -45,7 +45,7 @@ from newsroom.sources import (
 
 from .govuk_rights import GovUkLicenceEvidence
 from .govuk_evidence import (
-    GovUkContentHold, _api_url, _utc, parse_govuk_content_document,
+    GovUkContentHold, _api_url, _utc, _require_attachment_inventory, parse_govuk_content_document,
     parse_govuk_manual_inventory,
 )
 from .govuk_spreadsheet import (
@@ -326,7 +326,7 @@ class NativeSourceIntake:
                 return (), tuple(observations), ((item.canonical_url, exc.reason_code),)
             units, holds = [], []
             leaf_handoff = publication_leaves and _declared_publication_leaves(
-                raw, item.canonical_url, exc.child_items,
+                raw, item.canonical_url,
             )
             follow_inventory = follow_children or leaf_handoff
             collection_children = follow_children and json.loads(raw).get("document_type") == "document_collection"
@@ -403,6 +403,12 @@ class NativeSourceIntake:
             if unsupported_attachments:
                 holds.append((item.canonical_url, exc.reason_code))
             return tuple(units), tuple(observations), tuple(holds)
+        if terminal_html_leaf:
+            value = json.loads(raw)
+            if value.get("links", {}).get("children") or value.get("details", {}).get("attachments"):
+                return (), tuple(observations), ((
+                    item.canonical_url, "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE",
+                ),)
         units = self._retain_item(
             source_id, definition_id, version_id, version, complete,
             observation_digest, _utc(observed), rights_id,
@@ -1006,7 +1012,7 @@ def _require_parent_inventory_binding(
                 parent_found = any(item.canonical_url == parent_url for item in feed_items)
                 if not parent_found and (
                     spreadsheet_asset_url(unit) is not None
-                    or _declared_publication_leaves(raw, parent_url, ((section_path, ""),))
+                    or _declared_publication_leaves(raw, parent_url)
                 ):
                     parent_found = _declared_file_parent_in_feed_child(
                         unit=unit, parent_url=parent_url, feed_items=feed_items,
@@ -1044,11 +1050,12 @@ def _require_parent_inventory_binding(
     return parent_url, raw
 
 
-def _declared_publication_leaves(raw, parent_url, children) -> bool:
+def _declared_publication_leaves(raw, parent_url) -> bool:
     """Allow only a publication's strictly descended declared HTML inventory."""
     try:
         value = json.loads(raw)
         path = urlsplit(parent_url).path
+        children, _unsupported = _require_attachment_inventory(value)
         return (
             value.get("schema_name") == "publication"
             and value.get("document_type") in {"correspondence", "corporate_report", "regulation", "transparency"}
