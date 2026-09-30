@@ -5267,7 +5267,7 @@ def test_owned_compensation_uses_only_bare_driver_and_exact_retained_guard(
             )
             events.append("guard")
 
-        async def recover_owned_pending(self, *, owner_stop_check):
+        async def recover_owned_pending(self, *, owner_stop_check, phase_observer=None):
             assert active
             owner_stop_check()
             events.append("compensate")
@@ -5321,7 +5321,7 @@ def test_owned_compensation_preserves_pending_state_when_boundary_refuses(monkey
         def __init__(self, *_args, **_values):
             events.append("guard")
 
-        async def recover_owned_pending(self, *, owner_stop_check):
+        async def recover_owned_pending(self, *, owner_stop_check, phase_observer=None):
             owner_stop_check()
             events.append("compensate")
             await asyncio.sleep(1)
@@ -5415,7 +5415,7 @@ def test_owned_compensation_bounds_never_finishing_driver_close_without_changing
         def __init__(self, *_args, **_values):
             pass
 
-        async def recover_owned_pending(self, *, owner_stop_check):
+        async def recover_owned_pending(self, *, owner_stop_check, phase_observer=None):
             owner_stop_check()
             events.append("recovered")
             return marker
@@ -5445,3 +5445,235 @@ def test_owned_compensation_bounds_never_finishing_driver_close_without_changing
         assert real.recover_owned_pending(**arguments) is (marker if recovery == "recovered" else None)
     assert events.count("close") == events.count("close_cancelled") == 1
     assert events.count("recovered") == int(recovery == "recovered")
+
+
+@pytest.mark.parametrize("outcome,phase,cause,status", (
+    ("timeout", "INVENTORY", "TimeoutError", "TIMEOUT"),
+    ("guard", "FULL_VERIFY", "GuardError", "FAILED"),
+    ("stop", "RESTORE", "VetoError", "STOPPED"),
+    ("recovered", "SNAPSHOT_CLEANUP", "NONE", "RECOVERED"),
+    ("refused", "OWNERSHIP", "NONE", "REFUSED"),
+    ("cleanup_error", "CONNECTION_CLEANUP", "RuntimeError", "RECOVERED_CLEANUP_FAILED"),
+    ("inventory_bound", "INVENTORY", "GuardError", "FAILED"),
+    ("inventory_coverage", "INVENTORY", "GuardError", "FAILED"),
+    ("inventory_identity", "INVENTORY", "GuardError", "FAILED"),
+))
+def test_owned_recovery_emits_one_coarse_phase_diagnostic_without_private_content(
+    monkeypatch, caplog, outcome, phase, cause, status,
+):
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.control_plane.veto import VetoError
+    from newsroom.graphiti_adapter.neo4j_guard import GuardError
+
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    digest = digest_canonical({"retained": "private source payload"})
+    driver = SimpleNamespace(close=AsyncMock())
+    if outcome == "cleanup_error":
+        driver.close.side_effect = RuntimeError("TOKEN=private-credential; cleanup detail")
+    active_phase = None
+
+    class Guard:
+        @staticmethod
+        async def owned_pending_identity(*_args, **_values):
+            return "private-episode-identity", "private-marker-identity", 1
+
+        def __init__(self, *_args, **_values):
+            pass
+
+        async def recover_owned_pending(self, *, owner_stop_check, phase_observer=None):
+            nonlocal active_phase
+            active_phase = phase
+            if phase_observer is not None:
+                phase_observer(phase)
+            if outcome == "timeout":
+                await asyncio.Event().wait()
+            elif outcome == "guard":
+                raise GuardError("TOKEN=private-credential; raw source payload; query text")
+            elif outcome.startswith("inventory_"):
+                raise GuardError({
+                    "inventory_bound": "Graphiti identity inventory exceeds its byte bound",
+                    "inventory_coverage": "Graphiti identity inventory omits a pre-existing target",
+                    "inventory_identity": "Graphiti inventory identity is absent",
+                }[outcome])
+            elif outcome == "stop":
+                owner_stop_check()
+            elif outcome == "refused":
+                return None
+            return GuardMarker(GuardState.RECOVERED_AMBIGUOUS, 1, digest)
+
+    @contextmanager
+    def authenticated_input(*_args):
+        yield digest
+
+    def stop():
+        if outcome == "stop" and active_phase is not None:
+            raise VetoError("TOKEN=private-credential; raw source payload")
+
+    monkeypatch.setattr(real, "_open_compensation_driver", lambda: driver)
+    monkeypatch.setattr(real, "Neo4jMutationGuard", Guard)
+    for name in ("_load_graphiti", "openrouter_api_key", "build_cli_llm_client", "_bootstrap_graphiti_schema"):
+        monkeypatch.setattr(real, name, lambda *a, **kw: pytest.fail("provider/setup boundary"))
+    caplog.set_level("WARNING", logger=real.__name__)
+    arguments = dict(
+        authenticated_input=authenticated_input, owner_stop_check=stop,
+        deadline=now + timedelta(seconds=0.01 if outcome == "timeout" else 180), clock=lambda: now,
+    )
+    if outcome in {"guard", "stop", "cleanup_error"} or outcome.startswith("inventory_"):
+        with pytest.raises(GuardError if cause == "GuardError" else VetoError if outcome == "stop" else RuntimeError):
+            real.recover_owned_pending(**arguments)
+    else:
+        result = real.recover_owned_pending(**arguments)
+        assert (result is not None) == (outcome == "recovered")
+    records = [record for record in caplog.records if record.name == real.__name__]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert f"status={status}" in message
+    assert f"phase={phase}" in message
+    assert f"failure_class={cause}" in message
+    if cause == "GuardError":
+        reason = {
+            "inventory_bound": "INVENTORY_BYTE_BOUND",
+            "inventory_coverage": "SNAPSHOT_COVERAGE",
+            "inventory_identity": "IDENTITY_BINDING",
+        }.get(outcome, "GUARD_ERROR")
+        assert f"reason_code={reason}" in message
+    assert "deadline_ms=" in message and "elapsed_ms=" in message
+    assert len(message.encode()) <= 200
+    assert records[0].exc_info is None
+    assert all(private not in message for private in (
+        "private-credential", "private source", "private-episode", "private-marker", "query text", digest,
+    ))
+    driver.close.assert_awaited_once()
+
+
+def test_owned_recovery_diagnostic_logs_setup_failure_but_not_no_owner_ticks(monkeypatch, caplog):
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.control_plane.broker import BrokerError
+
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    arguments = dict(
+        authenticated_input=lambda *a: pytest.fail("no selected owner"), owner_stop_check=lambda: None,
+        deadline=now + timedelta(seconds=180), clock=lambda: now,
+    )
+    caplog.set_level("WARNING", logger=real.__name__)
+    monkeypatch.setattr(real, "_open_compensation_driver", lambda: (_ for _ in ()).throw(BrokerError("TOKEN=private")))
+    with pytest.raises(BrokerError):
+        real.recover_owned_pending(**arguments)
+    messages = [record.getMessage() for record in caplog.records if record.name == real.__name__]
+    assert len(messages) == 1
+    assert "phase=SETUP" in messages[0] and "failure_class=BrokerError" in messages[0]
+    assert "private" not in messages[0]
+    caplog.clear()
+    driver = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(real, "_open_compensation_driver", lambda: driver)
+    monkeypatch.setattr(real, "Neo4jMutationGuard", SimpleNamespace(owned_pending_identity=AsyncMock(return_value=None)))
+    for _ in range(2):
+        assert real.recover_owned_pending(**arguments) is None
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("boundary", ("setup", "recovery", "cleanup"))
+@pytest.mark.parametrize("recognised", (False, True))
+def test_owned_recovery_diagnostics_never_emit_custom_or_oversized_exception_class_names(
+    monkeypatch, caplog, boundary, recognised,
+):
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.control_plane.broker import BrokerError
+    from newsroom.graphiti_adapter.neo4j_guard import GuardError
+
+    base, safe_name = {
+        "setup": (BrokerError, "BrokerError"),
+        "recovery": (GuardError, "GuardError"),
+        "cleanup": (RuntimeError, "RuntimeError"),
+    }[boundary]
+    custom = type("TOKEN_PRIVATE_" + "X" * 300, (base if recognised else Exception,), {})
+    failure = custom("Graphiti identity inventory exceeds its byte bound")
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    digest = digest_canonical({"retained": "input"})
+    driver = SimpleNamespace(close=AsyncMock(side_effect=failure if boundary == "cleanup" else None))
+
+    class Guard:
+        @staticmethod
+        async def owned_pending_identity(*_args, **_values):
+            return "episode", "episode", 1
+
+        def __init__(self, *_args, **_values):
+            pass
+
+        async def recover_owned_pending(self, *, owner_stop_check, phase_observer):
+            phase_observer("INVENTORY")
+            if boundary == "recovery":
+                raise failure
+            return GuardMarker(GuardState.RECOVERED_AMBIGUOUS, 1, digest)
+
+    @contextmanager
+    def authenticated_input(*_args):
+        yield digest
+
+    def open_driver():
+        if boundary == "setup":
+            raise failure
+        return driver
+
+    monkeypatch.setattr(real, "_open_compensation_driver", open_driver)
+    monkeypatch.setattr(real, "Neo4jMutationGuard", Guard)
+    caplog.set_level("WARNING", logger=real.__name__)
+    with pytest.raises(custom) as caught:
+        real.recover_owned_pending(
+            authenticated_input=authenticated_input, owner_stop_check=lambda: None,
+            deadline=now + timedelta(seconds=180), clock=lambda: now,
+        )
+    assert caught.value is failure
+    records = [record for record in caplog.records if record.name == real.__name__]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert f"failure_class={safe_name if recognised else 'OTHER_ERROR'}" in message
+    assert "TOKEN_PRIVATE_" not in message and custom.__name__ not in message
+    assert len(message.encode()) <= 200 and records[0].exc_info is None
+    if boundary == "recovery" and recognised:
+        assert "reason_code=INVENTORY_BYTE_BOUND" in message
+
+
+@pytest.mark.parametrize("outcome", ("recovered", "refused", "stop"))
+def test_owned_recovery_logger_failure_preserves_exact_result_or_owner_stop(monkeypatch, outcome):
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.control_plane.veto import VetoError
+
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    digest = digest_canonical({"retained": "input"})
+    marker = GuardMarker(GuardState.RECOVERED_AMBIGUOUS, 1, digest)
+    stopped = VetoError("owner emergency stop")
+    driver = SimpleNamespace(close=AsyncMock())
+
+    class Guard:
+        @staticmethod
+        async def owned_pending_identity(*_args, **_values):
+            return "episode", "episode", 1
+
+        def __init__(self, *_args, **_values):
+            pass
+
+        async def recover_owned_pending(self, *, owner_stop_check, phase_observer):
+            phase_observer("RESTORE")
+            if outcome == "stop":
+                raise stopped
+            return marker if outcome == "recovered" else None
+
+    @contextmanager
+    def authenticated_input(*_args):
+        yield digest
+
+    monkeypatch.setattr(real, "_open_compensation_driver", lambda: driver)
+    monkeypatch.setattr(real, "Neo4jMutationGuard", Guard)
+    monkeypatch.setattr(real._LOGGER, "warning", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("fixture logger failure")))
+    arguments = dict(
+        authenticated_input=authenticated_input, owner_stop_check=lambda: None,
+        deadline=now + timedelta(seconds=180), clock=lambda: now,
+    )
+    if outcome == "stop":
+        with pytest.raises(VetoError) as caught:
+            real.recover_owned_pending(**arguments)
+        assert caught.value is stopped
+    else:
+        assert real.recover_owned_pending(**arguments) is (marker if outcome == "recovered" else None)
+    driver.close.assert_awaited_once()

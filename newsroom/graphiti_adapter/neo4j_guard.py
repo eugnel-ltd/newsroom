@@ -25,6 +25,10 @@ _PAGE_TARGET_LIMIT = 64
 _PAGE_PROPERTY_BYTES = 8 * 1024 * 1024
 _INVENTORY_BYTES = 8 * 1024 * 1024
 _UNRESOLVED_STATES = ('SNAPSHOTTING', 'PENDING', 'ROLLING_BACK', 'RECOVERING')
+_OWNED_RECOVERY_PHASES = frozenset({
+    "OWNERSHIP", "INVENTORY", "DELETE_NEW_RELATIONSHIPS", "DELETE_NEW_NODES",
+    "RESTORE", "FULL_VERIFY", "TERMINAL", "SNAPSHOT_CLEANUP",
+})
 _SCHEMA_QUERIES = (
     f"""
     CREATE CONSTRAINT newsroom_ingest_marker_episode IF NOT EXISTS
@@ -35,6 +39,36 @@ _SCHEMA_QUERIES = (
 
 class GuardError(RuntimeError):
     """The proposal generation could not be proved unchanged or recoverable."""
+
+
+_OWNED_GUARD_REASON_CODES = {
+    "Graphiti identity inventory exceeds its byte bound": "INVENTORY_BYTE_BOUND",
+    "Graphiti snapshot coverage count is invalid": "SNAPSHOT_COVERAGE",
+    "Graphiti snapshot coverage identity is absent": "SNAPSHOT_COVERAGE",
+    "Graphiti identity inventory omits a pre-existing target": "SNAPSHOT_COVERAGE",
+    "Graphiti target exceeds the full property byte bound": "PROPERTY_BYTE_BOUND",
+    "a pre-existing Graphiti node is missing": "TARGET_MISSING",
+    "a pre-existing Graphiti relationship is missing": "TARGET_MISSING",
+    "Graphiti bounded property write lost an actual target": "TARGET_MISSING",
+    "Graphiti property read lost an inventoried actual pair": "TARGET_MISSING",
+    "Graphiti label repair lost an actual target": "TARGET_MISSING",
+    "a pre-existing Graphiti node changed across the attempt": "TARGET_DRIFT",
+    "a pre-existing Graphiti relationship changed across the attempt": "TARGET_DRIFT",
+    "Graphiti inventory identity is absent": "IDENTITY_BINDING",
+    "Graphiti inventory has a duplicate actual pair": "IDENTITY_BINDING",
+    "Graphiti guard marker identity is absent": "IDENTITY_BINDING",
+    "Graphiti owned compensation identity is malformed": "IDENTITY_BINDING",
+    "Graphiti owned compensation snapshot is malformed": "IDENTITY_BINDING",
+    "Graphiti guard snapshot identity is malformed": "IDENTITY_BINDING",
+    "Graphiti guard marker identity differs from this input": "IDENTITY_BINDING",
+    "Graphiti attempt marker identity differs": "IDENTITY_BINDING",
+    "Graphiti guard marker is malformed": "IDENTITY_BINDING",
+}
+
+
+def _owned_recovery_guard_reason(error: GuardError) -> str:
+    message = error.args[0] if len(error.args) == 1 and type(error.args[0]) is str else None
+    return _OWNED_GUARD_REASON_CODES.get(message, "GUARD_ERROR")
 
 
 class GuardState(StrEnum):
@@ -111,6 +145,7 @@ class Neo4jMutationGuard:
         "_input_digest",
         "_marker_episode_uuid",
         "_owned_recovery_stop_check",
+        "_owned_recovery_phase_observer",
         "_snapshot_id",
     )
 
@@ -129,6 +164,7 @@ class Neo4jMutationGuard:
         self._fence_transaction: Any | None = None
         self._snapshot_cleanup_pending = False
         self._owned_recovery_stop_check: Callable[[], None] | None = None
+        self._owned_recovery_phase_observer: Callable[[str], None] | None = None
         self._generation_key = "generation-owner:v1:" + digest_bytes(group_id.encode("utf-8"))
         self._group_id = group_id
         self._episode_uuid = episode_uuid
@@ -280,19 +316,22 @@ class Neo4jMutationGuard:
 
     async def recover_owned_pending(
         self, *, owner_stop_check: Callable[[], None] | None = None,
+        phase_observer: Callable[[str], None] | None = None,
     ) -> GuardMarker | None:
         """Compensate this exact expired owner without a fresh snapshot or leaf."""
-        if owner_stop_check is not None:
-            owner_stop_check()
-        identity = await self.owned_pending_identity(self._driver, group_id=self._group_id)
-        if identity != (self._episode_uuid, self._marker_episode_uuid, self._attempt_number):
-            return None
-        raw = await self._marker()
-        if raw is None or str(raw.get("state")) not in {"PENDING", "ROLLING_BACK"}:
-            return None
-        marker = self._bind_marker(raw)
-        self._owned_recovery_stop_check = owner_stop_check
+        self._owned_recovery_phase_observer = phase_observer
         try:
+            self._observe_owned_recovery_phase("OWNERSHIP")
+            if owner_stop_check is not None:
+                owner_stop_check()
+            identity = await self.owned_pending_identity(self._driver, group_id=self._group_id)
+            if identity != (self._episode_uuid, self._marker_episode_uuid, self._attempt_number):
+                return None
+            raw = await self._marker()
+            if raw is None or str(raw.get("state")) not in {"PENDING", "ROLLING_BACK"}:
+                return None
+            marker = self._bind_marker(raw)
+            self._owned_recovery_stop_check = owner_stop_check
             taken_over = await self._take_over(raw, state=marker.state.value)
             if taken_over is None:
                 return None
@@ -301,9 +340,15 @@ class Neo4jMutationGuard:
                 embedding_usage=dict(marker.embedding_usage or {}),
                 reason="EXACT_OWNED_COMPENSATION",
             )
+            self._observe_owned_recovery_phase("TERMINAL")
             return await self.recovered_ambiguous_marker_or_none()
         finally:
             self._owned_recovery_stop_check = None
+            self._owned_recovery_phase_observer = None
+
+    def _observe_owned_recovery_phase(self, phase: str) -> None:
+        if self._owned_recovery_phase_observer is not None and phase in _OWNED_RECOVERY_PHASES:
+            self._owned_recovery_phase_observer(phase)
 
     def _generation_lock(self) -> str:
         # All coordinated writers acquire generation before episode. The WHERE
@@ -668,6 +713,7 @@ class Neo4jMutationGuard:
                 self._fence_transaction = None
         if self._snapshot_cleanup_pending:
             self._snapshot_cleanup_pending = False
+            self._observe_owned_recovery_phase("SNAPSHOT_CLEANUP")
             await self._delete_snapshot()
 
     @asynccontextmanager
@@ -711,7 +757,9 @@ class Neo4jMutationGuard:
             if str(retained.get("claim_token") or "") != self._claim_token:
                 raise GuardError("Graphiti rollback is owned by another claim")
         async with self.fenced_graph_mutation():
+            self._observe_owned_recovery_phase("INVENTORY")
             inventories = await self._restoration_inventories()
+            self._observe_owned_recovery_phase("DELETE_NEW_RELATIONSHIPS")
             await self._query(
                 f"""
                 MATCH (a)-[r]->(b)
@@ -727,6 +775,7 @@ class Neo4jMutationGuard:
                 group_id=self._group_id,
                 snapshot_id=self._snapshot_id,
             )
+            self._observe_owned_recovery_phase("DELETE_NEW_NODES")
             await self._query(
                 f"""
                 MATCH (n)
@@ -745,8 +794,11 @@ class Neo4jMutationGuard:
                 group_id=self._group_id,
                 snapshot_id=self._snapshot_id,
             )
+            self._observe_owned_recovery_phase("RESTORE")
             await self._restore_properties(inventories=inventories)
+            self._observe_owned_recovery_phase("FULL_VERIFY")
             await self.assert_preexisting_unchanged()
+            self._observe_owned_recovery_phase("TERMINAL")
             recovered = await self._owned_query(
                 self._owned_match(("ROLLING_BACK",)) + """
                 SET m.state = 'RECOVERED_AMBIGUOUS', m.recovery_reason = $reason,
