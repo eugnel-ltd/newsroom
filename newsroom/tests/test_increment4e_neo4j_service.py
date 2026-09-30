@@ -351,8 +351,9 @@ def _event_count(path: Path) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM ledger_events").fetchone()[0])
 
 
-def test_actual_service_guard_rollback_does_not_promote_snapshot_copies() -> None:
-    from newsroom.graphiti_adapter.neo4j_guard import Neo4jMutationGuard
+@pytest.mark.parametrize("case", ("ordinary", "null-and-duplicates", "wrong-endpoint", "wrong-type"))
+def test_actual_service_guard_rollback_does_not_promote_snapshot_copies(case: str) -> None:
+    from newsroom.graphiti_adapter.neo4j_guard import GuardError, Neo4jMutationGuard
 
     async def exercise() -> None:
         config = _service_config()
@@ -403,6 +404,47 @@ def test_actual_service_guard_rollback_does_not_promote_snapshot_copies() -> Non
                 new=f"new-{suffix}",
                 group_id=group_id,
             )
+            if case != "ordinary":
+                await query(
+                    """
+                    MATCH (a:Entity {uuid:$a}),(b:Entity {uuid:$b})
+                    CREATE (:Entity {group_id:$group_id,name:'null-new'}),
+                           (a)-[:REL {fact:'null-new'}]->(b),
+                           (a)-[:REL {uuid:$new_relationship,fact:'new'}]->(b),
+                           (:NewsroomSnapshotNode {group_id:$group_id,uuid:$new,
+                               _newsroom_snapshot_id:$foreign_snapshot,_newsroom_source_uuid:$new}),
+                           (:NewsroomSnapshotRelationship {group_id:$group_id,uuid:$new_relationship,
+                               _newsroom_snapshot_id:$foreign_snapshot,
+                               _newsroom_relationship_uuid:$new_relationship}),
+                           (:NewsroomIngestMarker {group_id:$group_id,episode_uuid:$foreign_marker})
+                    """, a=f"a-{suffix}", b=f"b-{suffix}", new=f"new-{suffix}",
+                    new_relationship=f"new-relationship-{suffix}", group_id=group_id,
+                    foreign_snapshot=f"foreign-{snapshot_id}", foreign_marker=f"foreign-{episode_uuid}",
+                )
+                if case == "null-and-duplicates":
+                    await query(
+                        """
+                        MATCH (a {uuid:$a})-[r:REL {uuid:$relationship}]->(b {uuid:$b})
+                        CREATE (duplicate:Changed), (a)-[same:REL]->(b), (b)-[wrong:OTHER]->(a)
+                        SET duplicate=properties(a), duplicate.group_id='changed-'+$group_id,
+                            same=properties(r), wrong=properties(r), wrong.fact='mismatch'
+                        """, a=f"a-{suffix}", b=f"b-{suffix}", relationship=f"relationship-{suffix}",
+                        group_id=group_id,
+                    )
+                else:
+                    replacement = "(b)-[replacement:REL]->(a)" if case == "wrong-endpoint" else "(a)-[replacement:OTHER]->(b)"
+                    await query(
+                        "MATCH (a {uuid:$a})-[r:REL {uuid:$relationship}]->(b {uuid:$b}) "
+                        f"CREATE {replacement} SET replacement=properties(r) DELETE r",
+                        a=f"a-{suffix}", b=f"b-{suffix}", relationship=f"relationship-{suffix}",
+                    )
+                    with pytest.raises(GuardError, match="pre-existing"):
+                        await guard.rollback_pending(chat_invocations=[], embedding_usage={}, reason="SERVICE_HOLD")
+                    retained = await query("MATCH (n {uuid:$new}) WHERE n:Entity RETURN count(n) AS count", new=f"new-{suffix}")
+                    assert retained.records[0]["count"] == 1
+                    marker = await query("MATCH (m:NewsroomIngestMarker {episode_uuid:$episode}) RETURN m.state AS state", episode=episode_uuid)
+                    assert marker.records[0]["state"] == "ROLLING_BACK"
+                    return
             await guard.rollback_pending(
                 chat_invocations=[],
                 embedding_usage={
@@ -414,7 +456,8 @@ def test_actual_service_guard_rollback_does_not_promote_snapshot_copies() -> Non
             result = await query(
                 """
                 MATCH (n {group_id:$group_id})
-                WHERE n.uuid IS NOT NULL
+                WHERE n.uuid IS NOT NULL AND NOT n:NewsroomSnapshotNode
+                  AND NOT n:NewsroomSnapshotRelationship AND NOT n:NewsroomIngestMarker
                 OPTIONAL MATCH (n)-[r]->()
                 RETURN collect(DISTINCT [n.uuid,n.name]) AS nodes,
                        collect(DISTINCT [r.uuid,r.fact]) AS relationships
@@ -425,10 +468,6 @@ def test_actual_service_guard_rollback_does_not_promote_snapshot_copies() -> Non
                 """
                 MATCH (s)
                 WHERE s._newsroom_snapshot_id=$snapshot_id
-                   OR s:NewsroomSnapshotNode
-                      AND s.group_id=$group_id
-                   OR s:NewsroomSnapshotRelationship
-                      AND s.uuid=$relationship
                 RETURN count(s) AS count
                 """,
                 snapshot_id=snapshot_id,
@@ -439,21 +478,35 @@ def test_actual_service_guard_rollback_does_not_promote_snapshot_copies() -> Non
             assert sorted(record["nodes"]) == sorted(
                 [[f"a-{suffix}", "before"], [f"b-{suffix}", "other"]]
             )
-            assert [
-                item for item in record["relationships"] if item[0] is not None
-            ] == [[f"relationship-{suffix}", "before"]]
+            assert sorted(item for item in record["relationships"] if item[0] is not None) == sorted(
+                [[f"relationship-{suffix}", "before"]]
+                + ([[f"relationship-{suffix}", "mismatch"]] if case == "null-and-duplicates" else [])
+            )
             assert int(snapshots.records[0]["count"]) == 0
+            if case == "null-and-duplicates":
+                parity = await query(
+                    """
+                    MATCH (n {group_id:$group_id})
+                    RETURN count(CASE WHEN n:Entity AND n.uuid=$a THEN 1 END) AS originals,
+                           count(CASE WHEN n.name='null-new' THEN 1 END) AS null_nodes,
+                           count(CASE WHEN n._newsroom_snapshot_id=$foreign_snapshot THEN 1 END) AS foreign_snapshots,
+                           count(CASE WHEN n:NewsroomIngestMarker AND n.episode_uuid=$foreign_marker THEN 1 END) AS foreign_markers
+                    """, group_id=group_id, a=f"a-{suffix}", foreign_snapshot=f"foreign-{snapshot_id}",
+                    foreign_marker=f"foreign-{episode_uuid}",
+                )
+                assert dict(parity.records[0]) == {"originals": 2, "null_nodes": 0, "foreign_snapshots": 2, "foreign_markers": 1}
         finally:
             try:
                 await query(
                     """
                     MATCH (n)
-                    WHERE n.group_id=$group_id
+                    WHERE n.group_id=$group_id OR n.uuid=$a
                        OR n.episode_uuid=$episode_uuid
                        OR n._newsroom_snapshot_id=$snapshot_id
                     DETACH DELETE n
                     """,
                     group_id=group_id,
+                    a=f"a-{suffix}",
                     episode_uuid=episode_uuid,
                     snapshot_id=snapshot_id,
                 )
