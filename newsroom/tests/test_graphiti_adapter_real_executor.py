@@ -1544,6 +1544,9 @@ def _guard_fixture_session(driver, lock: asyncio.Lock | None = None):
             await self.commit()
 
     class Session:
+        def __init__(self) -> None:
+            self._config = SimpleNamespace(fetch_size=1000)
+
         async def __aenter__(self):
             return self
 
