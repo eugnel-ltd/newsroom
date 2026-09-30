@@ -335,7 +335,14 @@ def recover_owned_pending(
             # fabricated and a later native tick may resume after lease expiry.
             return None
         finally:
-            await driver.close()
+            try:
+                await asyncio.wait_for(
+                    driver.close(), timeout=GRAPHITI_CLEANUP_TIMEOUT_MS / 1_000,
+                )
+            except TimeoutError:
+                # Closing a connection changes neither retained graph state nor
+                # the verified recovery result; preserve an owner stop as well.
+                pass
 
     return asyncio.run(bounded_recovery())
 

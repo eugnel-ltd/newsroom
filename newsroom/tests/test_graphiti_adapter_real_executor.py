@@ -5385,3 +5385,63 @@ def test_owned_compensation_driver_never_schedules_schema_or_provider_setup(monk
             real._open_compensation_driver()
     asyncio.run(forbidden_async_boundary())
     assert events == ["driver"]
+
+
+@pytest.mark.parametrize("recovery", ("no_owner", "recovered", "owner_stop"))
+def test_owned_compensation_bounds_never_finishing_driver_close_without_changing_result(
+    monkeypatch, recovery,
+):
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.control_plane.veto import VetoError
+
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    digest = digest_canonical({"retained": "input"})
+    marker = GuardMarker(GuardState.RECOVERED_AMBIGUOUS, 1, digest)
+    events = []
+
+    async def never_close():
+        events.append("close")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("close_cancelled")
+
+    class Guard:
+        @staticmethod
+        async def owned_pending_identity(*_args, **_values):
+            events.append("identity")
+            return None if recovery == "no_owner" else ("episode", "episode", 1)
+
+        def __init__(self, *_args, **_values):
+            pass
+
+        async def recover_owned_pending(self, *, owner_stop_check):
+            owner_stop_check()
+            events.append("recovered")
+            return marker
+
+    @contextmanager
+    def authenticated_input(*_args):
+        yield digest
+
+    def stop():
+        if recovery == "owner_stop" and "identity" in events:
+            raise VetoError("owner emergency stop")
+
+    # A cancellable outer child bound proves the defect without hanging pytest.
+    run = asyncio.run
+    monkeypatch.setattr(real.asyncio, "run", lambda child: run(asyncio.wait_for(child, timeout=0.25)))
+    monkeypatch.setattr(real, "GRAPHITI_CLEANUP_TIMEOUT_MS", 10)
+    monkeypatch.setattr(real, "_open_compensation_driver", lambda: SimpleNamespace(close=never_close))
+    monkeypatch.setattr(real, "Neo4jMutationGuard", Guard)
+    arguments = dict(
+        authenticated_input=authenticated_input, owner_stop_check=stop,
+        deadline=now + timedelta(seconds=180), clock=lambda: now,
+    )
+    if recovery == "owner_stop":
+        with pytest.raises(VetoError, match="owner emergency stop"):
+            real.recover_owned_pending(**arguments)
+    else:
+        assert real.recover_owned_pending(**arguments) is (marker if recovery == "recovered" else None)
+    assert events.count("close") == events.count("close_cancelled") == 1
+    assert events.count("recovered") == int(recovery == "recovered")
