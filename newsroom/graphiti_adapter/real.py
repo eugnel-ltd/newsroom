@@ -1467,6 +1467,7 @@ class RealGraphitiAdapter:
         validation_phase = "ENTITY_PROPOSALS"
         validation_error: ExtractionContractError | None = None
         validation_usage: ExtractionUsage | None = None
+        rollback = "UNOBSERVED"
 
         def validation_diagnostic(rollback: str) -> None:
             if validation_error is None:
@@ -1803,7 +1804,6 @@ class RealGraphitiAdapter:
         except (BrokerError, GraphitiAdapterContractError):
             raise
         except ExtractionContractError:
-            validation_diagnostic("UNOBSERVED")
             produced = validated.get("produced")
             if produced is None:
                 raise
@@ -1817,7 +1817,6 @@ class RealGraphitiAdapter:
                     == GraphitiRecoveryClassification.ROLLED_BACK_AMBIGUOUS_EFFECT
                 )
                 rollback = "COMPLETE" if rollback_completed else "INCOMPLETE"
-            validation_diagnostic(rollback)
             produced = validated.get("produced")
             if (
                 produced is not None
@@ -1883,6 +1882,9 @@ class RealGraphitiAdapter:
                 embedding_usage=telemetry.embedding_usage,
                 attempt_receipt=raw,
             )
+
+        finally:
+            validation_diagnostic(rollback)
 
         produced = validated.get("produced")
         if produced is None:

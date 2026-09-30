@@ -5767,3 +5767,32 @@ def test_validation_contract_diagnostic_never_emits_private_error_text(monkeypat
     assert len(records) == 1 and "phase=ENTITY_PROPOSALS" in records[0] and "reason=CONTRACT_INVALID" in records[0]
     assert "rollback=INCOMPLETE" in records[0]
     assert "PRIVATE_SOURCE_SECRET" not in records[0] and len(records[0].encode()) <= 300
+
+@pytest.mark.parametrize("termination", ["guard", "timeout"])
+def test_validation_cause_is_observed_when_secondary_rollback_terminates(monkeypatch, caplog, termination):
+    import logging
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.extraction.types import ExtractionContractError
+    caplog.set_level(logging.WARNING, logger=real.__name__)
+    def invalid_proposals(*args):
+        raise ExtractionContractError("PRIVATE_SOURCE_SECRET")
+    async def interrupted(**values):
+        result = SimpleNamespace(episode=SimpleNamespace(uuid=values["episode_id"]), nodes=(), edges=())
+        try:
+            values["validate_result"](result, values["telemetry"])
+        except ExtractionContractError:
+            if termination == "guard":
+                raise real.GuardError("fixture secondary rollback failure")
+            raise asyncio.TimeoutError
+    monkeypatch.setattr(real, "entity_proposals", invalid_proposals)
+    monkeypatch.setattr(real, "_load_graphiti", lambda: SimpleNamespace())
+    monkeypatch.setattr(real, "openrouter_api_key", lambda: "fixture")
+    monkeypatch.setattr(real, "neo4j_community_password", lambda: "fixture")
+    monkeypatch.setattr(real, "_add_episode", interrupted)
+    produced = RealGraphitiAdapter()._produce(
+        evaluation_attempt_for(("A retained source passage.",)), UtcTimestamp.parse("2026-08-20T00:00:00.000000Z"),
+    )
+    assert produced.failure_code is (ExtractionFailureCode.PRODUCER_INTERNAL_ERROR if termination == "guard" else ExtractionFailureCode.EXECUTION_TIMEOUT)
+    records = [r.getMessage() for r in caplog.records if "graphiti_validation" in r.getMessage()]
+    assert len(records) == 1 and "phase=ENTITY_PROPOSALS" in records[0] and "rollback=UNOBSERVED" in records[0]
+    assert "PRIVATE_SOURCE_SECRET" not in records[0]
