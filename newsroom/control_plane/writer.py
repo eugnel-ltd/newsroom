@@ -691,6 +691,14 @@ class CliProcessError(RuntimeError):
         self.provider_status = provider_status
 
 
+class CliTimeoutError(RuntimeError):
+    """The CLI wall deadline expired; provider completion and usage stay unknown."""
+
+
+class CliEmptyOutputError(RuntimeError):
+    """The CLI exited successfully without a retained provider response."""
+
+
 @dataclass(frozen=True, slots=True)
 class _HermeticWorkspace:
     root: str
@@ -1627,7 +1635,7 @@ def _run(
             provider_dispatched=False,
         ) from exc
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{name} writer timed out") from None
+        raise CliTimeoutError(f"{name} writer timed out") from None
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise CliProcessError(
@@ -1635,7 +1643,7 @@ def _run(
             provider_status=_provider_control_status(detail),
         )
     if not result.stdout.strip():
-        raise RuntimeError("writer returned empty stdout")
+        raise CliEmptyOutputError("writer returned empty stdout")
     return result.stdout
 
 
