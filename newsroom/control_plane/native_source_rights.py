@@ -12,12 +12,13 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from typing import ContextManager
 from threading import RLock
+import json
 import urllib.request
 
 from lxml import html
 
-from newsroom.authority import HydrationRequest, ObjectAdmissionId, ObjectAdmissionRequest
-from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
+from newsroom.authority import HydrationRequest, ObjectAdmissionId, ObjectAdmissionRequest, UtcTimestamp
+from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical, validate_sha256_digest
 from newsroom.increment9.proving import SOURCE_URLS
 
 from .govuk_evidence import _NoRedirect
@@ -131,22 +132,26 @@ class RightsSnapshotReference:
     assessment_blob_digest: str
     observation_admission_id: str
     observation_blob_digest: str
+    observation_source_id: str | None = None
+    observation_member_digest: str | None = None
 
     def __post_init__(self) -> None:
-        from newsroom.authority.canonical import validate_sha256_digest
         ObjectAdmissionId.parse(self.assessment_admission_id)
         ObjectAdmissionId.parse(self.observation_admission_id)
         validate_sha256_digest(self.assessment_blob_digest)
         validate_sha256_digest(self.observation_blob_digest)
+        if self.observation_source_id is not None or self.observation_member_digest is not None:
+            if self.observation_source_id not in SOURCE_URLS:
+                raise ValueError("rights observation source selector differs")
+            validate_sha256_digest(self.observation_member_digest)
 
 
-def retain_rights_snapshot(
-    *, objects, proof, source_id: str, definition_url: str,
+def _rights_snapshot_values(
+    *, source_id: str, definition_url: str,
     assessment: PublicationRightsAssessment, observed_at: str,
     reason: str, observations: tuple[tuple[str, str, str, str], ...],
     govuk_semantic_evidence: dict | None = None,
-) -> RightsSnapshotReference:
-    """Retain the current observation and its stable semantic assessment."""
+) -> tuple[dict, dict]:
     if govuk_semantic_evidence is not None:
         from .govuk_rights import POLICY_DIGEST as GOVUK_POLICY, _govuk_semantic_evidence
         expected = _govuk_semantic_evidence(source_id=source_id, definition_url=definition_url)
@@ -155,15 +160,12 @@ def retain_rights_snapshot(
                 or assessment.policy_digest != GOVUK_POLICY
                 or assessment.evidence_digest != digest_canonical(expected)):
             raise ValueError("GOV.UK semantic rights binding differs")
-    observation_bytes = canonical_json_bytes({
+    observation_value = {
         "schema": "hermes-native-rights-observation-v1",
         "source_id": source_id, "definition_url": definition_url,
         "observed_at": observed_at, "reason": reason,
         "observations": observations,
-    })
-    observation = objects.admit(ObjectAdmissionRequest(
-        "evidence.source", f"native-rights-observation:{digest_bytes(observation_bytes)}",
-    ), observation_bytes, proof=proof).admission
+    }
     assessment_value = {
         "schema": "hermes-native-rights-assessment-v1",
         "source_id": source_id, "definition_url": definition_url,
@@ -180,20 +182,205 @@ def retain_rights_snapshot(
         assessment_value["schema"] = "hermes-native-rights-assessment-v2"
         del assessment_value["evidence"]
         assessment_value["semantic_evidence"] = govuk_semantic_evidence
-    assessment_bytes = canonical_json_bytes(assessment_value)
+    return observation_value, assessment_value
+
+
+def _retain_assessment(*, objects, proof, value):
+    assessment_bytes = canonical_json_bytes(value)
     retained = objects.admit(ObjectAdmissionRequest(
-        "evidence.source", f"native-rights-assessment:{assessment.record_id}",
+        "evidence.source", f"native-rights-assessment:{value['record_id']}",
     ), assessment_bytes, proof=proof).admission
-    for admission, raw in ((observation, observation_bytes), (retained, assessment_bytes)):
-        hydrated = objects.rehydrate(
-            HydrationRequest(admission.admission_id, "evidence.source"), proof=proof,
-        )
-        if hydrated.data != raw:
-            raise ValueError("retained source rights snapshot differs")
+    hydrated = objects.rehydrate(
+        HydrationRequest(retained.admission_id, "evidence.source"), proof=proof,
+    )
+    if hydrated.data != assessment_bytes:
+        raise ValueError("retained source rights snapshot differs")
+    return retained
+
+
+def retain_rights_snapshot(
+    *, objects, proof, source_id: str, definition_url: str,
+    assessment: PublicationRightsAssessment, observed_at: str,
+    reason: str, observations: tuple[tuple[str, str, str, str], ...],
+    govuk_semantic_evidence: dict | None = None,
+) -> RightsSnapshotReference:
+    """Retain an individual observation, including the legacy read contract."""
+    observation_value, assessment_value = _rights_snapshot_values(
+        source_id=source_id, definition_url=definition_url, assessment=assessment,
+        observed_at=observed_at, reason=reason, observations=observations,
+        govuk_semantic_evidence=govuk_semantic_evidence,
+    )
+    observation_bytes = canonical_json_bytes(observation_value)
+    observation = objects.admit(ObjectAdmissionRequest(
+        "evidence.source", f"native-rights-observation:{digest_bytes(observation_bytes)}",
+    ), observation_bytes, proof=proof).admission
+    retained = _retain_assessment(objects=objects, proof=proof, value=assessment_value)
+    hydrated = objects.rehydrate(
+        HydrationRequest(observation.admission_id, "evidence.source"), proof=proof,
+    )
+    if hydrated.data != observation_bytes:
+        raise ValueError("retained source rights snapshot differs")
     return RightsSnapshotReference(
         str(retained.admission_id), retained.blob.blob_digest,
         str(observation.admission_id), observation.blob.blob_digest,
     )
+
+
+_OBSERVATION_SCHEMA = "hermes-native-rights-observation-v1"
+_BUNDLE_SCHEMA = "hermes-native-rights-observation-bundle-v1"
+
+
+def _validate_observation_member(value, *, source_id, definition_url):
+    if (type(value) is not dict or set(value) != {
+            "schema", "source_id", "definition_url", "observed_at", "reason", "observations",
+        } or value["schema"] != _OBSERVATION_SCHEMA
+        or value["source_id"] != source_id or value["definition_url"] != definition_url
+        or type(value["reason"]) is not str or not value["reason"]
+        or type(value["observations"]) not in (list, tuple)):
+        raise ValueError("rights observation member binding differs")
+    UtcTimestamp.parse(value["observed_at"])
+    urls = []
+    for item in value["observations"]:
+        if (type(item) not in (list, tuple) or len(item) != 4
+            or any(type(field) is not str for field in item)
+            or not item[0]):
+            raise ValueError("rights observation raw reference differs")
+        validate_sha256_digest(item[1])
+        ObjectAdmissionId.parse(item[2])
+        urls.append(item[0])
+    if len(urls) != len(set(urls)):
+        raise ValueError("rights observation raw inventory differs")
+
+
+def _bundle_members(value):
+    if (type(value) is not dict or set(value) != {"schema", "members"}
+        or value["schema"] != _BUNDLE_SCHEMA or type(value["members"]) is not list):
+        raise ValueError("rights observation bundle shape differs")
+    members = {}
+    for entry in value["members"]:
+        if (type(entry) is not dict or set(entry) != {"source_id", "member_digest", "member"}
+            or type(entry["source_id"]) is not str
+            or entry["source_id"] not in SOURCE_URLS or entry["source_id"] in members):
+            raise ValueError("rights observation bundle inventory differs")
+        source_id = entry["source_id"]
+        _validate_observation_member(entry["member"], source_id=source_id,
+                                     definition_url=SOURCE_URLS[source_id])
+        if digest_bytes(canonical_json_bytes(entry["member"])) != entry["member_digest"]:
+            raise ValueError("rights observation member digest differs")
+        members[source_id] = entry
+    if set(members) != set(SOURCE_URLS) or list(members) != sorted(members):
+        raise ValueError("rights observation bundle inventory differs")
+    return members
+
+
+def retain_rights_snapshot_bundle(*, objects, proof, snapshots, stop_check):
+    """Retain every fresh source fact in one immutable portfolio envelope."""
+    if type(snapshots) is not dict or set(snapshots) != set(SOURCE_URLS):
+        raise ValueError("rights observation bundle inventory differs")
+    values = {source: _rights_snapshot_values(source_id=source, **snapshots[source])
+              for source in sorted(snapshots)}
+    bundle = {"schema": _BUNDLE_SCHEMA, "members": [
+        {"source_id": source, "member_digest": digest_bytes(canonical_json_bytes(observation)),
+         "member": observation}
+        for source, (observation, _) in values.items()
+    ]}
+    members = _bundle_members(bundle)
+    stop_check()
+    raw = canonical_json_bytes(bundle)
+    admission = objects.admit(ObjectAdmissionRequest(
+        "evidence.source", f"native-rights-observation-bundle:{digest_bytes(raw)}",
+    ), raw, proof=proof).admission
+    hydrated = objects.rehydrate(
+        HydrationRequest(admission.admission_id, "evidence.source"), proof=proof,
+    )
+    if hydrated.data != raw:
+        raise ValueError("retained rights observation bundle differs")
+    result = {}
+    for source, (_, assessment) in values.items():
+        stop_check()
+        retained = _retain_assessment(objects=objects, proof=proof, value=assessment)
+        result[source] = RightsSnapshotReference(
+            str(retained.admission_id), retained.blob.blob_digest,
+            str(admission.admission_id), admission.blob.blob_digest,
+            source, members[source]["member_digest"],
+        )
+    return result
+
+
+def read_rights_observation(*, objects, proof, reference, source_id, definition_url):
+    """Recheck current governed authority and the exact selected fresh fact."""
+    if type(reference) is not RightsSnapshotReference:
+        raise ValueError("rights observation reference differs")
+    raw = objects.rehydrate(HydrationRequest(
+        ObjectAdmissionId.parse(reference.observation_admission_id), "evidence.source",
+    ), proof=proof).data
+    if digest_bytes(raw) != reference.observation_blob_digest:
+        raise ValueError("rights observation blob digest differs")
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("rights observation duplicate field")
+            value[key] = item
+        return value
+    try:
+        value = json.loads(raw, object_pairs_hook=unique_object)
+        if canonical_json_bytes(value) != raw:
+            raise ValueError("rights observation bytes are not canonical")
+        if type(value) is dict and value.get("schema") == _BUNDLE_SCHEMA:
+            members = _bundle_members(value)
+            if (reference.observation_source_id != source_id
+                or source_id not in members
+                or members[source_id]["member_digest"] != reference.observation_member_digest):
+                raise ValueError("rights observation selector differs")
+            value = members[source_id]["member"]
+        elif reference.observation_source_id is not None:
+            raise ValueError("rights observation selector requires a bundle")
+        _validate_observation_member(value, source_id=source_id, definition_url=definition_url)
+    except (TypeError, KeyError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("rights observation bytes differ") from exc
+    return value
+
+
+def validate_rights_observation_selector(value, *, source_id=None, definition_url=None):
+    """Keep legacy packets valid; bind every new packet's member selector."""
+    fields = {"observation_source_id", "observation_member_digest"}
+    present = fields.intersection(value)
+    if not present:
+        return
+    if (present != fields or type(value["observation_source_id"]) is not str
+        or value["observation_source_id"] not in SOURCE_URLS
+        or value["observation_source_id"] != value.get("source_id")
+        or (source_id is not None and value["observation_source_id"] != source_id)
+        or (definition_url is not None and value.get("source_url") != definition_url)):
+        raise ValueError("rights observation selector differs")
+    validate_sha256_digest(value["observation_member_digest"])
+
+
+def require_rights_assessment(*, objects, proof, reference, assessment, observation):
+    """A current rights packet must not reference revoked or rebound evidence."""
+    raw = objects.rehydrate(HydrationRequest(
+        ObjectAdmissionId.parse(reference.assessment_admission_id), "evidence.source",
+    ), proof=proof).data
+    if digest_bytes(raw) != reference.assessment_blob_digest:
+        raise ValueError("rights assessment blob digest differs")
+    try:
+        value = json.loads(raw)
+        semantic = None
+        if type(value) is dict and value.get("schema") == "hermes-native-rights-assessment-v2":
+            from .govuk_rights import _govuk_semantic_evidence
+            semantic = _govuk_semantic_evidence(
+                source_id=observation["source_id"], definition_url=observation["definition_url"],
+            )
+        _, expected = _rights_snapshot_values(
+            source_id=observation["source_id"], definition_url=observation["definition_url"],
+            assessment=assessment, observed_at=observation["observed_at"], reason=observation["reason"],
+            observations=observation["observations"], govuk_semantic_evidence=semantic,
+        )
+        if canonical_json_bytes(expected) != raw:
+            raise ValueError("rights assessment is not the current source assessment")
+    except (TypeError, KeyError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("rights assessment bytes differ") from exc
 
 
 class NativePortfolioRights:

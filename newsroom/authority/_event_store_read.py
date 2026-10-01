@@ -265,8 +265,8 @@ class _EventStoreReadMixin:
             ).fetchone()
             if row is None:
                 raise KeyError(command_id)
-            data = bytes(row["result_bytes"])
             digest = str(row["result_digest"])
+            data = self._logical_result_bytes(bytes(row["result_bytes"]), digest, command_id=str(row["command_id"]))
             self._decode_result(data, digest, replayed=False)
             return CommandResultRecord(
                 command_id=str(row["command_id"]),
@@ -361,15 +361,24 @@ class _EventStoreReadMixin:
         )
 
     def _request_record_from_row(
-        self, row: sqlite3.Row
+        self, row: sqlite3.Row, *, connection: sqlite3.Connection | None = None,
+        selected_backing: dict | None = None, verified_definitions: dict | None = None,
+        verified_schemas: dict | None = None,
     ) -> AuthorizationRequestRecord:
         from .authorization_request_storage_migrations import (
             authorization_request_value_from_v38_row,
         )
 
         try:
-            value = authorization_request_value_from_v38_row(row)
-            data = canonical_json_bytes(value)
+            if bytes(row["storage_request_marker"]) == b"v41":
+                from .command_bound_storage import command_request_value
+                value = command_request_value(connection or self._connection, row,
+                    selected_backing=selected_backing, verified_definitions=verified_definitions,
+                    verified_schemas=verified_schemas)
+                data = canonical_json_bytes(value)
+            else:
+                value = authorization_request_value_from_v38_row(row)
+                data = canonical_json_bytes(value)
         except (KeyError, TypeError, ValueError) as exc:
             raise AuthorityPersistenceError(
                 "stored authorization request representation differs"

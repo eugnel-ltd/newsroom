@@ -350,22 +350,30 @@ class _EventStoreBase:
     def _validate_immutable_records(
         self, conn: sqlite3.Connection
     ) -> None:
-        for row in conn.execute(
-            "SELECT * FROM payload_schema_contracts"
-        ):
-            self._schema_record_from_row(row)
-        for row in conn.execute(
-            "SELECT * FROM command_definitions"
-        ):
-            self._definition_record_from_row(row)
-        for row in conn.execute(
-            "SELECT * FROM authentication_contexts"
-        ):
+        from .command_bound_storage import (
+            COMMAND_REQUEST_MARKER, COMMAND_RESULT_PREFIX, COMMAND_RESULT_SELECT, command_request_rows,
+            restore_command_result, selected_command_request_backing,
+        )
+        verified_schemas = {}
+        for row in conn.execute("SELECT * FROM payload_schema_contracts"):
+            record = self._schema_record_from_row(row)
+            verified_schemas[record.contract_digest] = (
+                record.canonical_bytes, self._decode_canonical(record.canonical_bytes),
+            )
+        verified_definitions = {}
+        for row in conn.execute("SELECT * FROM command_definitions"):
+            record = self._definition_record_from_row(row)
+            verified_definitions[record.definition_digest] = (
+                record.canonical_bytes, self._decode_canonical(record.canonical_bytes),
+            )
+        for row in conn.execute("SELECT * FROM authentication_contexts"):
             self._authentication_record_from_row(row)
-        for row in conn.execute(
-            "SELECT * FROM authorization_requests"
-        ):
-            self._request_record_from_row(row)
+        # Local verified definitions live for this validation operation only.
+        # Each joined row still checks their exact retained bytes and indexes.
+        for row in command_request_rows(conn):
+            backing = selected_command_request_backing(row) if bytes(row["storage_request_marker"]) == COMMAND_REQUEST_MARKER else None
+            self._request_record_from_row(row, connection=conn, selected_backing=backing,
+                verified_definitions=verified_definitions, verified_schemas=verified_schemas)
         for row in conn.execute("SELECT * FROM authorization_scope_contents"):
             self._scope_content_from_row(row)
         for row in conn.execute(
@@ -378,15 +386,16 @@ class _EventStoreBase:
                 row,
                 selected_scope_bytes=row["selected_scope_canonical_bytes"],
             )
-        for row in conn.execute(
-            "SELECT command_id,result_digest,result_bytes "
-            "FROM authority_commands"
-        ):
-            self._decode_result(
-                bytes(row["result_bytes"]),
-                str(row["result_digest"]),
-                replayed=False,
-            )
+        cursor = conn.execute(COMMAND_RESULT_SELECT)
+        for row in cursor:
+            data = bytes(row["result_bytes"])
+            if data.startswith(COMMAND_RESULT_PREFIX):
+                event = {name: row[f"selected_{name}"] for name in (
+                    "command_id", "aggregate_type", "aggregate_id", "aggregate_version", "ledger_seq", "event_id",
+                )}
+                data = restore_command_result(row, data, event_row=event)
+            self._decode_result(data, str(row["result_digest"]), replayed=False,
+                connection=conn, command_id=str(row["command_id"]))
 
     def _validate_registry_coverage(
         self, conn: sqlite3.Connection

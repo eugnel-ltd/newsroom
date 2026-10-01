@@ -409,6 +409,14 @@ def test_trigger_preserving_fk_clean_aggregate_rewrite_fails_closed(
     triggers = connection.execute(
         "SELECT name,sql FROM sqlite_schema WHERE type='trigger' ORDER BY name"
     ).fetchall()
+    from newsroom.authority.command_bound_storage import command_request_bytes, validated_command_result_bytes
+    from newsroom.authority import AuthorityPersistenceError
+    original_result_bytes = validated_command_result_bytes(connection, command)
+    original_request_row = connection.execute(
+        "SELECT * FROM authorization_requests WHERE request_digest=?",
+        (command["authorization_request_digest"],),
+    ).fetchone()
+    original_request_bytes = command_request_bytes(connection, original_request_row)
 
     def rewritten_row(row: sqlite3.Row, **changes: object) -> tuple[object, ...]:
         return tuple(
@@ -453,16 +461,17 @@ def test_trigger_preserving_fk_clean_aggregate_rewrite_fails_closed(
         == triggers
     )
     assert command["aggregate_id"] == expected
-    assert expected.encode() in bytes(command["result_bytes"])
+    assert expected.encode() in original_result_bytes
     request = connection.execute(
         "SELECT storage_request_residual FROM authorization_requests "
         "WHERE request_digest=?",
         (command["authorization_request_digest"],),
     ).fetchone()
-    assert expected.encode() in bytes(request[0])
+    assert bytes(request[0]) == bytes(original_request_row["storage_request_residual"])
+    assert expected.encode() in original_request_bytes
     connection.close()
 
-    with pytest.raises((AuthoritySchemaError, ValueError), match="aggregate|lineage"):
+    with pytest.raises((AuthorityPersistenceError, ValueError), match="aggregate|lineage"):
         open_event_hypothesis_lineage_authority(**args)
 
 

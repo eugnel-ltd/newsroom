@@ -85,7 +85,7 @@ def _settle(service, envelope, allocation, *, zero):
     )
 
 
-def _recovered_ambiguous_pattern(service, policy, shape, unit):
+def _recovered_ambiguous_pattern(service, policy, shape, unit, *, bundle_members=(False, False)):
     first, allocation = _attempt(service, policy, shape, unit, 1)
     _settle(service, first, allocation, zero=True)
     with sqlite3.connect(service.path) as connection:
@@ -139,6 +139,11 @@ def _recovered_ambiguous_pattern(service, policy, shape, unit):
             "actual_gbp_microunits": 0, "unused_reservation_released": True,
         },
     }
+    if bundle_members[0]:
+        original["dispatch_rights"].update(
+            observation_source_id=unit.source_id,
+            observation_member_digest=usage_module.digest_canonical({"member": "original"}),
+        )
     connection = connect(service.path)
     insert_graphiti_attempt_receipt(
         connection, ingest_id=unit.ingest_id, attempt_number=1,
@@ -188,6 +193,11 @@ def _recovered_ambiguous_pattern(service, policy, shape, unit):
             },
         },
     }
+    if bundle_members[1]:
+        replay["dispatch_rights"].update(
+            observation_source_id=unit.source_id,
+            observation_member_digest=usage_module.digest_canonical({"member": "replay"}),
+        )
     replay_digest = insert_graphiti_attempt_receipt(
         connection, ingest_id=unit.ingest_id, attempt_number=2,
         outcome="FAILED", receipt=replay,

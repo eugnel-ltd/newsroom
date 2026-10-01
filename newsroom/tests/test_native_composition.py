@@ -623,13 +623,23 @@ def test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(
         ):
             raise AssertionError("unqualified composition entered")
     assert _RetrievalProjection.bootstraps == 2
-    assert stops == ["checked"] * 5  # Three opens and two bounded ACK turns.
+    # Three opens, eleven bounded observation/assessment stop checks per open,
+    # and two bounded ACK turns. No network/provider stage skips its fence.
+    assert stops == ["checked"] * 38
     assert fences == ["entered"] * 8
 
 
 def test_rights_refresh_registers_and_binds_a_newly_permitted_source(
     tmp_path, monkeypatch,
 ) -> None:
+    # This registration/retrieval-key fixture supplies raw reference identities,
+    # not CAS bytes. The governed reader has its own real-runtime bundle tests.
+    def current_observation(**arguments):
+        entry = permitted[arguments["source_id"]]
+        return {"observed_at": entry.observed_at, "reason": entry.reason,
+                "observations": entry.observations}
+    monkeypatch.setattr(native_composition, "read_rights_observation", current_observation)
+    monkeypatch.setattr(native_composition, "require_rights_assessment", lambda **_: None)
     unavailable = {
         source_id: native_source_rights.SourceTermsEvidence(
             source_id, NOW.isoformat(), "SOURCE_TERMS_UNAVAILABLE", (),

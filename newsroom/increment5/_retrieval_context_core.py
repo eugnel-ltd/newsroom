@@ -16,6 +16,7 @@ import sqlite3
 import stat
 import threading
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1719,7 +1720,7 @@ class RetrievalContextJournal:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             self._initialise_schema(connection)
 
     @staticmethod
@@ -1754,7 +1755,7 @@ class RetrievalContextJournal:
         _require_digest(request_digest, "journal_request_digest")
         if not callable(producer):
             raise TypeError("journal producer must be callable")
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_purge_safe_journal(connection)
 
@@ -1901,7 +1902,7 @@ class RetrievalContextJournal:
             )
 
         retained: list[RetrievalContextPurgeReceipt] = []
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_purge_safe_journal(connection)
             inventories: dict[
