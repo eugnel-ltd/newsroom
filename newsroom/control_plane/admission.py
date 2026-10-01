@@ -1068,7 +1068,16 @@ class DeterministicWriteAdmission:
             or item.claim not in package.passages[item.passage_index]
             or item.supporting_excerpt not in package.passages[item.passage_index]
             or not set(item.source_ids).issubset(package.source_ids)
-            or item.status is not GovernedClaimStatus.CONFIRMED_FACT
+            or (
+                item.status is not GovernedClaimStatus.CONFIRMED_FACT
+                and not (
+                    item.claim_role == "CONTEXT"
+                    and item.status in {
+                        GovernedClaimStatus.EXPRESSLY_PROVISIONAL_FACT,
+                        GovernedClaimStatus.CONTEXTUAL_BACKGROUND,
+                    }
+                )
+            )
             or not _valid_zh_hant_hk_rendering(item)
             or any(
                 entity not in item.claim
