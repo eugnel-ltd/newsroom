@@ -134,10 +134,19 @@ class NativePipeline:
             work_deadline=self._monotonic_clock() + self._reassessment_quantum,
         )
         self._drain_between_work()
-        # Keep LAND order: progress can be a no-dispatch route HOLD, and later
-        # arrivals must not starve retained pending work.
+        # Reuse one current/archive preference for pending and ready work.
+        # Archive turns keep LAND order so later arrivals cannot starve history.
+        if not self._spill_archive_turn:
+            pending_revisions.sort(key=_source_update_time, reverse=True)
         pending_revisions = tuple(pending_revisions)
         fresh_deadline = self._monotonic_clock() + self._reassessment_quantum
+        pending_turn_taken = False
+
+        def defer_pending(unit) -> bool:
+            nonlocal pending_turn_taken
+            deferred = self._monotonic_clock() >= fresh_deadline
+            pending_turn_taken |= not deferred
+            return deferred
 
         # Extraction stays per ingest; projection remains one complete cohort.
         pending = tuple(unit for _, units in pending_revisions for unit in units)
@@ -147,7 +156,7 @@ class NativePipeline:
             try:
                 results = self._graphiti.advance(
                     pending, cycle_id=cycle_id,
-                    defer_before_unit=lambda _: self._monotonic_clock() >= fresh_deadline,
+                    defer_before_unit=defer_pending,
                 )
                 if len(results) != len(pending) or {item.ingest_id for item in results} != {unit.ingest_id for unit in pending}:
                     raise ValueError("native Graphiti continuation partition differs")
@@ -189,6 +198,7 @@ class NativePipeline:
                             else "MULTIPLE_GRAPHITI_HOLDS"
                         )
                     self._journal.advance(revision_id, stage="GRAPHITI_COMPLETE" if complete else "GRAPHITI_HOLD", facts=facts)
+                    pending_turn_taken |= complete
                 self._drain_between_work()
             except OperatorDrainRequested:
                 raise
@@ -220,9 +230,10 @@ class NativePipeline:
             ready_spill + tuple(reassessments),
             work_deadline=self._monotonic_clock() + self._reassessment_quantum,
         )
-        if len(deferred) < len(ready_spill):
-            # Alternate news recency with LAND/FIFO only after an actual spill
-            # turn. Restart resets this preference, never retained work.
+        if pending_turn_taken or len(deferred) < len(ready_spill):
+            # Consume the shared preference at most once after eligible pending
+            # work, newly completed admission or an actual ready-spill turn.
+            # Restart resets this preference, never retained work.
             self._spill_archive_turn = not self._spill_archive_turn
         self._drain_between_work()
         states = Counter(
