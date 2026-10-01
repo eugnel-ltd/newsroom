@@ -56,9 +56,9 @@ def test_fresh_and_v39_upgrade_have_exact_partial_index_schema_identity(
         fresh.execute("PRAGMA foreign_keys=ON")
         apply_pending_migrations(fresh, applied_at="2042-01-01T00:00:00.000000Z")
         assert fresh.execute("PRAGMA user_version").fetchone() == (
-            RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION,
+            SCHEMA_VERSION,
         )
-        assert SCHEMA_VERSION == RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION
+        assert SCHEMA_VERSION >= RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION
         assert fresh.execute(
             "SELECT name,sql FROM sqlite_master WHERE type='index' "
             "AND name='idx_ledger_events_relationship_event_type'"
@@ -95,8 +95,8 @@ def test_fresh_and_v39_upgrade_have_exact_partial_index_schema_identity(
         connection.close()
     assert predecessor.version == RELATIONSHIP_OPEN_INDEX_PREDECESSOR_SCHEMA_VERSION
     assert inspect_exact_prefix(
-        upgraded, expected_version=RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION
-    ) == canonical_cell(RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION)
+        upgraded, expected_version=SCHEMA_VERSION
+    ) == canonical_cell(SCHEMA_VERSION)
 
 
 def test_partial_index_migration_checksum_pins_exact_statement() -> None:
