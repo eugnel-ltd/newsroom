@@ -237,6 +237,14 @@ from .graphiti_recovered_ambiguous_migrations import (
     GRAPHITI_RECOVERED_AMBIGUOUS_MIGRATION_STATEMENTS,
     GRAPHITI_RECOVERED_AMBIGUOUS_SCHEMA_VERSION,
 )
+from .command_bound_storage_migrations import (
+    COMMAND_BOUND_STORAGE_MIGRATION,
+    COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM,
+    COMMAND_BOUND_STORAGE_MIGRATION_NAME,
+    COMMAND_BOUND_STORAGE_MIGRATION_STATEMENTS,
+    COMMAND_BOUND_STORAGE_SCHEMA_VERSION,
+    migrate_command_bound_storage,
+)
 from .relationship_open_index_migrations import (
     RELATIONSHIP_OPEN_INDEX_MIGRATION,
     RELATIONSHIP_OPEN_INDEX_MIGRATION_CHECKSUM,
@@ -350,7 +358,7 @@ from .triage_work_item_migrations import (
 )
 
 BASE_SCHEMA_VERSION = 1
-SCHEMA_VERSION = RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION
+SCHEMA_VERSION = COMMAND_BOUND_STORAGE_SCHEMA_VERSION
 ISOLATED_SCHEMA_VERSION_RESERVATIONS = frozenset({33})
 MIGRATION_NAME = "authority_event_foundation_v1"
 
@@ -1720,6 +1728,17 @@ def apply_pending_migrations(conn: sqlite3.Connection, *, applied_at: str) -> No
                 ),
             )
             current = RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION
+        if current == RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION:
+            migrate_command_bound_storage(conn, expected_history=tuple(
+                (r.version, r.name, r.checksum) for r in MIGRATIONS
+                if r.version <= RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION
+            ))
+            conn.execute(
+                "INSERT INTO authority_migrations(version,name,checksum,applied_at) VALUES(?,?,?,?)",
+                (COMMAND_BOUND_STORAGE_SCHEMA_VERSION, COMMAND_BOUND_STORAGE_MIGRATION_NAME,
+                 COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM, applied_at),
+            )
+            current = COMMAND_BOUND_STORAGE_SCHEMA_VERSION
         # fmt: on
         conn.execute(f"PRAGMA user_version={current}")
         conn.execute("COMMIT")
@@ -1769,6 +1788,7 @@ MIGRATIONS: tuple[MigrationRecord | object, ...] = (
     AUTHORIZATION_REQUEST_STORAGE_MIGRATION,
     GRAPHITI_RECOVERED_AMBIGUOUS_MIGRATION,
     RELATIONSHIP_OPEN_INDEX_MIGRATION,
+    COMMAND_BOUND_STORAGE_MIGRATION,
 )
 
 
@@ -1965,6 +1985,11 @@ EXPECTED_MIGRATION_HISTORY: tuple[tuple[int, str, str], ...] = (
         RELATIONSHIP_OPEN_INDEX_SCHEMA_VERSION,
         RELATIONSHIP_OPEN_INDEX_MIGRATION_NAME,
         RELATIONSHIP_OPEN_INDEX_MIGRATION_CHECKSUM,
+    ),
+    (
+        COMMAND_BOUND_STORAGE_SCHEMA_VERSION,
+        COMMAND_BOUND_STORAGE_MIGRATION_NAME,
+        COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM,
     ),
 )
 # fmt: on

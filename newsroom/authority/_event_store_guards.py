@@ -4,6 +4,7 @@ import sqlite3
 
 from ._capability import _AuthorizedCommandGrant
 from .canonical import canonical_json_bytes, digest_bytes, digest_canonical
+from .command_bound_storage import COMMAND_REQUEST_MARKER, pending_command_request_bytes
 from .persistence import (
     AuthorityPersistenceError,
     CommandDefinitionRecord,
@@ -55,6 +56,7 @@ class _ExactAuthorityGuards:
         request: object,
         decision: object,
         recorded_at: str,
+        pending_command_id: str | None = None,
     ) -> None:
         super()._persist_security_records(  # type: ignore[misc]
             conn,
@@ -62,6 +64,7 @@ class _ExactAuthorityGuards:
             request=request,
             decision=decision,
             recorded_at=recorded_at,
+            pending_command_id=pending_command_id,
         )
         expected = (
             (
@@ -98,7 +101,9 @@ class _ExactAuthorityGuards:
             retained_bytes = None if row is None else (
                 self._authentication_record_from_row(row).canonical_bytes
                 if table == "authentication_contexts"
-                else self._request_record_from_row(row).canonical_bytes
+                else pending_command_request_bytes(row, expected_bytes, pending_command_id)
+                if pending_command_id is not None and bytes(row["storage_request_marker"]) == COMMAND_REQUEST_MARKER
+                else self._request_record_from_row(row, connection=conn).canonical_bytes
             )
             if (
                 retained_bytes != expected_bytes
@@ -566,6 +571,7 @@ class _ExactAuthorityGuards:
                 bytes(command["result_bytes"]),
                 str(command["result_digest"]),
                 replayed=False,
+                command_id=str(command["command_id"]),
             )
             if (
                 result.command_id,

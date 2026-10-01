@@ -30,7 +30,7 @@ def _prefix(tmp_path, monkeypatch, *, count=15, admission=False, allocated=False
         for index, unit in enumerate(units)
     }
     candidates = {version.version_id: version for version in versions.values()}
-    lookups, batches, ordinary = [], [], []
+    lookups, batches, ordinary, version_batches = [], [], [], []
     for index, unit in enumerate(units):
         version = versions[unit.revision_id]
         journal.land((unit,))
@@ -48,13 +48,18 @@ def _prefix(tmp_path, monkeypatch, *, count=15, admission=False, allocated=False
         lookups.append(version_id)
         return candidates[version_id]
 
+    def candidate_versions(version_ids):
+        version_batches.append(version_ids)
+        lookups.extend(version_ids)
+        return tuple(candidates.get(version_id) for version_id in version_ids)
+
     def batch(selected):
         batches.append(selected)
         return usage.retained_pre_dispatch_failure_many(selected)
 
     continuation = NativePublicationContinuation(
         journal=journal,
-        runtime=NS(authority=NS(candidate_version=candidate_version), ingress=object(),
+        runtime=NS(authority=NS(candidate_version=candidate_version, candidate_versions=candidate_versions), ingress=object(),
                    publication=object(), policies=object(), proof=object()),
         evidence_controller=object.__new__(NativeEvidenceController), sources={},
         assessment_pre_dispatch_failure=usage.retained_pre_dispatch_failure,
@@ -79,7 +84,20 @@ def _prefix(tmp_path, monkeypatch, *, count=15, admission=False, allocated=False
     return NS(pipeline=pipeline, journal=journal, connection=connection, service=service,
               usage=usage, units=units, versions=versions, candidates=candidates, calls=calls,
               dispositions=dispositions, lookups=lookups, batches=batches, ordinary=ordinary,
-              continuation=continuation)
+              continuation=continuation, version_batches=version_batches)
+
+
+def test_eighty_five_recovery_candidates_use_one_authority_snapshot(tmp_path, monkeypatch):
+    context = _prefix(tmp_path, monkeypatch, count=85, admission=True)
+    try:
+        report = context.pipeline.tick(cycle_id="finite-authority-recovery")
+        expected = tuple(version.version_id for version in context.versions.values())
+        assert context.version_batches == [expected]
+        assert context.lookups == list(expected)
+        assert report.revision_states == {"EVIDENCE_HOLD": 85}
+        assert not context.ordinary
+    finally:
+        context.connection.close()
 
 
 @pytest.mark.parametrize("admission", (False, True))
@@ -126,7 +144,7 @@ def test_fifteen_interrupted_candidates_share_one_global_walk_and_exact_transiti
         context.connection.close()
 
 
-def test_allocated_unknown_and_protected_candidates_remain_ordinary_before_fresh_work(tmp_path, monkeypatch):
+def test_checked_allocated_denial_skips_duplicate_while_unknown_and_protected_remain_ordinary(tmp_path, monkeypatch):
     context = _prefix(tmp_path, monkeypatch, count=4, allocated=True)
     allocated, unknown, started, publishing = context.units
     context.candidates.pop(context.versions[unknown.revision_id].version_id)
@@ -137,7 +155,7 @@ def test_allocated_unknown_and_protected_candidates_remain_ordinary_before_fresh
     before = dict(context.journal.progress)
     try:
         context.pipeline.tick(cycle_id="unknown-before-fresh")
-        assert context.ordinary == [unit.revision_id for unit in context.units]
+        assert context.ordinary == [unit.revision_id for unit in (unknown, started, publishing)]
         assert len(context.batches) == 1 and len(context.batches[0]) == 1
         assert context.batches[0][0] == context.versions[allocated.revision_id]
         assert context.journal.progress[allocated.revision_id] == before[allocated.revision_id]
@@ -159,7 +177,7 @@ def test_unrelated_global_corruption_denies_all_prefix_transitions(tmp_path, mon
         report = context.pipeline.tick(cycle_id="global-integrity-denial")
         assert report.revision_states == {"ASSESSMENT_INTERRUPTED": 3}
         assert context.journal.progress == before
-        assert context.ordinary == [unit.revision_id for unit in context.units]
+        assert not context.ordinary
         assert len(context.batches) == 1
     finally:
         context.connection.close()
@@ -208,8 +226,8 @@ def test_prefix_bounds_preserve_unattempted_facts_and_reprove_next_tick(tmp_path
         context.pipeline.tick(cycle_id="fresh-proof-after-mutation")
         assert len(context.batches) == 2
         assert all(context.journal.progress[unit.revision_id] == before[unit.revision_id] for unit in context.units[1:])
-        assert context.ordinary.count(context.units[1].revision_id) == 1
-        assert context.ordinary.count(context.units[2].revision_id) == 1
+        assert context.ordinary.count(context.units[1].revision_id) == 0
+        assert context.ordinary.count(context.units[2].revision_id) == 0
     finally:
         context.connection.close()
 
@@ -228,13 +246,13 @@ def test_predispatch_atomic_read_overrun_makes_progress_before_next_tick(
             **context.journal.progress[unit.revision_id]["facts"], "acquisition_attempt_count": 3,
         })
     before = dict(context.journal.progress)
-    candidate_version = context.continuation._runtime.authority.candidate_version
+    candidate_versions = context.continuation._runtime.authority.candidate_versions
     batch = context.usage.retained_pre_dispatch_failure_many
 
-    def slow_candidate(version_id):
-        version = candidate_version(version_id)
-        now[0] += 101
-        return version
+    def slow_candidate(version_ids):
+        versions = candidate_versions(version_ids)
+        now[0] += 301
+        return versions
 
     def slow_proof(candidates):
         result = batch(candidates)
@@ -242,13 +260,13 @@ def test_predispatch_atomic_read_overrun_makes_progress_before_next_tick(
         return result
 
     if boundary == "candidate-read":
-        context.continuation._runtime.authority.candidate_version = slow_candidate
+        context.continuation._runtime.authority.candidate_versions = slow_candidate
     else:
         monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", slow_proof)
     try:
         first = context.pipeline.tick(cycle_id="atomic-read-overrun")
         assert first.revision_states == {"EVIDENCE_HOLD": 1, "ASSESSMENT_INTERRUPTED": 2}
-        assert now[0] == (303 if boundary == "candidate-read" else 301)
+        assert now[0] == 301
         assert len(context.batches) == 1
         assert context.journal.progress[context.units[0].revision_id]["facts"]["acquisition_attempt_count"] == 3
         assert all(context.journal.progress[unit.revision_id] == before[unit.revision_id] for unit in context.units[1:])
@@ -260,7 +278,7 @@ def test_predispatch_atomic_read_overrun_makes_progress_before_next_tick(
             context.pipeline.tick(cycle_id=f"atomic-read-overrun-{tick}")
             assert sum(progress["stage"] == "EVIDENCE_HOLD" for progress in context.journal.progress.values()) > settled_before
         assert all(progress["stage"] == "EVIDENCE_HOLD" for progress in context.journal.progress.values())
-        assert len(context.batches) == (2 if boundary == "candidate-read" else 3)
+        assert len(context.batches) == 3
         assert not context.ordinary
     finally:
         context.connection.close()
@@ -281,13 +299,13 @@ def test_predispatch_read_overrun_still_obeys_stop_and_drain_before_commit(
             raise VetoError("stop after atomic read overrun")
 
     context.pipeline._check = check
-    candidate_version = context.continuation._runtime.authority.candidate_version
+    candidate_versions = context.continuation._runtime.authority.candidate_versions
     batch = context.usage.retained_pre_dispatch_failure_many
 
-    def slow_candidate(version_id):
-        version = candidate_version(version_id)
+    def slow_candidate(version_ids):
+        versions = candidate_versions(version_ids)
         now[0], stopped[0] = 301, True
-        return version
+        return versions
 
     def slow_proof(candidates):
         result = batch(candidates)
@@ -295,7 +313,7 @@ def test_predispatch_read_overrun_still_obeys_stop_and_drain_before_commit(
         return result
 
     if boundary == "candidate-read":
-        context.continuation._runtime.authority.candidate_version = slow_candidate
+        context.continuation._runtime.authority.candidate_versions = slow_candidate
     else:
         monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", slow_proof)
     before = dict(context.journal.progress)
@@ -341,5 +359,70 @@ def test_predispatch_expired_proof_never_retires_unproved_targets(
             assert context.journal.progress[context.units[1].revision_id]["stage"] == "EVIDENCE_HOLD"
         assert len(context.batches) == 1
         assert not context.ordinary
+    finally:
+        context.connection.close()
+
+
+@pytest.mark.parametrize("partition", ([], (), (None,), (object(), object(), object())))
+def test_recovery_candidate_partition_never_grants_forged_recovery(tmp_path, monkeypatch, partition):
+    context = _prefix(tmp_path, monkeypatch, count=3)
+    context.continuation._runtime.authority.candidate_versions = lambda _: partition
+    before = dict(context.journal.progress)
+    try:
+        if type(partition) is tuple and len(partition) == 3:
+            assert context.continuation.recover_pre_dispatch(
+                tuple(context.versions), failure_many=lambda _: pytest.fail("no proved Candidate"),
+                before_revision=lambda: True,
+            ) == ()
+        else:
+            from newsroom.control_plane.native_publication import NativePublicationError
+            with pytest.raises(NativePublicationError, match="version partition"):
+                context.continuation.recover_pre_dispatch(
+                    tuple(context.versions), failure_many=lambda _: pytest.fail("no proved Candidate"),
+                    before_revision=lambda: True,
+                )
+        assert context.journal.progress == before
+    finally:
+        context.connection.close()
+
+
+def test_none_recovery_partition_is_one_checked_turn_without_changes_and_reproves_next_tick(
+    tmp_path, monkeypatch,
+):
+    context = _prefix(tmp_path, monkeypatch, count=85, admission=True)
+    original = context.usage.retained_pre_dispatch_failure_many
+    monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", lambda candidates: (None,) * len(candidates))
+    before = dict(context.journal.progress)
+    try:
+        context.pipeline.tick(cycle_id="checked-no-proof")
+        assert context.journal.progress == before
+        assert len(context.batches) == len(context.version_batches) == 1
+        assert not context.ordinary
+        # A later tick sees fresh model history; no denial survives this call.
+        monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", original)
+        context.pipeline.tick(cycle_id="fresh-proof-after-denial")
+        assert len(context.batches) == len(context.version_batches) == 2
+        assert not context.ordinary
+        assert all(value["facts"]["reason"] == "ASSESSOR_PRE_DISPATCH_HOLD" for value in context.journal.progress.values())
+    finally:
+        context.connection.close()
+
+
+def test_none_recovery_partition_keeps_contract_revalidation_ordinary(tmp_path, monkeypatch):
+    context = _prefix(tmp_path, monkeypatch, count=1, admission=True)
+    unit = context.units[0]
+    context.continuation._assessment_contract_version = "newsroom.native-evidence-assessor.v20"
+    context.journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
+        **context.journal.progress[unit.revision_id]["facts"],
+        "assessment_contract_version": "newsroom.native-evidence-assessor.v19",
+        "editorial_hold_reason_codes": ["EVIDENCE_VALIDATION_HOLD"],
+    })
+    before = dict(context.journal.progress)
+    try:
+        assert context.continuation.recover_pre_dispatch(
+            (unit.revision_id,), failure_many=lambda candidates: (None,) * len(candidates),
+            before_revision=lambda: True,
+        ) == ()
+        assert context.journal.progress == before
     finally:
         context.connection.close()

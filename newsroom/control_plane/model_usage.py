@@ -3185,6 +3185,7 @@ def _native_immutable_replay_proof(
     # only the attempt identity and recomputed raw digest; each attempt also
     # carries its own freshly retained rights evidence and spend accounting.
     stable_rights = ("policy_digest", "scope", "source_id", "source_url")
+    member_fields = {"observation_source_id", "observation_member_digest"}
     fresh_rights = (
         "assessment_admission_id", "assessment_blob_digest",
         "observation_admission_id", "observation_blob_digest",
@@ -3200,6 +3201,8 @@ def _native_immutable_replay_proof(
         for rights in (replay_rights, provider_rights):
             if not isinstance(rights, Mapping):
                 raise ValueError("replay rights evidence is absent")
+            from .native_source_rights import validate_rights_observation_selector
+            validate_rights_observation_selector(rights)
             for field in fresh_rights:
                 value = rights.get(field)
                 if type(value) is not str or not value:
@@ -3209,8 +3212,10 @@ def _native_immutable_replay_proof(
     except ValueError:
         return True, None
     if (
-        set(replay_rights) != set(stable_rights) | set(fresh_rights)
-        or set(provider_rights) != set(stable_rights) | set(fresh_rights)
+        set(replay_rights) not in (set(stable_rights) | set(fresh_rights),
+                                  set(stable_rights) | set(fresh_rights) | member_fields)
+        or set(provider_rights) not in (set(stable_rights) | set(fresh_rights),
+                                        set(stable_rights) | set(fresh_rights) | member_fields)
         or any(replay_rights[field] != provider_rights[field] for field in stable_rights)
         or replay_raw_digest == provider_raw_digest
     ):
@@ -4964,13 +4969,14 @@ class ModelUsageService:
             raise ModelUsageAdmissionError(
                 "config identity is outside qualified policy"
             )
-        if _canonical_circuit_route(allocation.route) in _usage_blocking_routes(
-            connection
-        ):
+        blocking_routes = _usage_blocking_routes(connection)
+        if _canonical_circuit_route(allocation.route) in blocking_routes:
             raise ModelUsageAdmissionError(
                 "affected route has unresolved usage or a policy breach"
             )
-        if self._route_state(connection, allocation.route)["state"] == "OPEN":
+        if self._route_state(
+            connection, allocation.route, blocking_routes=blocking_routes,
+        )["state"] == "OPEN":
             raise ModelUsageAdmissionError("affected route circuit is open")
         duplicate = connection.execute(
             "SELECT 1 FROM model_invocation_allocations "

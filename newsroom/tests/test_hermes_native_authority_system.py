@@ -153,6 +153,8 @@ def test_hermes_composition_opens_one_writer_and_all_native_facades(
         assert system.hypotheses and system.relationships and system.lineage
         assert system.candidates and system.candidate_read_port
         assert system.commands and system.events and system.collision is collision
+        missing = "00000000-0000-4000-8000-000000000001"
+        assert system.candidate_versions((missing, missing)) == (None, None)
         with pytest.raises(CandidateContractError, match="unknown Candidate Version"):
             system.candidate_read_port.require_retained_version(
                 "00000000-0000-4000-8000-000000000001"

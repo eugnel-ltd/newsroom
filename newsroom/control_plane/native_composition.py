@@ -67,7 +67,8 @@ from .native_source_intake import (
     spreadsheet_asset_url,
 )
 from .native_source_rights import (
-    NativePortfolioRights, observe_portfolio_terms, retain_rights_snapshot,
+    NativePortfolioRights, observe_portfolio_terms, read_rights_observation,
+    retain_rights_snapshot_bundle, require_rights_assessment,
 )
 from .native_assessor_spans import PARTITION_VERSION
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
@@ -442,7 +443,7 @@ def open_native_pipeline(
                 current = NativePortfolioRights(
                     govuk, evidence, govuk_reason=govuk_reason,
                 )
-                snapshots = {}
+                snapshot_inputs = {}
                 for source_id, definition_url in SOURCE_URLS.items():
                     assessment = current.for_source(source_id=source_id, definition_url=definition_url)
                     source_evidence = evidence.get(source_id)
@@ -464,9 +465,8 @@ def open_native_pipeline(
                         observed_at = clock().astimezone(UTC).isoformat()
                         reason = govuk_reason
                         observations = ()
-                    snapshots[source_id] = retain_rights_snapshot(
-                        objects=runtime.authority.objects, proof=proof,
-                        source_id=source_id, definition_url=definition_url,
+                    snapshot_inputs[source_id] = dict(
+                        definition_url=definition_url,
                         assessment=assessment,
                         observed_at=observed_at, reason=reason,
                         observations=observations,
@@ -476,6 +476,10 @@ def open_native_pipeline(
                             else None
                         ),
                     )
+                snapshots = retain_rights_snapshot_bundle(
+                    objects=runtime.authority.objects, proof=proof,
+                    snapshots=snapshot_inputs, stop_check=stop_check,
+                )
                 return govuk, govuk_reason, evidence, snapshots
 
             licence = NativePortfolioRights(
@@ -551,7 +555,34 @@ def open_native_pipeline(
             snapshot = licence.snapshot_for(source_id)
             if snapshot is None:
                 return None
-            return {"source_id": source_id, "source_url": url,
+            observed = read_rights_observation(
+                objects=runtime.authority.objects, proof=proof,
+                reference=snapshot, source_id=source_id, definition_url=url,
+            )
+            current_evidence = licence.evidence.get(source_id)
+            if current_evidence is not None:
+                facts = {"observed_at": current_evidence.observed_at,
+                         "reason": current_evidence.reason,
+                         "observations": current_evidence.observations}
+            else:
+                current_licence = licence.govuk
+                if current_licence is None:
+                    return None
+                facts = {"observed_at": current_licence.observed_at,
+                         "reason": "REVIEWED_REUSE_PERMITTED", "observations": tuple(
+                    (endpoint, digest, str(admission), "")
+                    for endpoint, digest, admission in zip(
+                        (REUSE_URL, LICENCE_URL), current_licence.raw_digests,
+                        current_licence.admission_ids, strict=True,
+                    )
+                )}
+            if digest_canonical({field: observed[field] for field in facts}) != digest_canonical(facts):
+                raise ValueError("rights observation is not the current fetched snapshot")
+            require_rights_assessment(
+                objects=runtime.authority.objects, proof=proof,
+                reference=snapshot, assessment=rights, observation=observed,
+            )
+            packet = {"source_id": source_id, "source_url": url,
                     "packet_digest": rights.evidence_digest,
                     "rights_decision_id": rights.record_id,
                     "assessment_admission_id": snapshot.assessment_admission_id,
@@ -560,6 +591,10 @@ def open_native_pipeline(
                     "observation_blob_digest": snapshot.observation_blob_digest,
                     "policy_digest": rights.policy_digest,
                     "scope": "NATIVE_RETAINED_SOURCE_TEXT"}
+            if snapshot.observation_source_id is not None:
+                packet.update(observation_source_id=snapshot.observation_source_id,
+                              observation_member_digest=snapshot.observation_member_digest)
+            return packet
 
         def rights_for_unit(unit):
             current = runtime.authority.sources.current_summary(

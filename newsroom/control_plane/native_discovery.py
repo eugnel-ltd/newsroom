@@ -39,6 +39,7 @@ from newsroom.sources import (
 )
 
 from .corpus import CorpusIngestUnit
+from .native_source_rights import validate_rights_observation_selector
 
 POLICY_VERSION = "hermes-delivered-discovery-v1"
 
@@ -60,7 +61,8 @@ def _same_gate_assessment(previous: GateDecisionRequest, current: GateDecisionRe
         for reason in request.supporting_reasons:
             if reason.code == "RIGHTS.CURRENT_ASSESSMENT" and tuple(
                 ref.reference_type for ref in reason.references
-            ) == ("RIGHTS_ASSESSMENT", "RIGHTS_OBSERVATION"):
+            ) in (("RIGHTS_ASSESSMENT", "RIGHTS_OBSERVATION"),
+                  ("RIGHTS_ASSESSMENT", "RIGHTS_OBSERVATION", "RIGHTS_OBSERVATION_MEMBER")):
                 reason = replace(reason, references=reason.references[:1])
             reasons.append(reason)
         return replace(
@@ -412,6 +414,13 @@ class NativeDiscovery:
         )
         supporting_reasons = ()
         if rights_current:
+            validate_rights_observation_selector(
+                rights, source_id=unit.source_id, definition_url=version.locator,
+            )
+            member_reference = (() if "observation_source_id" not in rights else (
+                ReasonReference("RIGHTS_OBSERVATION_MEMBER", rights["observation_source_id"],
+                                rights["observation_member_digest"]),
+            ))
             supporting_reasons = (
                 StructuredReason(
                     "RIGHTS.CURRENT_ASSESSMENT",
@@ -427,6 +436,7 @@ class NativeDiscovery:
                             str(rights["observation_admission_id"]),
                             str(rights["observation_blob_digest"]),
                         ),
+                        *member_reference,
                     ),
                     "Exact rights assessment and current observation used by this Gate decision.",
                 ),

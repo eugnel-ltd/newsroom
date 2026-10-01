@@ -11,6 +11,7 @@ from newsroom.authority import AuthorityPersistenceError, canonical_json_bytes
 from newsroom.authority._event_store import _EventAuthorityStore
 from newsroom.authority._event_store_payload_integrity import _PayloadAndEnvelopeIntegrity
 from newsroom.authority.canonical import digest_bytes
+from newsroom.authority.command_bound_storage import COMMAND_REQUEST_SELECT, COMMAND_RESULT_SELECT
 
 from .authority_event_helpers import open_test_system
 from .authority_helpers import FIXED_NOW, command, make_service, proof
@@ -21,12 +22,12 @@ _STREAMED_QUERIES = frozenset(
         "SELECT * FROM payload_schema_contracts",
         "SELECT * FROM command_definitions",
         "SELECT * FROM authentication_contexts",
-        "SELECT * FROM authorization_requests",
+        COMMAND_REQUEST_SELECT,
         "SELECT * FROM authorization_scope_contents",
         "SELECT d.*,s.canonical_bytes AS selected_scope_canonical_bytes "
         "FROM authorization_decisions d LEFT JOIN authorization_scope_contents s "
         "ON s.scope_content_digest=d.scope_content_digest",
-        "SELECT command_id,result_digest,result_bytes FROM authority_commands",
+        COMMAND_RESULT_SELECT,
         "SELECT p.*,c.contract_digest AS selected_contract_digest,"
         "c.schema_version AS selected_schema_version,"
         "c.payload_mode AS selected_payload_mode,"
@@ -59,6 +60,10 @@ class _StreamingCursor:
     def __iter__(self) -> Iterator[sqlite3.Row]:
         return iter(self._cursor)
 
+    @property
+    def description(self):
+        return self._cursor.description
+
     def fetchall(self) -> list[sqlite3.Row]:
         raise AssertionError("full-table integrity validation must stream rows")
 
@@ -75,6 +80,12 @@ class _StreamingConnection:
         normalised = " ".join(sql.split())
         if parameters and normalised == _PER_DECISION_SCOPE_QUERY:
             raise AssertionError("streamed OPEN cannot look up scopes per decision")
+        if parameters and (
+            "WHERE c.command_id=?" in normalised
+            or normalised.startswith("SELECT * FROM ledger_events WHERE command_id=?")
+            or normalised.startswith("SELECT * FROM authority_commands WHERE command_id=?")
+        ):
+            raise AssertionError("streamed OPEN cannot look up backing per request/result")
         if not parameters and normalised in _STREAMED_QUERIES:
             self.streamed_queries.append(normalised)
             return _StreamingCursor(cursor)

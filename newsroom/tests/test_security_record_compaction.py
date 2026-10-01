@@ -7,6 +7,7 @@ import pytest
 
 from newsroom.authority import AuthorityPersistenceError, canonical_json_bytes
 from newsroom.authority import authorization_request_storage_migrations as request_migration
+from newsroom.authority import command_bound_storage_migrations as command_migration
 from newsroom.authority import graphiti_recovered_ambiguous_migrations as recovery_migration
 from newsroom.authority import relationship_open_index_migrations as index_migration
 from newsroom.authority import security_record_migrations as migration
@@ -37,7 +38,7 @@ def test_current_security_storage_is_compact_with_exact_public_provenance(tmp_pa
         auth = connection.execute('SELECT * FROM authentication_contexts').fetchone()
         request = connection.execute('SELECT * FROM authorization_requests').fetchone()
         assert bytes(auth['storage_context_marker']) == b'v37'
-        assert bytes(request['storage_request_marker']) == b'v38'
+        assert bytes(request['storage_request_marker']) == b'v41'
         residual = json.loads(bytes(request['storage_request_residual']))
         assert not {
             'request_digest', 'authentication_context_id', 'principal_id',
@@ -61,6 +62,8 @@ def test_current_security_storage_is_compact_with_exact_public_provenance(tmp_pa
              recovery_migration.GRAPHITI_RECOVERED_AMBIGUOUS_MIGRATION_CHECKSUM),
             (40, index_migration.RELATIONSHIP_OPEN_INDEX_MIGRATION_NAME,
              index_migration.RELATIONSHIP_OPEN_INDEX_MIGRATION_CHECKSUM),
+            (41, command_migration.COMMAND_BOUND_STORAGE_MIGRATION_NAME,
+             command_migration.COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM),
         )
         assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
     with open_test_system(path) as system:
@@ -87,7 +90,13 @@ def test_v38_request_decoder_does_not_reparse_reconstructed_bytes(
         ).authorization_request.canonical_bytes
     with sqlite3.connect(path) as connection:
         connection.row_factory = sqlite3.Row
-        row = connection.execute('SELECT * FROM authorization_requests').fetchone()
+        row = dict(connection.execute('SELECT * FROM authorization_requests').fetchone())
+        # The historical decoder's no-reparse contract remains explicitly v38.
+        row['storage_request_marker'] = b'v38'
+        row['storage_request_residual'] = canonical_json_bytes({
+            key: value for key, value in json.loads(expected).items()
+            if key not in request_migration.AUTHORIZATION_REQUEST_INDEXED_FIELDS
+        })
         reader = object.__new__(_EventAuthorityStore)
         monkeypatch.setattr(
             reader,

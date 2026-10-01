@@ -433,6 +433,7 @@ def _drop_v39_recovered_ambiguous_guards(
 def _drop_v40_relationship_open_index(connection: sqlite3.Connection) -> None:
     """Remove the exact v40 partial index from an older-schema fixture."""
 
+    _drop_v41_command_bound_storage(connection)
     if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 40:
         return
     from newsroom.authority.relationship_open_index_migrations import (
@@ -1343,3 +1344,55 @@ def downgrade_empty_graphiti_adapter_schema_to_v15(database: Path) -> None:
         conn.execute("PRAGMA user_version=15")
     finally:
         conn.close()
+
+
+def _drop_v41_command_bound_storage(connection: sqlite3.Connection) -> None:
+    """Restore exact v40 bytes/DDL for explicit historical-codec fixtures."""
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 41:
+        return
+    from newsroom.authority.command_bound_storage import command_request_bytes, command_result_bytes
+    from newsroom.authority.authorization_request_storage_migrations import AUTHORIZATION_REQUEST_INDEXED_FIELDS
+    from newsroom.authority.canonical import canonical_json_bytes
+    from newsroom.authority.command_bound_storage_migrations import (
+        COMMAND_BOUND_STORAGE_MIGRATION_NAME, COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM,
+    )
+    import json
+    if tuple(connection.execute("SELECT name,checksum FROM authority_migrations WHERE version=41").fetchone()) != (
+        COMMAND_BOUND_STORAGE_MIGRATION_NAME, COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM,
+    ):
+        raise sqlite3.DatabaseError("downgrade requires exact v41 storage authority")
+    connection.execute("SAVEPOINT checked_command_storage_downgrade")
+    try:
+        guards = tuple(connection.execute("SELECT sql FROM sqlite_schema WHERE name IN "
+            "('immutable_authorization_requests_update','immutable_authority_commands_update','immutable_authority_migrations_delete') ORDER BY name"))
+        for name in ('immutable_authorization_requests_update','immutable_authority_commands_update','immutable_authority_migrations_delete'):
+            connection.execute(f"DROP TRIGGER {name}")
+        for table in ('authorization_requests','authority_commands'):
+            cursor = connection.execute(f"SELECT rowid,* FROM {table}")
+            names = tuple(item[0] for item in cursor.description)
+            for raw in cursor:
+                row = dict(zip(names, raw, strict=True))
+                if table == 'authorization_requests':
+                    original = json.loads(command_request_bytes(connection, row))
+                    residual = canonical_json_bytes({key: value for key, value in original.items() if key not in AUTHORIZATION_REQUEST_INDEXED_FIELDS})
+                    connection.execute("UPDATE authorization_requests SET storage_request_residual=?,storage_request_marker=? WHERE rowid=?", (residual,b'v38',row['rowid']))
+                else:
+                    original = command_result_bytes(connection, bytes(row['result_bytes']), str(row['result_digest']))
+                    connection.execute("UPDATE authority_commands SET result_bytes=? WHERE rowid=?", (original,row['rowid']))
+        connection.execute("DROP TRIGGER authorization_request_storage_guard")
+        connection.execute("ALTER TABLE authorization_requests DROP COLUMN storage_request_marker")
+        connection.execute("ALTER TABLE authorization_requests ADD COLUMN storage_request_marker "
+            "BLOB NOT NULL DEFAULT X'763338' CHECK(storage_request_marker=X'763338')")
+        connection.execute("""CREATE TRIGGER authorization_request_storage_guard
+        BEFORE INSERT ON authorization_requests
+        WHEN NEW.storage_request_marker != X'763338'
+        BEGIN SELECT RAISE(ABORT,'authorization request storage differs'); END""")
+        connection.execute("DELETE FROM authority_migrations WHERE version=41")
+        for (guard,) in guards:
+            connection.execute(guard)
+        connection.execute("PRAGMA user_version=40")
+    except Exception:
+        connection.execute("ROLLBACK TO SAVEPOINT checked_command_storage_downgrade")
+        connection.execute("RELEASE SAVEPOINT checked_command_storage_downgrade")
+        raise
+    connection.execute("RELEASE SAVEPOINT checked_command_storage_downgrade")

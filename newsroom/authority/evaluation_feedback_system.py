@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from newsroom.authority._capability import _CapabilityIssuer
 from newsroom.authority._event_store import _EventAuthorityStore
+from newsroom.authority.persistence import AuthorityPersistenceError
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from newsroom.authority.increment8_evaluation_migrations import INCREMENT8_EVALUATION_TABLES
 from newsroom.authority.models import InlinePayload, SemanticCommand
@@ -440,7 +441,10 @@ class _EvaluationFeedbackAuthorityRoot:
             raise FeedbackContractError("Feedback audit envelope differs")
         return value
     def _verify_local(self) -> dict[str, EvaluationFeedbackAcceptance]:
-        self._event_store._validate_schema_and_integrity()
+        try:
+            self._event_store._validate_schema_and_integrity()
+        except AuthorityPersistenceError as exc:
+            raise FeedbackContractError("Feedback retained command authority differs") from exc
         self._verify_schema()
         accepted = self._feedback_rows()
         obligations = {item.obligation.obligation_id: item.obligation for item in accepted.values()}

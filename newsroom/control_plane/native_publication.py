@@ -641,10 +641,27 @@ class NativePublicationContinuation:
                 continue
             if not before_revision():
                 break
+            selected.append((revision_id, progress, version_id))
+        if not selected or not before_revision():
+            return ()
+        try:
+            versions = self._runtime.authority.candidate_versions(
+                tuple(version_id for _, _, version_id in selected)
+            )
+        except (OperatorDrainRequested, VetoError):
+            raise
+        except Exception:
+            # Global or upstream corruption grants no recovery proof.
+            return ()
+        if type(versions) is not tuple or len(versions) != len(selected):
+            raise NativePublicationError("native Candidate version partition differs")
+        retained = []
+        for (revision_id, progress, version_id), version in zip(selected, versions, strict=True):
+            facts = progress.get("facts", {})
             try:
-                version = self._runtime.authority.candidate_version(version_id)
                 if (
-                    version.version_id != version_id
+                    version is None
+                    or version.version_id != version_id
                     or type(version.candidate_id) is not str
                     or not version.candidate_id.strip()
                     or facts.get("candidate_id") not in (None, version.candidate_id)
@@ -655,7 +672,8 @@ class NativePublicationContinuation:
             except Exception:
                 # A failed authoritative read remains ordinary unknown work.
                 continue
-            selected.append((revision_id, progress, version))
+            retained.append((revision_id, progress, version))
+        selected = retained
         if not selected:
             return ()
         # An authoritative read started within the quantum may finish one
@@ -665,13 +683,20 @@ class NativePublicationContinuation:
         failures = failure_many(tuple(version for _, _, version in selected))
         if type(failures) is not tuple or len(failures) != len(selected):
             raise NativePublicationError("native pre-dispatch proof partition differs")
-        attempted = []
+        attempted, checked = [], []
         # The batch reader has closed its transaction before any journal write.
         # These proofs never enter ordinary advance or survive this call.
         for (revision_id, progress, version), failure in zip(selected, failures, strict=True):
             if not before_revision() and attempted:
                 break
             if self._journal.progress.get(revision_id, {}) != progress:
+                continue
+            if failure is None and not assessment_revalidation_due(
+                progress.get("facts", {}), self._assessment_contract_version,
+            ):
+                # This exact proof-only turn was checked and denied. Ordinary
+                # advance would only repeat it; no state, proof or effect is minted.
+                checked.append(revision_id)
                 continue
             if type(failure) is not RetainedAssessorPreDispatchFailure:
                 continue
@@ -686,10 +711,12 @@ class NativePublicationContinuation:
                 # An attempted proved revision must not enter an effectful
                 # second turn in this tick, even when its journal write fails.
                 attempted.append(revision_id)
+                checked.append(revision_id)
                 continue
             if result is not None:
                 attempted.append(revision_id)
-        return tuple(attempted)
+                checked.append(revision_id)
+        return tuple(checked)
 
     def _retain_pre_dispatch_hold(
         self, revision_id, candidate_version_id, version, pre_dispatch, facts,

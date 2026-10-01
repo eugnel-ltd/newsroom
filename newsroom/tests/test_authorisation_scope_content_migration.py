@@ -12,7 +12,10 @@ from newsroom.authority.migrations import SCHEMA_VERSION, apply_pending_migratio
 
 from .authority_event_helpers import open_test_system
 from .authority_helpers import command, proof
-from .graphiti_adapter_4d_migration_helpers import _drop_v36_shared_scope_schema
+from .graphiti_adapter_4d_migration_helpers import (
+    _drop_v36_shared_scope_schema,
+    _drop_v37_security_record_schema,
+)
 
 
 def _v35_path(tmp_path):
@@ -272,6 +275,9 @@ def test_v36_fixture_downgrade_preserves_references_inside_rollback(tmp_path) ->
         system.commands.execute(command(key="retained-downgrade"), proof=proof())
     with sqlite3.connect(path, isolation_level=None) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
+        # This inverse/rollback contract starts at v36, not the latest codec.
+        _drop_v37_security_record_schema(connection)
+        assert connection.execute("PRAGMA user_version").fetchone() == (36,)
         before = _v35_state(connection)
         retained_ids = tuple(connection.execute(
             "SELECT authorization_decision_id,canonical_digest "

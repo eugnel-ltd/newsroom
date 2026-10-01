@@ -130,37 +130,62 @@ def _encoded(value: object) -> bytes:
     raise AuditRetentionError("unexpected SQLite value type")
 
 
+def _logical_storage_values(source, table, names, row):
+    """Authenticate logical request/result bytes without hiding other row fields."""
+    from .command_bound_storage import command_request_bytes, validated_command_result_bytes
+
+    if table not in ("authorization_requests", "authority_commands"):
+        return tuple(row)
+    values = dict(zip(names, row, strict=True))
+    if table == "authorization_requests" and "storage_request_marker" in values:
+        values["storage_request_residual"] = command_request_bytes(source, values)
+        values["storage_request_marker"] = b"logical-canonical-request-v1"
+    elif table == "authority_commands":
+        values["result_bytes"] = validated_command_result_bytes(source, values)
+    return tuple(values[name] for name in names)
+
+
 def _scan_business(
     source: sqlite3.Connection, *, tokens: sqlite3.Connection | None = None,
     exclude_audit: bool = False,
     exclude_projection_details: bool = False,
+    logical_storage: bool = False,
 ) -> dict[str, object]:
     """Hash actual rows and collect references together, bounded by one row."""
     digest = hashlib.sha256()
     rows = byte_count = 0
     pending: list[tuple[str]] = []
     for table in _tables(source):
+        # Migration identity is verified separately when comparing encodings;
+        # ordinary retention keeps its unchanged raw-row hash contract.
+        if logical_storage and table == "authority_migrations":
+            continue
         if exclude_audit and table in _AUDIT_KEYS:
             continue
         if exclude_projection_details and table == "projection_delivery_attempts":
             continue
         digest.update(table.encode() + b"\0")
         columns = source.execute(f"PRAGMA main.table_info({_q(table)})").fetchall()
+        names = tuple(c[1] for c in columns)
         primary = [c[1] for c in sorted(columns, key=lambda c: c[5]) if c[5]]
         order = ",".join(map(_q, primary)) if primary else "rowid"
         for row in source.execute(f"SELECT * FROM main.{_q(table)} ORDER BY {order}"):
             rows += 1
             digest.update(b"r")
-            for value in row:
+            logical = _logical_storage_values(source, table, names, row) if logical_storage or tokens is not None else tuple(row)
+            hashed = logical if logical_storage else row
+            for value in hashed:
                 raw = _encoded(value)
                 byte_count += len(raw)
                 digest.update(len(raw).to_bytes(8, "big"))
                 digest.update(raw)
-                if tokens is not None and isinstance(value, (str, bytes)):
-                    pending.extend(_reference_tokens(value.encode("utf-8") if isinstance(value, str) else value))
-                    if len(pending) >= 4096:
-                        tokens.executemany("INSERT OR IGNORE INTO _audit_tokens VALUES (?)", pending)
-                        pending.clear()
+            if tokens is not None:
+                for value in logical:
+                    if isinstance(value, (str, bytes)):
+                        pending.extend(_reference_tokens(value.encode("utf-8") if isinstance(value, str) else value))
+                        if len(pending) >= 4096:
+                            tokens.executemany("INSERT OR IGNORE INTO _audit_tokens VALUES (?)", pending)
+                            pending.clear()
     if pending:
         assert tokens is not None
         tokens.executemany("INSERT OR IGNORE INTO _audit_tokens VALUES (?)", pending)

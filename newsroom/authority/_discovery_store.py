@@ -363,8 +363,12 @@ def _validate_discovery_reads_in_transaction(
             (spec := _DISCOVERY_RECORD_SPECS.get(row["command_type"])) is None
             or (row["aggregate_type"], row["event_type"], row["trust_scope"]) != (spec[0], spec[1], spec[2].value)
             or digest_canonical(command) != row["stable_semantic_request_digest"]
-            or _DiscoveryAuthorityStore._decode_canonical(bytes(row["result_bytes"])) != expected_result
-            or digest_bytes(bytes(row["result_bytes"])) != row["result_digest"]
+            or verifier._decode_canonical(verifier._logical_result_bytes(
+                bytes(row["result_bytes"]), str(row["result_digest"]), connection=connection, command_id=str(row["command_id"]),
+            )) != expected_result
+            or digest_bytes(verifier._logical_result_bytes(
+                bytes(row["result_bytes"]), str(row["result_digest"]), connection=connection, command_id=str(row["command_id"]),
+            )) != row["result_digest"]
             or len({(row["authentication_context_id"], row["authorization_request_digest"], row["authorization_decision_id"]), (row["event_auth"], row["event_request"], row["event_decision"]), (row["audit_auth"], row["audit_request"], row["audit_decision"])}) != 1 or row["committed_at"] != row["recorded_at"]
             or row["audit_recorded_at"] != row["recorded_at"]
             or row["audit_event_type"] != row["event_type"]

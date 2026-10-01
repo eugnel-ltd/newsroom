@@ -1711,6 +1711,23 @@ class StoryCandidateReadPort:
             StoryCandidateVersion,
         )
 
+    def require_retained_versions_in_transaction(
+        self, version_ids: tuple[str, ...],
+    ) -> tuple[StoryCandidateVersion | None, ...]:
+        message = "Candidate retained version partition differs"
+        _require(type(version_ids) is tuple and all(
+            type(value) is str and value.strip() for value in version_ids
+        ), message)
+        values = _normalise(
+            lambda: self.__authority.require_retained_versions_in_transaction(version_ids),
+            message,
+        )
+        _require(type(values) is tuple and len(values) == len(version_ids), message)
+        _require(all(value is None or (
+            type(value) is StoryCandidateVersion and value.version_id == identity
+        ) for identity, value in zip(version_ids, values, strict=True)), message)
+        return values
+
     def require_retained_version(self, version_id: str) -> StoryCandidateVersion:
         if self.__bounded_version is None:
             return self.require_retained_version_in_transaction(version_id)

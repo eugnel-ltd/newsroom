@@ -11,6 +11,10 @@ from .authorization_request_storage_migrations import (
     AUTHORIZATION_REQUEST_STORAGE_MARKER,
 )
 from .canonical import canonical_json_bytes, digest_bytes, digest_canonical
+from .command_bound_storage import (
+    COMMAND_REQUEST_MARKER, COMMAND_RESULT_PREFIX, command_request_storage,
+    command_result_bytes, compact_command_result, pending_command_request_bytes,
+)
 from .persistence import (
     AuthorityPersistenceError,
     CommittedCommand,
@@ -84,9 +88,10 @@ class _EventStoreCommitMixin:
             ) from exc
 
         with self._object_payload_commit_guard(conn, grant) as pinned:
+            command_id = str(CommandId.new())
             self._persist_schema_contract(conn, grant, recorded_at=recorded_at)
             self._persist_definition(conn, grant, recorded_at=recorded_at)
-            self._persist_security(conn, grant, recorded_at=recorded_at)
+            self._persist_security(conn, grant, recorded_at=recorded_at, pending_command_id=command_id)
             self._validate_causation(conn, grant)
             current_version, new_version = self._resolve_version(conn, grant)
 
@@ -117,7 +122,6 @@ class _EventStoreCommitMixin:
                         "retained payload digest mismatch"
                     )
 
-            command_id = str(CommandId.new())
             event_id = str(EventId.new())
             audit_id = str(AuditId.new())
             payload_id = str(PayloadId.new())
@@ -126,17 +130,20 @@ class _EventStoreCommitMixin:
                     "SELECT COALESCE(MAX(ledger_seq),0)+1 FROM ledger_events"
                 ).fetchone()[0]
             )
-            result_bytes = canonical_json_bytes(
-                {
-                    "command_id": command_id,
-                    "aggregate_type": grant.definition.aggregate_type,
-                    "aggregate_id": grant.aggregate_id,
-                    "aggregate_version": new_version,
-                    "ledger_seq": ledger_seq,
-                    "event_id": event_id,
-                }
-            )
+            result_value = {
+                "command_id": command_id,
+                "aggregate_type": grant.definition.aggregate_type,
+                "aggregate_id": grant.aggregate_id,
+                "aggregate_version": new_version,
+                "ledger_seq": ledger_seq,
+                "event_id": event_id,
+            }
+            result_bytes = canonical_json_bytes(result_value)
             result_digest = digest_bytes(result_bytes)
+            stored_result = compact_command_result(
+                {**result_value, "result_bytes": result_bytes, "result_digest": result_digest},
+                event_row=result_value,
+            )
 
             conn.execute(
                 "INSERT INTO authority_payloads("
@@ -184,7 +191,7 @@ class _EventStoreCommitMixin:
                     grant.authorization_request.request_digest,
                     str(grant.authorization.authorization_decision_id),
                     result_digest,
-                    result_bytes,
+                    stored_result,
                     recorded_at,
                 ),
             )
@@ -291,6 +298,14 @@ class _EventStoreCommitMixin:
                     grant.definition.trust_scope.value,
                 ),
             )
+            # Pending compact security is authenticated against real persisted
+            # backing only after the command/event FK closure exists.
+            request_row = conn.execute(
+                "SELECT * FROM authorization_requests WHERE request_digest=?",
+                (grant.authorization_request.request_digest,),
+            ).fetchone()
+            self._request_record_from_row(request_row, connection=conn)
+            self._decode_result(stored_result, result_digest, replayed=False, connection=conn, command_id=command_id)
             if payload_mode is PayloadMode.OBJECT_ADMISSION:
                 self._final_object_payload_commit_check(
                     conn, grant, pinned
@@ -389,6 +404,7 @@ class _EventStoreCommitMixin:
         grant: _AuthorizedCommandGrant,
         *,
         recorded_at: str,
+        pending_command_id: str | None = None,
     ) -> None:
         self._persist_security_records(
             conn,
@@ -396,6 +412,7 @@ class _EventStoreCommitMixin:
             request=grant.authorization_request,
             decision=grant.authorization,
             recorded_at=recorded_at,
+            pending_command_id=pending_command_id,
         )
 
     def _persist_security_records(
@@ -406,16 +423,18 @@ class _EventStoreCommitMixin:
         request: Any,
         decision: Any,
         recorded_at: str,
+        pending_command_id: str | None = None,
     ) -> None:
         request_value = request.canonical_value()
-        request_residual = canonical_json_bytes(
-            {
-                key: value
-                for key, value in request_value.items()
-                if key
-                not in AUTHORIZATION_REQUEST_INDEXED_FIELDS
-            }
-        )
+        if pending_command_id is None:
+            request_residual = canonical_json_bytes({
+                key: value for key, value in request_value.items()
+                if key not in AUTHORIZATION_REQUEST_INDEXED_FIELDS
+            })
+            request_marker = AUTHORIZATION_REQUEST_STORAGE_MARKER
+        else:
+            request_residual = command_request_storage(request_value, pending_command_id)
+            request_marker = COMMAND_REQUEST_MARKER
         scopes_bytes = canonical_json_bytes(list(decision.effective_scopes))
         scope_content_digest = digest_bytes(scopes_bytes)
 
@@ -454,7 +473,7 @@ class _EventStoreCommitMixin:
                 request_residual,
                 request.digest,
                 recorded_at,
-                AUTHORIZATION_REQUEST_STORAGE_MARKER,
+                request_marker,
             ),
         )
         conn.execute(
@@ -505,8 +524,11 @@ class _EventStoreCommitMixin:
         if auth_row is None or request_row is None or decision_row is None:
             raise AuthorityPersistenceError("security provenance was not persisted")
         self._authentication_record_from_row(auth_row)
-        self._request_record_from_row(request_row)
-        self._decision_record_from_row(decision_row)
+        if pending_command_id is not None and bytes(request_row["storage_request_marker"]) == COMMAND_REQUEST_MARKER:
+            pending_command_request_bytes(request_row, canonical_json_bytes(request_value), pending_command_id)
+        else:
+            self._request_record_from_row(request_row, connection=conn)
+        self._decision_record_from_row(decision_row, connection=conn)
 
     def _replay_existing(
         self, grant: _AuthorizedCommandGrant, row: sqlite3.Row
@@ -529,7 +551,7 @@ class _EventStoreCommitMixin:
         ):
             raise IdempotencyConflict("replay command identity mismatch")
         return self._decode_result(
-            bytes(row["result_bytes"]), str(row["result_digest"]), replayed=True
+            bytes(row["result_bytes"]), str(row["result_digest"]), replayed=True, command_id=str(row["command_id"])
         )
 
     @staticmethod
@@ -584,9 +606,19 @@ class _EventStoreCommitMixin:
             raise AuthorityPersistenceError("stored JSON is not canonical")
         return value
 
+    def _logical_result_bytes(
+        self, data: bytes, expected_digest: str, *, connection: sqlite3.Connection | None = None,
+        command_id: str | None = None,
+    ) -> bytes:
+        if data.startswith(COMMAND_RESULT_PREFIX):
+            return command_result_bytes(connection or self._connection, data, expected_digest, command_id=command_id)
+        return data
+
     def _decode_result(
-        self, data: bytes, expected_digest: str, *, replayed: bool
+        self, data: bytes, expected_digest: str, *, replayed: bool,
+        connection: sqlite3.Connection | None = None, command_id: str | None = None,
     ) -> CommittedCommand:
+        data = self._logical_result_bytes(data, expected_digest, connection=connection, command_id=command_id)
         if digest_bytes(data) != expected_digest:
             raise AuthorityPersistenceError("stored command result digest mismatch")
         value = self._decode_canonical(data)
@@ -600,6 +632,8 @@ class _EventStoreCommitMixin:
         }
         if not isinstance(value, dict) or set(value) != required:
             raise AuthorityPersistenceError("stored command result shape is invalid")
+        if command_id is not None and value["command_id"] != command_id:
+            raise AuthorityPersistenceError("stored command result identity mismatch")
         return CommittedCommand(
             command_id=str(value["command_id"]),
             aggregate_type=str(value["aggregate_type"]),
