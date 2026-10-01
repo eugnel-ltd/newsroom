@@ -1595,35 +1595,54 @@ class NativeAssessmentUsage:
     ) -> RetainedAssessorPreDispatchFailure | None:
         """Prove no assessor leaf was ever allocated for this exact Candidate."""
 
-        candidate_id = getattr(candidate, "candidate_id", None)
-        version_id = getattr(candidate, "version_id", None)
-        manifest = getattr(candidate, "governing_manifest", None)
-        manifest_digest = getattr(manifest, "canonical_digest", None)
-        if not all(type(value) is str and value for value in (
-            candidate_id, version_id, manifest_digest,
-        )):
-            return None
+        return self.retained_pre_dispatch_failure_many((candidate,))[0]
+
+    def retained_pre_dispatch_failure_many(
+        self, candidates: tuple[object, ...]
+    ) -> tuple[RetainedAssessorPreDispatchFailure | None, ...]:
+        """Authenticate global history once for a finite, fresh recovery batch.
+
+        Results retain input order, including duplicates and malformed inputs.
+        Nothing survives this read, and its transaction closes before return.
+        """
+
+        if type(candidates) is not tuple:
+            raise TypeError("native pre-dispatch recovery requires a finite tuple")
+        denied = (None,) * len(candidates)
+        bindings = []
+        by_candidate: dict[str, list[int]] = {}
+        eligible = set()
+        for index, candidate in enumerate(candidates):
+            manifest = getattr(candidate, "governing_manifest", None)
+            binding = (
+                getattr(candidate, "candidate_id", None),
+                getattr(candidate, "version_id", None),
+                getattr(manifest, "canonical_digest", None),
+            )
+            bindings.append(binding)
+            if all(type(value) is str and value for value in binding):
+                by_candidate.setdefault(binding[0], []).append(index)
+                eligible.add(index)
+        if not eligible:
+            return denied
         connection = sqlite3.connect(f"file:{self._service.path}?mode=ro", uri=True)
         try:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("BEGIN")
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-                return None
+                return denied
             if self._service._route_state(connection, ROUTE)["state"] != "CLOSED":
-                return None
+                return denied
             inventory = []
             envelopes = {}
-            candidate_envelopes = set()
+            envelope_targets: dict[str, set[int]] = {}
             for row in connection.execute(
                 "SELECT envelope_id,cycle_id,workload_class,admitted_at,"
                 "canonical_digest,record_json FROM model_work_envelopes "
                 "ORDER BY envelope_id",
             ):
-                try:
-                    record = json.loads(row[5])
-                    envelope = _envelope_from_record(record)
-                except (TypeError, ValueError, ModelUsageIntegrityError):
-                    return None
+                record = json.loads(row[5])
+                envelope = _envelope_from_record(record)
                 if canonical_json_bytes(record).decode() != row[5] or tuple(row[:5]) != (
                     envelope.envelope_id,
                     envelope.cycle_id,
@@ -1631,12 +1650,13 @@ class NativeAssessmentUsage:
                     record["admitted_at"],
                     envelope.canonical_digest,
                 ) or envelope.as_record() != record:
-                    return None
+                    return denied
                 envelopes[envelope.envelope_id] = envelope
                 if envelope.workload_class is not WorkloadClass.NATIVE_EVIDENCE_ASSESSOR:
                     continue
                 inventory.append(envelope.canonical_digest)
-                if envelope.candidate_id == candidate_id:
+                for index in by_candidate.get(envelope.candidate_id, ()):
+                    _candidate_id, version_id, manifest_digest = bindings[index]
                     if (
                         envelope.hypothesis_digest != manifest_digest
                         or envelope.evidence_package_digest is None
@@ -1644,8 +1664,9 @@ class NativeAssessmentUsage:
                             version_id, envelope.evidence_package_digest, contract,
                         ) for contract in (_V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION, _V17_PRODUCER_VERSION, _V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, VERSION))
                     ):
-                        return None
-                    candidate_envelopes.add(envelope.envelope_id)
+                        eligible.discard(index)
+                    else:
+                        envelope_targets.setdefault(envelope.envelope_id, set()).add(index)
             allocations = {}
             for row in connection.execute(
                 "SELECT invocation_id,envelope_id,cycle_id,leaf_ordinal,"
@@ -1653,11 +1674,8 @@ class NativeAssessmentUsage:
                 "parent_invocation_id,allocated_at,canonical_digest,record_json "
                 "FROM model_invocation_allocations ORDER BY invocation_id",
             ):
-                try:
-                    record = json.loads(row[13])
-                    allocation = _allocation_from_record(record)
-                except (TypeError, ValueError, ModelUsageIntegrityError):
-                    return None
+                record = json.loads(row[13])
+                allocation = _allocation_from_record(record)
                 if (
                     allocation.envelope_id not in envelopes
                     or canonical_json_bytes(record).decode() != row[13]
@@ -1678,28 +1696,24 @@ class NativeAssessmentUsage:
                     )
                     or allocation.as_record() != record
                 ):
-                    return None
+                    return denied
                 allocations[allocation.invocation_id] = allocation
-                if allocation.envelope_id in candidate_envelopes:
-                    return None
+                eligible.difference_update(envelope_targets.get(allocation.envelope_id, ()))
                 if allocation.workload_class is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR:
                     if (
                         envelopes[allocation.envelope_id].workload_class
                         is not WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
                     ):
-                        return None
+                        return denied
                     inventory.append(allocation.canonical_digest)
             for row in connection.execute(
                 "SELECT observation_digest,invocation_id,observed_at,state,"
                 "evidence_digest,record_json FROM model_transport_observations "
                 "ORDER BY observation_digest",
             ):
-                try:
-                    record = json.loads(row[5])
-                    unsigned = dict(record)
-                    retained_digest = unsigned.pop("observation_digest", None)
-                except (TypeError, ValueError):
-                    return None
+                record = json.loads(row[5])
+                unsigned = dict(record)
+                retained_digest = unsigned.pop("observation_digest", None)
                 if (
                     row[1] not in allocations
                     or canonical_json_bytes(record).decode() != row[5]
@@ -1713,18 +1727,20 @@ class NativeAssessmentUsage:
                         record.get("evidence_digest"),
                     )
                 ):
-                    return None
+                    return denied
                 if (
                     allocations[row[1]].workload_class
                     is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
                 ):
                     inventory.append(retained_digest)
-            return RetainedAssessorPreDispatchFailure(
-                candidate_id,
-                version_id,
-                manifest_digest,
-                digest_canonical(tuple(inventory)),
+            inventory_digest = digest_canonical(tuple(inventory))
+            return tuple(
+                RetainedAssessorPreDispatchFailure(*binding, inventory_digest)
+                if index in eligible else None
+                for index, binding in enumerate(bindings)
             )
+        except (AttributeError, KeyError, TypeError, ValueError, ModelUsageIntegrityError):
+            return denied
         finally:
             connection.close()
 

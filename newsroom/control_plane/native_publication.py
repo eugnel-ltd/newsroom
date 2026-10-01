@@ -619,6 +619,102 @@ class NativePublicationContinuation:
             and facts.get("copy_correction_checked_version") != "newsroom.offline-exact-copy.v3"
         )
 
+    def recover_pre_dispatch(
+        self, revision_ids: tuple[str, ...], *,
+        failure_many: Callable[[tuple[object, ...]], tuple],
+        before_revision: Callable[[], bool],
+    ) -> tuple[str, ...]:
+        """Consume one finite proof-only snapshot before ordinary effects."""
+        selected = []
+        for revision_id in revision_ids:
+            progress = self._journal.progress.get(revision_id, {})
+            facts = progress.get("facts", {})
+            if not (
+                (progress.get("stage") == "ASSESSMENT_INTERRUPTED"
+                 and facts.get("failure_class") == "NativeEvidenceError")
+                or (progress.get("stage") == "EVIDENCE_HOLD"
+                    and assessor_admission_recovery_due(facts))
+            ):
+                continue
+            version_id = facts.get("candidate_version_id")
+            if type(version_id) is not str or not version_id:
+                continue
+            if not before_revision():
+                break
+            try:
+                version = self._runtime.authority.candidate_version(version_id)
+                if (
+                    version.version_id != version_id
+                    or type(version.candidate_id) is not str
+                    or not version.candidate_id.strip()
+                    or facts.get("candidate_id") not in (None, version.candidate_id)
+                ):
+                    continue
+            except (OperatorDrainRequested, VetoError):
+                raise
+            except Exception:
+                # A failed authoritative read remains ordinary unknown work.
+                continue
+            selected.append((revision_id, progress, version))
+        if not selected or not before_revision():
+            return ()
+        failures = failure_many(tuple(version for _, _, version in selected))
+        if type(failures) is not tuple or len(failures) != len(selected):
+            raise NativePublicationError("native pre-dispatch proof partition differs")
+        attempted = []
+        # The batch reader has closed its transaction before any journal write.
+        # These proofs never enter ordinary advance or survive this call.
+        for (revision_id, progress, version), failure in zip(selected, failures, strict=True):
+            if not before_revision():
+                break
+            if self._journal.progress.get(revision_id, {}) != progress:
+                continue
+            if type(failure) is not RetainedAssessorPreDispatchFailure:
+                continue
+            try:
+                result = self._retain_pre_dispatch_hold(
+                    revision_id, version.version_id, version, failure,
+                    dict(progress.get("facts", {})),
+                )
+            except (OperatorDrainRequested, VetoError):
+                raise
+            except Exception:
+                # An attempted proved revision must not enter an effectful
+                # second turn in this tick, even when its journal write fails.
+                attempted.append(revision_id)
+                continue
+            if result is not None:
+                attempted.append(revision_id)
+        return tuple(attempted)
+
+    def _retain_pre_dispatch_hold(
+        self, revision_id, candidate_version_id, version, pre_dispatch, facts,
+    ) -> NativePublicationContinuationResult | None:
+        candidate_id = version.candidate_id
+        if not (
+            type(pre_dispatch) is RetainedAssessorPreDispatchFailure
+            and pre_dispatch.candidate_id == candidate_id
+            and pre_dispatch.candidate_version_id == candidate_version_id
+            and pre_dispatch.governing_manifest_digest
+            == version.governing_manifest.canonical_digest
+        ):
+            return None
+        attempt_count = facts.get("acquisition_attempt_count", 0)
+        if type(attempt_count) is not int or attempt_count < 0:
+            raise NativePublicationError("native acquisition attempt differs")
+        facts.update(
+            candidate_id=candidate_id,
+            candidate_version_id=candidate_version_id,
+            reason="ASSESSOR_PRE_DISPATCH_HOLD",
+            acquisition_retryable=attempt_count < _MAX_ACQUISITION_ATTEMPTS,
+            assessment_pre_dispatch_candidate_id=pre_dispatch.candidate_id,
+            assessment_pre_dispatch_candidate_version_id=pre_dispatch.candidate_version_id,
+            assessment_pre_dispatch_manifest_digest=pre_dispatch.governing_manifest_digest,
+            assessment_pre_dispatch_inventory_digest=pre_dispatch.envelope_inventory_digest,
+        )
+        self._journal.advance(revision_id, stage="EVIDENCE_HOLD", facts=facts)
+        return NativePublicationContinuationResult("EVIDENCE_HOLD", facts["reason"], None)
+
     def advance(
         self, *, revision_id: str, candidate_version_id: str
     ) -> NativePublicationContinuationResult:
@@ -719,42 +815,11 @@ class NativePublicationContinuation:
                 and self._assessment_pre_dispatch_failure is not None
             ):
                 pre_dispatch = self._assessment_pre_dispatch_failure(version)
-            if (
-                type(pre_dispatch) is RetainedAssessorPreDispatchFailure
-                and pre_dispatch.candidate_id == candidate_id
-                and pre_dispatch.candidate_version_id == candidate_version_id
-                and pre_dispatch.governing_manifest_digest
-                == version.governing_manifest.canonical_digest
-            ):
-                attempt_count = facts.get("acquisition_attempt_count", 0)
-                if type(attempt_count) is not int or attempt_count < 0:
-                    raise NativePublicationError(
-                        "native acquisition attempt differs"
-                    )
-                facts.update(
-                    reason="ASSESSOR_PRE_DISPATCH_HOLD",
-                    acquisition_retryable=(
-                        attempt_count < _MAX_ACQUISITION_ATTEMPTS
-                    ),
-                    assessment_pre_dispatch_candidate_id=(
-                        pre_dispatch.candidate_id
-                    ),
-                    assessment_pre_dispatch_candidate_version_id=(
-                        pre_dispatch.candidate_version_id
-                    ),
-                    assessment_pre_dispatch_manifest_digest=(
-                        pre_dispatch.governing_manifest_digest
-                    ),
-                    assessment_pre_dispatch_inventory_digest=(
-                        pre_dispatch.envelope_inventory_digest
-                    ),
-                )
-                self._journal.advance(
-                    revision_id, stage="EVIDENCE_HOLD", facts=facts
-                )
-                return NativePublicationContinuationResult(
-                    "EVIDENCE_HOLD", facts["reason"], None
-                )
+            retained = self._retain_pre_dispatch_hold(
+                revision_id, candidate_version_id, version, pre_dispatch, facts,
+            )
+            if retained is not None:
+                return retained
             return NativePublicationContinuationResult(
                 "EVIDENCE_HOLD" if admission_recovery else "ASSESSMENT_INTERRUPTED",
                 str(facts.get("reason", "ACQUISITION_RESULT_NOT_RETAINED")),
