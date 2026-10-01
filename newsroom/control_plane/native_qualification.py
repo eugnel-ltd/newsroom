@@ -43,6 +43,7 @@ _TERMINAL_REVISION_STATES = frozenset({
     "GRAPHITI_HOLD",
     "NO_CANDIDATE",
     "OPERATIONAL_HOLD",
+    "PUBLICATION_HOLD",
     "RETRIEVAL_HOLD",
     "SAME_STATE_ASSOCIATED",
     "SCHEDULING_HOLD",
@@ -110,6 +111,7 @@ def qualification_report_ready(states: object, unclassified: object) -> bool:
         "ASSESSMENT_CONTRACT_REVALIDATION", "INTAKE_REQUESTED", "INTAKE_ACKNOWLEDGED",
         "ACQUISITION_STARTED", "ASSESSMENT_STARTED", "ASSESSMENT_INTERRUPTED",
         "EVIDENCE_RETAINED", "PUBLICATION_PREPARED", "PUBLICATION_STARTED",
+        "COPY_CORRECTION_PREPARED",
     }
     if (
         type(states) is not dict
