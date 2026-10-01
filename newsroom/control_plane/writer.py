@@ -179,7 +179,7 @@ def _required_title_and_body(package: EvidencePackage) -> tuple[str, str] | None
     body_claims = tuple(
         claim
         for claim in package.governed_claims
-        if claim.claim_role == "SUBSTANTIVE"
+        if claim.claim_role in {"SUBSTANTIVE", "CONTEXT"}
     )
     return (
         f"【未出版】{headlines[0].rendered_assertion_zh_hant_hk}",
@@ -463,7 +463,7 @@ def _source_ordered_story_claims(
 ) -> tuple[GovernedClaimEvidence, ...]:
     ordered: list[tuple[int, int, GovernedClaimEvidence]] = []
     for claim in package.governed_claims:
-        if claim.claim_role not in {"HEADLINE", "SUBSTANTIVE"}:
+        if claim.claim_role not in {"HEADLINE", "SUBSTANTIVE", "CONTEXT"}:
             continue
         if claim.passage_index >= len(package.passages):
             raise ValueError("governed claim source span order is unavailable")
@@ -511,7 +511,7 @@ def required_surface_copy(
     body_claims = tuple(
         claim
         for claim in package.governed_claims
-        if claim.claim_role == "SUBSTANTIVE"
+        if claim.claim_role in {"SUBSTANTIVE", "CONTEXT"}
     )
     linked_claims = (headline, *body_claims)
     if context_preserving:
@@ -1226,7 +1226,7 @@ def validate_writer_copy(
             ) if copy.writer_id == "newsroom.offline-exact-copy.v3" else
             copy.body == "\n\n".join(
                 claim.rendered_assertion_zh_hant_hk for claim in package.governed_claims
-                if claim.claim_role == "SUBSTANTIVE"
+                if claim.claim_role in {"SUBSTANTIVE", "CONTEXT"}
             ) if copy.writer_id == "newsroom.offline-exact-copy.v2" else
             copy.body.startswith("本報根據已核實證據報道：")
             and copy.body.count("本報根據已核實證據報道：") == 1

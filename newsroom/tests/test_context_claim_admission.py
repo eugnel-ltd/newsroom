@@ -5,7 +5,14 @@ import pytest
 from newsroom.control_plane.admission import DeterministicWriteAdmission
 from newsroom.control_plane.editorial import StoryCandidateRecord
 from newsroom.control_plane.evidence import EvidencePackage, GovernedClaimStatus
-from newsroom.control_plane.writer import _writer_evidence_value
+from newsroom.control_plane.writer import (
+    FixtureWriter,
+    WriterCopy,
+    _prompt,
+    _writer_evidence_value,
+    required_surface_copy,
+    validate_writer_copy,
+)
 from newsroom.tests.test_zero_quota_write_loop import _bind_fixture_entities, _candidate_package
 
 
@@ -140,6 +147,75 @@ def test_writer_input_retains_context_status_and_provisional_rendering(
     assert context["claim_role"] == "CONTEXT"
     assert context["status"] == status.value
     assert context["rendered_assertion"] == "費用估算仍屬暫定。"
+
+
+@pytest.mark.parametrize("status", _CONTEXT_STATUSES)
+@pytest.mark.parametrize("surface", ("v3", "v2", "fixture"))
+def test_writer_surfaces_render_and_link_context_exactly_once(
+    status: GovernedClaimStatus, surface: str,
+) -> None:
+    candidate, package = _context_package(status)
+    source_renderings = tuple(claim.rendered_assertion_zh_hant_hk for claim in package.governed_claims)
+    if surface == "v3":
+        # Source order, not the governed inventory order, controls native paragraphs.
+        package = replace(package, governed_claims=tuple(reversed(package.governed_claims)))
+    if surface == "fixture":
+        copy = FixtureWriter().write(candidate, package)
+    else:
+        title, body, links = required_surface_copy(
+            package, paragraphs=True, context_preserving=surface == "v3",
+        )
+        copy = WriterCopy(
+            title=title, body=body, writer_id=f"newsroom.offline-exact-copy.{surface}",
+            evidence_package_digest=package.digest, evidence_links=links,
+        )
+
+    assert copy.body.count("費用估算仍屬暫定。") == 1
+    assert {link.governed_claim_id for link in copy.evidence_links} == {
+        claim.claim_id for claim in package.governed_claims
+    }
+    assert all(result.result == "PASS" for result in validate_writer_copy(copy, package))
+    if surface == "v3":
+        assert copy.body.split("\n\n") == list(source_renderings)
+
+
+@pytest.mark.parametrize("status", _CONTEXT_STATUSES)
+def test_normal_writer_prompt_includes_context_rendering_and_link(
+    status: GovernedClaimStatus,
+) -> None:
+    candidate, package = _context_package(status)
+
+    prompt = _prompt(candidate, package)
+
+    assert "費用估算仍屬暫定。" in prompt
+    assert '"governed_claim_id": "fixture:context"' in prompt
+
+
+@pytest.mark.parametrize("status", _CONTEXT_STATUSES)
+@pytest.mark.parametrize("mutation", ("omitted", "duplicated", "unsupported-residue"))
+def test_native_context_copy_keeps_exact_once_and_entailment_fail_closed(
+    status: GovernedClaimStatus, mutation: str,
+) -> None:
+    _, package = _context_package(status)
+    title, body, links = required_surface_copy(
+        package, paragraphs=True, context_preserving=True,
+    )
+    if mutation == "omitted":
+        body = body.replace("費用估算仍屬暫定。", "")
+    elif mutation == "duplicated":
+        body += "\n\n費用估算仍屬暫定。"
+    else:
+        body += "\n\n呢句補充未有證據支持。"
+    copy = WriterCopy(
+        title=title, body=body, writer_id="newsroom.offline-exact-copy.v3",
+        evidence_package_digest=package.digest, evidence_links=links,
+    )
+
+    results = {result.validator: result for result in validate_writer_copy(copy, package)}
+
+    assert results["ROLE_SPECIFIC_EXACT_ONCE_STRUCTURE"].result == "FAIL"
+    assert results["GOVERNED_CLAIM_ENTAILMENT_BOUNDARY"].result == "FAIL"
+    assert results["GOVERNED_CLAIM_ENTAILMENT_BOUNDARY"].reason_code == "UNSUPPORTED_CLAIM_RESIDUE"
 
 
 @pytest.mark.parametrize(
