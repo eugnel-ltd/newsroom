@@ -1238,7 +1238,7 @@ class _StoryCandidateReadAuthority:
         _require_candidate_read_connection(self.__connection, active=True)
         return self.__verifier._verify()
 
-    def __verified_receipts(self, *, version_id=None, candidate_id=None):
+    def __verified_receipts(self, *, version_id=None, candidate_id=None, version_ids=None):
         _require_candidate_read_connection(self.__connection, active=True)
         verified = self.__verifier._verify_local()
         matches = tuple(
@@ -1246,8 +1246,9 @@ class _StoryCandidateReadAuthority:
             for item in verified.values()
             if (version_id is None or item[2].version_id == version_id)
             and (candidate_id is None or item[2].candidate_id == candidate_id)
+            and (version_ids is None or item[2].version_id in version_ids)
         )
-        if not matches:
+        if not matches and version_ids is None:
             raise CandidateContractError(
                 "unknown Candidate" if candidate_id is not None
                 else "unknown Candidate Version"
@@ -1275,6 +1276,13 @@ class _StoryCandidateReadAuthority:
         self, version_id: str
     ) -> StoryCandidateVersion:
         return self.__verified_receipts(version_id=version_id)[0][2]
+
+    def require_retained_versions_in_transaction(
+        self, version_ids: tuple[str, ...],
+    ) -> tuple[StoryCandidateVersion | None, ...]:
+        matches = self.__verified_receipts(version_ids=frozenset(version_ids))
+        by_version = {item[2].version_id: item[2] for item in matches}
+        return tuple(by_version.get(version_id) for version_id in version_ids)
 
     def require_current_head_in_transaction(
         self, candidate_id: str, *, proof: AuthenticationProof

@@ -506,6 +506,20 @@ def open_hermes_native_authority_system(
                         connection.execute("ROLLBACK")
                     raise
 
+        def candidate_versions(version_ids: tuple[str, ...]):
+            with operation_lock:
+                connection.execute("BEGIN")
+                try:
+                    values = transaction_candidate_port.require_retained_versions_in_transaction(
+                        version_ids
+                    )
+                    connection.execute("COMMIT")
+                    return values
+                except Exception:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
+
         candidate_read_port = transaction_candidate_port._with_bounded_version(
             candidate_version
         )
@@ -544,6 +558,7 @@ def open_hermes_native_authority_system(
             build_candidate_manifest=_SharedAuthority(candidate_store, operation_lock).build_manifest,
             candidate_read_port=candidate_read_port,
             candidate_version=candidate_version,
+            candidate_versions=candidate_versions,
             receive_evidence_intake=receive_evidence_intake,
             collision=collision_enforcer,
             commands=authority_commands,

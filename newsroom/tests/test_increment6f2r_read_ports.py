@@ -58,6 +58,7 @@ def test_read_port_types_are_token_gated_and_expose_only_reads() -> None:
         "require_retained_candidate_in_transaction",
         "require_retained_version",
         "require_retained_version_in_transaction",
+        "require_retained_versions_in_transaction",
         "verify_retained_integrity_in_transaction",
     }
     assert handoff_names == {
@@ -258,5 +259,65 @@ def test_candidate_historical_read_does_not_impose_current_upstream_state(
             expected.candidate_id, proof=location.seed[0][3]
         )
     assert connection.in_transaction
+    connection.execute("ROLLBACK")
+    connection.close()
+
+
+def test_candidate_bulk_snapshot_authenticates_global_history_once_and_reproves_next_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from newsroom.authority.story_candidate_system import _CandidateStore
+
+    adapter = candidate_fixture._Adapter(tmp_path)
+    location = adapter.create_location()
+    handle = adapter.open_handle(location)
+    handle.submit(candidate_fixture._generic("record-1"))
+    handle.submit(candidate_fixture._generic("record-2"))
+    rows = tuple(handle._row(name) for name in ("record-1", "record-2"))
+    versions = tuple(handle._opened().load_version(str(row[1])) for row in rows)
+    handle.close()
+    args = candidate_fixture._collaborators(location.seed)
+    connection = _checked_connection(location.seed[1])
+    port = _create_story_candidate_read_port(
+        connection, retrieval_authority=args["retrieval_authority"],
+        authenticator=args["authenticator"], command_registry=args["command_registry"],
+        payload_schemas=args["payload_schemas"], clock=args["clock"],
+    )
+    local_calls, upstream_calls = [], []
+    verify_local, verify_upstream = _CandidateStore._verify_local, _CandidateStore._verify_upstream
+
+    def local(store):
+        local_calls.append(True)
+        return verify_local(store)
+
+    def upstream(store, selected, **options):
+        upstream_calls.append(tuple(item[2].version_id for item in selected.values()))
+        return verify_upstream(store, selected, **options)
+
+    monkeypatch.setattr(_CandidateStore, "_verify_local", local)
+    monkeypatch.setattr(_CandidateStore, "_verify_upstream", upstream)
+    identities = (versions[0].version_id,) * 83 + ("missing", versions[1].version_id)
+    with pytest.raises(CandidateContractError, match="active checked connection"):
+        port.require_retained_versions_in_transaction(identities)
+    connection.execute("BEGIN")
+    assert port.require_retained_versions_in_transaction(identities) == (versions[0],) * 83 + (None, versions[1])
+    assert len(local_calls) == len(upstream_calls) == 1
+    assert set(upstream_calls[0]) == {item.version_id for item in versions}
+    assert connection.in_transaction
+    with pytest.raises(CandidateContractError, match="partition differs"):
+        port.require_retained_versions_in_transaction((None,))
+    connection.execute("ROLLBACK")
+    # Another retained head changed after the read. No verified state survives.
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("DROP TRIGGER candidate_head_update_guard")
+    connection.execute("UPDATE story_candidate_heads SET candidate_bytes=? WHERE candidate_id=?", (b"{}", versions[1].candidate_id))
+    connection.execute("COMMIT")
+    connection.execute("BEGIN")
+    with pytest.raises(CandidateContractError):
+        port.require_retained_versions_in_transaction((versions[0].version_id,))
+    assert len(local_calls) == 2
+    with pytest.raises(CandidateContractError):
+        port.require_retained_versions_in_transaction(("missing",))
+    assert len(local_calls) == 3
     connection.execute("ROLLBACK")
     connection.close()
