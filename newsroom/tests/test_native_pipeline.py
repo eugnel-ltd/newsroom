@@ -1339,3 +1339,142 @@ def test_ready_spill_source_dates_fall_back_without_using_observation_time(tmp_p
         assert [revision for kind, revision in calls if kind == "publish"] == [units[first].revision_id]
     finally:
         connection.close()
+
+
+def _quantum_pending_graphiti(pipeline, journal, now):
+    completed, extracted = set(), []
+
+    def graphiti(selected, *, cycle_id, defer_before_unit):
+        expected = tuple(
+            unit for revision_id, units in journal.units.items()
+            if not journal.progress.get(revision_id, {}).get("facts", {}).get("graphiti_receipts")
+            for unit in units
+        )
+        assert {unit.ingest_id for unit in selected} == {unit.ingest_id for unit in expected}
+        for revision_id in dict.fromkeys(unit.revision_id for unit in selected):
+            members = tuple(unit for unit in selected if unit.revision_id == revision_id)
+            assert tuple(unit.chunk_ordinal for unit in members) == tuple(range(1, members[0].chunk_count + 1))
+        results = []
+        for unit in selected:
+            if unit.ingest_id in completed:
+                results.append(NativeGraphitiOutcome(unit.ingest_id, "GRAPHITI_COMPLETE", unit.observation_digest, None))
+            elif defer_before_unit(unit):
+                results.append(NativeGraphitiOutcome(unit.ingest_id, "GRAPHITI_DEFERRED", None, "WORK_QUANTUM_EXHAUSTED"))
+            else:
+                extracted.append((unit.item_key, unit.chunk_ordinal))
+                completed.add(unit.ingest_id)
+                now[0] += 301
+                results.append(NativeGraphitiOutcome(unit.ingest_id, "GRAPHITI_COMPLETE", unit.observation_digest, None))
+        return tuple(results)
+
+    pipeline._graphiti = NS(advance=graphiti)
+    return completed, extracted
+
+
+def test_pending_alternates_source_recency_and_land_order_without_dropping_chunks(tmp_path, monkeypatch):
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+    first_chunk = replace(_native("archive-chunks"), chunk_count=2,
+                          published_at="2010-01-01T00:00:00Z", updated_at=None,
+                          observed_at="2026-10-02T00:00:00Z")
+    second_chunk = replace(first_chunk, chunk_ordinal=2, predecessor_ingest_id=first_chunk.ingest_id)
+    archive = replace(_native("archive"), published_at="2011-01-01T00:00:00Z", updated_at=None)
+    weekly = replace(_native("weekly"), published_at="2024-05-10T00:00:00Z",
+                     updated_at="2026-10-01T00:00:00Z", observed_at="2026-09-01T00:00:00Z")
+    recent = replace(_native("recent"), published_at="2026-09-30T00:00:00Z", updated_at=None)
+    journal.land((second_chunk, first_chunk))
+    for unit in (archive, weekly, recent):
+        journal.land((unit,))
+    journal.advance(archive.revision_id, stage="GRAPHITI_HOLD", facts={"reason": "RETRY_PENDING"})
+    previous_hold = dict(journal.progress[archive.revision_id])
+    dispositions[0] = ()
+    _, extracted = _quantum_pending_graphiti(pipeline, journal, now)
+    incoming = tuple(replace(_native(f"incoming-{index}"), updated_at=f"2026-10-{index + 2:02}T00:00:00Z")
+                     for index in range(5))
+    try:
+        for index in range(6):
+            if index:
+                unit = incoming[index - 1]
+                dispositions[0] = (NS(source_id=unit.source_id, status="READY", reason_code="RETAINED", units=(unit,)),)
+            pipeline.tick(cycle_id=f"fair-pending-{index}")
+            if index < 3:
+                assert first_chunk.revision_id not in journal.progress
+            if index < 5:
+                assert journal.progress[archive.revision_id] == previous_hold
+        assert extracted == [
+            (weekly.item_key, 1), (first_chunk.item_key, 1), (incoming[1].item_key, 1),
+            (second_chunk.item_key, 2), (incoming[3].item_key, 1), (archive.item_key, 1),
+        ]
+        assert journal.progress[first_chunk.revision_id]["facts"]["graphiti_receipts"] == [
+            {"ingest_id": unit.ingest_id, "state": "GRAPHITI_COMPLETE", "receipt_digest": unit.observation_digest, "reason": None}
+            for unit in (first_chunk, second_chunk)
+        ]
+        assert set(journal.units) == {unit.revision_id for unit in (first_chunk, archive, weekly, recent, *incoming)}
+        assert all(unit.revision_id not in journal.progress for unit in (recent, incoming[0], incoming[2], incoming[4]))
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("cached_prefix", [False, True])
+def test_pending_empty_quantum_and_cached_prefix_do_not_consume_current_turn(tmp_path, monkeypatch, cached_prefix):
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+    dispositions[0] = ()
+    first_chunk = replace(_native("old-chunks"), chunk_count=2, updated_at="2020-01-01T00:00:00Z")
+    second_chunk = replace(first_chunk, chunk_ordinal=2, predecessor_ingest_id=first_chunk.ingest_id)
+    current = replace(_native("current"), updated_at="2026-10-01T00:00:00Z")
+    journal.land((first_chunk, second_chunk))
+    journal.land((current,))
+    completed, extracted = _quantum_pending_graphiti(pipeline, journal, now)
+    if cached_prefix:
+        completed.add(first_chunk.ingest_id)
+    original, calls = pipeline._graphiti.advance, [0]
+
+    def expire_first_quantum(selected, **kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            now[0] += 301
+        return original(selected, **kwargs)
+
+    pipeline._graphiti = NS(advance=expire_first_quantum)
+    try:
+        pipeline.tick(cycle_id="expired-before-pending")
+        assert extracted == [] and journal.progress == {}
+        assert pipeline._spill_archive_turn is False
+        pipeline.tick(cycle_id="first-real-pending")
+        pipeline.tick(cycle_id="archive-pending")
+        assert extracted[:2] == [(current.item_key, 1), (first_chunk.item_key, 2 if cached_prefix else 1)]
+        if not cached_prefix:
+            assert first_chunk.revision_id not in journal.progress
+    finally:
+        connection.close()
+
+
+def test_pending_and_ready_spill_share_preference_and_toggle_only_once_per_tick(tmp_path, monkeypatch):
+    pipeline, journal, connection, calls, now = _overrunning_ready_spill(tmp_path, monkeypatch)
+    spill = tuple(replace(_native(f"spill-{index}"), updated_at=date) for index, date in enumerate(
+        ("2020-01-01T00:00:00Z", "2026-10-04T00:00:00Z"),
+    ))
+    pending = tuple(replace(_native(f"pending-{index}"), updated_at=date) for index, date in enumerate(
+        ("2010-01-01T00:00:00Z", "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z"),
+    ))
+    for unit in spill:
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage="GRAPHITI_COMPLETE", facts={"graphiti_receipts": [{"retained": True}]})
+    for unit in pending:
+        journal.land((unit,))
+    _, extracted = _quantum_pending_graphiti(pipeline, journal, now)
+    try:
+        pipeline.tick(cycle_id="current-pending-and-spill")
+        assert extracted == [(pending[2].item_key, 1)]
+        assert [revision for kind, revision in calls if kind == "publish"] == [spill[1].revision_id]
+        assert pipeline._spill_archive_turn is True
+        pipeline.tick(cycle_id="archive-pending-and-spill")
+        assert extracted == [(pending[2].item_key, 1), (pending[0].item_key, 1)]
+        assert [revision for kind, revision in calls if kind == "publish"] == [spill[1].revision_id, spill[0].revision_id]
+        assert pipeline._spill_archive_turn is False
+        assert pending[1].revision_id not in journal.progress
+    finally:
+        connection.close()
