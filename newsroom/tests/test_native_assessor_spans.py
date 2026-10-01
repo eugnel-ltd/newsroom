@@ -147,8 +147,52 @@ def test_source_and_segment_entity_order_matches_existing_recogniser():
 def test_legacy_inventory_does_not_invent_contextual_entity_occurrences():
     body = "Home Secretary said yes. The Home Secretary approved changes."
     view = build_lossless_source_view((body,), ("SOURCE-1",))
-    assert view.segments[0].entities == (("Home Secretary", "PERSON"),)
-    assert view.segments[1].entities == ()
+    assert len(view.segments) == 1
+    assert view.segments[0].entities == (("Home Secretary", "PERSON"),) * 2
+    wire = _wire()
+    claim = wire["package"]["governed_claims"][0]
+    claim["claim_range"] = claim["support_range"] = _range()
+    claim["rendered_fragments"] = ["", " 表示同意；", " 批准新安排。"]
+    package, receipt = materialise(wire, view, "request-id")
+    assert package["package"]["governed_claims"][0]["claim"] == body
+    assert receipt["claim_entity_order"] == [[["Home Secretary", "PERSON"]] * 2]
+
+
+@pytest.mark.parametrize("body", [
+    "Home Secretary said yes. The Home Secretary approved changes. Other arrangements remain unchanged.",
+    "The Home Secretary approved changes. Home Secretary said yes. Other arrangements remain unchanged.",
+    "Alice Smith said yes. Alice Smith said no. Other arrangements remain unchanged.",
+    "Alice Smith said yes. Minister Alice Smith approved changes. Minister Alice Smith said yes.",
+    "Special Agency Authority (SAA) confirmed it. SAA changed its arrangements.",
+    "張小明表示同意。張小明批准新安排。其他安排不變。",
+    "Home Secretary said yes.\r\nThe Home Secretary approved changes. Other arrangements remain unchanged.",
+])
+def test_every_contiguous_range_advertises_authoritative_entity_order(body):
+    view = build_lossless_source_view((body,), ("SOURCE-1",))
+    for first in range(len(view.segments)):
+        for last in range(first, len(view.segments)):
+            selected = view.segments[first:last + 1]
+            text = view.resolve_range(_range(selected[0].span_id, selected[-1].span_id))[0]
+            advertised = tuple(entity for segment in selected for entity in segment.entities)
+            assert advertised == _claim_entities(text, body)
+            wire = _wire()
+            claim = wire["package"]["governed_claims"][0]
+            claim["claim_range"] = claim["support_range"] = _range(
+                selected[0].span_id, selected[-1].span_id,
+            )
+            claim["rendered_fragments"] = [""] * (len(advertised) + 1)
+            package, receipt = materialise(wire, view, "request-id")
+            assert package["package"]["governed_claims"][0]["claim"] == text
+            assert receipt["claim_entity_order"] == [[list(entity) for entity in advertised]]
+    assert "".join(segment.text for segment in view.segments) == body
+
+
+@pytest.mark.parametrize("sentence", ["他說：「新安排明日開始。」", "首句。）", "首句。』】"])
+def test_terminal_cjk_closers_remain_attached_to_their_sentence(sentence):
+    terminal = build_lossless_source_view((sentence,), ("SOURCE-1",))
+    assert [segment.text for segment in terminal.segments] == [sentence]
+    followed = build_lossless_source_view((sentence + "下一句。",), ("SOURCE-1",))
+    assert [segment.text for segment in followed.segments] == [sentence, "下一句。"]
 
 
 def test_source_declared_acronym_remains_bound_to_full_body_context():

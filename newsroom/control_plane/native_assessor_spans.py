@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import replace
 from itertools import pairwise
@@ -16,7 +17,7 @@ from .native_assessor_references import (
 )
 
 PARTITION_VERSION = "newsroom.native-assessor-spans.v1"
-_CLOSERS = r"[\"'’”）)\]】」』]*"
+_CLOSERS = r"[\"'’”）)\]】」』]*+"
 _BOUNDARY = re.compile(
     rf"(?P<latin>[.!?]){_CLOSERS}[ \t]+(?=\S)|"
     rf"(?P<cjk>[。！？]){_CLOSERS}[ \t]*(?=\S)"
@@ -73,6 +74,60 @@ def _chunks(segment: SourceSegment) -> Iterator[str]:
         yield text[first:last]
 
 
+def _range_closed_chunks(line: SourceSegment, body: str) -> tuple[tuple[str, tuple], ...]:
+    """Keep a context-dependent name's occurrences in one selectable unit."""
+    texts = tuple(_chunks(line))
+    if len(texts) == 1:
+        return ((line.text, line.entities),)
+    chunks = tuple((text, _claim_entities(text, body)) for text in texts)
+    occurrences = sorted(
+        [(match.start(), match.end(), name, kind)
+         for name, kind in dict.fromkeys(line.entities)
+         for match in re.finditer(_entity_pattern(name), line.text)],
+        key=lambda item: (item[0], -(item[1] - item[0])),
+    )
+    selected = []
+    for item in occurrences:
+        if not selected or item[0] >= selected[-1][1]:
+            selected.append(item)
+    offset = 0
+    sensitive = set()
+    for text, actual in chunks:
+        end = offset + len(text)
+        expected = tuple((name, kind) for first, _, name, kind in selected if offset <= first < end)
+        if actual != expected:
+            counts = Counter(actual)
+            counts.subtract(expected)
+            sensitive.update(name for (name, _), count in counts.items() if count)
+            if not any(counts.values()):
+                sensitive.update(name for name, _ in (*actual, *expected))
+        offset = end
+    if not sensitive:
+        return chunks
+    neighbourhoods = []
+    for name in sensitive:
+        matches = tuple(re.finditer(_entity_pattern(name), line.text))
+        neighbourhoods.append((matches[0].start(), matches[-1].end()))
+    cuts = [0]
+    offset = 0
+    for text in texts:
+        offset += len(text)
+        if not any(first < offset < last for first, last in neighbourhoods):
+            cuts.append(offset)
+    merged = tuple((line.text[first:last], _claim_entities(line.text[first:last], body))
+                   for first, last in pairwise(cuts))
+    # Each surviving unit must expose exactly its full-line occurrence slice.
+    # Ambiguous overlap retains the original physical-line contract instead.
+    offset = 0
+    for text, actual in merged:
+        end = offset + len(text)
+        expected = tuple((name, kind) for first, _, name, kind in selected if offset <= first < end)
+        if actual != expected:
+            return ((line.text, line.entities),)
+        offset = end
+    return merged
+
+
 def build_lossless_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...]) -> SourceView:
     """Refine the legacy view without changing its bytes or v1 range proof."""
     original = build_source_view(passages, source_ids)
@@ -81,13 +136,12 @@ def build_lossless_source_view(passages: tuple[str, ...], source_ids: tuple[str,
         ordinal = 0
         for line in (item for item in original.segments if item.passage_index == passage_index):
             offset = line.start_byte
-            for text in _chunks(line):
+            for text, entities in _range_closed_chunks(line, body):
                 if len(segments) >= MAX_SEGMENTS:
                     raise SourceReferenceError("source segment count exceeds bound")
                 ordinal += 1
                 raw = text.encode("utf-8")
                 end = offset + len(raw)
-                entities = line.entities if text == line.text else _claim_entities(text, body)
                 segments.append(replace(
                     line, span_id=f"S{passage_index + 1}L{ordinal}", ordinal=ordinal,
                     text=text, start_byte=offset, end_byte=end,
