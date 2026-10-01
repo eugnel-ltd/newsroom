@@ -268,6 +268,14 @@ def parse_govuk_content_document(
         "speech",
     }:
         body_text = _document_text(value)
+        if value.get("details", {}).get("attachments") or value.get("links", {}).get("children"):
+            children, unsupported = _require_attachment_inventory(value)
+            raise GovUkContentHold(
+                "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE",
+                child_items=children,
+                unsupported_attachments=unsupported,
+                exclusion_signals=_exclusion_signals(value, body_text),
+            )
     elif document_type == "official_statistics_announcement":
         _require_future_statistics_announcement(value, retrieved_at=retrieved_at)
         raise GovUkContentHold("SOURCE_ITEM_NOT_YET_PUBLISHED")
@@ -433,6 +441,8 @@ def _require_attachment_inventory(
     links = value.get("links")
     attachments = details.get("attachments") if type(details) is dict else None
     children = links.get("children") if type(links) is dict else None
+    if any(entries is not None and type(entries) is not list for entries in (attachments, children)):
+        raise ValueError("source attachment inventory differs")
     inventories = []
     if type(attachments) is list and attachments:
         inventories.append(attachments)
