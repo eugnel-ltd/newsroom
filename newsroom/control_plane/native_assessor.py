@@ -56,6 +56,7 @@ from .model_usage import (
     _envelope_from_record,
     _policy_for_allocation,
     _require_reported_telemetry,
+    _retained_terminal_allocation,
     _terminal_from_record,
 )
 
@@ -1164,28 +1165,20 @@ class NativeAssessmentUsage:
         )
 
     def _require_diagnostic_allocation(self, connection, allocation):
-        row = connection.execute(
-            "SELECT canonical_digest,request_digest,record_json "
-            "FROM model_invocation_allocations WHERE invocation_id=?",
-            (allocation.invocation_id,),
-        ).fetchone()
-        if (allocation.workload_class is not WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
+        try:
+            retained_allocation, terminal = _retained_terminal_allocation(
+                connection, allocation.invocation_id,
+            )
+        except ModelUsageIntegrityError as exc:
+            raise NativeEvidenceError("native transport diagnostic subject differs") from exc
+        if (retained_allocation != allocation
+            or allocation.workload_class is not WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
             or allocation.invocation_policy_digest != self._policy.canonical_digest
-            or row is None or tuple(row[:2]) != (allocation.canonical_digest, allocation.request_digest)
-            or row[2] != canonical_json_bytes(allocation.as_record()).decode()):
-            raise NativeEvidenceError("native transport diagnostic allocation differs")
-        terminal_row = connection.execute(
-            "SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?",
-            (allocation.invocation_id,),
-        ).fetchone()
-        if terminal_row is None:
-            raise NativeEvidenceError("native transport diagnostic lacks a failed terminal")
-        terminal = _terminal_from_record(json.loads(terminal_row[0]))
-        if (terminal.outcome != "ASSESSOR_PROVIDER_FAILED"
+            or terminal.invocation_id != allocation.invocation_id
+            or terminal.outcome != "ASSESSOR_PROVIDER_FAILED"
             or terminal.failure_class != "UNKNOWN_PROVIDER_FAILURE"
             or terminal.usage_status is not UsageStatus.ESTIMATED
-            or terminal.dispatch_at is None
-            or canonical_json_bytes(terminal.as_record()).decode() != terminal_row[0]):
+            or terminal.dispatch_at is None):
             raise NativeEvidenceError("native transport diagnostic terminal differs")
         return terminal
 

@@ -214,3 +214,68 @@ def test_retained_reader_rejects_rebound_or_unsafe_diagnostics(tmp_path, monkeyp
             usage.read_transport_diagnostic(allocation, reference)
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('fault', ('rebound_body', 'terminal_digest', 'outcome', 'usage_status', 'failure_class', 'completed_at'))
+def test_timeout_diagnostic_subject_rejects_terminal_body_or_index_rebinding(tmp_path, monkeypatch, fault):
+    from dataclasses import fields
+    connection, candidate, base, service, usage, _calls, assessor = _assessor_fixture(
+        tmp_path, monkeypatch, stdout=None, stderr=None,
+    )
+    try:
+        with pytest.raises(writer.CliTimeoutError) as caught:
+            assessor(candidate, base, (), ())
+        reference = dict(caught.value.diagnostic_reference)
+        with sqlite3.connect(service.path) as retained:
+            allocation = native_assessor._allocation_from_record(json.loads(retained.execute(
+                'SELECT record_json FROM model_invocation_allocations').fetchone()[0]))
+            body = json.loads(retained.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0])
+            if fault == 'rebound_body':
+                original = native_assessor._terminal_from_record(body)
+                values = {field.name: getattr(original, field.name) for field in fields(original)}
+                values['invocation_id'] = 'sha256:' + 'f' * 64
+                foreign = type(original).create(**values)
+                retained.execute('UPDATE model_invocation_terminals SET record_json=? WHERE invocation_id=?',
+                                 (canonical_json_bytes(foreign.as_record()).decode(), allocation.invocation_id))
+            else:
+                value = {
+                    'terminal_digest': 'sha256:' + 'f' * 64,
+                    'outcome': 'ASSESSOR_ACCEPTED', 'usage_status': 'REPORTED',
+                    'failure_class': 'CHANGED_FAILURE', 'completed_at': '2026-01-01T12:00:00Z',
+                }[fault]
+                retained.execute(f'UPDATE model_invocation_terminals SET {fault}=? WHERE invocation_id=?',
+                                 (value, allocation.invocation_id))
+        # Pre-fix, retention may accept the rebound subject; its fresh read-back
+        # must still deny it. Post-fix, both write and read deny the same binding.
+        try:
+            reference = usage.retain_transport_diagnostic(allocation, caught.value.evidence)
+        except native_assessor.NativeEvidenceError:
+            pass
+        with pytest.raises(native_assessor.NativeEvidenceError):
+            usage.read_transport_diagnostic(allocation, reference)
+        with pytest.raises(native_assessor.NativeEvidenceError):
+            usage.retain_transport_diagnostic(allocation, caught.value.evidence)
+    finally:
+        connection.close()
+
+
+def test_terminal_binding_failure_in_capture_preserves_original_cli_timeout(tmp_path, monkeypatch, caplog):
+    connection, candidate, base, service, usage, calls, assessor = _assessor_fixture(
+        tmp_path, monkeypatch, stdout=None, stderr=None,
+    )
+    original_complete = usage.complete
+    def rebound_after_completion(*arguments, **keywords):
+        original_complete(*arguments, **keywords)
+        with sqlite3.connect(service.path) as retained:
+            retained.execute("UPDATE model_invocation_terminals SET outcome='ASSESSOR_ACCEPTED'")
+    monkeypatch.setattr(usage, 'complete', rebound_after_completion)
+    try:
+        with pytest.raises(writer.CliTimeoutError, match='grok writer timed out') as caught:
+            assessor(candidate, base, (), ())
+        assert caught.value.diagnostic_reference is None
+        assert len(calls) == 1
+        assert 'native timeout diagnostic was not retained' in caplog.text
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute("SELECT count(*) FROM ledger WHERE kind='NATIVE_ASSESSOR_TRANSPORT_DIAGNOSTIC'").fetchone()[0] == 0
+    finally:
+        connection.close()
