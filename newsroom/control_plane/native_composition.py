@@ -69,6 +69,7 @@ from .native_source_intake import (
 from .native_source_rights import (
     NativePortfolioRights, observe_portfolio_terms, retain_rights_snapshot,
 )
+from .native_assessor_spans import PARTITION_VERSION
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
 from .native_weather_sources import poll_other_source
 from .native_weather_evidence import NativeWeatherEvidenceAcquisition, POLICY_DIGEST as WEATHER_TRANSPORT_POLICY
@@ -78,7 +79,7 @@ from .zh_hant import ZH_HANT_HK_SHAPE_POLICY_VERSION
 ASSESSMENT_CONTRACT_VERSION = (
     f"{ASSESSOR_CONTRACT_VERSION}+{NAMED_ENTITY_POLICY_VERSION}+"
     f"{ZH_HANT_HK_SHAPE_POLICY_VERSION}+{FACTUAL_LOCALISATION_POLICY_VERSION}+"
-    f"{QUALIFICATION_RELATION_POLICY_VERSION}+{RETAINED_ASSESSMENT_POLICY_VERSION}"
+    f"{QUALIFICATION_RELATION_POLICY_VERSION}+{RETAINED_ASSESSMENT_POLICY_VERSION}+{PARTITION_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
