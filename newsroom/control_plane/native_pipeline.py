@@ -13,6 +13,8 @@ from newsroom.authority import UtcTimestamp
 
 from .native_cycle import advance_native_cycle
 from .native_assessor import assessor_admission_recovery_due, assessment_revalidation_due, same_assessment_producer
+from .native_evidence import NativeEvidenceHold
+
 from .native_progress import NativeRevisionJournal
 from .veto import OperatorDrainRequested, VetoError
 
@@ -247,43 +249,44 @@ class NativePipeline:
                         and not previous.get("facts", {}).get("candidate_version_id")):
                     deadline_deferred_ready.append((revision_id, units))
                 continue
-            if previous.get("stage") in {"ASSESSMENT_INTERRUPTED", "COPY_CORRECTION_PREPARED"} or (
-                previous.get("stage") == "EVIDENCE_HOLD"
-                and assessor_admission_recovery_due(previous.get("facts", {}))
-            ):
-                candidate_version_id = previous.get("facts", {}).get(
-                    "candidate_version_id"
-                )
-                if type(candidate_version_id) is str and candidate_version_id:
-                    self._publish.advance(
-                        revision_id=revision_id,
-                        candidate_version_id=candidate_version_id,
-                    )
-                continue
-            if previous.get("stage") == "ACKNOWLEDGED":
-                due = getattr(self._publish, "copy_correction_due", None)
-                facts = previous.get("facts", {})
-                if callable(due) and due(facts):
-                    self._publish.advance(revision_id=revision_id, candidate_version_id=facts["candidate_version_id"])
-                continue
-            if previous.get("stage") == "SAME_STATE_ASSOCIATED":
-                continue
-            if (
-                previous.get("stage") == "EVIDENCE_HOLD"
-                and previous.get("facts", {}).get("acquisition_retryable") is not True
-                and previous.get("facts", {}).get("reason") not in {
-                    "CURRENT_RIGHTS_HOLD", "GOVUK_LICENCE_BINDING_HOLD",
-                    "GOVUK_LICENCE_REVIEW_HOLD", "NATIVE_SOURCE_RIGHTS_HOLD",
-                    "PUBLICATION_RIGHTS_HOLD",
-                }
-                and not assessment_revalidation_due(
-                    previous.get("facts", {}), self._assessment_contract_version,
-                )
-            ):
-                continue
             facts = dict(previous.get("facts", {}))
-            stage = "GRAPHITI"
+            stage = "PUBLICATION"
             try:
+                if previous.get("stage") in {"ASSESSMENT_INTERRUPTED", "COPY_CORRECTION_PREPARED"} or (
+                    previous.get("stage") == "EVIDENCE_HOLD"
+                    and assessor_admission_recovery_due(previous.get("facts", {}))
+                ):
+                    candidate_version_id = previous.get("facts", {}).get(
+                        "candidate_version_id"
+                    )
+                    if type(candidate_version_id) is str and candidate_version_id:
+                        self._publish.advance(
+                            revision_id=revision_id,
+                            candidate_version_id=candidate_version_id,
+                        )
+                    continue
+                if previous.get("stage") == "ACKNOWLEDGED":
+                    due = getattr(self._publish, "copy_correction_due", None)
+                    facts = previous.get("facts", {})
+                    if callable(due) and due(facts):
+                        self._publish.advance(revision_id=revision_id, candidate_version_id=facts["candidate_version_id"])
+                    continue
+                if previous.get("stage") == "SAME_STATE_ASSOCIATED":
+                    continue
+                if (
+                    previous.get("stage") == "EVIDENCE_HOLD"
+                    and previous.get("facts", {}).get("acquisition_retryable") is not True
+                    and previous.get("facts", {}).get("reason") not in {
+                        "CURRENT_RIGHTS_HOLD", "GOVUK_LICENCE_BINDING_HOLD",
+                        "GOVUK_LICENCE_REVIEW_HOLD", "NATIVE_SOURCE_RIGHTS_HOLD",
+                        "PUBLICATION_RIGHTS_HOLD",
+                    }
+                    and not assessment_revalidation_due(
+                        previous.get("facts", {}), self._assessment_contract_version,
+                    )
+                ):
+                    continue
+                stage = "GRAPHITI"
                 if not facts.get("graphiti_receipts"):
                     continue
                 candidate_version_id = facts.get("candidate_version_id")
@@ -334,7 +337,20 @@ class NativePipeline:
                 # Do not overwrite a more precise durable provider-dispatch or
                 # publication intent marker with a generic outer-loop failure.
                 retained = self._journal.progress.get(revision_id, {})
-                if retained.get("stage") in {"ASSESSMENT_STARTED", "PUBLICATION_STARTED"}:
+                if retained.get("stage") in {
+                    "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "ASSESSMENT_INTERRUPTED",
+                    "COPY_CORRECTION_PREPARED", "ACKNOWLEDGED",
+                } or (
+                    retained.get("stage") == "EVIDENCE_HOLD"
+                    and assessor_admission_recovery_due(retained.get("facts", {}))
+                ):
+                    if isinstance(exc, NativeEvidenceHold):
+                        self._journal.advance(revision_id, stage=retained["stage"], facts={
+                            **retained.get("facts", {}),
+                            "last_continuation_hold": {
+                                "reason": exc.reason_code, "source_id": exc.source_id,
+                            },
+                        })
                     continue
                 self._journal.advance(revision_id, stage=f"{stage}_HOLD", facts={
                     **self._journal.progress.get(revision_id, {}).get("facts", facts),
