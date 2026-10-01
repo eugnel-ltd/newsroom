@@ -129,9 +129,24 @@ class NativePipeline:
         # turn has the existing quantum; an atomic revision may overrun it.
         ordinary.sort(key=lambda item: self._journal.progress.get(item[0], {}).get("stage")
                       not in {"ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
+        ordinary_deadline = self._monotonic_clock() + self._reassessment_quantum
+        recover = getattr(self._publish, "recover_pre_dispatch", None)
+        if callable(recover):
+            def before_recovery() -> bool:
+                self._drain_between_work()
+                self._check()
+                return self._monotonic_clock() < ordinary_deadline
+
+            attempted = set(recover(
+                tuple(revision_id for revision_id, _ in ordinary),
+                before_revision=before_recovery,
+            ))
+            # Reclassification is this revision's only turn in the tick, not
+            # permission for a fresh source/model retry using the batch proof.
+            ordinary = [item for item in ordinary if item[0] not in attempted]
         deadline_deferred_ready = self._advance_revisions(
             tuple(ordinary),
-            work_deadline=self._monotonic_clock() + self._reassessment_quantum,
+            work_deadline=ordinary_deadline,
         )
         self._drain_between_work()
         # Reuse one current/archive preference for pending and ready work.

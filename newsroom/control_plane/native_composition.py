@@ -684,6 +684,27 @@ def open_native_pipeline(
         class Publication:
             copy_correction_due = staticmethod(NativePublicationContinuation.copy_correction_due)
 
+            def continuation(self, sources):
+                return NativePublicationContinuation(
+                    journal=journal, runtime=runtime, evidence_controller=evidence,
+                    sources=sources,
+                    assessment_contract_failure=(
+                        assessment_usage.retained_output_contract_failure
+                    ),
+                    assessment_pre_dispatch_failure=(
+                        assessment_usage.retained_pre_dispatch_failure
+                    ),
+                    assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,
+                    clock=now,
+                )
+
+            def recover_pre_dispatch(self, revision_ids, *, before_revision):
+                return self.continuation({}).recover_pre_dispatch(
+                    revision_ids,
+                    failure_many=assessment_usage.retained_pre_dispatch_failure_many,
+                    before_revision=before_revision,
+                )
+
             def advance(self, *, revision_id, candidate_version_id):
                 progress = journal.progress.get(revision_id, {})
                 sources = ()
@@ -702,17 +723,8 @@ def open_native_pipeline(
                             raise
                         # The correction continuation retains the old ACK and
                         # records a current-source HOLD, without blocking peers.
-                return NativePublicationContinuation(
-                    journal=journal, runtime=runtime, evidence_controller=evidence,
-                    sources={revision_id: sources} if sources else {},
-                    assessment_contract_failure=(
-                        assessment_usage.retained_output_contract_failure
-                    ),
-                    assessment_pre_dispatch_failure=(
-                        assessment_usage.retained_pre_dispatch_failure
-                    ),
-                    assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,
-                    clock=now,
+                return self.continuation(
+                    {revision_id: sources} if sources else {},
                 ).advance(revision_id=revision_id, candidate_version_id=candidate_version_id)
 
         intake = NativeSourceIntake(
