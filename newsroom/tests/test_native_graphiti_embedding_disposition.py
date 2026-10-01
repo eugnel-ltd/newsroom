@@ -257,6 +257,57 @@ def test_native_embedding_cancellation_does_not_replay_native_progress(
         case.connection.close()
 
 
+def test_route_state_snapshot_keeps_native_accounting_and_rechecks_same_count_mutation(
+    tmp_path, monkeypatch,
+):
+    case = _cancelled(tmp_path, monkeypatch)
+    try:
+        record = _dispose(case)
+        before = _immutable_snapshot(case)
+        calls = []
+        original = model_usage_module._usage_blocking_routes
+
+        def checked(connection):
+            if len(calls) < 2:
+                assert connection.in_transaction
+            calls.append(connection)
+            return original(connection)
+
+        monkeypatch.setattr(model_usage_module, "_usage_blocking_routes", checked)
+        with case.usage.route_state_snapshot() as read:
+            assert read(ROUTE)["state"] == "CLOSED"
+            assert read("GRAPHITI_CHAT_PRIMARY")["state"] == "CLOSED"
+            assert len(calls) == 1
+            assert _immutable_snapshot(case) == before
+            changed = {**record, "exact_usage_remains_unknown": False}
+            changed.pop("disposition_digest")
+            changed["disposition_digest"] = digest_canonical(changed)
+            case.connection.execute(
+                "UPDATE model_usage_conservative_dispositions SET "
+                "disposition_digest=?,record_json=? WHERE invocation_id=?",
+                (changed["disposition_digest"], canonical_json_bytes(changed).decode(),
+                 case.allocation.invocation_id),
+            )
+            case.connection.commit()
+            # A single read transaction keeps the already proved state, not
+            # a mixture of old blocker authority and newly changed records.
+            assert read(ROUTE)["state"] == "CLOSED"
+            assert len(calls) == 1
+        assert case.connection.execute(
+            "SELECT count(*) FROM model_usage_conservative_dispositions"
+        ).fetchone() == (1,)
+        assert _immutable_snapshot(case) == before
+        with pytest.raises(ModelUsageIntegrityError, match="native conservative disposition differs"):
+            with case.usage.route_state_snapshot():
+                pytest.fail("changed historical authority entered a new snapshot")
+        assert len(calls) == 2
+        with pytest.raises(ModelUsageIntegrityError, match="native conservative disposition differs"):
+            case.usage.route_state("GRAPHITI_CHAT_PRIMARY")
+        assert len(calls) == 3
+    finally:
+        case.connection.close()
+
+
 @pytest.mark.parametrize("leaf", ["chat", "embedding"])
 def test_native_disposition_uses_request_revision_hint_before_landing_bodies(
     tmp_path, monkeypatch, leaf,

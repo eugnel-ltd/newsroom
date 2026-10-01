@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1199,21 +1201,114 @@ def test_required_routes_allow_only_a_closed_grok_substitute(
     ] == ["GRAPHITI_CHAT_PRIMARY"]
 
 
-def test_required_route_check_reads_only_states_needed_for_the_decision() -> None:
+@pytest.mark.parametrize("primary,fallback_permitted,event_digest,fallback,expected", (
+    ("CLOSED", False, "sha256:" + "a" * 64, "CLOSED", ()),
+    ("CLOSED", True, "sha256:" + "a" * 64, "CLOSED", ()),
+    ("OPEN", False, "sha256:" + "a" * 64, "CLOSED", ("GRAPHITI_CHAT_PRIMARY",)),
+    ("OPEN", True, None, "CLOSED", ("GRAPHITI_CHAT_PRIMARY",)),
+    ("OPEN", True, "sha256:" + "a" * 64, "CLOSED", ()),
+    ("OPEN", True, "sha256:" + "a" * 64, "OPEN", ("GRAPHITI_CHAT_PRIMARY",)),
+))
+def test_required_route_check_reads_only_states_needed_for_the_decision(
+    primary, fallback_permitted, event_digest, fallback, expected,
+) -> None:
     calls = []
+    scopes = []
 
     class Routes:
+        @contextmanager
+        def route_state_snapshot(self):
+            scopes.append("entered")
+            try:
+                yield self.route_state
+            finally:
+                scopes.append("closed")
+
         def route_state(self, route):
+            assert scopes == ["entered"]
             calls.append(route)
             return {
                 "route": route,
-                "state": "CLOSED",
-                "event_digest": "sha256:" + "a" * 64,
+                "state": primary if route == "GRAPHITI_CHAT_PRIMARY" else (
+                    fallback if route == "GRAPHITI_CHAT_FALLBACK" else "CLOSED"
+                ),
+                "event_digest": event_digest,
             }
 
     service = Routes()
-    assert graphiti_required_route_holds(service) == ()
-    assert calls == ["GRAPHITI_EMBEDDING", "GRAPHITI_CHAT_PRIMARY"]
+    holds = graphiti_required_route_holds(service, fallback_permitted=fallback_permitted)
+    assert tuple(item["route"] for item in holds) == expected
+    assert calls == ["GRAPHITI_EMBEDDING", "GRAPHITI_CHAT_PRIMARY"] + (
+        ["GRAPHITI_CHAT_FALLBACK"]
+        if primary == "OPEN" and fallback_permitted and event_digest is not None else []
+    )
+    assert scopes == ["entered", "closed"]
+
+
+@pytest.mark.parametrize("fallback_permitted", (False, True))
+def test_required_route_check_authenticates_blocking_history_once(
+    tmp_path, monkeypatch, fallback_permitted,
+):
+    service = ModelUsageService(str(tmp_path / "unpublished.sqlite3"))
+    service.open_route_circuit(
+        route="GRAPHITI_CHAT_PRIMARY", reason="QUOTA",
+        invocation_id=None, recorded_at=T0,
+    )
+    calls = []
+    original = model_usage_module._usage_blocking_routes
+
+    def checked(connection):
+        assert connection.in_transaction
+        calls.append(connection)
+        return original(connection)
+
+    monkeypatch.setattr(model_usage_module, "_usage_blocking_routes", checked)
+    holds = graphiti_required_route_holds(service, fallback_permitted=fallback_permitted)
+    assert tuple(item["route"] for item in holds) == (
+        () if fallback_permitted else ("GRAPHITI_CHAT_PRIMARY",)
+    )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("failure", ("blockers", "route", "consumer"))
+def test_route_state_snapshot_closes_after_partial_failure(tmp_path, monkeypatch, failure):
+    service = ModelUsageService(str(tmp_path / "unpublished.sqlite3"))
+    connections = []
+    statements = []
+    original_connection = service._connection
+    original_blockers = model_usage_module._usage_blocking_routes
+    original_route = service._route_state
+
+    def connected():
+        connection = original_connection()
+        connection.set_trace_callback(statements.append)
+        connections.append(connection)
+        return connection
+
+    def blockers(connection):
+        if failure == "blockers":
+            raise RuntimeError("snapshot failure")
+        return original_blockers(connection)
+
+    def route(connection, name, **values):
+        if failure == "route" and name == "GRAPHITI_CHAT_PRIMARY":
+            raise RuntimeError("snapshot failure")
+        return original_route(connection, name, **values)
+
+    monkeypatch.setattr(service, "_connection", connected)
+    monkeypatch.setattr(model_usage_module, "_usage_blocking_routes", blockers)
+    monkeypatch.setattr(service, "_route_state", route)
+    with pytest.raises(RuntimeError, match="snapshot failure"):
+        with service.route_state_snapshot() as read:
+            assert read("GRAPHITI_EMBEDDING")["state"] == "CLOSED"
+            if failure == "consumer":
+                raise RuntimeError("snapshot failure")
+            read("GRAPHITI_CHAT_PRIMARY")
+    assert len(connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+    assert not any(sql.split()[0] in {"INSERT", "UPDATE", "DELETE", "CREATE"}
+                   for sql in statements)
 
 
 def test_embedding_transport_observes_separate_preallocated_leaf_and_od011_receipt(
