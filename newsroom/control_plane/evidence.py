@@ -26,7 +26,7 @@ EVIDENCE_APPROVAL_POLICY_VERSION = "newsroom.evidence-approval.v8"
 EVIDENCE_APPROVAL_PRINCIPAL = "HERMES_EVIDENCE_CONTROLLER"
 ORIGINALITY_POLICY_VERSION = "newsroom.cont-originality.v3"
 NAMED_ENTITY_POLICY_VERSION = "newsroom.named-entity.v15"
-FACTUAL_LOCALISATION_POLICY_VERSION = "newsroom.factual-localisation.v1"
+FACTUAL_LOCALISATION_POLICY_VERSION = "newsroom.factual-localisation.v2"
 
 _SOURCE_RECORD_FIELDS = frozenset(
     {
@@ -1046,7 +1046,7 @@ def _canonical_localised_fact(value: str) -> tuple[object, ...] | None:
         r"(\d{1,2}|[零〇一二三四五六七八九十]+)月"
         r"(\d{1,2}|[零〇一二三四五六七八九十]+)(?:日|號|号)"
         r"(?:(上午|下午)?(\d{1,2}|[零〇一二三四五六七八九十]+)"
-        r"(?:時|时|點|点)(\d{1,2}|[零〇一二三四五六七八九十]+)分?)?",
+        r"(?:時|时|點|点|:)(\d{1,2}|[零〇一二三四五六七八九十]+)分?)?",
         value,
     )
     if chinese_date:
@@ -1064,6 +1064,8 @@ def _canonical_localised_fact(value: str) -> tuple[object, ...] | None:
         if (chinese_date.group(1) is not None and year is None) or (
             chinese_date.group(5) is not None and (hour is None or minute is None)
         ):
+            return None
+        if ":" in value and chinese_date.group(4) and not 1 <= hour <= 12:
             return None
         if hour is not None:
             if chinese_date.group(4) == "上午" and hour == 12:
