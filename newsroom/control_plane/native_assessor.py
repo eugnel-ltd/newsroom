@@ -88,6 +88,8 @@ from .native_assessor_references import (
     build_source_view, make_provider_schema, materialise as materialise_v17,
 )
 
+from .native_assessor_spans import PARTITION_VERSION, build_lossless_source_view
+
 from .native_assessor_wire import (
     make_provider_schema as make_v18_provider_schema, materialise as materialise_v18,
 )
@@ -720,9 +722,30 @@ def _materialise_reference_result(raw, view, request_identity, contract):
 
 
 def _reference_binding(view: SourceView) -> dict:
-    return {"version": SOURCE_REFERENCE_VERSION,
-            "manifest_digest": view.manifest_digest,
-            "body_digests": list(view.body_digests)}
+    binding = {"version": SOURCE_REFERENCE_VERSION,
+               "manifest_digest": view.manifest_digest,
+               "body_digests": list(view.body_digests)}
+    partition = getattr(view, "partition_version", None)
+    if partition is not None:
+        if partition != PARTITION_VERSION:
+            raise NativeEvidenceError("native source partition differs")
+        binding["partition_version"] = partition
+    return binding
+
+
+def _source_view_for_binding(passages, source_ids, binding) -> SourceView:
+    if type(binding) is not dict:
+        raise NativeEvidenceError("native source reference binding differs")
+    partition = binding.get("partition_version")
+    if partition is None:
+        view = build_source_view(passages, source_ids)
+    elif partition == PARTITION_VERSION:
+        view = build_lossless_source_view(passages, source_ids)
+    else:
+        raise NativeEvidenceError("native source partition differs")
+    if _reference_binding(view) != binding:
+        raise NativeEvidenceError("native source reference binding differs")
+    return view
 
 
 def _materialisation_record(allocation, context, raw_digest, receipt) -> dict:
@@ -737,6 +760,7 @@ def _materialisation_record(allocation, context, raw_digest, receipt) -> dict:
         allocation.prompt_contract_version not in _REFERENCE_PRODUCERS
         or type(binding) is not dict
         or binding.get("version") != SOURCE_REFERENCE_VERSION
+        or binding.get("partition_version") not in (None, PARTITION_VERSION)
         or receipt.get("version") != binding.get("version")
         or receipt.get("request_identity") != allocation.request_digest
         or receipt.get("raw_digest") != raw_digest
@@ -839,7 +863,7 @@ class NativeAssessmentUsage:
                 "ASSESSOR_EXACT_INPUT_BOUND_HOLD", candidate.candidate_id
             )
         if VERSION in _REFERENCE_PRODUCERS:
-            source_view = source_view or build_source_view(base.passages, base.source_ids)
+            source_view = source_view or build_lossless_source_view(base.passages, base.source_ids)
             if source_view.passages != base.passages or source_view.source_ids != base.source_ids:
                 raise NativeEvidenceError("native assessor source view differs from base")
         package_bytes = canonical_json_bytes(evidence_package_value(base))
@@ -1180,7 +1204,7 @@ class NativeAssessmentUsage:
                 parameters,
             ).fetchall()
             matches: list[RetainedAssessorResult] = []
-            reference_view = None
+            reference_views = {}
             for row in rows:
                 try:
                     envelope_record = json.loads(row[5])
@@ -1521,8 +1545,18 @@ class NativeAssessmentUsage:
                             # but a derived package is not executable authority.
                             execution = None
                         else:
-                            reference_view = reference_view or build_source_view(base.passages, base.source_ids)
-                            if _reference_binding(reference_view) != context.get("source_reference_binding"):
+                            binding = context.get("source_reference_binding")
+                            if type(binding) is not dict:
+                                return None
+                            partition = binding.get("partition_version")
+                            if partition is not None and partition != PARTITION_VERSION:
+                                return None
+                            if partition not in reference_views:
+                                reference_views[partition] = _source_view_for_binding(
+                                    base.passages, base.source_ids, binding,
+                                )
+                            reference_view = reference_views[partition]
+                            if _reference_binding(reference_view) != binding:
                                 return None
                             _package, derived = _materialise_reference_result(
                                 execution.text, reference_view, allocation.request_digest,
@@ -1879,7 +1913,7 @@ class AutonomousNativeEvidenceAssessor:
             ):
                 raise NativeEvidenceHold("ASSESSOR_EXACT_INPUT_BOUND_HOLD", source_id)
             try:
-                reference_view = build_source_view(base.passages, base.source_ids)
+                reference_view = build_lossless_source_view(base.passages, base.source_ids)
                 if sources and (base.source_ids != tuple(item.unit.source_id for item in sources)
                         or base.passages != tuple(item.body.decode("utf-8") for item in acquired)):
                     raise SourceReferenceError("acquired source and base bytes differ")

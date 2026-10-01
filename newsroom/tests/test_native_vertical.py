@@ -289,10 +289,16 @@ def _install_boundaries(monkeypatch, counters):
         assert "passages" not in request["base_package"]
         assert "".join(item["text"] for item in source["segments"])
         headline = counters.get("document_body", "Official deadline changed.")
-        selected = {item["text"].removesuffix("\n"): item["span_id"]
-                    for item in source["segments"]}
-        assert headline in selected
-        assert "Visa rules updated" in selected
+        def selected_range(text):
+            segments = source["segments"]
+            for first in range(len(segments)):
+                for last in range(first, len(segments)):
+                    if "".join(item["text"] for item in segments[first:last + 1]).removesuffix("\n") == text:
+                        return {"first_span_id": segments[first]["span_id"],
+                                "last_span_id": segments[last]["span_id"]}
+            pytest.fail("exact fixture source range is absent")
+        selected = {text: selected_range(text)
+                    for text in (headline, "Visa rules updated")}
         rendered_headline = (
             "官方限期已經更改。" if headline == "Official deadline changed."
             else "官方限期已更改，截止日期延後。"
@@ -309,8 +315,8 @@ def _install_boundaries(monkeypatch, counters):
 
         def governed_claim(*, span_id, rendered, role):
             return {
-                "claim_range": {"first_span_id": span_id, "last_span_id": span_id},
-                "support_range": {"first_span_id": span_id, "last_span_id": span_id},
+                "claim_range": span_id,
+                "support_range": span_id,
                 "status": "CONFIRMED_FACT",
                 "rendered_fragments": [rendered],
                 "claim_role": role,

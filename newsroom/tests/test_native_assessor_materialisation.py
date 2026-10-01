@@ -54,7 +54,7 @@ def _reference_claim(span_id, role, fragments, *, localised=(), quotations=()):
     }
 
 
-def _literal_reference_inputs():
+def _literal_reference_inputs(*, partitioned=False):
     """Synthetic table evidence proves the interface, not a production news fact."""
 
     candidate, base, source, acquired, _raw = _qualification_assessor_inputs(
@@ -95,7 +95,9 @@ def _literal_reference_inputs():
             ),
         }
     )
-    view = build_source_view((body,), (source.unit.source_id,))
+    from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
+    builder = build_lossless_source_view if partitioned else build_source_view
+    view = builder((body,), (source.unit.source_id,))
     title_id = view.segments[0].span_id
     row_segment = view.segments[-1]
     assert row_segment.text == row
@@ -211,8 +213,8 @@ _USAGE = {"usage_basis": "PROVIDER_REPORTED", "input_tokens": 1,
           "reasoning_tokens": 0, "context_tokens": 1, "total_tokens": 2}
 
 
-def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_override=None):
-    candidate, base, source, acquired, view, wire, _row, _body = _literal_reference_inputs()
+def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_override=None, partitioned=True):
+    candidate, base, source, acquired, view, wire, _row, _body = _literal_reference_inputs(partitioned=partitioned)
     wire = _v18_wire_from_v17(wire)
     service, usage = _usage(tmp_path, monkeypatch)
     # Fixture creates the ledger after the usage schema; exercise normal startup
@@ -230,6 +232,8 @@ def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_ove
 
     assessor = AutonomousNativeEvidenceAssessor(dispatch, usage=usage, dispatch_fence=nullcontext)
     facade = EvidenceAssessor(assessor)
+    if not partitioned:
+        monkeypatch.setattr("newsroom.control_plane.native_assessor.build_lossless_source_view", build_source_view)
     if malformed or raw_override is not None:
         with pytest.raises(NativeEvidenceHold, match="ASSESSOR_SOURCE_REFERENCE_HOLD"):
             facade.assess(candidate, base, (source,), (acquired,))
@@ -239,10 +243,14 @@ def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_ove
     return service, usage, assessor, candidate, base, source, acquired, calls, raw, result
 
 
-def test_v20_raw_and_materialised_results_are_retained_once_and_cached(tmp_path, monkeypatch):
+@pytest.mark.parametrize("partitioned", (False, True))
+def test_v20_raw_and_materialised_results_are_retained_once_and_cached(tmp_path, monkeypatch, partitioned):
     service, usage, assessor, candidate, base, source, acquired, calls, raw, result = (
-        _run_reference_assessment(tmp_path, monkeypatch)
+        _run_reference_assessment(tmp_path, monkeypatch, partitioned=partitioned)
     )
+    if not partitioned:
+        from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
+        monkeypatch.setattr("newsroom.control_plane.native_assessor.build_lossless_source_view", build_lossless_source_view)
     request = calls[0]
     assert request["contract"] == VERSION
     assert usage._policy.model == "grok-4.7"
