@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
@@ -76,6 +77,7 @@ from .writer import (
     CONT_PRIMARY_PROVIDER,
     CONT_PRIMARY_REASONING,
     WriterDispatchError,
+    CliTimeoutError,
     _run_grok_json,
     _grok_command_flags,
     cont_writer_implementation_identity,
@@ -83,6 +85,7 @@ from .writer import (
 )
 from .cycle import _complete_writer_usage
 from .store import append_ledger
+from newsroom.graphiti_adapter.cli_process import validated_timeout_diagnostics
 from .native_assessor_references import (
     VERSION as SOURCE_REFERENCE_VERSION, SourceReferenceError, SourceView,
     build_source_view, make_provider_schema, materialise as materialise_v17,
@@ -561,6 +564,9 @@ _ASSESSMENT_RESULT_SCHEMA_VERSION = "newsroom.native-assessment-result.v1"
 _MAX_RETAINED_RESULT_BYTES = 256 * 1024
 _MATERIALISATION_KIND = "NATIVE_ASSESSMENT_MATERIALISATION"
 _MATERIALISATION_SCHEMA_VERSION = "newsroom.native-assessment-materialisation.v1"
+_TRANSPORT_DIAGNOSTIC_KIND = "NATIVE_ASSESSOR_TRANSPORT_DIAGNOSTIC"
+_TRANSPORT_DIAGNOSTIC_SCHEMA = "newsroom.native-assessor-transport-diagnostic.v1"
+_MAX_TRANSPORT_DIAGNOSTIC_BYTES = 2048
 
 
 def _semantic_record_id(claim_id: str, claim: str, rendered: str) -> str:
@@ -1156,6 +1162,105 @@ class NativeAssessmentUsage:
             provider_dispatched=provider_dispatched,
             policy=self._policy,
         )
+
+    def _require_diagnostic_allocation(self, connection, allocation):
+        row = connection.execute(
+            "SELECT canonical_digest,request_digest,record_json "
+            "FROM model_invocation_allocations WHERE invocation_id=?",
+            (allocation.invocation_id,),
+        ).fetchone()
+        if (allocation.workload_class is not WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
+            or allocation.invocation_policy_digest != self._policy.canonical_digest
+            or row is None or tuple(row[:2]) != (allocation.canonical_digest, allocation.request_digest)
+            or row[2] != canonical_json_bytes(allocation.as_record()).decode()):
+            raise NativeEvidenceError("native transport diagnostic allocation differs")
+        terminal_row = connection.execute(
+            "SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?",
+            (allocation.invocation_id,),
+        ).fetchone()
+        if terminal_row is None:
+            raise NativeEvidenceError("native transport diagnostic lacks a failed terminal")
+        terminal = _terminal_from_record(json.loads(terminal_row[0]))
+        if (terminal.outcome != "ASSESSOR_PROVIDER_FAILED"
+            or terminal.failure_class != "UNKNOWN_PROVIDER_FAILURE"
+            or terminal.usage_status is not UsageStatus.ESTIMATED
+            or terminal.dispatch_at is None
+            or canonical_json_bytes(terminal.as_record()).decode() != terminal_row[0]):
+            raise NativeEvidenceError("native transport diagnostic terminal differs")
+        return terminal
+
+    def retain_transport_diagnostic(self, allocation, evidence) -> dict:
+        """Append bounded failure evidence, never a provider result or authority."""
+        diagnostic = validated_timeout_diagnostics([evidence])[0]
+        record = {
+            "schema_version": _TRANSPORT_DIAGNOSTIC_SCHEMA,
+            "invocation_id": allocation.invocation_id,
+            "allocation_digest": allocation.canonical_digest,
+            "request_digest": allocation.request_digest,
+            "observed_at": self._clock().astimezone(UTC).isoformat(),
+            "diagnostic": diagnostic,
+        }
+        connection = self._service._connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            terminal = self._require_diagnostic_allocation(connection, allocation)
+            record["terminal_digest"] = terminal.terminal_digest
+            raw = canonical_json_bytes(record)
+            if len(raw) >= _MAX_TRANSPORT_DIAGNOSTIC_BYTES:
+                raise NativeEvidenceError("native transport diagnostic exceeds bound")
+            append_ledger(connection, _TRANSPORT_DIAGNOSTIC_KIND, record)
+            row = connection.execute(
+                "SELECT seq,payload_digest FROM ledger WHERE seq=last_insert_rowid()",
+            ).fetchone()
+            connection.commit()
+            return {"seq": int(row[0]), "payload_digest": str(row[1])}
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def read_transport_diagnostic(self, allocation, reference) -> dict:
+        """Authenticate one exact retained failure record by primary key."""
+        if (type(reference) is not dict or set(reference) != {"seq", "payload_digest"}
+            or type(reference["seq"]) is not int or reference["seq"] <= 0):
+            raise NativeEvidenceError("native transport diagnostic reference differs")
+        connection = sqlite3.connect(f"file:{self._service.path}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            terminal = self._require_diagnostic_allocation(connection, allocation)
+            row = connection.execute(
+                "SELECT kind,payload_json,payload_digest FROM ledger WHERE seq=?",
+                (reference["seq"],),
+            ).fetchone()
+            if (row is None or row[0] != _TRANSPORT_DIAGNOSTIC_KIND
+                or type(row[1]) is not str
+                or len(row[1].encode()) >= _MAX_TRANSPORT_DIAGNOSTIC_BYTES
+                or row[2] != reference["payload_digest"]
+                or digest_bytes(row[1].encode()) != row[2]):
+                raise NativeEvidenceError("native transport diagnostic bytes differ")
+            record = json.loads(row[1])
+            if (type(record) is not dict or set(record) != {
+                    "schema_version", "invocation_id", "allocation_digest", "request_digest",
+                    "observed_at", "diagnostic", "terminal_digest",
+                } or canonical_json_bytes(record).decode() != row[1]
+                or record["schema_version"] != _TRANSPORT_DIAGNOSTIC_SCHEMA
+                or record["invocation_id"] != allocation.invocation_id
+                or record["allocation_digest"] != allocation.canonical_digest
+                or record["request_digest"] != allocation.request_digest
+                or record["terminal_digest"] != terminal.terminal_digest):
+                raise NativeEvidenceError("native transport diagnostic binding differs")
+            observed = datetime.fromisoformat(record["observed_at"])
+            if observed.tzinfo is None or observed.utcoffset() != timedelta(0):
+                raise NativeEvidenceError("native transport diagnostic time differs")
+            validated_timeout_diagnostics([record["diagnostic"]])
+            return record
+        except (TypeError, ValueError) as exc:
+            raise NativeEvidenceError("native transport diagnostic record differs") from exc
+        finally:
+            connection.close()
 
     def retained_output_contract_failure(
         self, candidate: object
@@ -2048,7 +2153,7 @@ class AutonomousNativeEvidenceAssessor:
                     else str(getattr(candidate, "candidate_id", "unknown-candidate"))
                 ),
             ) from exc
-        except BaseException:
+        except BaseException as exc:
             if allocation is not None:
                 self._usage.complete(
                     allocation,
@@ -2066,6 +2171,15 @@ class AutonomousNativeEvidenceAssessor:
                         else "ASSESSMENT_VALIDATION_FAILED"
                     ),
                 )
+                if isinstance(exc, CliTimeoutError) and exc.evidence is not None:
+                    try:
+                        reference = self._usage.retain_transport_diagnostic(allocation, exc.evidence)
+                        self._usage.read_transport_diagnostic(allocation, reference)
+                        exc.diagnostic_reference = reference
+                    except Exception:
+                        logging.getLogger(__name__).warning(
+                            "native timeout diagnostic was not retained",
+                        )
             raise
         if allocation is not None:
             self._usage.complete(

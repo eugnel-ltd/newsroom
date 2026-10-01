@@ -9,6 +9,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +29,9 @@ from newsroom.control_plane.zh_hant import (
     contains_discourse_filler,
     contains_non_han_letter,
     contains_simplified_variant,
+)
+from newsroom.graphiti_adapter.cli_process import (
+    timeout_deadline_after, timeout_diagnostic, validated_timeout_diagnostics,
 )
 from newsroom.graphiti_adapter.usage_meter import (
     cursor_cli_usage,
@@ -693,6 +697,22 @@ class CliProcessError(RuntimeError):
 
 class CliTimeoutError(RuntimeError):
     """The CLI wall deadline expired; provider completion and usage stay unknown."""
+
+    def __init__(self, message: str, *, evidence: dict | None = None) -> None:
+        super().__init__(message)
+        self.evidence = (None if evidence is None
+                         else validated_timeout_diagnostics([evidence])[0])
+        self.diagnostic_reference: dict | None = None
+
+
+def _timeout_output_bytes(value: object) -> bytes | None:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="surrogatepass")
+    return None  # Unexpected output types remain unobserved, never fabricated.
 
 
 class CliEmptyOutputError(RuntimeError):
@@ -1617,6 +1637,8 @@ def _run(
     environment: dict[str, str] | None = None,
 ) -> str:
     name = os.path.basename(command[0])
+    deadline = timeout_deadline_after(timeout)
+    started = time.monotonic()
     try:
         result = subprocess.run(
             command,
@@ -1634,8 +1656,18 @@ def _run(
             reason_code="EXECUTABLE_NOT_FOUND",
             provider_dispatched=False,
         ) from exc
-    except subprocess.TimeoutExpired:
-        raise CliTimeoutError(f"{name} writer timed out") from None
+    except subprocess.TimeoutExpired as exc:
+        stdout, stderr = _timeout_output_bytes(exc.output), _timeout_output_bytes(exc.stderr)
+        progress = ("UNOBSERVED" if stdout is None or stderr is None
+                    else "OUTPUT_OBSERVED" if stdout or stderr else "NO_OUTPUT_OBSERVED")
+        evidence = timeout_diagnostic(
+            boundary="CONTROLLER_DEADLINE", phase="CLI_TRANSPORT",
+            cause="CONFIGURED_TIMEOUT_EXPIRED", configured_timeout_ms=round(timeout * 1000),
+            elapsed_ms=max(0, round((time.monotonic() - started) * 1000)),
+            deadline_at=deadline, last_progress=progress, termination="UNOBSERVED",
+            process="CLI_CHILD", stdout=stdout, stderr=stderr,
+        )
+        raise CliTimeoutError(f"{name} writer timed out", evidence=evidence) from None
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise CliProcessError(
