@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from newsroom.tests.assessor_fixture_support import candidate_fixture
+
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from newsroom.control_plane import native_assessor as native
 from newsroom.control_plane.model_usage import (
@@ -88,7 +90,7 @@ def _execution(**changes):
 
 
 def _fixture(tmp_path, monkeypatch, *, declared_cli="1.0.10", observed_cli="1.0.10", **usage_changes):
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     connection.close()
     old = _policy(
@@ -166,7 +168,7 @@ def test_output_guard_requalification_preserves_failure_and_releases_only_future
 
 @pytest.mark.parametrize("limit", [None, 10_000])
 def test_policy_and_allocation_output_limit_roundtrip_preserves_hashes(tmp_path, monkeypatch, limit):
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     connection.close()
     policy = _policy()
@@ -206,7 +208,7 @@ def test_absent_output_limit_is_native_assessor_only(changes):
     ({"input_tokens": 90_000, "context_tokens": 90_050, "total_tokens": 102_050}, "MAX_TOTAL_TOKENS_EXCEEDED"),
 ])
 def test_new_output_above_ten_thousand_keeps_other_token_guards(tmp_path, monkeypatch, changes, breach):
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     connection.close()
     service, usage = _usage(tmp_path, monkeypatch, _policy())
@@ -229,7 +231,7 @@ def test_allocation_reader_rejects_invalid_output_guard(tmp_path, monkeypatch, b
 
 @pytest.mark.parametrize(("requested", "policy_limit"), [(10_000, None), (None, 10_000)])
 def test_output_guard_presence_must_match_at_admission_and_terminal(tmp_path, monkeypatch, requested, policy_limit):
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     connection.close()
     service, usage = _usage(tmp_path, monkeypatch, _policy())

@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from newsroom.tests.assessor_fixture_support import candidate_fixture
 from jsonschema import Draft202012Validator, ValidationError
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
@@ -221,7 +223,7 @@ def _model_package_value(package):
 
 
 def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tmp_path) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     assessed = _ready_package(candidate)[1]
     validator = Draft202012Validator(SCHEMA)
@@ -326,7 +328,7 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
 def test_native_assessor_derives_entities_from_constructed_uk03_output(
     tmp_path, claim_text, excerpt, rendered, expected_entities,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     package = _model_package_value(_ready_package(candidate)[1])
     claim = package["governed_claims"][0]
@@ -1395,7 +1397,7 @@ def test_native_assessor_retains_precise_qualification_contract_hold(
     tmp_path, monkeypatch,
 ) -> None:
     _use_historical_v16(monkeypatch)
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     package = _model_package_value(base)
     package["qualification_evidence"] = [{
@@ -1541,7 +1543,7 @@ def test_native_assessor_input_bound_has_planning_headroom_not_an_output_limit(
 def test_native_assessor_exact_request_bound_precedes_allocation(
     tmp_path, monkeypatch, request_bytes,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     bound = native_assessment_input_bound(usage._policy)
@@ -1573,7 +1575,7 @@ def test_native_assessor_exact_request_bound_precedes_allocation(
 
 
 def test_native_assessor_exact_byte_ceiling_and_plus_one(tmp_path, monkeypatch) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     maximum = native_assessment_input_bound(usage._policy)['max_request_bytes']
@@ -1593,7 +1595,7 @@ def test_native_assessor_exact_byte_ceiling_and_plus_one(tmp_path, monkeypatch) 
 def test_assessor_rejects_source_lower_bound_before_building_reference_view(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     maximum = native_assessment_input_bound(usage._policy)["max_request_bytes"]
@@ -1632,7 +1634,7 @@ def test_assessor_rejects_source_lower_bound_before_building_reference_view(
 def test_native_assessor_uses_exact_candidate_and_base_without_ambient_context(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     calls = []
     fence_active = False
@@ -1714,7 +1716,7 @@ def test_native_assessor_uses_exact_candidate_and_base_without_ambient_context(
 def test_native_assessor_command_version_is_observed_without_becoming_a_gate(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -1744,7 +1746,7 @@ def test_native_assessor_command_version_is_observed_without_becoming_a_gate(
 def test_native_assessor_pre_dispatch_recovery_requires_zero_exact_envelopes(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     _service, usage = _usage(tmp_path, monkeypatch)
 
@@ -1820,7 +1822,7 @@ def test_native_assessor_pre_dispatch_recovery_requires_zero_exact_envelopes(
 def test_native_assessor_resumes_only_exact_empty_envelope_when_route_eligible(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     from newsroom.control_plane.native_assessor import _assessment_cycle_id
@@ -1851,7 +1853,7 @@ def test_native_assessor_resumes_only_exact_empty_envelope_when_route_eligible(
 def test_native_assessor_empty_envelope_mismatch_remains_unresolved(
     tmp_path, monkeypatch, defect,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     from newsroom.control_plane.native_assessor import _assessment_cycle_id
@@ -1903,7 +1905,7 @@ def test_native_assessor_retains_post_dispatch_failures(
     output,
     outcome,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     dispatches = 0
@@ -2032,7 +2034,7 @@ def test_native_assessor_retains_post_dispatch_failures(
 def test_native_assessor_result_diagnostic_is_bounded_and_replay_safe(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     allocation = usage.begin(candidate, base, "exact request")
@@ -2072,7 +2074,7 @@ def test_native_assessor_result_diagnostic_is_bounded_and_replay_safe(
 def test_native_assessor_result_diagnostic_rejects_oversized_output(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     allocation = usage.begin(candidate, base, "exact request")
@@ -2096,7 +2098,7 @@ def test_native_assessor_result_diagnostic_rejects_oversized_output(
 def test_native_assessor_oversized_result_becomes_accounted_contract_hold(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     output = "x" * (_MAX_RETAINED_RESULT_BYTES + 1)
@@ -2166,7 +2168,7 @@ def test_native_work_envelopes_reject_unrelated_authority_ids() -> None:
 def test_inflight_native_assessor_is_not_a_retained_contract_failure(
     tmp_path, monkeypatch,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     _service, usage = _usage(tmp_path, monkeypatch)
 
@@ -2188,7 +2190,7 @@ def test_retained_assessment_revalidation_reuses_output_without_provider(tmp_pat
             module, "CONTEXT_MANIFEST_SCHEMA_VERSION",
             "newsroom.native-evidence-assessor.context-manifest.v1",
         )
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     calls = []
@@ -2247,7 +2249,7 @@ def test_consumer_only_revalidation_requires_exact_cached_input(
 ) -> None:
     import newsroom.control_plane.native_assessor as module
 
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     calls = []
 
@@ -2296,7 +2298,7 @@ def test_consumer_only_revalidation_requires_exact_cached_input(
 def test_consumer_only_revalidation_without_retention_never_dispatches(
     tmp_path,
 ) -> None:
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     calls = []
     assessor = AutonomousNativeEvidenceAssessor(
@@ -2330,7 +2332,7 @@ def test_superseded_assessor_allows_one_new_contract_attempt_only_after_settleme
 ):
     import newsroom.control_plane.native_assessor as module
 
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     monkeypatch.setattr(module, "VERSION", prior_contract)
     monkeypatch.setattr(__import__(__name__, fromlist=["VERSION"]), "VERSION", module.VERSION)
@@ -2537,7 +2539,7 @@ def test_hko_base_upgrade_proves_original_bytes_and_rejects_other_changes(tmp_pa
     from newsroom.control_plane.native_weather_evidence import hko_evidence_body
     from newsroom.tests.test_native_weather_evidence import HKO_WARNING
 
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     try:
         raw = canonical_json_bytes({"WTS": HKO_WARNING})
         old = replace(_base_package(_ready_package(candidate)[1]), source_ids=("HK-02",),
@@ -2575,7 +2577,7 @@ def test_hko_base_upgrade_proves_original_bytes_and_rejects_other_changes(tmp_pa
 def test_proved_hko_representation_upgrade_has_one_new_accounted_contract_attempt(tmp_path, monkeypatch):
     import newsroom.control_plane.native_assessor as module
 
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     try:
         base = _base_package(_ready_package(candidate)[1])
         calls = []
