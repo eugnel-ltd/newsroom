@@ -280,6 +280,33 @@ def test_binary_only_form_does_not_gain_spreadsheet_coverage(tmp_path, monkeypat
         assert fetched == list(bodies)[:2]
 
 
+def test_html_bearing_form_retains_valid_xlsx_through_existing_asset_contract(
+    tmp_path, monkeypatch,
+):
+    asset_url = "https://assets.publishing.service.gov.uk/media/form.xlsx"
+    asset = _xlsx_asset()
+    parent = _form_parent()
+    declaration = json.loads(_spreadsheet_parent(PUBLICATION, asset_url, asset))
+    parent["details"]["attachments"].extend(declaration["details"]["attachments"])
+    bodies = _bodies(parent)
+    bodies[asset_url] = asset
+    with _poll_fixture(tmp_path, monkeypatch, bodies, source_id="UK-05") as case:
+        runtime, _, result, fetched = case
+        assert result.status == "READY" and result.item_holds == ()
+        assert len(result.units) == 2
+        html, spreadsheet = result.units
+        assert (html.canonical_url, html.body) == (CANONICAL + LEAF, FULL_TEXT)
+        assert spreadsheet.canonical_url == CANONICAL + PUBLICATION
+        assert spreadsheet.item_key.endswith("|" + asset_url)
+        assert "Example College" in spreadsheet.body and "125000" in spreadsheet.body
+        assert len(result.observations) == len(bodies)
+        assert Counter(fetched) == Counter(bodies.keys())
+        assert len(native_evidence_sources(
+            observations={value[1]: value for value in result.observations},
+            **_evidence_args(runtime, result),
+        )) == 2
+
+
 @pytest.mark.parametrize("boundary", ("non-descendant", "other-route", "other-type", "nested", "missing"))
 def test_collection_form_handoff_stays_strict_bounded_and_terminal(
     tmp_path, monkeypatch, boundary,
