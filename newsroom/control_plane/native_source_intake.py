@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import ssl
 import urllib.error
 import urllib.request
@@ -44,7 +45,7 @@ from newsroom.sources import (
 
 from .govuk_rights import GovUkLicenceEvidence
 from .govuk_evidence import (
-    GovUkContentHold, _api_url, _utc, parse_govuk_content_document,
+    GovUkContentHold, _api_url, _utc, _require_attachment_inventory, parse_govuk_content_document,
     parse_govuk_manual_inventory,
 )
 from .govuk_spreadsheet import (
@@ -306,6 +307,7 @@ class NativeSourceIntake:
     def _settle_item(
         self, source_id, definition_id, version_id, version, item,
         item_url, raw, observed, rights_id, *, follow_children=True,
+        publication_leaves=False, terminal_html_leaf=False,
     ):
         admission, access = self._admit_observation(source_id, raw)
         observation_digest = digest_bytes(raw)
@@ -320,20 +322,26 @@ class NativeSourceIntake:
                 return (), tuple(observations), ((
                     item.canonical_url, "SOURCE_ITEM_RIGHTS_EXCLUSION_HOLD",
                 ),)
-            if not exc.child_items and not exc.unsupported_attachments:
+            if terminal_html_leaf or (not exc.child_items and not exc.unsupported_attachments):
                 return (), tuple(observations), ((item.canonical_url, exc.reason_code),)
             units, holds = [], []
-            if exc.child_items and not follow_children:
+            leaf_handoff = publication_leaves and _declared_publication_leaves(
+                raw, item.canonical_url,
+            )
+            follow_inventory = follow_children or leaf_handoff
+            collection_children = follow_children and json.loads(raw).get("document_type") == "document_collection"
+            if exc.child_items and not follow_inventory:
                 holds.append((item.canonical_url, exc.reason_code))
             for child, fetched in self._fetch_manual_sections(
-                source_id, observation_digest, exc.child_items if follow_children else (),
+                source_id, observation_digest, exc.child_items if follow_inventory else (),
             ):
                 try:
                     child_url, child_raw, child_observed = fetched.result()
                     child_units, child_observations, child_holds = self._settle_item(
                         source_id, definition_id, version_id, version, child,
                         child_url, child_raw, child_observed, rights_id,
-                        follow_children=False,
+                        follow_children=False, publication_leaves=collection_children,
+                        terminal_html_leaf=leaf_handoff,
                     )
                     units.extend(child_units)
                     observations.extend(child_observations)
@@ -395,6 +403,12 @@ class NativeSourceIntake:
             if unsupported_attachments:
                 holds.append((item.canonical_url, exc.reason_code))
             return tuple(units), tuple(observations), tuple(holds)
+        if terminal_html_leaf:
+            value = json.loads(raw)
+            if value.get("links", {}).get("children") or value.get("details", {}).get("attachments"):
+                return (), tuple(observations), ((
+                    item.canonical_url, "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE",
+                ),)
         units = self._retain_item(
             source_id, definition_id, version_id, version, complete,
             observation_digest, _utc(observed), rights_id,
@@ -996,10 +1010,14 @@ def _require_parent_inventory_binding(
                     body=feed_raw,
                 )
                 parent_found = any(item.canonical_url == parent_url for item in feed_items)
-                if not parent_found and spreadsheet_asset_url(unit) is not None:
+                if not parent_found and (
+                    spreadsheet_asset_url(unit) is not None
+                    or _declared_publication_leaves(raw, parent_url)
+                ):
                     parent_found = _declared_file_parent_in_feed_child(
                         unit=unit, parent_url=parent_url, feed_items=feed_items,
                         observations=observations, objects=objects, proof=proof,
+                        collection_only=spreadsheet_asset_url(unit) is None,
                     )
                 if parent_found:
                     break
@@ -1032,10 +1050,29 @@ def _require_parent_inventory_binding(
     return parent_url, raw
 
 
+def _declared_publication_leaves(raw, parent_url) -> bool:
+    """Allow only a publication's strictly descended declared HTML inventory."""
+    try:
+        value = json.loads(raw)
+        path = urlsplit(parent_url).path
+        children, _unsupported = _require_attachment_inventory(value)
+        return (
+            value.get("schema_name") == "publication"
+            and value.get("document_type") in {"correspondence", "corporate_report", "regulation", "transparency"}
+            and value.get("base_path") == path
+            and path.startswith("/government/publications/")
+            and bool(children)
+            and all(child.startswith(path + "/") for child, _title in children)
+        )
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def _declared_file_parent_in_feed_child(
     *, unit, parent_url, feed_items, observations, objects, proof,
+    collection_only=False,
 ) -> bool:
-    """Prove exactly feed -> declared HTML child -> file parent; never crawl."""
+    """Prove exactly feed -> direct inventory -> attachment parent; never crawl."""
     feed_urls = set()
     for item in feed_items:
         try:
@@ -1053,6 +1090,8 @@ def _declared_file_parent_in_feed_child(
                 admission_id, NATIVE_SOURCE_OBSERVATION_PURPOSE, 0, access.allowed_bytes,
             ), proof=proof).data
             if digest_bytes(raw) != observation[1]:
+                continue
+            if collection_only and json.loads(raw).get("document_type") != "document_collection":
                 continue
             try:
                 parse_govuk_content_document(
