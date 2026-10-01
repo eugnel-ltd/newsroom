@@ -1065,6 +1065,8 @@ def _canonical_localised_fact(value: str) -> tuple[object, ...] | None:
             chinese_date.group(5) is not None and (hour is None or minute is None)
         ):
             return None
+        if ":" in value and chinese_date.group(4) and not 1 <= hour <= 12:
+            return None
         if hour is not None:
             if chinese_date.group(4) == "上午" and hour == 12:
                 hour = 0
