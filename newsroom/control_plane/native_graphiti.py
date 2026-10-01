@@ -165,7 +165,7 @@ class NativeGraphitiProcessor:
                 deadline=self._clock() + timedelta(milliseconds=GRAPHITI_EXTRACTION_TIMEOUT_MS),
             )
         # Resolve retained accounting before considering another provider call.
-        self._settle_missing_subscription_usage(units)
+        self._settle_missing_subscription_usage(units_by_ingest)
         terminal_holds = {
             ingest_id: "REPORTED_OUTPUT_REJECTION_NO_RETRY"
             for ingest_id in reported_output_rejected_ingests(self._connection)
@@ -528,11 +528,16 @@ class NativeGraphitiProcessor:
         return True
 
     def _settle_missing_subscription_usage(
-        self, units: tuple[CorpusIngestUnit, ...],
+        self, units: tuple[CorpusIngestUnit, ...] | Mapping[str, CorpusIngestUnit],
     ) -> None:
         if self._usage is None:
             return
-        units_by_ingest = {unit.ingest_id: unit for unit in units}
+        # Reuse exact keys only before dispatch. After the external-call boundary,
+        # advance supplies the units again to derive current identities afresh.
+        units_by_ingest = (
+            units if isinstance(units, Mapping) else
+            {unit.ingest_id: unit for unit in units}
+        )
         for ingest_id in sorted(units_by_ingest):
             output_rejections = self._connection.execute(
                 "SELECT a.invocation_id,a.canonical_digest,t.terminal_digest "

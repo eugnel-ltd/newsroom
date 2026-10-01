@@ -303,11 +303,13 @@ def parse_govuk_content_document(
             unsupported_attachments=unsupported,
             exclusion_signals=_exclusion_signals(value, ""),
         )
-    elif document_type in {"correspondence", "corporate_report", "regulation", "national_statistics"}:
+    elif document_type in {"correspondence", "corporate_report", "regulation", "national_statistics", "form"}:
         if value.get("schema_name") != "publication":
             raise ValueError("source attachment-bearing schema differs")
         body_text = _document_text(value)
         children, unsupported = _require_attachment_inventory(value)
+        if document_type == "form" and not children:
+            raise ValueError("source form HTML inventory is absent")
         raise GovUkContentHold(
             "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE",
             child_items=children,

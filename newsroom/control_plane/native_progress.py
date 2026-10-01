@@ -95,6 +95,10 @@ def _landed_units(value: dict) -> tuple[CorpusIngestUnit, ...]:
     """Decode both retained encodings for journal and selected accounting reads."""
     bodies: dict[str, str] = {}
     raw_units = value.get("units", ())
+    if len(raw_units) > 1:
+        # Chunk authority/identity text repeats too. Reuse replay's immutable
+        # sharing without aliasing any individual receipt's lists or dicts.
+        _share_progress_strings(value)
     if "shared_body" in value:
         body = value["shared_body"]
         if type(body) is not str or any("body" in item for item in raw_units):
