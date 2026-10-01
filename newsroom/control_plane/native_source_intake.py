@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager, ExitStack
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from itertools import chain
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
@@ -190,6 +191,7 @@ class NativeSourceIntake:
         self._fence, self._fetch, self._clock = dispatch_fence, fetch, clock
         self._other_source_poll = other_source_poll
         self._retained_units = {} if retained_units is None else retained_units
+        self._pending_units = {}
 
     def bind_definitions(
         self, definition_ids: Mapping[str, SourceDefinitionId],
@@ -207,6 +209,7 @@ class NativeSourceIntake:
         self._definitions.update(definition_ids)
 
     def poll(self) -> tuple[NativeSourceDisposition, ...]:
+        self._pending_units.clear()
         results = []
         for source_id in SOURCE_IDS:
             try:
@@ -613,30 +616,35 @@ class NativeSourceIntake:
         access = self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, raw)
         return admission, access
 
-    def _manual_item_key(self, source_id, version_id, item):
-        root, separator, path = item.item_key.partition("|")
-        if separator != "|" or not path.startswith("/") or item.canonical_url != "https://www.gov.uk" + path:
-            return item.item_key
+    @staticmethod
+    def _govuk_item_path(item):
+        path = urlsplit(item.canonical_url).path
+        if not path.startswith("/") or item.canonical_url != "https://www.gov.uk" + path:
+            return None
+        if item.item_key in (item.canonical_url, "tag:www.gov.uk,2005:" + path):
+            return path
+        root, separator, tail = item.item_key.partition("|")
+        if separator != "|" or tail != path:
+            return None
         try:
             validate_sha256_digest(root)
         except ValueError:
+            return None
+        return path
+
+    def _manual_item_key(self, source_id, version_id, item):
+        path = self._govuk_item_path(item)
+        if path is None:
             return item.item_key
-        # Journal LAND order supplies the first admitted namespace. A parent
-        # update is not a new child; keep its exact original ancestry proof.
-        for units in self._retained_units.values():
+        # First journal LAND wins, then the first successful retention this poll.
+        # Keep that exact namespace and its original ancestry proof.
+        for units in chain(self._retained_units.values(), self._pending_units.values()):
             unit = units[0]
-            if (unit.source_id != source_id or unit.authority is None
-                    or unit.authority.definition_version_id != str(version_id)
-                    or unit.canonical_url != item.canonical_url):
-                continue
-            prior_root, separator, prior_path = unit.item_key.partition("|")
-            if separator != "|" or prior_path != path:
-                continue
-            try:
-                validate_sha256_digest(prior_root)
-            except ValueError:
-                continue
-            return unit.item_key
+            if (unit.source_id == source_id and unit.authority is not None
+                    and unit.authority.definition_version_id == str(version_id)
+                    and unit.canonical_url == item.canonical_url
+                    and self._govuk_item_path(unit) == path):
+                return unit.item_key
         return item.item_key
 
     def _retain_item(self, source_id, definition_id, version_id, version, item,
@@ -704,7 +712,7 @@ class NativeSourceIntake:
             fields_digest, representation_digest, UtcTimestamp.parse(first_observed),
             f"native-source-representation:{representation_id}",
         )
-        retained = self._retained_units.get(str(revision_id))
+        retained = self._retained_units.get(str(revision_id), self._pending_units.get(str(revision_id)))
         if retained is not None:
             # Polling already checked the current definition/rights and fetched
             # the complete bytes. Reuse the journal's original chunk receipts,
@@ -764,7 +772,9 @@ class NativeSourceIntake:
             unit = replace(provisional, authority=binding)
             result.append(unit)
             predecessor = unit.ingest_id
-        return tuple(result)
+        settled = tuple(result)
+        self._pending_units[str(revision_id)] = settled
+        return settled
 
     def _hydrate(self, admission, purpose: str, expected: bytes):
         try:
