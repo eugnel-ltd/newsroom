@@ -13,7 +13,8 @@ import json
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -6618,6 +6619,19 @@ class ModelUsageService:
         finally:
             connection.close()
 
+    @contextmanager
+    def route_state_snapshot(self) -> Iterator[Callable[[str], dict[str, object]]]:
+        """Authenticate global blockers once for one consistent route decision."""
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN")
+            blocking_routes = _usage_blocking_routes(connection)
+            yield lambda route: self._route_state(
+                connection, route, blocking_routes=blocking_routes,
+            )
+        finally:
+            connection.close()
+
     def open_route_circuit(
         self,
         *,
@@ -6839,10 +6853,14 @@ class ModelUsageService:
             connection.close()
 
     def _route_state(
-        self, connection: sqlite3.Connection, route: str
+        self, connection: sqlite3.Connection, route: str,
+        *, blocking_routes: set[str] | None = None,
     ) -> dict[str, object]:
         canonical_route = _canonical_circuit_route(route)
-        usage_blocking = canonical_route in _usage_blocking_routes(connection)
+        usage_blocking = canonical_route in (
+            _usage_blocking_routes(connection)
+            if blocking_routes is None else blocking_routes
+        )
         has_canonical = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='unpublished_route_circuits'"

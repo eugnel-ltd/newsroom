@@ -186,19 +186,20 @@ def graphiti_required_route_holds(
     if service is None:
         return ()
     holds = []
-    embedding = service.route_state(GRAPHITI_EMBEDDING_ROUTE)
-    if embedding["state"] == "OPEN":
-        holds.append(embedding)
-    primary = service.route_state(GRAPHITI_CHAT_PRIMARY_ROUTE)
-    if primary["state"] == "OPEN":
-        fallback_substitutes = False
-        if fallback_permitted and isinstance(primary.get("event_digest"), str):
-            fallback_substitutes = (
-                service.route_state(GRAPHITI_CHAT_FALLBACK_ROUTE)["state"]
-                == "CLOSED"
-            )
-        if not fallback_substitutes:
-            holds.append(primary)
+    with service.route_state_snapshot() as route_state:
+        embedding = route_state(GRAPHITI_EMBEDDING_ROUTE)
+        if embedding["state"] == "OPEN":
+            holds.append(embedding)
+        primary = route_state(GRAPHITI_CHAT_PRIMARY_ROUTE)
+        if primary["state"] == "OPEN":
+            fallback_substitutes = False
+            if fallback_permitted and isinstance(primary.get("event_digest"), str):
+                fallback_substitutes = (
+                    route_state(GRAPHITI_CHAT_FALLBACK_ROUTE)["state"]
+                    == "CLOSED"
+                )
+            if not fallback_substitutes:
+                holds.append(primary)
     return tuple(holds)
 
 _GRAPHITI_ADAPTER_DIRECTORY = Path(__file__).parent.parent / "graphiti_adapter"
