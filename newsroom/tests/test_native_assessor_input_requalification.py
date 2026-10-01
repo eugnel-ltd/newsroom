@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from newsroom.tests.assessor_fixture_support import candidate_fixture
+
 from newsroom.authority.canonical import digest_bytes, digest_canonical
 from newsroom.control_plane.model_usage import (
     InvocationAllocation, InvocationEfficiencyPolicy, ModelUsageAdmissionError,
@@ -36,7 +38,7 @@ def _fixture(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(native, 'REASONING', native.CONT_PRIMARY_REASONING)
     monkeypatch.setattr(native, 'COMMAND_FLAGS', native.CONT_PRIMARY_COMMAND_FLAGS)
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     assert usage._policy.model == 'grok-4.6'
@@ -243,7 +245,7 @@ def test_historical_requalification_survives_current_producer_change(tmp_path, m
 @pytest.mark.parametrize('field', ('system_digest', 'schema_digest'))
 def test_native_admission_binds_actual_context_to_input_bound(tmp_path, monkeypatch, field):
     service, usage = _usage(tmp_path, monkeypatch)
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     try:
         base = _base_package(_ready_package(candidate)[1])
         allocation = usage.begin(candidate, base, 'initial request')
