@@ -303,7 +303,7 @@ def parse_govuk_content_document(
             unsupported_attachments=unsupported,
             exclusion_signals=_exclusion_signals(value, ""),
         )
-    elif document_type in {"correspondence", "corporate_report", "regulation"}:
+    elif document_type in {"correspondence", "corporate_report", "regulation", "national_statistics"}:
         if value.get("schema_name") != "publication":
             raise ValueError("source attachment-bearing schema differs")
         body_text = _document_text(value)

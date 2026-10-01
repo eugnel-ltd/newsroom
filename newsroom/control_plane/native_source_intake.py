@@ -1068,9 +1068,12 @@ def _declared_publication_leaves(raw, parent_url) -> bool:
         children, _unsupported = _require_attachment_inventory(value)
         return (
             value.get("schema_name") == "publication"
-            and value.get("document_type") in {"correspondence", "corporate_report", "regulation", "transparency", "guidance"}
+            and value.get("document_type") in {"correspondence", "corporate_report", "regulation", "transparency", "guidance", "national_statistics"}
             and value.get("base_path") == path
-            and path.startswith("/government/publications/")
+            and path.startswith(
+                "/government/statistics/" if value.get("document_type") == "national_statistics"
+                else "/government/publications/"
+            )
             and bool(children)
             and all(child.startswith(path + "/") for child, _title in children)
         )
