@@ -212,3 +212,134 @@ def test_prefix_bounds_preserve_unattempted_facts_and_reprove_next_tick(tmp_path
         assert context.ordinary.count(context.units[2].revision_id) == 1
     finally:
         context.connection.close()
+
+
+@pytest.mark.parametrize("boundary", ("candidate-read", "proof-read"))
+def test_predispatch_atomic_read_overrun_makes_progress_before_next_tick(
+    tmp_path, monkeypatch, boundary,
+):
+    context = _prefix(tmp_path, monkeypatch, count=3)
+    now = [0.0]
+    context.pipeline._monotonic_clock = lambda: now[0]
+    # Settled revisions are non-retryable so later ticks exercise only the
+    # unconsumed proof prefix, never a fresh acquisition effect.
+    for unit in context.units:
+        context.journal.advance(unit.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+            **context.journal.progress[unit.revision_id]["facts"], "acquisition_attempt_count": 3,
+        })
+    before = dict(context.journal.progress)
+    candidate_version = context.continuation._runtime.authority.candidate_version
+    batch = context.usage.retained_pre_dispatch_failure_many
+
+    def slow_candidate(version_id):
+        version = candidate_version(version_id)
+        now[0] += 101
+        return version
+
+    def slow_proof(candidates):
+        result = batch(candidates)
+        now[0] += 301
+        return result
+
+    if boundary == "candidate-read":
+        context.continuation._runtime.authority.candidate_version = slow_candidate
+    else:
+        monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", slow_proof)
+    try:
+        first = context.pipeline.tick(cycle_id="atomic-read-overrun")
+        assert first.revision_states == {"EVIDENCE_HOLD": 1, "ASSESSMENT_INTERRUPTED": 2}
+        assert now[0] == (303 if boundary == "candidate-read" else 301)
+        assert len(context.batches) == 1
+        assert context.journal.progress[context.units[0].revision_id]["facts"]["acquisition_attempt_count"] == 3
+        assert all(context.journal.progress[unit.revision_id] == before[unit.revision_id] for unit in context.units[1:])
+        assert not context.ordinary
+        for tick in range(2):
+            settled_before = sum(progress["stage"] == "EVIDENCE_HOLD" for progress in context.journal.progress.values())
+            if settled_before == 3:
+                break
+            context.pipeline.tick(cycle_id=f"atomic-read-overrun-{tick}")
+            assert sum(progress["stage"] == "EVIDENCE_HOLD" for progress in context.journal.progress.values()) > settled_before
+        assert all(progress["stage"] == "EVIDENCE_HOLD" for progress in context.journal.progress.values())
+        assert len(context.batches) == (2 if boundary == "candidate-read" else 3)
+        assert not context.ordinary
+    finally:
+        context.connection.close()
+
+
+@pytest.mark.parametrize("boundary", ("candidate-read", "proof-read"))
+@pytest.mark.parametrize("signal", ("stop", "drain"))
+def test_predispatch_read_overrun_still_obeys_stop_and_drain_before_commit(
+    tmp_path, monkeypatch, boundary, signal,
+):
+    context = _prefix(tmp_path, monkeypatch, count=3)
+    now, stopped = [0.0], [False]
+    context.pipeline._monotonic_clock = lambda: now[0]
+    context.pipeline._operator_drain_requested = lambda: stopped[0] and signal == "drain"
+
+    def check():
+        if stopped[0] and signal == "stop":
+            raise VetoError("stop after atomic read overrun")
+
+    context.pipeline._check = check
+    candidate_version = context.continuation._runtime.authority.candidate_version
+    batch = context.usage.retained_pre_dispatch_failure_many
+
+    def slow_candidate(version_id):
+        version = candidate_version(version_id)
+        now[0], stopped[0] = 301, True
+        return version
+
+    def slow_proof(candidates):
+        result = batch(candidates)
+        now[0], stopped[0] = 301, True
+        return result
+
+    if boundary == "candidate-read":
+        context.continuation._runtime.authority.candidate_version = slow_candidate
+    else:
+        monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", slow_proof)
+    before = dict(context.journal.progress)
+    try:
+        with pytest.raises(VetoError if signal == "stop" else OperatorDrainRequested):
+            context.pipeline.tick(cycle_id="stopped-atomic-read-overrun")
+        assert context.journal.progress == before
+        assert len(context.batches) == (0 if boundary == "candidate-read" else 1)
+        assert not context.ordinary
+    finally:
+        context.connection.close()
+
+
+@pytest.mark.parametrize("unproved", ("allocated", "unknown", "global-corruption"))
+def test_predispatch_expired_proof_never_retires_unproved_targets(
+    tmp_path, monkeypatch, unproved,
+):
+    context = _prefix(tmp_path, monkeypatch, count=3, allocated=unproved == "allocated")
+    now = [0.0]
+    context.pipeline._monotonic_clock = lambda: now[0]
+    if unproved == "unknown":
+        context.candidates.pop(context.versions[context.units[0].revision_id].version_id)
+    elif unproved == "global-corruption":
+        _envelope(context.service, 0)
+        with sqlite3.connect(context.service.path) as connection:
+            connection.execute("UPDATE model_work_envelopes SET record_json='{}'")
+    batch = context.usage.retained_pre_dispatch_failure_many
+
+    def slow_proof(candidates):
+        result = batch(candidates)
+        now[0] += 301
+        return result
+
+    monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", slow_proof)
+    before = dict(context.journal.progress)
+    try:
+        context.pipeline.tick(cycle_id="expired-unproved-target")
+        assert context.journal.progress[context.units[0].revision_id] == before[context.units[0].revision_id]
+        assert context.journal.progress[context.units[2].revision_id] == before[context.units[2].revision_id]
+        if unproved == "global-corruption":
+            assert context.journal.progress == before
+        else:
+            assert context.journal.progress[context.units[1].revision_id]["stage"] == "EVIDENCE_HOLD"
+        assert len(context.batches) == 1
+        assert not context.ordinary
+    finally:
+        context.connection.close()

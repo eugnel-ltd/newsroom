@@ -656,8 +656,12 @@ class NativePublicationContinuation:
                 # A failed authoritative read remains ordinary unknown work.
                 continue
             selected.append((revision_id, progress, version))
-        if not selected or not before_revision():
+        if not selected:
             return ()
+        # An authoritative read started within the quantum may finish one
+        # proved recovery atomically, even if reading the prefix overruns it.
+        # The stop/drain check still applies before the proof and every write.
+        before_revision()
         failures = failure_many(tuple(version for _, _, version in selected))
         if type(failures) is not tuple or len(failures) != len(selected):
             raise NativePublicationError("native pre-dispatch proof partition differs")
@@ -665,7 +669,7 @@ class NativePublicationContinuation:
         # The batch reader has closed its transaction before any journal write.
         # These proofs never enter ordinary advance or survive this call.
         for (revision_id, progress, version), failure in zip(selected, failures, strict=True):
-            if not before_revision():
+            if not before_revision() and attempted:
                 break
             if self._journal.progress.get(revision_id, {}) != progress:
                 continue
