@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from newsroom.tests.assessor_fixture_support import candidate_fixture
+
 from newsroom.control_plane import native_assessor, writer
 from newsroom.control_plane.model_usage import InvocationEfficiencyPolicy, ModelUsageService
 from newsroom.control_plane.native_assessor import (
@@ -86,7 +88,7 @@ def test_assessor_dispatch_passes_model_and_high_reasoning_overrides(monkeypatch
 def test_policy_allocation_and_manifest_bind_current_profile_and_reject_stale(
     tmp_path, monkeypatch, change,
 ):
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     try:
@@ -150,7 +152,7 @@ def test_actual_dispatch_argv_selects_assessor_profile_or_unchanged_writer_defau
 def test_cli_failure_type_survives_assessor_without_changing_unknown_accounting(
     tmp_path, monkeypatch, failure, expected_type,
 ):
-    connection, _port, candidate = _candidate(tmp_path)
+    connection, _port, candidate = candidate_fixture(tmp_path)
     base = _base_package(_ready_package(candidate)[1])
     service, usage = _usage(tmp_path, monkeypatch)
     calls = []
