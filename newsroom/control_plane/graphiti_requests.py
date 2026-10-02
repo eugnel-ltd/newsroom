@@ -16,7 +16,7 @@ GRAPHITI_INTERNAL_REQUEST_SCHEMA_VERSION = (
 GRAPHITI_CALL_SHAPE_SCHEMA_VERSION = "newsroom.graphiti-call-shape-policy.v1"
 _POLICY_PATH = Path(__file__).with_name("graphiti_call_shape_policy_v1.json")
 _NATIVE_POLICY_PATH = Path(__file__).with_name(
-    "native_graphiti_call_shape_policy_v1.json"
+    "native_graphiti_call_shape_policy_v2.json"
 )
 ALLOWED_GRAPHITI_SEMANTIC_REQUEST_CLASSES = frozenset(
     {

@@ -2,6 +2,7 @@
 import json
 from dataclasses import asdict
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,8 +11,8 @@ from newsroom.authority.canonical import digest_canonical
 from newsroom.control_plane import model_usage as m
 from newsroom.control_plane.cycle import _graphiti_usage_cycle_id
 from newsroom.control_plane.graphiti import GraphitiModelUsageObserver
-from newsroom.control_plane.graphiti_fallback_policy import load_checked_native_graphiti_fallback_circuit_policy
-from newsroom.control_plane.graphiti_requests import load_checked_native_graphiti_call_shape_policy
+from newsroom.control_plane.graphiti_fallback_policy import _load_checked_graphiti_fallback_circuit_policy
+from newsroom.control_plane.graphiti_requests import _load_checked_graphiti_call_shape_policy
 from newsroom.control_plane.native_progress import NativeRevisionJournal
 from newsroom.control_plane.store import connect, insert_graphiti_attempt_receipt, reserve_graphiti_spend, reconcile_graphiti_spend
 from newsroom.tests.test_native_graphiti import _native
@@ -39,8 +40,10 @@ def _failed(tmp_path, monkeypatch, *, output=20_336, total=None, context=None,
         owner_stop_check=lambda: None, deadline=T0+timedelta(minutes=3),
         effective_revision_digest=digest_canonical(asdict(unit.effective_revision)),
         ingest_obligation_id=unit.ingest_id,
-        call_shape_policy=load_checked_native_graphiti_call_shape_policy(),
-        fallback_policy=load_checked_native_graphiti_fallback_circuit_policy(),
+        call_shape_policy=_load_checked_graphiti_call_shape_policy(
+            Path(m.__file__).with_name("native_graphiti_call_shape_policy_v1.json")),
+        fallback_policy=_load_checked_graphiti_fallback_circuit_policy(
+            Path(m.__file__).with_name("native_graphiti_fallback_circuit_policy_v1.json")),
     )
     allocation = observer.before_cli_invocation(
         provider='cursor-agent-cli', model='composer-2.5', prompt='source-safe prompt',
@@ -61,8 +64,10 @@ def _failed(tmp_path, monkeypatch, *, output=20_336, total=None, context=None,
             owner_stop_check=lambda: None, deadline=T0+timedelta(minutes=3),
             effective_revision_digest=digest_canonical(asdict(unit.effective_revision)),
             ingest_obligation_id=unit.ingest_id,
-            call_shape_policy=load_checked_native_graphiti_call_shape_policy(),
-            fallback_policy=load_checked_native_graphiti_fallback_circuit_policy(),
+            call_shape_policy=_load_checked_graphiti_call_shape_policy(
+            Path(m.__file__).with_name("native_graphiti_call_shape_policy_v1.json")),
+            fallback_policy=_load_checked_graphiti_fallback_circuit_policy(
+            Path(m.__file__).with_name("native_graphiti_fallback_circuit_policy_v1.json")),
         )
         peer_allocation = peer_observer.before_cli_invocation(
             provider='cursor-agent-cli', model='composer-2.5', prompt='other source-safe prompt',

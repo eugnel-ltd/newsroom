@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from typing import Iterable
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_canonical
-from newsroom.authority.persistence import LedgerEventRecord
+from newsroom.authority.persistence import LedgerEventRecord, RetiredLedgerEventRecord
 from newsroom.authority.types import TrustScope
 from newsroom.entities.models import (
     CanonicalEntity,
@@ -31,7 +31,9 @@ class Increment4ProofContractError(ValueError):
     """Raised when Increment 4 proof inputs are not exact admitted authority."""
 
 
-def _event_digest(event: LedgerEventRecord) -> str:
+def _event_digest(event: LedgerEventRecord | RetiredLedgerEventRecord) -> str:
+    if isinstance(event, RetiredLedgerEventRecord):
+        return event.original_header_digest
     if not isinstance(event, LedgerEventRecord):
         raise Increment4ProofContractError("proof event must be a retained ledger event")
     return digest_canonical(asdict(event))
@@ -294,7 +296,7 @@ def _stream_admitted_provenance(
     *,
     entities: tuple[Increment4EntityProjectionState, ...],
     relations: tuple[Increment4RelationProjectionState, ...],
-    events: Iterable[LedgerEventRecord],
+    events: Iterable[LedgerEventRecord | RetiredLedgerEventRecord],
     through_ledger_seq: int,
     hash_history: bool = True,
 ) -> tuple[Increment4AdmittedProjectionSnapshot, str | None]:
@@ -324,10 +326,14 @@ def _stream_admitted_provenance(
                 digest.update(b",")
             digest.update(canonical_json_bytes(_event_digest(event)))
         if event.event_id in required:
+            if isinstance(event, RetiredLedgerEventRecord):
+                raise Increment4ProofContractError("required mapping diagnostic provenance expired")
             retained.append(event)
         last = event
     if last is None or last.ledger_seq != through_ledger_seq:
         raise Increment4ProofContractError("proof watermark lacks an exact retained event")
+    if isinstance(last, RetiredLedgerEventRecord):
+        raise Increment4ProofContractError("proof watermark diagnostic provenance expired")
     if last.event_id not in required:
         retained.append(last)
     # Reuse all current entity, relation, endpoint and provenance checks.

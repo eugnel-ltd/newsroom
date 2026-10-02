@@ -134,6 +134,14 @@ class _PayloadAndEnvelopeIntegrity:
 
     @staticmethod
     def _validate_event_types(row: sqlite3.Row) -> None:
+        if "retired_header_digest" in row.keys() and row["retired_header_digest"] is not None:
+            from ._event_store_read import _EventStoreReadMixin
+            _EventStoreReadMixin._event_from_row(row)
+            for name, identifier_type in (("event_id", EventId), ("command_id", CommandId), ("aggregate_id", AggregateId)):
+                identifier_type.parse(str(row[name]))
+            if int(row["ledger_seq"]) <= 0:
+                raise AuthorityPersistenceError("retired ledger sequence differs")
+            return
         ledger_seq = int(row["ledger_seq"])
         aggregate_version = int(row["aggregate_version"])
         event_schema_version = int(row["event_schema_version"])

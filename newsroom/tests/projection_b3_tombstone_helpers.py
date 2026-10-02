@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 import sqlite3
 
@@ -220,8 +220,10 @@ def create_tombstoned_structural_history(
             connection.close()
         if source_row is None or tombstone_row is None:
             raise AssertionError("retained tombstone fixture event is absent")
-        source_event = LedgerEventRecord(**dict(source_row))
-        tombstone_event = LedgerEventRecord(**dict(tombstone_row))
+        # Construct logical full events, excluding physical reservation columns.
+        event_columns = tuple(field.name for field in fields(LedgerEventRecord))
+        source_event = LedgerEventRecord(**{name: source_row[name] for name in event_columns})
+        tombstone_event = LedgerEventRecord(**{name: tombstone_row[name] for name in event_columns})
         return (
             commands,
             schemas,

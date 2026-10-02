@@ -6,7 +6,7 @@ from ._projection_retention import (
 )
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import json
 import sqlite3
 from types import MappingProxyType
@@ -20,7 +20,8 @@ from .canonical import (
     digest_canonical,
     validate_sha256_digest,
 )
-from .persistence import AuthorityPersistenceError, LedgerEventRecord
+from .persistence import AuthorityPersistenceError, DiagnosticHistoryExpired, LedgerEventRecord, RetiredLedgerEventRecord
+from newsroom.increment4.models import _event_digest
 from .types import (
     EventId,
     ObjectAdmissionId,
@@ -1403,7 +1404,7 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
         if (
             str(source_record.event_id) != str(row["source_event_id"])
             or source_record.event_type != str(row["source_event_type"])
-            or digest_canonical(asdict(source_record))
+            or _event_digest(source_record)
             != str(row["source_event_digest"])
         ):
             raise AuthorityPersistenceError(
@@ -1545,7 +1546,7 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
     @staticmethod
     def _validate_projection_checkpoints(conn: sqlite3.Connection) -> None:
         generation_rows = conn.execute(
-            "SELECT generation_id FROM projection_generations"
+            "SELECT generation_id,state,diagnostic_history_expired FROM projection_generations"
         ).fetchall()
         for generation in generation_rows:
             generation_id = str(generation["generation_id"])
@@ -1555,16 +1556,20 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                 "ORDER BY checkpoint_version",
                 (generation_id,),
             ).fetchall()
-            if not rows:
-                raise AuthorityPersistenceError(
-                    "projection generation lacks checkpoint history"
-                )
+            expired = bool(generation["diagnostic_history_expired"])
+            if expired and (generation["state"] != "RETIRED" or conn.execute(
+                "SELECT 1 FROM ledger_events WHERE aggregate_type='projection_generation' AND aggregate_id=? AND retired_header_digest IS NOT NULL LIMIT 1", (generation_id,),
+            ).fetchone() is None):
+                raise AuthorityPersistenceError("retired diagnostic expiry marker differs")
+            if not rows and not expired:
+                raise AuthorityPersistenceError("projection generation lacks checkpoint history")
             previous_version = 0
             previous_sequence = -1
             for row in rows:
                 version = int(row["checkpoint_version"])
                 sequence = int(row["contiguous_ledger_seq"])
-                if version != previous_version + 1 or sequence < previous_sequence:
+                if (version <= previous_version or (not expired and version != previous_version + 1)
+                        or sequence < previous_sequence):
                     raise AuthorityPersistenceError(
                         "projection checkpoint history is not contiguous and monotonic"
                     )
@@ -2605,7 +2610,9 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                 outcome,
                 complete_required=complete_required,
             )
-            source_digest = digest_canonical(asdict(source))
+            if isinstance(source, RetiredLedgerEventRecord) and (mapping is not None or complete_required):
+                raise DiagnosticHistoryExpired("mapped diagnostic provenance expired")
+            source_digest = _event_digest(source)
             existing = conn.execute(
                 "SELECT * FROM projection_delivery_states "
                 "WHERE generation_id=? AND ledger_seq=?",
@@ -3197,11 +3204,16 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
 
     def _checkpoint_seq(self, conn: sqlite3.Connection, generation_id: str) -> int:
         row = conn.execute(
-            "SELECT contiguous_ledger_seq FROM projection_checkpoint_versions "
-            "WHERE generation_id=? ORDER BY checkpoint_version DESC LIMIT 1",
+            "SELECT c.contiguous_ledger_seq FROM projection_checkpoint_versions c "
+            "JOIN projection_generations g ON g.generation_id=c.generation_id "
+            "WHERE c.generation_id=? AND g.diagnostic_history_expired=0 "
+            "ORDER BY c.checkpoint_version DESC LIMIT 1",
             (generation_id,),
         ).fetchone()
         if row is None:
+            generation = conn.execute("SELECT state,diagnostic_history_expired FROM projection_generations WHERE generation_id=?", (generation_id,)).fetchone()
+            if generation is not None and generation["state"] == "RETIRED" and generation["diagnostic_history_expired"]:
+                raise DiagnosticHistoryExpired("retired generation checkpoint history expired")
             raise ProjectionStateError("projection generation lacks checkpoint")
         return int(row["contiguous_ledger_seq"])
 
@@ -3525,7 +3537,14 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                 )
             )
             event = self._source_event(conn, ledger_seq)
-            source_event_digest = digest_canonical(asdict(event))
+            source_event_digest = _event_digest(event)
+            if isinstance(event, RetiredLedgerEventRecord):
+                if mapping_contract.resolve(event.event_type) is not None or family.complete_projection_contract_digest is not None:
+                    raise DiagnosticHistoryExpired("required mapping diagnostic provenance expired")
+                return _ProjectionDeliverySource(
+                    generation, family, mapping_contract, None, False, event, source_event_digest,
+                    MappingProxyType({}), False, (),
+                )
             row = conn.execute(
                 "SELECT mode,payload_digest,payload_bytes,object_admission_id "
                 "FROM authority_payloads WHERE payload_id=?",

@@ -60,6 +60,7 @@ _EXPECTED_NAMES = {
     39: "graphiti_recovered_ambiguous_progression_v39",
     40: "relationship_open_index_v40",
     41: "command_bound_request_result_storage_v41",
+    42: "retired_projection_diagnostic_reservations_v42",
 }
 _EXPECTED_CHECKSUMS = {
     13: "sha256:c3e5ae627dda1c04bebc50952786413d977bd399e67b7f5b87452794f08f49ab",
@@ -90,6 +91,7 @@ _EXPECTED_CHECKSUMS = {
     39: "sha256:40a2d6a969e6759ad76fa950d122dda1552a81f44f6a65c30c4b1e8389ccc3ed",
     40: "sha256:1f126c29773eded31cb36abcf6f6101dd827e0032c9e379adabbbaffd06c1c79",
     41: "sha256:e2beb20eb921e69a8892234f2e4cae2349369700de2f615ffc9d744e8833fd22",
+    42: "sha256:6d8074762801dbb74e966ea4a441ad035a7eebea178372523dab69e5e91fd2e5",
 }
 
 _EXPECTED_MATRIX = """version | migration | objects | history fingerprint | schema fingerprint | object fingerprint
@@ -122,6 +124,7 @@ v38 | authorization_request_residual_storage_v38 | 1524 | sha256:28c196a875fd355
 v39 | graphiti_recovered_ambiguous_progression_v39 | 1524 | sha256:fa2d3fc80a04d5df4c5213e44f95c095279256a3bf3d31e41e465c38986a7b96 | sha256:d88defccf440c0c5a89ae9a3e2e900bb4acdc64fb9781c9483add6d0ad79a6c8 | sha256:a36bec5b6d0f281e2ee05274700d1ed18a0f38688ae5731a1f8688cd57c1e429
 v40 | relationship_open_index_v40 | 1525 | sha256:864fd85321ff4cfec55870a3d3737e94582f22cab32e9adcea9cf66bea6f3f7f | sha256:1e6a22fbc1b755d1eebd957378dc691b4e41e0ca405f2ef00d7ddcbd629206c7 | sha256:bff1d52da6dc88a67095977d8a737c710891af420efd07238ed16423040a466c
 v41 | command_bound_request_result_storage_v41 | 1525 | sha256:71dcf0dd7c21734f7d44261451c99c244bb6cdadb9e13c54a805a589089e8773 | sha256:94014382880d8d9cda0a7b727dea90ca522c65299345e5ea6f80cf857311a3e9 | sha256:2159817f0d9e5a0d7b11d00820eb0485f88168a140393c1c98c13ef2dd8f46de
+v42 | retired_projection_diagnostic_reservations_v42 | 1530 | sha256:f9b00420523752d7a736693da3288d922ec2895c79e21565e96596fefb9d4d9c | sha256:30bbcbc39e452773ae141b19794601c7ff8d294b09fa47624e561dc9de5ba104 | sha256:79901ff4764b2faf118d9aab2c2a1ed5a0a308f1bff6dfa69bc54e66feee99d7
 """
 
 
@@ -156,7 +159,7 @@ def test_registry_history_and_statement_pins_are_complete_and_named() -> None:
     assert RETAINED_MIN_VERSION == 13
     assert RETAINED_VERSIONS == tuple(_EXPECTED_NAMES)
     assert tuple(record.version for record in MIGRATION_REGISTRY) == tuple(
-        (*range(1, 33), 34, 35, 36, 37, 38, 39, 40, 41)
+        (*range(1, 33), 34, 35, 36, 37, 38, 39, 40, 41, 42)
     )
     assert (
         tuple(
@@ -253,6 +256,29 @@ def test_exact_prefix_invokes_v36_procedure_once_only_for_current(
     assert calls == expected_calls
 
 
+@pytest.mark.parametrize(("version", "expected_calls"), ((41, 0), (42, 1)))
+def test_exact_prefix_invokes_v42_procedure_only_at_its_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+    expected_calls: int,
+) -> None:
+    calls = 0
+    original = authority_migrations.migrate_projection_retirement
+
+    def counted(connection: sqlite3.Connection, *, expected_history) -> None:
+        nonlocal calls
+        calls += 1
+        assert connection.in_transaction
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert expected_history == history_through(41)
+        original(connection, expected_history=expected_history)
+
+    monkeypatch.setattr(authority_migrations, "migrate_projection_retirement", counted)
+    build_exact_prefix(tmp_path / f"procedural-v{version}.sqlite3", version)
+    assert calls == expected_calls
+
+
 @pytest.mark.parametrize("predecessor", UPGRADE_PREDECESSOR_VERSIONS)
 def test_exact_predecessors_upgrade_to_current(
     tmp_path: Path, predecessor: int
@@ -310,22 +336,31 @@ def test_default_connection_backup_leaves_exclusive_upgrade_available(
     inspect_exact_prefix(database, expected_version=CURRENT_VERSION)
 
 
-def test_failed_upgrade_rolls_back_to_exact_predecessor(tmp_path: Path) -> None:
-    database = tmp_path / f"rollback-v{PREDECESSOR_VERSION}.sqlite3"
-    before = build_exact_prefix(database, PREDECESSOR_VERSION)
-    fail_after = "ALTER TABLE authorization_requests DROP COLUMN storage_request_marker"
+@pytest.mark.parametrize(
+    ("predecessor", "fail_after", "message"),
+    (
+        (40, "ALTER TABLE authorization_requests DROP COLUMN storage_request_marker",
+         "injected after v41 marker removal"),
+        (41, "DROP TABLE ledger_events", "injected after v42 parent removal"),
+    ),
+)
+def test_failed_upgrade_rolls_back_to_exact_predecessor(
+    tmp_path: Path, predecessor: int, fail_after: str, message: str,
+) -> None:
+    database = tmp_path / f"rollback-v{predecessor}.sqlite3"
+    before = build_exact_prefix(database, predecessor)
 
-    class FailAfterV41Statement(sqlite3.Connection):
+    class FailAfterMigrationStatement(sqlite3.Connection):
         def execute(self, sql: str, parameters=(), /):
             cursor = super().execute(sql, parameters)
             if sql == fail_after:
-                raise sqlite3.OperationalError("injected after v41 marker removal")
+                raise sqlite3.OperationalError(message)
             return cursor
 
-    connection = sqlite3.connect(database, factory=FailAfterV41Statement)
+    connection = sqlite3.connect(database, factory=FailAfterMigrationStatement)
     try:
         connection.execute("PRAGMA foreign_keys=ON")
-        with pytest.raises(sqlite3.DatabaseError, match="after v41 marker removal"):
+        with pytest.raises(sqlite3.DatabaseError, match=message):
             authority_migrations.apply_pending_migrations(
                 connection, applied_at="1970-01-02T00:00:00.000000Z"
             )
@@ -333,9 +368,7 @@ def test_failed_upgrade_rolls_back_to_exact_predecessor(tmp_path: Path) -> None:
     finally:
         connection.close()
 
-    assert (
-        inspect_exact_prefix(database, expected_version=PREDECESSOR_VERSION) == before
-    )
+    assert inspect_exact_prefix(database, expected_version=predecessor) == before
 
 
 def test_successful_upgrade_can_restore_exact_backup_then_reupgrade(

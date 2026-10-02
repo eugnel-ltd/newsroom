@@ -1,0 +1,398 @@
+{
+  "schema_version": "newsroom.graphiti-call-shape-policy.v1",
+  "canonical_digest": "sha256:e2f79e64118875a62e0c0ab19eb24a0d785de2645e0a5643322f3e932699d32b",
+  "policy_id": "graphiti-core-0.29.3-newsroom-adapter-v1",
+  "version": "issue-981-native-sdk-advisory-v1",
+  "graphiti_core_release": "graphiti-core-0.29.3",
+  "framework_identity": "graphiti-core-0.29.3",
+  "prompt_identity": "newsroom.graphiti.proposal-only-prompt:v1",
+  "ontology_identity": "newsroom.graphiti.adapter-result-schema:v1",
+  "temporal_identity": "graphiti-source-reference-time-v1",
+  "generation_policy_identity": "newsroom-evaluation-graphiti-generation-v1",
+  "qualified_routes": [
+    {
+      "leaf_class": "PRIMARY",
+      "provider": "cursor-agent-cli",
+      "route": "GRAPHITI_CHAT_PRIMARY",
+      "model": "composer>=2.5",
+      "reasoning": "provider-default",
+      "config_identity": "cursor-sdk-api-key-composer-floor-v2",
+      "command_semantic_version": "newsroom.graphiti-provider-dispatch.v13",
+      "command_flags": [
+        "TRANSPORT=CURSOR_SDK",
+        "sdk=cursor-sdk>=1.0.29",
+        "auth=CURSOR_API_KEY",
+        "composer_floor>=2.5",
+        "selected_model=RUNTIME_SELECTED",
+        "tools=EMPTY",
+        "disallowed_tools=shell,mcp,task",
+        "mcp_servers=EMPTY",
+        "custom_tools=EMPTY",
+        "subagents=EMPTY",
+        "setting_sources=OMITTED",
+        "cwd=EMPTY_NON_GIT",
+        "store=EPHEMERAL_LOCAL_ISOLATED",
+        "fresh_run=TRUE",
+        "resume=FALSE",
+        "max_retries=0",
+        "unary_timeout_seconds=160",
+        "stream_timeout_seconds=160",
+        "CLIENT=PROCESS_OWNED",
+        "PROMPT_MAX_OUTPUT_TOKENS=REQUEST_MAX_TOKENS",
+        "CONTROLLER_OUTPUT_CONTRACT=cursor-sdk-controller-output-v1:65536+64*REQUEST_MAX_TOKENS",
+        "CONTROLLER_TIMEOUT_MS=160000",
+        "TIMEOUT_DIAGNOSTIC_SCHEMA=newsroom.graphiti-timeout-diagnostic.v1",
+        "TIMEOUT_DIAGNOSTIC_VOCABULARY=FIXED_V1",
+        "REPORTED_OUTPUT_TOKENS=ADVISORY_INCLUDES_REASONING_V1",
+        "REPORTED_TOTAL_TOKENS=ADVISORY_CUMULATIVE_CONSUMPTION_V1"
+      ],
+      "disabled_capabilities": [
+        "repository-discovery",
+        "prior-conversation",
+        "skills",
+        "tools",
+        "mcp",
+        "web",
+        "planning",
+        "subagents"
+      ],
+      "implementation_revision": "sha256:1cf4e3f26c1d2edac9c52107589f8be34e4635188662224fd5fb9d99e45c0247",
+      "max_prompt_bytes": 262144,
+      "max_context_tokens": 131072,
+      "max_output_tokens": 16384,
+      "max_total_tokens": 147456
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "provider": "grok-build-cli",
+      "route": "GRAPHITI_CHAT_FALLBACK",
+      "model": "grok-4.6",
+      "reasoning": "medium",
+      "config_identity": "graphiti-grok-hermetic-user-config-v2",
+      "command_semantic_version": "newsroom.graphiti-provider-dispatch.v8",
+      "command_flags": [
+        "ACP_COMMAND=--sandbox=read-only,--cwd=EMPTY_NON_GIT,--model=grok-4.6,--reasoning-effort=medium,agent,--no-leader,stdio",
+        "ACP_SEQUENCE=initialize,session/new,_x.ai/session/rename,session/close",
+        "ACP_SESSION=CALLER_UUID,headless,mcpServers=EMPTY,manual-title,closed",
+        "ACP_INFERENCE_REQUESTS=0",
+        "--prompt-file",
+        "--model=grok-4.6",
+        "--disable-web-search",
+        "--sandbox=read-only",
+        "--permission-mode=plan",
+        "--tools=",
+        "--deny=*",
+        "--no-plan",
+        "--max-turns=1",
+        "USER_CONFIG_MODEL_MAX_COMPLETION_TOKENS=REQUEST_MAX_TOKENS",
+        "USER_CONFIG_SCOPE=ISOLATED_HOME",
+        "AUTH_STORAGE=GROK_AUTH_PATH",
+        "--no-subagents",
+        "--reasoning-effort=medium",
+        "--verbatim",
+        "USER_CONFIG_TITLE_REFRESH=FALSE",
+        "USER_CONFIG_TURN_SUMMARY=FALSE",
+        "USER_CONFIG_MAX_RETRIES=0",
+        "--output-format=streaming-json",
+        "--resume=ACP_SESSION_UUID",
+        "CONTROLLER_STDOUT_CONTRACT=grok-controller-stdout-v1:65536+64*REQUEST_MAX_TOKENS",
+        "CONTROLLER_PROCESS_CONTRACT=shared-bounded-cli-process-v2",
+        "PREDISPATCH_TIMEOUT_DIAGNOSTICS=HELP_PROBE",
+        "CONTROLLER_TIMEOUT_MS=160000",
+        "TIMEOUT_DIAGNOSTIC_SCHEMA=newsroom.graphiti-timeout-diagnostic.v1",
+        "TIMEOUT_DIAGNOSTIC_VOCABULARY=FIXED_V1",
+        "QUALIFICATION_RETENTION=DIGEST_ONLY_V1",
+        "ASYNC_PIPE_DRAIN=GROUP_STOP_BEFORE_BOUNDED_REAP_V2",
+        "PROCESS_GROUP_SCOPE=ISOLATED_SESSION_V1",
+        "ABNORMAL_EXIT_GROUP_TERMINATION=SIGKILL_V1",
+        "PROCESS_CLEANUP_DEADLINE_MS=500",
+        "RESIDUAL_GROUP_CLEANUP=BEFORE_RESULT_HANDOFF_V1"
+      ],
+      "disabled_capabilities": [
+        "repository-discovery",
+        "prior-conversation",
+        "skills",
+        "tools",
+        "mcp",
+        "web",
+        "planning",
+        "subagents"
+      ],
+      "implementation_revision": "sha256:1cf4e3f26c1d2edac9c52107589f8be34e4635188662224fd5fb9d99e45c0247",
+      "max_prompt_bytes": 262144,
+      "max_context_tokens": 131072,
+      "max_output_tokens": 16384,
+      "max_total_tokens": 147456
+    },
+    {
+      "leaf_class": "EMBEDDING",
+      "provider": "openrouter",
+      "route": "GRAPHITI_EMBEDDING",
+      "model": "openai/text-embedding-3-large",
+      "reasoning": "none",
+      "config_identity": "graphiti-embedding-command-v1",
+      "command_semantic_version": "newsroom.graphiti-provider-dispatch.v1",
+      "command_flags": [
+        "POST=/embeddings",
+        "--model=openai/text-embedding-3-large"
+      ],
+      "disabled_capabilities": [
+        "repository-discovery",
+        "prior-conversation",
+        "skills",
+        "tools",
+        "mcp",
+        "web",
+        "planning",
+        "subagents"
+      ],
+      "implementation_revision": "sha256:8e32f8e9cdf4079d461c51a41058383ad82ed5cc2bbd134b5233e773ddbeebf2",
+      "max_prompt_bytes": 262144,
+      "max_context_tokens": 131072,
+      "max_output_tokens": 1,
+      "max_total_tokens": 131072
+    }
+  ],
+  "qualified_request_shapes": [
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "ExtractedEntities",
+      "response_schema_identity": "ExtractedEntities",
+      "response_schema_digest": "sha256:56db744fac017edf7409fa6a479c6eed651daa643b9ee1db0e47fdfa37f44428"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "NodeResolutions",
+      "response_schema_identity": "NodeResolutions",
+      "response_schema_digest": "sha256:a3b12c1524421ad9265a089e7745b144d3e18db14101788dec47d236b2c1c026"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "ExtractedEdges",
+      "response_schema_identity": "ExtractedEdges",
+      "response_schema_digest": "sha256:79024a7c300a14757f48390ac073c97d4ba19a931cad1bb349aff889be29f59a"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "EdgeTimestamps",
+      "response_schema_identity": "EdgeTimestamps",
+      "response_schema_digest": "sha256:9c69ff91808d5c41b6690fe761be284f593e1c3dbb13f1289e2344cffb0244bc"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "EdgeDuplicate",
+      "response_schema_identity": "EdgeDuplicate",
+      "response_schema_digest": "sha256:f5fb4d979abb8851ba013e9b12f52c627a4cb1a71ec47c50c5f40a38289329ef"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "SummarizedEntities",
+      "response_schema_identity": "SummarizedEntities",
+      "response_schema_digest": "sha256:ba64b6b66be61061612a1ed85d55b5bee7ba47b33d3b30a685bb7ca0e9899d8a"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "CombinedExtraction",
+      "response_schema_identity": "CombinedExtraction",
+      "response_schema_digest": "sha256:f82d136b470ba9247cf3c5c766a4f8711d56ba0277d6109f2ce3b08b0ed61ea9"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "BatchEdgeTimestamps",
+      "response_schema_identity": "BatchEdgeTimestamps",
+      "response_schema_digest": "sha256:e0381500464c5f27913952734855f99022ec7e860243fe8ccae5ff1344c522ef"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "ExtractedEntities",
+      "response_schema_identity": "ExtractedEntities",
+      "response_schema_digest": "sha256:56db744fac017edf7409fa6a479c6eed651daa643b9ee1db0e47fdfa37f44428"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "NodeResolutions",
+      "response_schema_identity": "NodeResolutions",
+      "response_schema_digest": "sha256:a3b12c1524421ad9265a089e7745b144d3e18db14101788dec47d236b2c1c026"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "ExtractedEdges",
+      "response_schema_identity": "ExtractedEdges",
+      "response_schema_digest": "sha256:79024a7c300a14757f48390ac073c97d4ba19a931cad1bb349aff889be29f59a"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "EdgeTimestamps",
+      "response_schema_identity": "EdgeTimestamps",
+      "response_schema_digest": "sha256:9c69ff91808d5c41b6690fe761be284f593e1c3dbb13f1289e2344cffb0244bc"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "EdgeDuplicate",
+      "response_schema_identity": "EdgeDuplicate",
+      "response_schema_digest": "sha256:f5fb4d979abb8851ba013e9b12f52c627a4cb1a71ec47c50c5f40a38289329ef"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "SummarizedEntities",
+      "response_schema_identity": "SummarizedEntities",
+      "response_schema_digest": "sha256:ba64b6b66be61061612a1ed85d55b5bee7ba47b33d3b30a685bb7ca0e9899d8a"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "CombinedExtraction",
+      "response_schema_identity": "CombinedExtraction",
+      "response_schema_digest": "sha256:f82d136b470ba9247cf3c5c766a4f8711d56ba0277d6109f2ce3b08b0ed61ea9"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "BatchEdgeTimestamps",
+      "response_schema_identity": "BatchEdgeTimestamps",
+      "response_schema_digest": "sha256:e0381500464c5f27913952734855f99022ec7e860243fe8ccae5ff1344c522ef"
+    },
+    {
+      "leaf_class": "EMBEDDING",
+      "semantic_request_class": "EMBEDDING_VECTOR",
+      "response_schema_identity": "embedding-vector",
+      "response_schema_digest": "sha256:61f33d3eb95aa8344239bebead9b8f7ef06ecb84e4db5950c418ec6ea53c5c6f"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "UNSTRUCTURED",
+      "response_schema_identity": "UNSTRUCTURED",
+      "response_schema_digest": "sha256:9a654d3f546e144a1d829e0939c44f24fded717777651e6ebe82538161c8dc22"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "UNSTRUCTURED",
+      "response_schema_identity": "UNSTRUCTURED",
+      "response_schema_digest": "sha256:9a654d3f546e144a1d829e0939c44f24fded717777651e6ebe82538161c8dc22"
+    },
+    {
+      "leaf_class": "PRIMARY",
+      "semantic_request_class": "NewsroomCombinedTemporalExtractionV1",
+      "response_schema_identity": "NewsroomCombinedTemporalExtractionV1",
+      "response_schema_digest": "sha256:4a4d8111fc3480830e740ecbbe2755a9f16e02eb8ced31d8b96e720ae0886f05"
+    },
+    {
+      "leaf_class": "FALLBACK",
+      "semantic_request_class": "NewsroomCombinedTemporalExtractionV1",
+      "response_schema_identity": "NewsroomCombinedTemporalExtractionV1",
+      "response_schema_digest": "sha256:4a4d8111fc3480830e740ecbbe2755a9f16e02eb8ced31d8b96e720ae0886f05"
+    }
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "zero-proposal",
+      "fixture_class": "ZERO_PROPOSAL",
+      "fixture_source": "newsroom/tests/test_graphiti_core_0293_call_shape.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 0,
+      "distinct_internal_request_count": 1
+    },
+    {
+      "fixture_id": "one-relation",
+      "fixture_class": "RELATIONS",
+      "fixture_source": "docs/research/2026-08-22-graphiti-combined-temporal-call-shapes.json",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 3,
+      "distinct_internal_request_count": 4
+    },
+    {
+      "fixture_id": "several-relations",
+      "fixture_class": "RELATIONS",
+      "fixture_source": "newsroom/tests/test_graphiti_core_0293_nonzero_combined_call_shape.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 3,
+      "distinct_internal_request_count": 4
+    },
+    {
+      "fixture_id": "temporal-current",
+      "fixture_class": "TEMPORAL_CURRENT",
+      "fixture_source": "newsroom/tests/test_graphiti_core_0293_nonzero_combined_call_shape.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 3,
+      "distinct_internal_request_count": 4
+    },
+    {
+      "fixture_id": "contradiction-invalidation",
+      "fixture_class": "CONTRADICTION_INVALIDATION",
+      "fixture_source": "newsroom/tests/test_graphiti_adapter_real_executor.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 3,
+      "distinct_internal_request_count": 4
+    },
+    {
+      "fixture_id": "existing-entity-resolution",
+      "fixture_class": "EXISTING_ENTITY_RESOLUTION",
+      "fixture_source": "newsroom/tests/test_graphiti_adapter_real_executor.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 3,
+      "distinct_internal_request_count": 4
+    },
+    {
+      "fixture_id": "long-multi-chunk-per-attempt",
+      "fixture_class": "LONG_MULTI_CHUNK",
+      "fixture_source": "newsroom/research/graphiti_sdk_no_tool_calibration.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 3,
+      "distinct_internal_request_count": 4
+    },
+    {
+      "fixture_id": "malformed-output-single-fallback",
+      "fixture_class": "MALFORMED_FALLBACK",
+      "fixture_source": "newsroom/tests/test_graphiti_adapter_real_executor.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 1,
+      "embedding_request_count": 0,
+      "distinct_internal_request_count": 2
+    },
+    {
+      "fixture_id": "timeout-cancellation",
+      "fixture_class": "TIMEOUT_CANCELLATION",
+      "fixture_source": "newsroom/tests/test_graphiti_adapter_real_executor.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 0,
+      "distinct_internal_request_count": 1
+    },
+    {
+      "fixture_id": "restart-after-pre-dispatch-allocation",
+      "fixture_class": "RESTART_PRE_DISPATCH",
+      "fixture_source": "newsroom/tests/test_model_usage_receipts.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 0,
+      "distinct_internal_request_count": 1
+    },
+    {
+      "fixture_id": "restart-after-possible-provider-io",
+      "fixture_class": "RESTART_POSSIBLE_IO",
+      "fixture_source": "newsroom/tests/test_model_usage_receipts.py",
+      "primary_chat_request_count": 1,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 0,
+      "distinct_internal_request_count": 1
+    },
+    {
+      "fixture_id": "embedding-leaves",
+      "fixture_class": "EMBEDDING",
+      "fixture_source": "newsroom/tests/test_graphiti_token_meter.py",
+      "primary_chat_request_count": 0,
+      "fallback_chat_request_count": 0,
+      "embedding_request_count": 3,
+      "distinct_internal_request_count": 3
+    }
+  ],
+  "evidence_digest": "sha256:6a4bd047d014e1c3a2c1b33b6b9abbb20f09be3926ed20a210f00bb57d70f8b7",
+  "maximum_qualified_fixture_count": 4,
+  "headroom": 2,
+  "max_distinct_internal_requests": 6
+}

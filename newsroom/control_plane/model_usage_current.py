@@ -268,7 +268,9 @@ def refresh(connection: sqlite3.Connection, invocation_id: str, *, importing: bo
     ).fetchone()
     expected = {"invocation_id": invocation_id, "allocation_digest": row[1], "terminal_digest": row[3], "policy_digest": row[6]}
     if reconciliations or disposition is not None:
-        from .model_usage import _retained_terminal_allocation, _policy_for_allocation, UsageComponents
+        from .model_usage import (_retained_terminal_allocation, _policy_for_allocation, UsageComponents,
+                                  native_sdk_reported_token_targets_are_advisory,
+                                  _native_sdk_reported_components_error)
         allocation, terminal = _retained_terminal_allocation(connection, invocation_id)
         policy = _policy_for_allocation(connection, allocation)
         for reconciliation in reconciliations:
@@ -284,9 +286,17 @@ def refresh(connection: sqlite3.Connection, invocation_id: str, *, importing: bo
             total = components["total_tokens"]
             context = components.get("context_tokens")
             output = components.get("output_tokens")
-            expected_breach = ("MAX_TOTAL_TOKENS_EXCEEDED" if total > policy.max_total_tokens
+            advisory = native_sdk_reported_token_targets_are_advisory(policy)
+            if advisory:
+                try:
+                    invalid = _native_sdk_reported_components_error(UsageComponents(**components))
+                except (TypeError, ValueError) as exc:
+                    raise CurrentUsageIntegrityError("current SDK reconciliation components differ") from exc
+                if invalid is not None:
+                    raise CurrentUsageIntegrityError(invalid)
+            expected_breach = ("MAX_TOTAL_TOKENS_EXCEEDED" if not advisory and total > policy.max_total_tokens
                 else "MAX_CONTEXT_TOKENS_EXCEEDED" if context is not None and context > policy.max_context_tokens
-                else "MAX_OUTPUT_TOKENS_EXCEEDED" if policy.max_output_tokens is not None
+                else "MAX_OUTPUT_TOKENS_EXCEEDED" if not advisory and policy.max_output_tokens is not None
                     and output is not None and output > policy.max_output_tokens else None)
             if reconciliation.get("policy_breach") != expected_breach:
                 raise CurrentUsageIntegrityError("current reconciliation policy binding differs")
