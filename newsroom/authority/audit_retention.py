@@ -324,18 +324,18 @@ def _index_children(
     return [(table, columns[0]) for table, columns in children]
 
 
-def _unreferenced(parent: str, children: list[tuple[str, str]]) -> str:
+def _unreferenced(parent: str, children: list[tuple[str, str]], *, opaque_tokens: bool = True) -> str:
     key = _AUDIT_KEYS[parent]
     canonical = "canonical_record_digest" if parent == "authorization_requests" else "canonical_digest"
     tests = [
         f"NOT EXISTS(SELECT 1 FROM _audit_tokens p WHERE p.id={_q(parent)}.{_q(column)})"
         for column in (key, canonical)
-    ]
+    ] if opaque_tokens else []
     tests.extend(
         f"NOT EXISTS(SELECT 1 FROM {_q(table)} c WHERE c.{_q(column)}={_q(parent)}.{_q(key)})"
         for table, column in children
     )
-    return " AND ".join(tests)
+    return " AND ".join(tests) or "1"
 
 
 def _candidates(conn: sqlite3.Connection, *, graphiti_cutoff: str) -> dict[str, int]:
@@ -529,15 +529,14 @@ def _delete_projection_candidates(conn: sqlite3.Connection) -> int:
 
 def prune_native_diagnostic_audit(
     data_root: Path, *, apply: bool = False, clock=UtcTimestamp.now,
-    _retire_projection_chains: bool = False,
 ) -> dict[str, object]:
     """Dry-run by default; apply atomically prunes, then compacts in place.
 
     Required external roots are deliberately not optional CLI flags. The
     authority lifetime writer lock excludes ordinary engine writes throughout.
-    No provider, CAS mutation or backup is performed. Default mode preserves
-    command history; the explicit retired projection wrapper expires only its
-    checked no-op chains.
+    No provider, CAS mutation or backup is performed. This read-diagnostic
+    pruner preserves command history; destructive retired-chain expiry has its
+    separate explicit transaction.
     """
     started = time.monotonic_ns()
     graphiti_cutoff = UtcTimestamp(
@@ -571,22 +570,16 @@ def prune_native_diagnostic_audit(
         conn.execute("PRAGMA cache_size=-8192")
         if apply:
             conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("BEGIN EXCLUSIVE" if apply and _retire_projection_chains else "BEGIN IMMEDIATE" if apply else "BEGIN")
+        conn.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
         try:
             _require_schema(conn)
             schema = _schema(conn)
             conn.execute("CREATE TEMP TABLE _audit_tokens(id TEXT PRIMARY KEY) WITHOUT ROWID")
-            if _retire_projection_chains:
-                from .projection_retirement import select_candidates, protect_candidates, expire_candidates
-                eligible_chains = select_candidates(conn)
-            else:
-                _policies(conn)
+            _policies(conn)
             _LOG.info("AUDIT_RETENTION_STAGE retained_authority_references")
             scan_started = time.monotonic_ns()
-            business = _scan_business(conn, tokens=conn, exclude_audit=not _retire_projection_chains,
-                exclude_projection_details=not _retire_projection_chains, retired_chains=_retire_projection_chains)
-            if not _retire_projection_chains:
-                _projection_references(conn)
+            business = _scan_business(conn, tokens=conn, exclude_audit=True, exclude_projection_details=True)
+            _projection_references(conn)
             _LOG.info("AUDIT_RETENTION_STAGE external_references")
             external_reports = {}
             readers = []
@@ -608,19 +601,11 @@ def prune_native_diagnostic_audit(
             cas_before = _fingerprint(cas_paths)
             cas_report = _scan_cas(cas, conn)
             scan_ms = (time.monotonic_ns() - scan_started) // 1_000_000
-            _LOG.info("AUDIT_RETENTION_STAGE %s", "classify_retired_projection_chains" if _retire_projection_chains else "classify_superseded_reads")
+            _LOG.info("AUDIT_RETENTION_STAGE classify_superseded_reads")
             candidates_started = time.monotonic_ns()
-            if _retire_projection_chains:
-                protected_chains = protect_candidates(conn)
-                counts = {"eligible_projection_chains": eligible_chains,
-                    "protected_projection_chains": protected_chains,
-                    "retired_projection_chains": conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0]}
-                business = _scan_business(conn, retired_chains=True)
-                protected_projection_details = None
-            else:
-                counts = _candidates(conn, graphiti_cutoff=graphiti_cutoff)
-                counts["prunable_projection_details"] = _projection_candidates(conn, cutoff=graphiti_cutoff)
-                protected_projection_details = _protected_projection_details(conn)
+            counts = _candidates(conn, graphiti_cutoff=graphiti_cutoff)
+            counts["prunable_projection_details"] = _projection_candidates(conn, cutoff=graphiti_cutoff)
+            protected_projection_details = _protected_projection_details(conn)
             report: dict[str, object] = {
                 "mode": "apply" if apply else "dry-run", "authority": str(authority),
                 "reference_scan_ms": scan_ms,
@@ -639,17 +624,11 @@ def prune_native_diagnostic_audit(
             if apply:
                 _LOG.info("AUDIT_RETENTION_STAGE prune_and_verify")
                 prune_started = time.monotonic_ns()
-                if _retire_projection_chains:
-                    report["deleted"] = expire_candidates(conn)
-                    report["retired_projection_chains"] = counts["retired_projection_chains"]
-                    report["projection_details_deleted"] = report["deleted"]["projection_delivery_attempts"]
-                else:
-                    report["deleted"] = _delete_candidates(conn)
-                    report["projection_details_deleted"] = _delete_projection_candidates(conn)
+                report["deleted"] = _delete_candidates(conn)
+                report["projection_details_deleted"] = _delete_projection_candidates(conn)
                 if (_schema(conn) != schema
-                        or _scan_business(conn, exclude_audit=not _retire_projection_chains,
-                            exclude_projection_details=not _retire_projection_chains, retired_chains=_retire_projection_chains) != business
-                        or (not _retire_projection_chains and _protected_projection_details(conn) != protected_projection_details)):
+                        or _scan_business(conn, exclude_audit=True, exclude_projection_details=True) != business
+                        or _protected_projection_details(conn) != protected_projection_details):
                     raise AuditRetentionError("retained business rows or schema changed; rolling back")
                 if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise AuditRetentionError("retained foreign-key integrity differs; rolling back")
@@ -706,5 +685,100 @@ def prune_native_diagnostic_audit(
 
 
 def retire_native_projection_diagnostics(data_root: Path, *, apply: bool = False) -> dict[str, object]:
-    """Explicit retired-chain expiry; no age heuristic or effect authority."""
-    return prune_native_diagnostic_audit(data_root, apply=apply, _retire_projection_chains=True)
+    """Explicit destructive diagnostic expiry; current business is outside target SQL.
+
+    Opaque historical diagnostic links deliberately do not pin expired logs.
+    The existing local FK/causation/shared-parent closure remains mandatory.
+    """
+    from .projection_retirement import select_candidates, protect_candidates, expire_candidates
+
+    def stage(name):
+        try:
+            _LOG.info("AUDIT_RETENTION_STAGE %s", name)
+        except Exception:
+            pass
+
+    started = time.monotonic_ns()
+    data_root = _exact_path(Path(data_root), directory=True)
+    authority = _exact_path(data_root / "increment4/authority.sqlite3")
+    before = authority.stat()
+    wal = Path(str(authority) + "-wal")
+    wal_before = wal.stat().st_size if wal.exists() else 0
+    lock = authority.with_name(authority.name + ".writer.lock")
+    if lock.is_symlink():
+        raise AuditRetentionError("writer lock path must not be a symlink")
+    report = {"operation": "DESTRUCTIVE_RETIRED_DIAGNOSTIC_EXPIRY",
+        "mode": "apply" if apply else "dry-run", "authority": str(authority),
+        "committed": False, "compacted": False, "database_bytes_before": before.st_size,
+        "wal_bytes_before": wal_before, "external_stores_mutated": False,
+        "reference_scan_performed": False}
+    with ExitStack() as stack:
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        stack.callback(os.close, fd)
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise AuthorityWriterBusy("another authority writer is active") from exc
+        conn = sqlite3.connect(authority.as_uri() + ("?mode=rw" if apply else "?mode=ro"),
+            uri=True, isolation_level=None, timeout=0)
+        stack.callback(conn.close)
+        conn.execute("PRAGMA foreign_keys=ON")
+        if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise AuditRetentionError("native foreign-key enforcement is required")
+        conn.execute("PRAGMA temp_store=FILE")
+        conn.execute("PRAGMA cache_size=-8192")
+        if apply:
+            conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("BEGIN EXCLUSIVE" if apply else "BEGIN")
+        try:
+            _require_schema(conn)
+            stage("select_retired_diagnostics")
+            eligible = select_candidates(conn)
+            stage("protect_local_references")
+            protected = protect_candidates(conn) if eligible else 0
+            candidates = conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0]
+            report["counts"] = {"eligible_projection_chains": eligible,
+                "protected_projection_chains": protected, "retired_projection_chains": candidates}
+            report["retired_projection_chains"] = candidates if apply else 0
+            if apply:
+                stage("delete_retired_diagnostics")
+                report["deleted"] = expire_candidates(conn) if candidates else {}
+                report["projection_details_deleted"] = report["deleted"].get("projection_delivery_attempts", 0)
+                _require_schema(conn)
+                conn.commit()
+                report["committed"] = True
+            else:
+                conn.rollback()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        if apply:
+            stage("compact_in_place")
+            compact_started = time.monotonic_ns()
+            try:
+                checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint is not None and checkpoint[0]:
+                    raise AuditRetentionError("authority WAL checkpoint is busy")
+                reclaimable = any(report["deleted"].values()) or conn.execute("PRAGMA freelist_count").fetchone()[0] > 0
+                if reclaimable:
+                    conn.execute("VACUUM")
+                else:
+                    report["compaction_skipped"] = "NO_RECLAIMABLE_PAGES"
+                checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint is not None and checkpoint[0]:
+                    raise AuditRetentionError("post-compaction WAL checkpoint is busy")
+                report["compacted"] = bool(reclaimable)
+            except Exception as exc:
+                report["compaction_error"] = f"Retirement committed; compaction failed: {exc}"
+            report["compaction_ms"] = (time.monotonic_ns() - compact_started) // 1_000_000
+    after = authority.stat()
+    wal_after = wal.stat().st_size if wal.exists() else 0
+    report.update({"database_bytes_after": after.st_size, "wal_bytes_after": wal_after,
+        "reclaimed_bytes": before.st_size + wal_before - after.st_size - wal_after,
+        "inode_preserved": (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino),
+        "wall_ms": (time.monotonic_ns() - started) // 1_000_000})
+    if not report["inode_preserved"]:
+        report["compaction_error"] = "Authority inode unexpectedly changed"
+    return report
