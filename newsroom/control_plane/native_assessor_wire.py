@@ -65,6 +65,16 @@ def make_provider_schema(v17_schema: dict[str, object]) -> dict[str, object]:
     return schema
 
 
+def make_v21_provider_schema(v18_schema: dict[str, object]) -> dict[str, object]:
+    """Select news once; core claim roles supply its canonical inventory."""
+    schema = json.loads(canonical_json_bytes(v18_schema))
+    package = schema["properties"]["package"]
+    package["properties"].pop("substantive_claim_indexes")
+    package["properties"]["select_new_information"] = {"type": "boolean"}
+    package["required"] = list(package["properties"])
+    return schema
+
+
 def _constant(schema: dict, key: str) -> object:
     value = schema.get("const")
     if "const" in schema:
@@ -139,11 +149,19 @@ def materialise(
             "test_evidence": witnesses,
             "policy_version": qualification_constants[test],
         })
+    if "substantive_claim_indexes" in source:
+        indexes = source["substantive_claim_indexes"]
+    else:
+        indexes = [index for index, claim in enumerate(claims)
+                   if claim["claim_role"] in {"HEADLINE", "SUBSTANTIVE"}]
+        if not source["select_new_information"]:
+            indexes = []
     v17_wire = {"package": {
         **{key: source[key] for key in (
-            "substantive_claim_indexes", "selection_rationale", "geography",
+            "selection_rationale", "geography",
             "categories", "explicit_exclusions",
         )},
+        "substantive_claim_indexes": indexes,
         "governed_claims": claims, "qualification_evidence": qualifications,
     }}
     package, receipt = materialise_v17(

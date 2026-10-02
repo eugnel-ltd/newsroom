@@ -1,0 +1,381 @@
+{
+  "source_ids": [
+    "HK-02"
+  ],
+  "source_passages": [
+    "{\"WTS\":{\"actionCode\":\"ISSUE\",\"code\":\"WTS\",\"expireTime\":\"2026-10-02T17:00:00+08:00\",\"issueTime\":\"2026-10-02T15:55:00+08:00\",\"name\":\"雷暴警告\",\"updateTime\":\"2026-10-02T15:55:00+08:00\"}}\n\nOfficial status changed: 香港天文台 issued the 雷暴警告.\nThe 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間).\nThe 雷暴警告 warning record was updated on 2 October 2026 at 15:55 (香港時間)."
+  ],
+  "raw_result_text": "{\"package\":{\"categories\":[\"Weather and disasters\"],\"explicit_exclusions\":[],\"geography\":[\"Hong Kong\"],\"governed_claims\":[{\"claim_role\":\"HEADLINE\",\"factual_localisations\":[],\"quotation_source_keys\":[],\"rendered_assertion_zh_hant_hk_fragments\":[\"官方狀態已改變：\",\"天文台已發出雷暴警告。\"],\"source_range\":{\"first_span_id\":\"S1L3\",\"last_span_id\":\"S1L3\"},\"status\":\"CONFIRMED_FACT\"},{\"claim_role\":\"SUBSTANTIVE\",\"factual_localisations\":[{\"rendered_expression\":\"2026年10月2日15:55\",\"source_lookup_key\":\"2 October 2026 at 15:55\"}],\"quotation_source_keys\":[],\"rendered_assertion_zh_hant_hk_fragments\":[\"雷暴警告的警告紀錄於2026年10月2日15:55（\",\"時間）發出。\"],\"source_range\":{\"first_span_id\":\"S1L4\",\"last_span_id\":\"S1L4\"},\"status\":\"CONFIRMED_FACT\"}],\"qualification_evidence\":[{\"claim_index\":0,\"test\":\"LAW_RIGHT_STATUS_POLICY\",\"test_evidence\":{\"change_kind\":\"STATUS\",\"change_relation\":\"NEW_OR_CHANGED_STATE\",\"event_polarity\":\"AFFIRMED\",\"material_relation_span_source_lookup_key\":\"Official status changed: 香港天文台 issued the 雷暴警告.\",\"new_state_source_lookup_key\":\"issued the 雷暴警告\"}}],\"selection_rationale\":\"可讀狀態句確認官方狀態已改變，香港天文台已發出雷暴警告，故列為標題，並以雷暴警告紀錄的發出時間作實質陳述。發出時間「2 October 2026 at 15:55」對應為「2026年10月2日15:55」。同一時間的紀錄更新句及原始警告 JSON 未納入治理陳述。\",\"substantive_claim_indexes\":[1]}}",
+  "raw_result_digest": "sha256:cd98d36fedbfa2fdacb8e5ce0d3da749ca2c2d4c84f45bab7f60ba7494e5a48c",
+  "raw_wire": {
+    "package": {
+      "categories": [
+        "Weather and disasters"
+      ],
+      "explicit_exclusions": [],
+      "geography": [
+        "Hong Kong"
+      ],
+      "governed_claims": [
+        {
+          "claim_role": "HEADLINE",
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "官方狀態已改變：",
+            "天文台已發出雷暴警告。"
+          ],
+          "source_range": {
+            "first_span_id": "S1L3",
+            "last_span_id": "S1L3"
+          },
+          "status": "CONFIRMED_FACT"
+        },
+        {
+          "claim_role": "SUBSTANTIVE",
+          "factual_localisations": [
+            {
+              "rendered_expression": "2026年10月2日15:55",
+              "source_lookup_key": "2 October 2026 at 15:55"
+            }
+          ],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "雷暴警告的警告紀錄於2026年10月2日15:55（",
+            "時間）發出。"
+          ],
+          "source_range": {
+            "first_span_id": "S1L4",
+            "last_span_id": "S1L4"
+          },
+          "status": "CONFIRMED_FACT"
+        }
+      ],
+      "qualification_evidence": [
+        {
+          "claim_index": 0,
+          "test": "LAW_RIGHT_STATUS_POLICY",
+          "test_evidence": {
+            "change_kind": "STATUS",
+            "change_relation": "NEW_OR_CHANGED_STATE",
+            "event_polarity": "AFFIRMED",
+            "material_relation_span_source_lookup_key": "Official status changed: 香港天文台 issued the 雷暴警告.",
+            "new_state_source_lookup_key": "issued the 雷暴警告"
+          }
+        }
+      ],
+      "selection_rationale": "可讀狀態句確認官方狀態已改變，香港天文台已發出雷暴警告，故列為標題，並以雷暴警告紀錄的發出時間作實質陳述。發出時間「2 October 2026 at 15:55」對應為「2026年10月2日15:55」。同一時間的紀錄更新句及原始警告 JSON 未納入治理陳述。",
+      "substantive_claim_indexes": [
+        1
+      ]
+    }
+  },
+  "retained_package": {
+    "candidate_id": "41d5ac98-89fb-4f5c-abe5-2b0bc00f00d6",
+    "categories": [
+      "Weather and disasters"
+    ],
+    "evidence_gate_evidence": [],
+    "evidence_gate_results": [],
+    "explicit_exclusions": [],
+    "freshness_result": "MISSING",
+    "geography": [
+      "Hong Kong"
+    ],
+    "governed_claims": [
+      {
+        "admitted_use": "PUBLICATION_EVIDENCE",
+        "attribution": "Hong Kong Observatory",
+        "authority_class": "RESPONSIBLE_PRIMARY",
+        "authority_scope": "Observe starts, changes and cancellations of Hong Kong weather warnings.",
+        "certainty": "CONFIRMED",
+        "claim": "Official status changed: 香港天文台 issued the 雷暴警告.",
+        "claim_id": "sha256:0339fd9db5c32ef3224e4bc54b37209a76cb9b3cdf7c405260c496dfa5e2cbf3",
+        "claim_role": "HEADLINE",
+        "dependency_evidence_ids": [
+          "sha256:c4600a0837eebcd6d32e1fb81f7dbbdb2b63ad61d8f8fa9e129e9872eea92914"
+        ],
+        "evidential_origin_ids": [
+          "sha256:92d3a32f109b72d2c3a7f67ae406d846c9a119fbd634272805acaadfcaae8c18"
+        ],
+        "localised_factual_expressions": [],
+        "named_entities": [
+          "香港"
+        ],
+        "named_entity_evidence": [
+          [
+            "香港",
+            "PLACE",
+            "sha256:53226bb8053bb26ee67dec4b26ffc57e37009774b1cb42151507f0c112b21962"
+          ]
+        ],
+        "originality_basis": "FACTUAL_REWRITE_REQUIRED",
+        "originality_policy_version": "newsroom.cont-originality.v3",
+        "passage_index": 0,
+        "policy_version": "newsroom.governed-claim.v7",
+        "quotations": [],
+        "rendered_assertion_zh_hant_hk": "官方狀態已改變：香港天文台已發出雷暴警告。",
+        "rendered_named_entities": [
+          "香港"
+        ],
+        "rights_decision_ids": [
+          "sha256:3122ea33904c426e196c77902460b7e7c86119168380151751720ce74d6e624b"
+        ],
+        "semantic_relation_evidence_id": "sha256:14dad2e4998634dc9c158b34f88b45ebe7fbf1fa8eb5c0d278d3fb93eed24e3f",
+        "source_authority_decision_ids": [
+          "sha256:a4d78fe4973c9d18b8a66cad158a8390c853735d52eb3370e236ae11fd90ab17"
+        ],
+        "source_ids": [
+          "HK-02"
+        ],
+        "source_record_ids": [
+          "sha256:a947c2ab96e237a460f8ceeb2797a3364b6b9718cec66fe421a6e79783d20fc1"
+        ],
+        "status": "CONFIRMED_FACT",
+        "supporting_excerpt": "Official status changed: 香港天文台 issued the 雷暴警告."
+      },
+      {
+        "admitted_use": "PUBLICATION_EVIDENCE",
+        "attribution": "Hong Kong Observatory",
+        "authority_class": "RESPONSIBLE_PRIMARY",
+        "authority_scope": "Observe starts, changes and cancellations of Hong Kong weather warnings.",
+        "certainty": "CONFIRMED",
+        "claim": "The 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間).",
+        "claim_id": "sha256:a108d6a594c6b29439c55c9e384a487daf857518b73834469ed9216fa0308145",
+        "claim_role": "SUBSTANTIVE",
+        "dependency_evidence_ids": [
+          "sha256:c4600a0837eebcd6d32e1fb81f7dbbdb2b63ad61d8f8fa9e129e9872eea92914"
+        ],
+        "evidential_origin_ids": [
+          "sha256:92d3a32f109b72d2c3a7f67ae406d846c9a119fbd634272805acaadfcaae8c18"
+        ],
+        "localised_factual_expressions": [
+          [
+            "2 October 2026 at 15:55",
+            "2026年10月2日15:55"
+          ]
+        ],
+        "named_entities": [
+          "香港"
+        ],
+        "named_entity_evidence": [
+          [
+            "香港",
+            "PLACE",
+            "sha256:e1d682bd2ef027f8b8d85b78c9cad6eb9bf10c18e9bd449ea54c3e4256b65cdb"
+          ]
+        ],
+        "originality_basis": "FACTUAL_REWRITE_REQUIRED",
+        "originality_policy_version": "newsroom.cont-originality.v3",
+        "passage_index": 0,
+        "policy_version": "newsroom.governed-claim.v7",
+        "quotations": [],
+        "rendered_assertion_zh_hant_hk": "雷暴警告的警告紀錄於2026年10月2日15:55（香港時間）發出。",
+        "rendered_named_entities": [
+          "香港"
+        ],
+        "rights_decision_ids": [
+          "sha256:3122ea33904c426e196c77902460b7e7c86119168380151751720ce74d6e624b"
+        ],
+        "semantic_relation_evidence_id": "sha256:d36911cf220855a7a49220932f6687ac7e70a4be1116a417feef79741cc0e18e",
+        "source_authority_decision_ids": [
+          "sha256:cb00c51d6f261a66bcaf8f8baa133b78a4231e6fbe06223b6d2d21453ace7326"
+        ],
+        "source_ids": [
+          "HK-02"
+        ],
+        "source_record_ids": [
+          "sha256:a947c2ab96e237a460f8ceeb2797a3364b6b9718cec66fe421a6e79783d20fc1"
+        ],
+        "status": "CONFIRMED_FACT",
+        "supporting_excerpt": "The 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間)."
+      }
+    ],
+    "hypothesis_id": "d7e020b5-37a3-5d03-85e7-22399d9f2e13",
+    "integrity_result": "MISSING",
+    "lead_ids": [
+      "bf08df36-a637-47f5-b898-6ae17ddb1196"
+    ],
+    "observation_digests": [
+      "sha256:99b6f1737d8456b95a456c1afeab428b6200a2654ccbec3dc5505df4cdb41f3a"
+    ],
+    "passages": [
+      "{\"WTS\":{\"actionCode\":\"ISSUE\",\"code\":\"WTS\",\"expireTime\":\"2026-10-02T17:00:00+08:00\",\"issueTime\":\"2026-10-02T15:55:00+08:00\",\"name\":\"雷暴警告\",\"updateTime\":\"2026-10-02T15:55:00+08:00\"}}\n\nOfficial status changed: 香港天文台 issued the 雷暴警告.\nThe 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間).\nThe 雷暴警告 warning record was updated on 2 October 2026 at 15:55 (香港時間)."
+    ],
+    "qualification_evidence": [
+      {
+        "governed_claim_id": "sha256:0339fd9db5c32ef3224e4bc54b37209a76cb9b3cdf7c405260c496dfa5e2cbf3",
+        "policy_version": "newsroom.evid-012.v7",
+        "qualification_record_id": "sha256:7250b66039910d34aa9d0f50b92fe9f666047321a1711dca867d2f92b7a09f67",
+        "test": "LAW_RIGHT_STATUS_POLICY",
+        "test_evidence": [
+          [
+            "change_kind",
+            "STATUS"
+          ],
+          [
+            "change_relation",
+            "NEW_OR_CHANGED_STATE"
+          ],
+          [
+            "event_polarity",
+            "AFFIRMED"
+          ],
+          [
+            "material_relation_span",
+            "Official status changed: 香港天文台 issued the 雷暴警告."
+          ],
+          [
+            "new_state",
+            "issued the 雷暴警告"
+          ]
+        ]
+      }
+    ],
+    "resolved_evidence_records": [
+      [
+        "sha256:14dad2e4998634dc9c158b34f88b45ebe7fbf1fa8eb5c0d278d3fb93eed24e3f",
+        "sha256:50bb45badb786f1aca394deff798d9308bdb0ea7fd7d034214520d16b0e33d7e"
+      ],
+      [
+        "sha256:3122ea33904c426e196c77902460b7e7c86119168380151751720ce74d6e624b",
+        "sha256:a72b8b287f28a29bac9ec0dacfbd83c162096b5665980c693dac25702dbf531a"
+      ],
+      [
+        "sha256:53226bb8053bb26ee67dec4b26ffc57e37009774b1cb42151507f0c112b21962",
+        "sha256:c12a8726b47ac371ee563f6e0a6d81c40b3a9fccf732fa2d4e308b7607eb806c"
+      ],
+      [
+        "sha256:7250b66039910d34aa9d0f50b92fe9f666047321a1711dca867d2f92b7a09f67",
+        "sha256:641980a1d2d8ccd839ce71784424c886a3b0125ad9bf247c207e7a7a0b1c107e"
+      ],
+      [
+        "sha256:a4d78fe4973c9d18b8a66cad158a8390c853735d52eb3370e236ae11fd90ab17",
+        "sha256:5e4d984f6bb8f3932695dbc8b7ea7f70ad507ffe529bd05936f406385fa1b3b8"
+      ],
+      [
+        "sha256:a947c2ab96e237a460f8ceeb2797a3364b6b9718cec66fe421a6e79783d20fc1",
+        "sha256:99903f8ab7a393831d4cdbb1749111e9986b8aab025bf0aa876f6da162e654ab"
+      ],
+      [
+        "sha256:c4600a0837eebcd6d32e1fb81f7dbbdb2b63ad61d8f8fa9e129e9872eea92914",
+        "sha256:80950a2ff705a3cda6ce7d79fc1af41a5c518a37061545bacb15820edce79d10"
+      ],
+      [
+        "sha256:cb00c51d6f261a66bcaf8f8baa133b78a4231e6fbe06223b6d2d21453ace7326",
+        "sha256:4b282a1120c511162f21759f71eb3e2a53728673ce4f740514a2cf049c3a4028"
+      ],
+      [
+        "sha256:d36911cf220855a7a49220932f6687ac7e70a4be1116a417feef79741cc0e18e",
+        "sha256:2de0e0461a5261f01d479c5b16e7fb08a9d7a897d9e7c0d92dcc9c53e8a7848a"
+      ],
+      [
+        "sha256:e1d682bd2ef027f8b8d85b78c9cad6eb9bf10c18e9bd449ea54c3e4256b65cdb",
+        "sha256:aba3aca6325872de2697cd8b6c9e71c489868692c6e3566f0683cb71b98602bb"
+      ]
+    ],
+    "selection_rationale": "可讀狀態句確認官方狀態已改變，香港天文台已發出雷暴警告，故列為標題，並以雷暴警告紀錄的發出時間作實質陳述。發出時間「2 October 2026 at 15:55」對應為「2026年10月2日15:55」。同一時間的紀錄更新句及原始警告 JSON 未納入治理陳述。",
+    "signal_ids": [
+      "631a9b01-e5ee-4dab-b629-45dbc1218279"
+    ],
+    "source_ids": [
+      "HK-02"
+    ],
+    "substantive_new_information": [
+      "The 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間)."
+    ]
+  },
+  "editorial_policy": {
+    "candidate_version_digest": "sha256:3cc3ee33df67ffce207dd68ebc4d40a235633cfb2ca14979bc8ab31b21e9d5e0",
+    "candidate_version_id": "a0a519f5-eefe-40f8-a0f5-432f48840ebe",
+    "currentness": [
+      {
+        "currency_family": "CURRENT_VERSION",
+        "currency_window_seconds": null,
+        "evidence_digest": "sha256:4c6870e270e7ed253ec3534cc9b183a846d9c7bd3c08ad64934a20dc4151d507",
+        "publication_time": "2026-10-02T07:55:00.000000Z",
+        "reason_code": "CURRENT_CONTENT_API_VERSION_CONFIRMED",
+        "result": "PASS",
+        "retrieval_time": "2026-10-02T08:18:46.314268Z",
+        "source_definition_id": "b3c53de0-523e-4b3d-9809-3a8c91e1746e",
+        "source_definition_revision_digest": "sha256:fddd2ec9f74aa5527a67474f36f424cd3832224d55c84856ac6a5f0080c51f5e",
+        "source_id": "HK-02",
+        "supersession_evidence_digest": "sha256:4c6870e270e7ed253ec3534cc9b183a846d9c7bd3c08ad64934a20dc4151d507",
+        "version_reference": "2026-10-02T07:55:00.000000Z"
+      }
+    ],
+    "decision_id": "sha256:ee0d737da95da107abf899743739e5a268c33241285d14c29de778456f558a91",
+    "evaluated_at": "2026-10-02T08:22:11.671566Z",
+    "evidence_gate_results": [
+      [
+        "CLAIM_TRACEABILITY",
+        "PASS"
+      ],
+      [
+        "EVIDENCE_SUFFICIENCY",
+        "PASS"
+      ],
+      [
+        "SOURCE_AUTHORITY",
+        "PASS"
+      ]
+    ],
+    "governing_manifest_digest": "sha256:b6da4efcdc0f2ae18f0bad97296759d259bd14d217aa9b7bc67d147e5caf734d",
+    "integrity": [
+      {
+        "checks": [
+          "ACCESS_COMPLETE",
+          "ENCODING_VALID",
+          "EXTRACTION_COMPLETE",
+          "NOT_PAYWALL_FRAGMENT",
+          "NOT_TRUNCATED",
+          "VERSION_UNAMBIGUOUS"
+        ],
+        "reason_code": "INDEPENDENT_ACQUISITION_VERIFIED",
+        "result": "PASS",
+        "source_admission_id": "16197be3-acc7-488f-a21c-07b4cdf7a6b6",
+        "source_digest": "sha256:99b6f1737d8456b95a456c1afeab428b6200a2654ccbec3dc5505df4cdb41f3a",
+        "source_id": "HK-02"
+      }
+    ],
+    "package_admission_id": "137cf405-acc6-492d-9765-5a92b85ae423",
+    "package_digest": "sha256:6516bffa55b4b2b6521a18da4cd3cff5f1074741486d3b93e0fa22e4137cdcf2",
+    "policy_bundle_digest": "sha256:e576722159e5a126d60a95e230d667c9da3c83405818c7a3d4584eaba9bef6d5",
+    "schema_identity": "newsroom.increment10.editorial-policy-decision.v1"
+  },
+  "materialisation_receipt": {
+    "body_digests": [
+      "sha256:99b6f1737d8456b95a456c1afeab428b6200a2654ccbec3dc5505df4cdb41f3a"
+    ],
+    "claim_entity_order": [
+      [
+        [
+          "香港",
+          "PLACE"
+        ]
+      ],
+      [
+        [
+          "香港",
+          "PLACE"
+        ]
+      ]
+    ],
+    "manifest_digest": "sha256:470c334ada2d00ab4005c69985e01ce3a445092ce1ecf3eeaf319e6f3d4c0ebb",
+    "materialised_text": "{\"package\":{\"categories\":[\"Weather and disasters\"],\"explicit_exclusions\":[],\"geography\":[\"Hong Kong\"],\"governed_claims\":[{\"admitted_use\":\"PUBLICATION_EVIDENCE\",\"certainty\":\"CONFIRMED\",\"claim\":\"Official status changed: 香港天文台 issued the 雷暴警告.\",\"claim_id\":\"sha256:0339fd9db5c32ef3224e4bc54b37209a76cb9b3cdf7c405260c496dfa5e2cbf3\",\"claim_role\":\"HEADLINE\",\"localised_factual_expressions\":[],\"originality_basis\":\"FACTUAL_REWRITE_REQUIRED\",\"originality_policy_version\":\"newsroom.cont-originality.v3\",\"passage_index\":0,\"policy_version\":\"newsroom.governed-claim.v7\",\"quotations\":[],\"rendered_assertion_zh_hant_hk\":\"官方狀態已改變：香港天文台已發出雷暴警告。\",\"semantic_relation\":{\"relation\":\"SEMANTICALLY_EQUIVALENT\",\"rendered_modality\":\"ASSERTED\",\"rendered_polarity\":\"AFFIRMED\",\"source_modality\":\"ASSERTED\",\"source_polarity\":\"AFFIRMED\"},\"source_ids\":[\"HK-02\"],\"status\":\"CONFIRMED_FACT\",\"supporting_excerpt\":\"Official status changed: 香港天文台 issued the 雷暴警告.\"},{\"admitted_use\":\"PUBLICATION_EVIDENCE\",\"certainty\":\"CONFIRMED\",\"claim\":\"The 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間).\",\"claim_id\":\"sha256:a108d6a594c6b29439c55c9e384a487daf857518b73834469ed9216fa0308145\",\"claim_role\":\"SUBSTANTIVE\",\"localised_factual_expressions\":[[\"2 October 2026 at 15:55\",\"2026年10月2日15:55\"]],\"originality_basis\":\"FACTUAL_REWRITE_REQUIRED\",\"originality_policy_version\":\"newsroom.cont-originality.v3\",\"passage_index\":0,\"policy_version\":\"newsroom.governed-claim.v7\",\"quotations\":[],\"rendered_assertion_zh_hant_hk\":\"雷暴警告的警告紀錄於2026年10月2日15:55（香港時間）發出。\",\"semantic_relation\":{\"relation\":\"SEMANTICALLY_EQUIVALENT\",\"rendered_modality\":\"ASSERTED\",\"rendered_polarity\":\"AFFIRMED\",\"source_modality\":\"ASSERTED\",\"source_polarity\":\"AFFIRMED\"},\"source_ids\":[\"HK-02\"],\"status\":\"CONFIRMED_FACT\",\"supporting_excerpt\":\"The 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間).\"}],\"qualification_evidence\":[{\"governed_claim_id\":\"sha256:0339fd9db5c32ef3224e4bc54b37209a76cb9b3cdf7c405260c496dfa5e2cbf3\",\"policy_version\":\"newsroom.evid-012.v7\",\"test\":\"LAW_RIGHT_STATUS_POLICY\",\"test_evidence\":{\"change_kind\":\"STATUS\",\"change_relation\":\"NEW_OR_CHANGED_STATE\",\"event_polarity\":\"AFFIRMED\",\"material_relation_span\":\"Official status changed: 香港天文台 issued the 雷暴警告.\",\"new_state\":\"issued the 雷暴警告\"}}],\"selection_rationale\":\"可讀狀態句確認官方狀態已改變，香港天文台已發出雷暴警告，故列為標題，並以雷暴警告紀錄的發出時間作實質陳述。發出時間「2 October 2026 at 15:55」對應為「2026年10月2日15:55」。同一時間的紀錄更新句及原始警告 JSON 未納入治理陳述。\",\"substantive_new_information\":[\"The 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間).\"]}}",
+    "ordered_entities": [
+      [
+        [
+          "香港",
+          "PLACE"
+        ]
+      ]
+    ],
+    "package_digest": "sha256:68c48e710a64b11b1aefb91fcbe6b0e88ef79ef5c542425f84f134b75ef48e16",
+    "provider_schema_digest": "sha256:ee75aaced2b407df8051fd508af1626bedefca8c9e900af65320bba7aff1c1a0",
+    "raw_digest": "sha256:cd98d36fedbfa2fdacb8e5ce0d3da749ca2c2d4c84f45bab7f60ba7494e5a48c",
+    "receipt_digest": "sha256:1054ad50732212c3c10dc782a7eeb41872b64e39016ed66efa392986d987f1ad",
+    "request_identity": "sha256:e77a34e9564409553d5f7a342ebef5b346dc2ff3810936d052daa685892ec3ba",
+    "version": "newsroom.native-assessor-references.v1"
+  }
+}
