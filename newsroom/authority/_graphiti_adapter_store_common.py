@@ -327,6 +327,7 @@ class _GraphitiAdapterStoreSupport:
     def _graphiti_configuration_from_row(
         self, conn: sqlite3.Connection, row: Mapping[str, Any], *, replayed: bool
     ) -> GraphitiAdapterConfigurationRecord:
+        self._prove_current_record(row)
         value = self._graphiti_canonical_row_value(
             row, identity="Graphiti adapter configuration"
         )
@@ -623,6 +624,7 @@ class _GraphitiAdapterStoreSupport:
         self, conn: sqlite3.Connection, row: Mapping[str, Any], *, replayed: bool,
         require_current: bool = False,
     ) -> GraphitiAttemptRecord:
+        self._prove_current_record(row)
         value = self._graphiti_canonical_row_value(row, identity="Graphiti attempt")
         cleanup_row = conn.execute(
             "SELECT * FROM graphiti_cleanup_receipts WHERE receipt_id=?",

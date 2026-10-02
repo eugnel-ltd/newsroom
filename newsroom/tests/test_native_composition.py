@@ -146,7 +146,7 @@ def test_deployed_startup_rejects_unqualified_policy_before_credentials_or_io(
 
 
 @pytest.mark.parametrize("replace_existing", (False, True))
-def test_deployed_continuous_runtime_qualifies_without_prior_qualification_open(
+def test_deployed_continuous_runtime_runs_without_history_qualification_gate(
     tmp_path, monkeypatch, replace_existing,
 ):
     from newsroom.control_plane import broker, cycle, native_qualification, paths, writer
@@ -251,8 +251,8 @@ def test_deployed_continuous_runtime_qualifies_without_prior_qualification_open(
     else:
         report = service.run()
         assert report is not None and report.outcome == "COMPLETE"
-        assert len(qualified) == 1
-        assert qualified[0].startswith("sha256:")
+        assert qualified == []
+        assert service._qualify_once is None
     assert opens == ["open", "close"]
     assert opened_arguments[0]["reassessment_quantum_seconds"] == 300
 

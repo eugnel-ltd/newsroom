@@ -11,7 +11,7 @@ import json
 import re
 import sqlite3
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -2058,6 +2058,9 @@ class TriageWorkItemStore:
         self,
         connection: sqlite3.Connection,
         retrieval_authority: RetrievalContextAuthority | None = None,
+        *,
+        _validate_on_open: bool = True,
+        _validate_retained_event: Callable[[str], None] | None = None,
     ) -> None:
         if type(connection) is not sqlite3.Connection or connection.in_transaction:
             raise WorkItemContractError("store requires an idle sqlite3 connection")
@@ -2066,11 +2069,14 @@ class TriageWorkItemStore:
             raise WorkItemContractError("foreign keys must be enabled")
         self._connection = connection
         self._retrieval_authority = retrieval_authority
+        self._current_state_only = not _validate_on_open
+        self._validate_retained_event = _validate_retained_event
         if retrieval_authority is not None:
             retrieval_authority.attach(connection)
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._verify_integrity()
+            if _validate_on_open:
+                self._verify_integrity()
             connection.execute("COMMIT")
         except Exception:
             if connection.in_transaction:
@@ -2310,6 +2316,8 @@ class TriageWorkItemStore:
 
     def current_version(self, work_item_id: str) -> TriageWorkItemVersion:
         _uuid(work_item_id, "work_item_id")
+        if self._current_state_only:
+            self._verify_item_chain(work_item_id)
         row = self._connection.execute(
             "SELECT v.canonical_bytes,v.canonical_digest,h.current_version_digest "
             "FROM triage_work_item_heads h JOIN triage_work_item_versions v "
@@ -2365,6 +2373,8 @@ class TriageWorkItemStore:
             raise WorkItemContractError(
                 "transaction-aware Work Item use requires an active transaction"
             )
+        if self._current_state_only:
+            self._verify_item_chain(work_item_id)
         head = self._head(work_item_id)
         version = self.load_version(head[0])
         if version.canonical_digest != head[2]:
@@ -3013,6 +3023,30 @@ class TriageWorkItemStore:
         return reasons
 
     def _immutable_source_reasons(self, version: TriageWorkItemVersion) -> list[str]:
+        if self._validate_retained_event is not None:
+            events = {
+                lead.lead_event_id
+                for lead in (*version.decision_leads, *version.context_leads)
+            }
+            events.update(lead.disposition_event_id for lead in version.decision_leads)
+            for lead in (*version.decision_leads, *version.context_leads):
+                for table, column, identifier in (
+                    ("discovery_gate_decisions", "decision_id", lead.gate_decision_id),
+                    ("source_definition_versions", "version_id", lead.definition_version_id),
+                    ("source_definitions", "definition_id", lead.definition_id),
+                ):
+                    row = self._connection.execute(
+                        f"SELECT authority_event_id FROM {table} WHERE {column}=?", (identifier,),
+                    ).fetchone()
+                    if row is None:
+                        raise WorkItemContractError("selected Work Item source authority is absent")
+                    events.add(str(row[0]))
+            if version.watch is not None:
+                events.update((version.watch.watch_event_id, version.watch.source_disposition_event_id))
+            if version.supplemental_reentry is not None:
+                events.add(version.supplemental_reentry.source_lead_disposition_event_id)
+            for event_id in events:
+                self._validate_retained_event(event_id)
         reasons: list[str] = []
         for lead in version.decision_leads:
             if not self._lead_retained(lead):

@@ -270,11 +270,11 @@ def test_fallback_cancellation_qualification_reproves_retained_authority(tmp_pat
         case.connection.commit()
         with pytest.raises(NativeQualificationError):
             _invocations(case.connection, case.journal)
-        if field == "authority_scope":
-            assert ROUTE in m._usage_blocking_routes(case.connection)
-        else:
-            with pytest.raises(m.ModelUsageIntegrityError):
-                m._usage_blocking_routes(case.connection)
+        # Qualification is a historical audit lane; new admission consumes the
+        # already-settled current fact. Explicit settlement replay still checks.
+        assert ROUTE not in m._usage_blocking_routes(case.connection)
+        with pytest.raises((m.ModelUsageIntegrityError, m.ModelUsageAdmissionError)):
+            _dispose(case)
     finally:
         case.connection.close()
 

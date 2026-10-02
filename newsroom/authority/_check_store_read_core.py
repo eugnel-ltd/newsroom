@@ -36,6 +36,7 @@ class _CheckStoreReadCoreMixin:
         *,
         replayed: bool,
     ) -> CheckRequest:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="Check Request")
         event = self._validate_record_envelope(
             conn,
@@ -119,6 +120,7 @@ class _CheckStoreReadCoreMixin:
         *,
         replayed: bool,
     ) -> CheckAttempt:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="Check Attempt")
         event = self._validate_record_envelope(
             conn,
@@ -170,6 +172,7 @@ class _CheckStoreReadCoreMixin:
         *,
         replayed: bool,
     ) -> CheckOutcome:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="Check Outcome")
         event = self._validate_record_envelope(
             conn,

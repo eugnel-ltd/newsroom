@@ -22,7 +22,6 @@ from newsroom.increment6.collision import CurrentCollisionEffectEnforcer
 from newsroom.increment6.dispositions import (
     CurrentCandidateCitationReadPort,
     ProposalDispositionStore,
-    _require_verification_snapshot,
 )
 from newsroom.increment6.hypotheses import _compose_event_hypothesis_authority
 from newsroom.increment6.lineage import (
@@ -214,7 +213,11 @@ def open_hermes_native_authority_system(
     cas_fault_hook: Callable[[str], None] | None = None,
     disk_usage: Callable[[Path], Any] | None = None,
 ) -> HermesNativeAuthoritySystem:
-    """Open the sole production writer used by one Hermes runtime."""
+    """Open the sole native writer from current durable state.
+
+    Historical physical/record sweeps are explicit maintenance. Selected
+    business reads and effects still prove their exact retained dependencies.
+    """
 
     explicit_dependencies = (
         retrieval_authority is not None or collision_enforcer is not None
@@ -263,6 +266,7 @@ def open_hermes_native_authority_system(
         clock=clock,
         cas_fault_hook=cas_fault_hook,
         disk_usage=disk_usage,
+        _native_current_state=True,
     )
     try:
         root, service, cas, _, commands, schemas = base._authority_composition(
@@ -398,38 +402,33 @@ def open_hermes_native_authority_system(
         )
 
         with _validation_stage("native_semantic_stores"):
-            work_items = TriageWorkItemStore(connection, retrieval_authority)
+            work_items = TriageWorkItemStore(
+                connection, retrieval_authority, _validate_on_open=False,
+                _validate_retained_event=lambda event_id: with_native_rows(root._validate_retained_event, event_id),
+            )
             executions = _open_on_connection(
                 connection, retrieval_authority=retrieval_authority,
                 authenticator=authenticator, clock=clock,
                 lease_ttl_seconds=lease_ttl_seconds,
                 work_items=work_items,
+                _validate_on_open=False,
             )
             executions._TriageExecutionAuthority__store._transaction_lock = operation_lock
-            verified_dispositions = []
             dispositions = ProposalDispositionStore(
                 connection,
                 retrieval_authority,
                 authenticator,
                 current_candidate_citations,
                 work_items=work_items,
-                _open_verification=verified_dispositions,
+                _validate_on_open=False,
             )
-            # The root Event store holds the lifetime POSIX writer lock, so no
-            # compliant writer can commit after this verified snapshot. The
-            # in-transaction checks below also reject noncompliant changes.
-            disposition_values, disposition_snapshot = verified_dispositions[0]
-            verified_hypotheses = []
             hypothesis_store = _HypothesisStore(
                 connection, retrieval_authority, authenticator, clock,
                 current_candidate_citations,
                 dispositions=dispositions,
-                verified_dispositions=disposition_values,
-                verified_disposition_snapshot=disposition_snapshot,
-                _open_verification=verified_hypotheses,
+                _validate_on_open=False,
             )
             hypothesis_store._lock = operation_lock
-            hypothesis_values, hypothesis_snapshot = verified_hypotheses[0]
 
         relationship_store = _share_store(_SharedRelationshipStore, root)
         with relationship_store._hypothesis_rows():
@@ -459,25 +458,31 @@ def open_hermes_native_authority_system(
         )
         candidate_store._dispositions = dispositions
         candidate_store._service = service
-        # These facades share one writer and one stable validation transaction.
-        # Pass its verified upstream values directly; retain nothing across calls.
+        # Construct facades without replaying unused history. Their existing
+        # transaction-bound producer readers prove exact dependencies on use.
+        from ._native_startup import validate_current_heads
         with operation_lock, relationship_store._transaction():
-            _require_verification_snapshot(connection, hypothesis_snapshot)
-            relationship_store._adopt()
-            try:
-                with _validation_stage("native_relationships"):
+            validate_current_heads(connection)
+
+        def validate_retained_history():
+            with operation_lock, relationship_store._transaction():
+                root.validate_retained_history()
+                root._reconcile_blob_integrity(_include_historical_active=True)
+                root._validate_projection_integrity()
+                work_items._verify_integrity()
+                executions._TriageExecutionAuthority__store._verify_integrity()
+                verified_dispositions = dispositions._verify_integrity()
+                verified_hypotheses = hypothesis_store._verify(verified_dispositions=verified_dispositions)
+                relationship_store._adopt()
+                try:
                     _verify_relationship_event_coverage(connection)
-                    relationship_inputs = relationship_store._verify_relationships(
-                        verified_versions=hypothesis_values
-                    )
-                with _validation_stage("native_lineage"):
+                    inputs = relationship_store._verify_relationships(verified_versions=verified_hypotheses)
                     lineage_store._verify_global_event_coverage()
-                    lineage_store._verify(relationship_inputs=relationship_inputs)
-                with _validation_stage("native_candidates"):
+                    lineage_store._verify(relationship_inputs=inputs)
                     candidate_store._verify_global_event_coverage()
-                    candidate_store._verify(relationship_receipts=relationship_inputs[1])
-            finally:
-                relationship_store._release()
+                    candidate_store._verify(relationship_receipts=inputs[1])
+                finally:
+                    relationship_store._release()
 
         transaction_candidate_port = _create_story_candidate_read_port(
             connection,
@@ -564,6 +569,7 @@ def open_hermes_native_authority_system(
             collision=collision_enforcer,
             commands=authority_commands,
             events=authority_events,
+            validate_retained_history=validate_retained_history,
         )
     except BaseException:
         base.close()

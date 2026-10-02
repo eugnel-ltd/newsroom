@@ -219,6 +219,7 @@ class _EditorialRelationReadMixin:
     def _editorial_proposal_version_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EditorialRelationProposalVersion:
+        self._prove_current_record(row)
         event = self._editorial_record_context(
             conn, event_id=str(row["authority_event_id"])
         )
@@ -287,6 +288,7 @@ class _EditorialRelationReadMixin:
     def _editorial_decision_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EditorialRelationDecision:
+        self._prove_current_record(row)
         event = self._editorial_record_context(
             conn, event_id=str(row["authority_event_id"])
         )

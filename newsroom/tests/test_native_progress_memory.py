@@ -10,7 +10,7 @@ from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
 from newsroom.control_plane.corpus import units_from
 from newsroom.control_plane.editorial import GroupedObservation
 from newsroom.control_plane.items import SourceItem
-from newsroom.control_plane.native_progress import LAND, NativeRevisionJournal, _landed_units
+from newsroom.control_plane.native_progress import LAND, NativeRevisionJournal, _landed_units, import_legacy_native_progress
 from newsroom.control_plane.native_source_intake import NativeSourceDisposition
 from newsroom.control_plane.store import append_ledger, connect
 from newsroom.effective_revision import EffectiveRevisionIdentity
@@ -46,14 +46,16 @@ def test_replay_shares_unit_strings_with_exact_bytes_and_isolated_authority(tmp_
             del unit["body"]
     connection = connect(str(tmp_path / "private.sqlite3"))
     try:
+        connection.execute('DELETE FROM native_current_meta')
         append_ledger(connection, LAND, value)
         connection.commit()
+        import_legacy_native_progress(connection)
         rows = connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall()
         statements = []
         connection.set_trace_callback(statements.append)
         journal = NativeRevisionJournal(connection)
         connection.set_trace_callback(None)
-        assert len(statements) == 1
+        assert not any("FROM ledger" in statement for statement in statements)
         retained = journal.units[units[0].revision_id]
         assert retained == units
         assert _landed_units(json.loads(canonical_json_bytes(value))) == units
@@ -126,6 +128,7 @@ def test_cold_current_retrieval_pairs_do_not_remain_in_journal_heap(tmp_path):
     facts = {**_retrieval_facts(), "retrieval_rights_inventory": inventory}
     expected_pair_bytes = len(canonical_json_bytes(facts)) * 24
     revisions = []
+    connection.execute('DELETE FROM native_current_meta')
     for number in range(24):
         unit = _native(f"cold-{number}")
         revisions.append(unit.revision_id)
@@ -135,6 +138,7 @@ def test_cold_current_retrieval_pairs_do_not_remain_in_journal_heap(tmp_path):
             "stage": "EVIDENCE_HOLD", "facts": facts,
         })
     connection.commit()
+    import_legacy_native_progress(connection)
     gc.collect()
     tracemalloc.start()
     try:

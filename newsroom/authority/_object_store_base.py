@@ -237,6 +237,66 @@ class _ObjectStoreBase:
             )
         return value
 
+    def _verified_rights_value(self, rights: sqlite3.Row) -> dict[str, Any]:
+        """One exact rights record, shared by receipt reads and current effects."""
+        value = self._require_canonical_record(rights)
+        expected = {
+            field: rights[field]
+            for field in (
+                "rights_decision_id", "authentication_context_id",
+                "authorization_request_digest", "authorization_decision_id",
+                "rights_request_digest", "policy_contract_digest",
+                "admission_definition_digest", "object_class", "allowed_use",
+                "security_scope", "retention_scope", "reason_code",
+                "decided_at", "valid_from", "valid_until",
+            )
+        }
+        expected.update({
+            "blob": {"blob_digest": rights["blob_digest"], "size_bytes": rights["size_bytes"]},
+            "allowed": bool(rights["allowed"]),
+        })
+        if value != expected:
+            raise AuthorityPersistenceError("access decision rights indexed fields differ")
+        return value
+
+    def _prove_current_admission(self, conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+        rights = conn.execute(
+            "SELECT * FROM object_rights_decisions WHERE rights_decision_id=?", (row["rights_decision_id"],),
+        ).fetchone()
+        if rights is None:
+            raise AuthorityPersistenceError("current admission rights are absent")
+        value = self._verified_rights_value(rights)
+        if any(value[rights_field] != row[admission_field] for rights_field, admission_field in (
+            ("admission_definition_digest", "definition_digest"), ("object_class", "object_class"),
+            ("allowed_use", "allowed_use"), ("security_scope", "security_scope"),
+            ("retention_scope", "retention_scope"), ("valid_from", "valid_from"), ("valid_until", "valid_until"),
+        )) or value["blob"] != {"blob_digest": row["blob_digest"], "size_bytes": row["size_bytes"]}:
+            raise AuthorityPersistenceError("current admission differs from exact rights")
+        authentication = conn.execute(
+            "SELECT * FROM authentication_contexts WHERE authentication_context_id=?", (rights["authentication_context_id"],),
+        ).fetchone()
+        request = conn.execute(
+            "SELECT * FROM authorization_requests WHERE request_digest=?", (rights["authorization_request_digest"],),
+        ).fetchone()
+        decision = conn.execute(
+            "SELECT * FROM authorization_decisions WHERE authorization_decision_id=?", (rights["authorization_decision_id"],),
+        ).fetchone()
+        if any(record is None for record in (authentication, request, decision)):
+            raise AuthorityPersistenceError("current rights security closure is absent")
+        context = self._authentication_record_from_row(authentication)
+        requested = self._request_record_from_row(request, connection=conn)
+        authorised = self._decision_record_from_row(decision, connection=conn)
+        if (
+            not authorised.allowed
+            or requested.authentication_context_id != context.authentication_context_id
+            or authorised.authentication_context_id != context.authentication_context_id
+            or authorised.authorization_request_digest != requested.request_digest
+        ):
+            raise AuthorityPersistenceError("current rights security closure differs")
+        if row["event_id"] is None:
+            raise AuthorityPersistenceError("current admission activation is absent")
+        self._validate_retained_event(str(row["event_id"]))
+
     def _admission_row(
         self, admission_id: str, *, conn: sqlite3.Connection | None = None
     ) -> sqlite3.Row:
@@ -358,6 +418,8 @@ class _ObjectStoreBase:
         row = self._admission_row(admission_id, conn=conn)
         if require_active and str(row["state"]) != AdmissionState.ACTIVE.value:
             raise ObjectAdmissionDenied("object admission is not ACTIVE")
+        if self._current_state_only:
+            self._prove_current_admission(conn, row)
         valid_from = UtcTimestamp.parse(str(row["valid_from"]))
         valid_until = (
             None
@@ -977,14 +1039,15 @@ class _ObjectStoreBase:
             self._reconcile_staging_records()
             # An install can complete durably before SQLite commit.  Such a file
             # has no authoritative blob identity and is safe to remove.
-            self._cas.cleanup_unreferenced_installed(
-                known_digests=frozenset(
-                    str(row["blob_digest"])
-                    for row in self._connection.execute(
-                        "SELECT blob_digest FROM blob_identities"
-                    ).fetchall()
+            if not self._current_state_only:
+                self._cas.cleanup_unreferenced_installed(
+                    known_digests=frozenset(
+                        str(row["blob_digest"])
+                        for row in self._connection.execute(
+                            "SELECT blob_digest FROM blob_identities"
+                        ).fetchall()
+                    )
                 )
-            )
             self._reconcile_blob_integrity()
             self._reconcile_expired_rights()
             self._reconcile_deletions()
@@ -992,6 +1055,7 @@ class _ObjectStoreBase:
     def _reconcile_staging_records(self) -> None:
         records = self._connection.execute(
             "SELECT stage_id,staged_name,state FROM object_staging_records"
+            + (" WHERE state='STAGED'" if self._current_state_only else "")
         ).fetchall()
         for row in records:
             state = str(row["state"])
@@ -1018,9 +1082,16 @@ class _ObjectStoreBase:
                 "SELECT staged_name FROM object_staging_records WHERE state='STAGED'"
             ).fetchall()
         )
-        self._cas.cleanup_staging(keep_names=keep)
+        if not self._current_state_only:
+            self._cas.cleanup_staging(keep_names=keep)
 
-    def _reconcile_blob_integrity(self) -> None:
+    def _reconcile_blob_integrity(self, *, _include_historical_active: bool = False) -> None:
+        # ACTIVE is retained admission state, not proof that an old input is
+        # part of today's work. Rehydrate pins/rehashes it before use. Native
+        # boot only reconciles pending install/deletion byte obligations.
+        states = "'INSTALLED','DELETION_PENDING'"
+        if _include_historical_active:
+            states = "'INSTALLED','ACTIVE','DELETION_PENDING'"
         rows = self._connection.execute(
             "SELECT b.blob_digest,b.size_bytes,v.state,v.integrity_state "
             "FROM blob_identities b "
@@ -1028,6 +1099,8 @@ class _ObjectStoreBase:
             "JOIN blob_lifecycle_versions v "
             "ON v.blob_digest=h.blob_digest "
             "AND v.lifecycle_version=h.current_version"
+            + (f" WHERE v.state IN ({states})"
+               if self._current_state_only else "")
         ).fetchall()
         for row in rows:
             state = BlobLifecycleState(str(row["state"]))
@@ -1061,20 +1134,21 @@ class _ObjectStoreBase:
 
     def _reconcile_expired_rights(self) -> None:
         now = self._clock().to_text()
-        invalid_active = self._connection.execute(
-            "SELECT a.admission_id FROM object_admissions a "
-            "JOIN object_admission_heads h ON h.admission_id=a.admission_id "
-            "JOIN object_admission_versions v "
-            "ON v.admission_id=h.admission_id "
-            "AND v.lifecycle_version=h.current_version "
-            "JOIN object_rights_decisions r "
-            "ON r.rights_decision_id=a.rights_decision_id "
-            "WHERE v.state='ACTIVE' AND r.allowed=0 LIMIT 1"
-        ).fetchone()
-        if invalid_active is not None:
-            raise AuthorityPersistenceError(
-                "ACTIVE admission references a denying rights decision"
-            )
+        if not self._current_state_only:
+            invalid_active = self._connection.execute(
+                "SELECT a.admission_id FROM object_admissions a "
+                "JOIN object_admission_heads h ON h.admission_id=a.admission_id "
+                "JOIN object_admission_versions v "
+                "ON v.admission_id=h.admission_id "
+                "AND v.lifecycle_version=h.current_version "
+                "JOIN object_rights_decisions r "
+                "ON r.rights_decision_id=a.rights_decision_id "
+                "WHERE v.state='ACTIVE' AND r.allowed=0 LIMIT 1"
+            ).fetchone()
+            if invalid_active is not None:
+                raise AuthorityPersistenceError(
+                    "ACTIVE admission references a denying rights decision"
+                )
 
         pending = self._connection.execute(
             "SELECT a.admission_id FROM object_admissions a "
@@ -1108,6 +1182,7 @@ class _ObjectStoreBase:
             "JOIN object_deletion_versions v "
             "ON v.deletion_id=h.deletion_id "
             "AND v.lifecycle_version=h.current_version"
+            + (" WHERE v.state!='PHYSICALLY_REMOVED'" if self._current_state_only else "")
         ).fetchall()
         for row in rows:
             state = DeletionState(str(row["state"]))

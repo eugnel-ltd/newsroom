@@ -189,7 +189,6 @@ def deployed_native_service(args):
     from .cycle import assert_no_owner_emergency_stop, owner_emergency_stop_fence
     from .model_usage import WorkloadClass
     from .native_service import NativeService
-    from .native_qualification import record_qualification
     from .paths import (
         CANONICAL_PROVING_STORE, CANONICAL_UNPUBLISHED_STORE,
         CANONICAL_INCREMENT4_AUTHORITY_STORE, CANONICAL_OBJECT_CAS_ROOT,
@@ -320,7 +319,6 @@ def deployed_native_service(args):
         pipeline_factory=pipeline, ledger_path=str(CANONICAL_UNPUBLISHED_STORE),
         lock_path=Path(args.lock), stop_check=check, interval_seconds=args.interval,
         failure_backoff_seconds=args.failure_backoff,
-        qualify_once=record_qualification,
         preflight=preflight,
         service_event=service_event,
     )

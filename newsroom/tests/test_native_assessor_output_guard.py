@@ -340,7 +340,7 @@ def test_requalification_requires_one_raw_failed_result_and_no_materialisation(t
 
 
 @pytest.mark.parametrize("field", ["candidate_id", "qualified_policy_digest", "terminal_digest", "original_candidate_retry"])
-def test_tampered_requalification_receipt_is_not_an_exemption(tmp_path, monkeypatch, field):
+def test_tampered_settled_requalification_stays_off_admission_but_replay_rechecks(tmp_path, monkeypatch, field):
     service, _usage_, _candidate_, _base_, allocation, policy = _fixture(tmp_path, monkeypatch)
     _recover(service, allocation, policy)
     with sqlite3.connect(service.path) as c:
@@ -352,8 +352,10 @@ def test_tampered_requalification_receipt_is_not_an_exemption(tmp_path, monkeypa
         raw = canonical_json_bytes(receipt).decode()
         c.execute("UPDATE ledger SET payload_json=?,payload_digest=? WHERE seq=?", (raw, digest_bytes(raw.encode()), seq))
     reopened = ModelUsageService(service.path)
-    with sqlite3.connect(service.path) as c, pytest.raises(ModelUsageIntegrityError):
-        reopened._route_state(c, policy.route)
+    with sqlite3.connect(service.path) as c:
+        assert reopened._route_state(c, policy.route)["state"] == "CLOSED"
+    with pytest.raises(ModelUsageIntegrityError):
+        _recover(service, allocation, policy)
 
 
 def test_requalification_replay_rejects_another_qualified_policy(tmp_path, monkeypatch):
@@ -367,14 +369,16 @@ def test_requalification_replay_rejects_another_qualified_policy(tmp_path, monke
         assert c.execute("SELECT count(*) FROM ledger WHERE kind=?", (KIND,)).fetchone()[0] == 1
 
 
-def test_duplicated_requalification_receipt_is_not_an_exemption(tmp_path, monkeypatch):
+def test_duplicated_settled_requalification_stays_off_admission_but_replay_rechecks(tmp_path, monkeypatch):
     service, _usage_, _candidate_, _base_, allocation, policy = _fixture(tmp_path, monkeypatch)
     _recover(service, allocation, policy)
     with sqlite3.connect(service.path) as c:
         raw = c.execute("SELECT payload_json FROM ledger WHERE kind=?", (KIND,)).fetchone()[0]
         append_ledger(c, KIND, json.loads(raw))
-    with sqlite3.connect(service.path) as c, pytest.raises(ModelUsageIntegrityError):
-        service._route_state(c, policy.route)
+    with sqlite3.connect(service.path) as c:
+        assert service._route_state(c, policy.route)["state"] == "CLOSED"
+    with pytest.raises(ModelUsageIntegrityError, match="duplicated"):
+        _recover(service, allocation, policy)
 
 
 def test_output_requalification_never_changes_graphiti_circuit(tmp_path, monkeypatch):

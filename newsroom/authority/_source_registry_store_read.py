@@ -189,6 +189,7 @@ class _SourceRegistryReadMixin:
         *,
         replayed: bool,
     ) -> SourceDefinition:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="source definition")
         event = self._validate_record_envelope(
             conn,
@@ -225,6 +226,7 @@ class _SourceRegistryReadMixin:
         *,
         replayed: bool,
     ) -> SourceDefinitionVersion:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="source definition version")
         event = self._validate_record_envelope(
             conn,
@@ -265,6 +267,7 @@ class _SourceRegistryReadMixin:
         *,
         replayed: bool,
     ) -> SourceItem:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="source item")
         event = self._validate_record_envelope(
             conn,
@@ -335,6 +338,7 @@ class _SourceRegistryReadMixin:
         *,
         replayed: bool,
     ) -> LocatorContinuityDecision:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="locator continuity decision")
         event = self._validate_record_envelope(
             conn,
@@ -409,6 +413,7 @@ class _SourceRegistryReadMixin:
         *,
         replayed: bool,
     ) -> SourceRevision:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="source revision")
         event = self._validate_record_envelope(
             conn,
@@ -487,6 +492,7 @@ class _SourceRegistryReadMixin:
         *,
         replayed: bool,
     ) -> DiscoveryRepresentation:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="discovery representation")
         event = self._validate_record_envelope(
             conn,
@@ -563,6 +569,7 @@ class _SourceRegistryReadMixin:
         *,
         replayed: bool,
     ) -> DiscoveryOccurrence:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="discovery occurrence")
         event = self._validate_record_envelope(
             conn,

@@ -35,6 +35,7 @@ from .store import LEDGER_GENESIS, append_ledger
 _STARTED = "NATIVE_SERVICE_CYCLE_STARTED"
 _TERMINAL = "NATIVE_SERVICE_CYCLE_TERMINAL"
 _QUALIFICATION = "NATIVE_SERVICE_QUALIFICATION"
+_CURRENT_INVENTORY_VERSION = "native-current-qualification.v2"
 _TERMINAL_REVISION_STATES = frozenset({
     "ACKNOWLEDGED",
     "COLLISION_HOLD",
@@ -143,7 +144,9 @@ def _document(raw: str, payload_digest: str) -> dict:
 
 
 def _ledger(connection: sqlite3.Connection) -> tuple[tuple, ...]:
-    relevant_kinds = (_STARTED, _TERMINAL, _QUALIFICATION, LAND, STATE, PORTFOLIO)
+    # Ordinary progress is CURRENT state. Expiring STATE diagnostics are not
+    # qualification authority; selected provider/accounting readers prove pins.
+    relevant_kinds = (_STARTED, _TERMINAL, _QUALIFICATION, LAND, PORTFOLIO)
     rows = []
     cursor = connection.execute(
         "SELECT current.seq,current.at,current.kind,current.payload_digest,"
@@ -375,16 +378,20 @@ def _revision_inventory(
     return journal, dict(retained_states)
 
 
-def _revision_inventory_digest(rows: tuple[tuple, ...], terminal_seq: int) -> str:
-    references = [
-        {
-            "seq": row[0], "kind": row[2], "payload_digest": row[3],
-            "ledger_digest": row[6],
-        }
-        for row in rows
-        if row[0] <= terminal_seq and row[2] in {LAND, STATE}
+def _revision_inventory_digest(
+    connection: sqlite3.Connection, journal: NativeRevisionJournal,
+) -> str:
+    """Bind authenticated current source/head state, never debug transitions."""
+    sources = tuple(connection.execute(
+        'SELECT revision_id,land_seq,land_digest,content_digest FROM native_current_sources ORDER BY revision_id'
+    ))
+    heads = [
+        (revision, record.ordinal, record.state_digest, record.pair_digest)
+        for revision, record in sorted(journal._records.items())
     ]
-    return digest_bytes(canonical_json_bytes(references))
+    return digest_bytes(canonical_json_bytes({
+        'version': _CURRENT_INVENTORY_VERSION, 'sources': sources, 'heads': heads,
+    }))
 
 
 def _canonical_record(raw: str) -> dict:
@@ -593,7 +600,7 @@ def _candidate_qualification(
         terminal[0],
         terminal[6],
         digest_bytes(canonical_json_bytes(sources)),
-        _revision_inventory_digest(rows, terminal[0]),
+        _revision_inventory_digest(connection, journal),
         invocation_ids,
     )
 
@@ -616,6 +623,7 @@ def record_qualification(
         "terminal_ledger_digest": retained.terminal_ledger_digest,
         "source_inventory_digest": retained.source_inventory_digest,
         "revision_inventory_digest": retained.revision_inventory_digest,
+        "revision_inventory_version": _CURRENT_INVENTORY_VERSION,
         "invocation_ids": list(retained.invocation_ids),
     }
     append_ledger(connection, _QUALIFICATION, payload)
@@ -632,6 +640,13 @@ def validate_qualification(
         raise TypeError("native qualification requires a SQLite connection")
     try:
         validate_sha256_digest(current_identity_digest)
+        latest = connection.execute(
+            "SELECT payload_json,payload_digest FROM ledger WHERE kind=? "
+            "AND json_extract(payload_json,'$.runtime_identity_digest')=? ORDER BY seq DESC LIMIT 1",
+            (_QUALIFICATION, current_identity_digest),
+        ).fetchone()
+        if latest is not None and _document(latest[0], latest[1]).get('revision_inventory_version') != _CURRENT_INVENTORY_VERSION:
+            raise NativeQualificationError('historical native qualification expired; CURRENT qualification required')
         rows = _ledger(connection)
         references = [
             (row, _document(row[4], row[3]))
@@ -645,7 +660,7 @@ def validate_qualification(
         if set(reference) != {
             "runtime_identity_digest", "cycle_id", "started_seq",
             "started_ledger_digest", "terminal_seq", "terminal_ledger_digest",
-            "source_inventory_digest", "revision_inventory_digest", "invocation_ids",
+            "source_inventory_digest", "revision_inventory_digest", "revision_inventory_version", "invocation_ids",
         }:
             raise NativeQualificationError("native qualification reference differs")
         by_seq = {row[0]: row for row in rows}
@@ -661,6 +676,7 @@ def validate_qualification(
         start_payload = _document(start[4], start[3])
         terminal_payload = _document(terminal[4], terminal[3])
         sources, states = _terminal_portfolio(connection, rows, terminal, terminal_payload["pipeline"])
+        journal = NativeRevisionJournal(connection)
         if (
             start_payload != {
                 "cycle_id": reference["cycle_id"],
@@ -673,11 +689,10 @@ def validate_qualification(
             or terminal_payload.get("failure_class") is not None
             or digest_bytes(canonical_json_bytes(sources))
             != reference["source_inventory_digest"]
-            or _revision_inventory_digest(rows, terminal[0])
+            or _revision_inventory_digest(connection, journal)
             != reference["revision_inventory_digest"]
         ):
             raise NativeQualificationError("native qualification evidence differs")
-        journal = NativeRevisionJournal(connection)
         invocation_ids = _invocations(
             connection, journal, tuple(reference["invocation_ids"]),
         )

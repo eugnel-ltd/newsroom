@@ -21,6 +21,7 @@ from newsroom.control_plane.native_qualification import (
 )
 from newsroom.authority.canonical import validate_sha256_digest
 from newsroom.control_plane.store import append_ledger, connect
+from newsroom.control_plane.diagnostic_logging import emit_diagnostic, start_diagnostic_logging
 from newsroom.control_plane.veto import OperatorDrainRequested, VetoError
 
 LOCK_IDENTITY = "newsroom-hermes-native-service-v1\n"
@@ -120,6 +121,7 @@ class NativeService:
         with _instance_lock(self._lock_path):
             self._stop_check()
             ledger = connect(self._ledger_path)
+            stop_diagnostics = start_diagnostic_logging(Path(self._ledger_path).parent / 'diagnostics')
             try:
                 with self._pipeline_factory() as pipeline:
                     identity = getattr(pipeline, "runtime_identity_digest", None)
@@ -210,10 +212,14 @@ class NativeService:
                             break
             finally:
                 ledger.close()
+                stop_diagnostics()
         return last
 
     @staticmethod
     def _append(connection: sqlite3.Connection, kind: str, payload: dict) -> None:
+        if kind in {"NATIVE_SERVICE_CYCLE_STARTED", "NATIVE_SERVICE_CYCLE_TERMINAL"}:
+            emit_diagnostic(kind, payload)
+            return
         append_ledger(connection, kind, payload)
         connection.commit()
 

@@ -32,15 +32,13 @@ from newsroom.control_plane.graphiti_requests import (
     GraphitiLeafClass,
     load_checked_graphiti_call_shape_policy,
 )
-from newsroom.control_plane.issue_790_contract import (
-    issue_790_approved_plan_contracts,
-)
 from newsroom.control_plane.issue_790_step16_activation import (
     effective_issue_790_plan_contract,
 )
 from newsroom.control_plane.sqlite_profile import apply_control_plane_sqlite_profile
 from newsroom.control_plane.store import GRAPHITI_MAX_FAILURES
 from newsroom.control_plane.veto import assert_private_store
+from newsroom.control_plane import model_usage_current
 
 if TYPE_CHECKING:
     from newsroom.control_plane.corpus import CorpusIngestUnit
@@ -463,101 +461,26 @@ def _canonical_circuit_route(route: str) -> str:
     )
 
 
-def _approved_plan_contracts_for_store(
-    connection: sqlite3.Connection,
-) -> tuple:
-    contracts = list(issue_790_approved_plan_contracts())
-    if connection.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type='table' AND name='issue_790_step16_activations'"
-    ).fetchone():
-        for row in connection.execute(
-            "SELECT plan_digest FROM issue_790_step16_activations"
-        ):
-            try:
-                contracts.append(
-                    effective_issue_790_plan_contract(
-                        str(row[0]),
-                        connection=connection,
-                    )
-                )
-            except KeyError:
-                continue
-    return tuple(sorted(contracts, key=lambda item: item.plan_digest))
-
-
 def _usage_blocking_routes(connection: sqlite3.Connection) -> set[str]:
-    approved_contracts = _approved_plan_contracts_for_store(connection)
-    approved_bindings = " OR ".join(
-        "(d.approved_plan_digest=? AND d.invocation_id=?)"
-        for _ in approved_contracts
-    )
-    parameters = tuple(
-        value
-        for contract in approved_contracts
-        for value in (contract.plan_digest, contract.invocation_id)
-    )
-    canary_non_success_leaf = ""
-    if connection.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type='table' AND name='issue_790_bounded_canary_consumptions'"
-    ).fetchone() and connection.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type='table' AND name='issue_790_bounded_canary_outcomes'"
-    ).fetchone():
-        # Failed #790 canary leaves must not permanently block the next
-        # AUTHORISED_OPERATOR_RESET on the same route (wall-time / sequence).
-        canary_non_success_leaf = (
-            "EXISTS (SELECT 1 "
-            "FROM model_invocation_allocations a_canary "
-            "JOIN issue_790_bounded_canary_consumptions c "
-            "ON c.event_id=json_extract(a_canary.record_json,'$.cycle_id') "
-            "JOIN issue_790_bounded_canary_outcomes o "
-            "ON o.consumption_digest=c.consumption_digest "
-            "WHERE a_canary.invocation_id=t.invocation_id "
-            "AND json_extract(o.record_json,'$.result_class') "
-            "!= 'TRUTHFUL_PROVIDER_SUCCESS') "
-        )
-    canary_runtime_leaf_exclusion = (
-        f"AND NOT {canary_non_success_leaf}" if canary_non_success_leaf else ""
-    )
-    policy_breach_clause = "json_extract(t.record_json,'$.policy_breach') IS NOT NULL"
-    if canary_non_success_leaf:
-        policy_breach_clause = (
-            f"({policy_breach_clause} AND NOT ({canary_non_success_leaf}))"
-        )
-    disposed_breaches = (_reported_output_disposed_invocations(connection)
-                       | _requalified_assessor_invocations(connection))
-    breach_bindings = ",".join("?" for _ in disposed_breaches)
-    if breach_bindings:
-        policy_breach_clause = f"({policy_breach_clause} AND t.invocation_id NOT IN ({breach_bindings}))"
-    native_disposed = _native_disposed_invocation_ids(connection)
-    native_bindings = " OR ".join("t.invocation_id=?" for _ in native_disposed)
-    native_clause = (
-        f"AND NOT ({native_bindings}) " if native_bindings else ""
-    )
-    rows = connection.execute(
-        "SELECT a.route FROM model_invocation_terminals t "
-        "JOIN model_invocation_allocations a "
-        "ON a.invocation_id=t.invocation_id "
-        "WHERE (t.usage_status IN "
-        "('UNREPORTED','AMBIGUOUS','INVALID') "
-        "AND NOT EXISTS (SELECT 1 FROM model_usage_reconciliations r "
-        "WHERE r.invocation_id=t.invocation_id) "
-        "AND NOT EXISTS (SELECT 1 "
-        "FROM model_usage_conservative_dispositions d "
-        "WHERE d.invocation_id=t.invocation_id "
-        f"AND ({approved_bindings})) "
-        f"{native_clause}"
-        f"{canary_runtime_leaf_exclusion}"
-        ") "
-        f"OR {policy_breach_clause} "
-        "OR EXISTS (SELECT 1 FROM model_usage_reconciliations r "
-        "WHERE r.invocation_id=t.invocation_id "
-        "AND json_extract(r.record_json,'$.policy_breach') IS NOT NULL)",
-        parameters + tuple(sorted(native_disposed)) + tuple(sorted(disposed_breaches)),
-    ).fetchall()
-    return {_canonical_circuit_route(str(row[0])) for row in rows}
+    """Read only current active/unsettled facts, never re-prove settled history."""
+    try:
+        return model_usage_current.blocking_routes(connection)
+    except model_usage_current.CurrentUsageIntegrityError as exc:
+        raise ModelUsageIntegrityError(str(exc)) from exc
+
+
+def _refresh_current_usage(connection: sqlite3.Connection, invocation_id: str) -> None:
+    try:
+        model_usage_current.refresh(connection, invocation_id)
+    except model_usage_current.CurrentUsageIntegrityError as exc:
+        raise ModelUsageIntegrityError(str(exc)) from exc
+
+
+def _current_has_active(connection: sqlite3.Connection, route: str) -> bool:
+    try:
+        return model_usage_current.has_active(connection, route)
+    except model_usage_current.CurrentUsageIntegrityError as exc:
+        raise ModelUsageIntegrityError(str(exc)) from exc
 
 
 def _policy_for_allocation(
@@ -1392,103 +1315,46 @@ def _assessor_requalification_authority(
     }
 
 
-def _requalified_assessor_invocations(connection):
-    if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='ledger'").fetchone():
-        return set()
+def reported_output_rejected_ingests(
+    connection: sqlite3.Connection, *, ingest_ids: tuple[str, ...] | None = None,
+) -> frozenset[str]:
+    """Read durable selected no-retry obligations without historical LAND replay."""
+    if ingest_ids is not None and not ingest_ids:
+        return frozenset()
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_usage_reported_output_dispositions'"
+    ).fetchone() is None:
+        return frozenset()
     result = set()
-    for kind in (_ASSESSOR_REQUALIFICATION_KIND, _ASSESSOR_OUTPUT_REQUALIFICATION_KIND):
-        for digest, raw in connection.execute(
-            "SELECT payload_digest,payload_json FROM ledger WHERE kind=?", (kind,),
+    batches = (None,) if ingest_ids is None else tuple(
+        ingest_ids[start:start + 400] for start in range(0, len(ingest_ids), 400)
+    )
+    for batch in batches:
+        query = "SELECT d.invocation_id,d.disposition_digest,d.record_json FROM model_usage_reported_output_dispositions d"
+        if batch is not None:
+            # Select via the independent retained envelope identity. A damaged
+            # disposition ingest field must not silently remove its no-retry hold.
+            query = (
+                "SELECT d.invocation_id,d.disposition_digest,d.record_json FROM model_work_envelopes e "
+                "JOIN model_invocation_allocations a ON a.envelope_id=e.envelope_id "
+                "JOIN model_usage_reported_output_dispositions d ON d.invocation_id=a.invocation_id "
+                "WHERE e.workload_class='GRAPHITI_CHAT_PRIMARY' "
+                "AND json_extract(e.record_json,'$.ingest_id') IN (" + ",".join("?" for _ in batch) + ")"
+            )
+        for invocation_id, digest, raw in connection.execute(
+            query,
+            () if batch is None else batch,
         ):
             record = _object(raw)
-            try:
-                expected = _assessor_requalification_authority(
-                    connection, str(record.get("invocation_id")), str(record.get("qualified_policy_digest")),
-                    output_guard=kind == _ASSESSOR_OUTPUT_REQUALIFICATION_KIND,
-                )
-            except ModelUsageAdmissionError as exc:
-                raise ModelUsageIntegrityError("retained assessor requalification is ineligible") from exc
-            at = _instant(str(record.get("recorded_at")))
-            if at < _instant(expected["failure_settled_at"]):
-                raise ModelUsageIntegrityError("assessor requalification precedes failure")
-            expected["recorded_at"] = _utc_text(at)
-            expected["requalification_digest"] = digest_canonical(expected)
-            if record != expected or raw != _json(record) or digest_bytes(raw.encode()) != digest or record["invocation_id"] in result:
-                raise ModelUsageIntegrityError("assessor requalification differs")
-            result.add(record["invocation_id"])
-    return result
-
-
-def _reported_output_disposed_invocations(connection: sqlite3.Connection) -> set[str]:
-    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='model_usage_reported_output_dispositions'").fetchone() is None:
-        return set()
-    result = set()
-    for invocation_id, digest, raw in connection.execute(
-        "SELECT invocation_id,disposition_digest,record_json FROM model_usage_reported_output_dispositions"
-    ):
-        record = _object(raw)
-        expected = _reported_output_disposition_authority(
-            connection, invocation_id=invocation_id, revision_id=str(record.get("revision_id", "")),
-        )
-        observed_at = _instant(str(record.get("observed_at")))
-        if observed_at < _instant(str(expected["failure_settled_at"])):
-            raise ModelUsageIntegrityError("reported output disposition precedes failure")
-        expected["observed_at"] = _utc_text(observed_at)
-        expected["disposition_digest"] = digest_canonical(expected)
-        if expected != record or record["disposition_digest"] != digest or raw != _json(record):
-            raise ModelUsageIntegrityError("reported output disposition differs")
-        result.add(str(invocation_id))
-    return result
-
-
-def reported_output_rejected_ingests(connection: sqlite3.Connection) -> frozenset[str]:
-    """Read authenticated no-retry obligations, not merely circuit eligibility."""
-    invocations = _reported_output_disposed_invocations(connection)
-    if not invocations:
-        return frozenset()
-    return frozenset(
-        str(_object(raw)["ingest_id"])
-        for invocation_id, raw in connection.execute(
-            "SELECT invocation_id,record_json FROM model_usage_reported_output_dispositions"
-        )
-        if invocation_id in invocations
-    )
-
-
-def _native_disposed_invocation_ids(connection: sqlite3.Connection) -> set[str]:
-    rows = connection.execute(
-        "SELECT invocation_id FROM model_usage_conservative_dispositions "
-        "WHERE json_extract(record_json,'$.authority_scope') IN (?,?,?,?)",
-        (
-            NATIVE_AUTONOMOUS_USAGE_SCOPE,
-            NATIVE_EMBEDDING_TIMEOUT_USAGE_SCOPE,
-            NATIVE_GRAPHITI_EMBEDDING_CANCELLATION_USAGE_SCOPE,
-            NATIVE_GRAPHITI_FALLBACK_CANCELLATION_USAGE_SCOPE,
-        ),
-    ).fetchall()
-    result: set[str] = set()
-    for row in rows:
-        invocation_id = str(row[0])
-        allocation_row = connection.execute(
-            "SELECT record_json FROM model_invocation_allocations "
-            "WHERE invocation_id=?",
-            (invocation_id,),
-        ).fetchone()
-        terminal_row = connection.execute(
-            "SELECT record_json FROM model_invocation_terminals "
-            "WHERE invocation_id=?",
-            (invocation_id,),
-        ).fetchone()
-        if allocation_row is None or terminal_row is None:
-            raise ModelUsageIntegrityError("native conservative disposition is orphaned")
-        allocation = _allocation_from_record(_object(allocation_row[0]))
-        terminal = _terminal_from_record(_object(terminal_row[0]))
-        if _valid_native_disposition(
-            connection, allocation=allocation, terminal=terminal
-        ) is None:
-            raise ModelUsageIntegrityError("native conservative disposition differs")
-        result.add(invocation_id)
-    return result
+            unsigned = dict(record)
+            retained_digest = unsigned.pop("disposition_digest", None)
+            if (retained_digest != digest or digest_canonical(unsigned) != digest
+                    or record.get("invocation_id") != invocation_id
+                    or (batch is not None and record.get("ingest_id") not in batch)
+                    or record.get("retry_authorised") is not False or raw != _json(record)):
+                raise ModelUsageIntegrityError("current no-retry disposition differs")
+            result.add(_token(record.get("ingest_id"), field="current no-retry ingest"))
+    return frozenset(result)
 
 
 def _native_envelope(
@@ -1841,6 +1707,20 @@ def _native_landed_source_unit(
             )
         return units[0].revision_id, units
 
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_current_meta'").fetchone():
+        from .native_progress_state import selected_landing_rows
+        try:
+            rows = selected_landing_rows(connection, ingest_id=ingest_id,
+                revision_id_hint=revision_id_hint, effective_revision_digest=effective_revision_digest)
+            matches = [unit for selected in rows for unit in decode_landing(selected)[1]
+                       if unit.ingest_id == ingest_id and (effective_revision_digest is None
+                           or digest_canonical(asdict(unit.effective_revision)) == effective_revision_digest)]
+        except (KeyError, TypeError, ValueError) as exc:
+            message = ('native conservative source landing changed' if 'source landing changed' in str(exc)
+                       else 'native conservative source landing differs')
+            raise ModelUsageIntegrityError(message) from exc
+        return matches[0] if len(matches) == 1 else None
+
     candidate_revisions: set[str] = set()
     if revision_id_hint is not None:
         candidate_revisions.add(_token(revision_id_hint, field="native revision hint"))
@@ -2154,13 +2034,28 @@ def _native_embedding_progress_binding(
         )
     matches: list[dict[str, object]] = []
     if retained_progress is None:
-        rows = connection.execute(
-            "SELECT seq,payload_digest,payload_json FROM ledger "
-            "WHERE kind='NATIVE_REVISION_PROGRESS' "
-            "AND json_extract(payload_json,'$.stage')='EMBEDDING_STARTED' "
-            "AND payload_json LIKE ? AND payload_json LIKE ? ORDER BY seq",
-            (f'%"{envelope.ingest_id}"%', f'%"{envelope.cycle_id}"%'),
-        )
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_current_meta'").fetchone():
+            from .native_progress_state import require_ready
+            try:
+                require_ready(connection, verify_inventory=False)
+            except ValueError as exc:
+                raise ModelUsageIntegrityError('native embedding disposition CURRENT state differs') from exc
+            rows = connection.execute(
+                "SELECT pin.progress_seq,pin.progress_digest,record.payload_json "
+                "FROM native_embedding_progress_pins AS pin JOIN ledger AS record "
+                "ON record.seq=pin.progress_seq AND record.payload_digest=pin.progress_digest "
+                "WHERE pin.passage_id=? AND pin.cycle_id=? "
+                "AND record.kind='NATIVE_REVISION_PROGRESS' ORDER BY pin.progress_seq",
+                (envelope.ingest_id, envelope.cycle_id),
+            )
+        else:
+            rows = connection.execute(
+                "SELECT seq,payload_digest,payload_json FROM ledger "
+                "WHERE kind='NATIVE_REVISION_PROGRESS' "
+                "AND json_extract(payload_json,'$.stage')='EMBEDDING_STARTED' "
+                "AND payload_json LIKE ? AND payload_json LIKE ? ORDER BY seq",
+                (f'%"{envelope.ingest_id}"%', f'%"{envelope.cycle_id}"%'),
+            )
     else:
         rows = connection.execute(
             "SELECT seq,payload_digest,payload_json FROM ledger WHERE seq=? "
@@ -2228,30 +2123,35 @@ def _native_embedding_progress_binding(
         _landed_units,
     )
 
-    landed = []
-    for payload_digest, raw in connection.execute(
-        "SELECT payload_digest,payload_json FROM ledger WHERE kind=? "
-        "AND json_extract(payload_json,'$.revision_id')=?",
-        (LAND, result["revision_id"]),
-    ):
-        payload = _object(raw)
-        units = _landed_units(payload)
-        NativeRevisionJournal._validate_units(units)
-        if (
-            raw != canonical_json_bytes(payload).decode("utf-8")
-            or payload_digest != digest_bytes(raw.encode("utf-8"))
-            or payload.get("revision_id") != result["revision_id"]
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_current_meta'").fetchone():
+        unit = _native_landed_source_unit(connection, ingest_id=result['unit_ingest_id'],
+                                          revision_id_hint=result['revision_id'])
+        landed = [] if unit is None else [unit]
+    else:
+        landed = []
+        for payload_digest, raw in connection.execute(
+            "SELECT payload_digest,payload_json FROM ledger WHERE kind=? "
+            "AND json_extract(payload_json,'$.revision_id')=?",
+            (LAND, result["revision_id"]),
         ):
-            raise ModelUsageIntegrityError(
-                "native embedding disposition source landing differs"
+            payload = _object(raw)
+            units = _landed_units(payload)
+            NativeRevisionJournal._validate_units(units)
+            if (
+                raw != canonical_json_bytes(payload).decode("utf-8")
+                or payload_digest != digest_bytes(raw.encode("utf-8"))
+                or payload.get("revision_id") != result["revision_id"]
+            ):
+                raise ModelUsageIntegrityError(
+                    "native embedding disposition source landing differs"
+                )
+            landed.extend(
+                unit
+                for unit in units
+                if unit.ingest_id == result["unit_ingest_id"]
+                and unit.proving_run_id.startswith("native-source:")
+                and unit.authority is not None
             )
-        landed.extend(
-            unit
-            for unit in units
-            if unit.ingest_id == result["unit_ingest_id"]
-            and unit.proving_run_id.startswith("native-source:")
-            and unit.authority is not None
-        )
     if len(landed) != 1:
         raise ModelUsageIntegrityError(
             "native embedding disposition lacks its landed source unit"
@@ -3419,6 +3319,8 @@ class ModelUsageService:
         connection = self._connection()
         try:
             connection.executescript(_SCHEMA)
+            connection.executescript(model_usage_current.SCHEMA)
+            model_usage_current.initialise_empty(connection)
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone():
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS model_usage_native_landed_revision "
@@ -3464,6 +3366,21 @@ class ModelUsageService:
         apply_control_plane_sqlite_profile(connection)
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
+
+    def import_current_state(self) -> int:
+        """Explicit quiescent legacy cutover; ordinary boot never imports history."""
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            count = model_usage_current.import_legacy(connection)
+            connection.commit()
+            return count
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def register_policy(self, policy: InvocationEfficiencyPolicy) -> None:
         policy._validate()
@@ -4047,6 +3964,7 @@ class ModelUsageService:
                     "duplicate request digest in work envelope"
                 ) from exc
             raise
+        _refresh_current_usage(connection, allocation.invocation_id)
 
     @staticmethod
     def _validate_graphiti_identity(
@@ -5221,7 +5139,12 @@ class ModelUsageService:
                         _json(observation_record),
                     ),
                 )
-            if retained.usage_status in {
+            _refresh_current_usage(connection, retained.invocation_id)
+            current_blocker = connection.execute(
+                "SELECT 1 FROM model_usage_current WHERE invocation_id=? "
+                "AND (unresolved=1 OR policy_breach=1)", (retained.invocation_id,),
+            ).fetchone() is not None
+            if current_blocker and retained.usage_status in {
                 UsageStatus.UNREPORTED,
                 UsageStatus.AMBIGUOUS,
                 UsageStatus.INVALID,
@@ -5234,7 +5157,7 @@ class ModelUsageService:
                     invocation_id=retained.invocation_id,
                     recorded_at=retained.observed_at,
                 )
-            elif retained.policy_breach:
+            elif current_blocker and retained.policy_breach:
                 self._append_route_state(
                     connection,
                     route=route,
@@ -5861,6 +5784,7 @@ class ModelUsageService:
                     _json(record),
                 ),
             )
+            _refresh_current_usage(connection, invocation_id)
             connection.commit()
             return record
         except Exception:
@@ -5935,6 +5859,8 @@ class ModelUsageService:
             elif record.get("authority_scope") != NATIVE_GRAPHITI_EMBEDDING_CANCELLATION_USAGE_SCOPE:
                 raise ModelUsageIntegrityError("native cancellation disposition scope differs")
 
+            _refresh_current_usage(connection, invocation_id)
+
             # complete() retained this exact missing-telemetry cause. A valid
             # estimate may close it, but never another cause or live/unknown leaf.
             latest = connection.execute(
@@ -5945,12 +5871,7 @@ class ModelUsageService:
             if (
                 latest is not None
                 and tuple(latest) == ("OPEN", "MISSING_PROVIDER_TELEMETRY", invocation_id)
-                and connection.execute(
-                    "SELECT 1 FROM model_invocation_allocations a LEFT JOIN "
-                    "model_invocation_terminals t ON t.invocation_id=a.invocation_id "
-                    "WHERE a.route=? AND t.invocation_id IS NULL LIMIT 1",
-                    (allocation.route,),
-                ).fetchone() is None
+                and not _current_has_active(connection, allocation.route)
                 and _canonical_circuit_route(allocation.route) not in _usage_blocking_routes(connection)
             ):
                 self._append_route_state(
@@ -6076,6 +5997,7 @@ class ModelUsageService:
                 )
 
             def close_exact_timeout_route(disposition_digest: str) -> None:
+                _refresh_current_usage(connection, invocation_id)
                 latest_route = connection.execute(
                     "SELECT state,reason,invocation_id FROM "
                     "model_usage_route_circuit_events WHERE route=? "
@@ -6086,15 +6008,7 @@ class ModelUsageService:
                     latest_route is not None
                     and tuple(latest_route)
                     == ("OPEN", "TimeoutError", allocation.invocation_id)
-                    and connection.execute(
-                        "SELECT 1 FROM model_invocation_allocations a LEFT JOIN "
-                        "model_invocation_terminals t "
-                        "ON t.invocation_id=a.invocation_id "
-                        "WHERE a.route=? AND a.invocation_id<>? "
-                        "AND t.invocation_id IS NULL LIMIT 1",
-                        (allocation.route, allocation.invocation_id),
-                    ).fetchone()
-                    is None
+                    and not _current_has_active(connection, allocation.route)
                     and _canonical_circuit_route(allocation.route)
                     not in _usage_blocking_routes(connection)
                 ):
@@ -6481,6 +6395,7 @@ class ModelUsageService:
                     _json(record),
                 ),
             )
+            _refresh_current_usage(connection, invocation_id)
             connection.commit()
             return record
         except Exception:
@@ -6588,6 +6503,7 @@ class ModelUsageService:
                     _json({**record, "reconciliation_digest": digest}),
                 ),
             )
+            _refresh_current_usage(connection, invocation_id)
             canonical_route = _canonical_circuit_route(route)
             blocking_cause_on_canonical_route = (
                 canonical_route in _usage_blocking_routes(connection)
@@ -6621,6 +6537,7 @@ class ModelUsageService:
     def route_state(self, route: str) -> dict[str, object]:
         connection = self._connection()
         try:
+            connection.execute("BEGIN")
             return self._route_state(connection, route)
         finally:
             connection.close()
@@ -6710,6 +6627,7 @@ class ModelUsageService:
                 expected["disposition_digest"] = digest_canonical(expected)
                 if record != expected or prior[0] != record["disposition_digest"] or prior[1] != _json(record):
                     raise ModelUsageIntegrityError("reported output disposition differs")
+            _refresh_current_usage(connection, invocation_id)
             latest = connection.execute(
                 "SELECT state,reason,invocation_id,recorded_at FROM model_usage_route_circuit_events "
                 "WHERE route='GRAPHITI_CHAT_PRIMARY' ORDER BY recorded_at DESC,rowid DESC LIMIT 1"
@@ -6718,11 +6636,7 @@ class ModelUsageService:
                 latest is not None and latest[0] == "OPEN" and latest[2] == invocation_id
                 and observed_at >= _instant(str(latest[3]))
                 and latest[1] in {"REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED", "CONTEXT_OUTPUT_BREACH"}
-                and connection.execute(
-                    "SELECT 1 FROM model_invocation_allocations a LEFT JOIN model_invocation_terminals t "
-                    "ON t.invocation_id=a.invocation_id WHERE a.route='GRAPHITI_CHAT_PRIMARY' "
-                    "AND t.invocation_id IS NULL LIMIT 1"
-                ).fetchone() is None
+                and not _current_has_active(connection, "GRAPHITI_CHAT_PRIMARY")
                 and "GRAPHITI_CHAT_PRIMARY" not in _usage_blocking_routes(connection)
             ):
                 self._append_route_state(
@@ -6767,14 +6681,23 @@ class ModelUsageService:
                 connection, invocation_id, qualified_policy_digest,
                 output_guard=kind == _ASSESSOR_OUTPUT_REQUALIFICATION_KIND,
             )
-            if invocation_id in _requalified_assessor_invocations(connection):
-                raw = connection.execute(
+            prior_rows = connection.execute(
                     "SELECT payload_json FROM ledger WHERE kind=? AND json_extract(payload_json,'$.invocation_id')=?",
                     (kind, invocation_id),
-                ).fetchone()[0]
-                record = _object(raw)
+                ).fetchall()
+            if len(prior_rows) > 1:
+                raise ModelUsageIntegrityError("assessor requalification replay is duplicated")
+            prior = prior_rows[0] if prior_rows else None
+            if prior is not None:
+                record = _object(prior[0])
                 if record["qualified_policy_digest"] != qualified_policy_digest:
                     raise ModelUsageIntegrityError("assessor requalification replay policy differs")
+                at = _instant(str(record.get("recorded_at")))
+                expected = {**authority, "recorded_at": _utc_text(at)}
+                expected["requalification_digest"] = digest_canonical(expected)
+                if (at < _instant(authority["failure_settled_at"])
+                        or expected != record or prior[0] != _json(record)):
+                    raise ModelUsageIntegrityError("assessor requalification replay differs")
                 return str(record["requalification_digest"])
             route = "NATIVE_EVIDENCE_ASSESSOR"
             state = self._route_state(connection, route)
@@ -6783,15 +6706,13 @@ class ModelUsageService:
                     or recorded_at < _instant(str(state["recorded_at"]))
                     or recorded_at < _instant(authority["failure_settled_at"])):
                 raise ModelUsageAdmissionError("assessor requalification is not bound to the current failure")
-            if connection.execute(
-                "SELECT 1 FROM model_invocation_allocations a LEFT JOIN model_invocation_terminals t "
-                "USING(invocation_id) WHERE a.route=? AND t.invocation_id IS NULL", (route,),
-            ).fetchone():
+            if _current_has_active(connection, route):
                 raise ModelUsageAdmissionError("assessor requalification has an active invocation")
             authority["recorded_at"] = _utc_text(recorded_at)
             digest = digest_canonical(authority)
             authority["requalification_digest"] = digest
             append_ledger(connection, kind, authority)
+            _refresh_current_usage(connection, invocation_id)
             if route in _usage_blocking_routes(connection):
                 raise ModelUsageAdmissionError("assessor requalification leaves another usage blocker")
             self._append_route_state(

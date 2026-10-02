@@ -470,29 +470,7 @@ class _ObjectHydrationStoreMixin:
                 raise AuthorityPersistenceError(
                     "access decision admission authority is missing"
                 )
-            rights_value = self._require_canonical_record(rights)
-            expected_rights = {
-                field: rights[field]
-                for field in (
-                    "rights_decision_id", "authentication_context_id",
-                    "authorization_request_digest", "authorization_decision_id",
-                    "rights_request_digest", "policy_contract_digest",
-                    "admission_definition_digest", "object_class", "allowed_use",
-                    "security_scope", "retention_scope", "reason_code",
-                    "decided_at", "valid_from", "valid_until",
-                )
-            }
-            expected_rights.update({
-                "blob": {
-                    "blob_digest": rights["blob_digest"],
-                    "size_bytes": rights["size_bytes"],
-                },
-                "allowed": bool(rights["allowed"]),
-            })
-            if rights_value != expected_rights:
-                raise AuthorityPersistenceError(
-                    "access decision rights indexed fields differ"
-                )
+            rights_value = self._verified_rights_value(rights)
             definition = self._admission_registry.resolve_exact(
                 str(admission["admission_type"]),
                 str(admission["definition_version"]),
