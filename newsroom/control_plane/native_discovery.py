@@ -294,7 +294,7 @@ class NativeDiscovery:
         except LookupError:
             reobserved = (
                 prior_observed is not None
-                and prior_observed.request.revision_id == revision.revision_id
+                and prior_observed == revision.revision_id
             )
         else:
             reobserved = retained_outcome.request.kind is CheckOutcomeKind.SUCCESS_UNCHANGED
@@ -329,7 +329,7 @@ class NativeDiscovery:
         except LookupError:
             # Check lineage follows actual observations, which can arrive out
             # of canonical ingestion order. Replay keeps its exact outcome bound.
-            prior = None if prior_observed is None else prior_observed.request.revision_id
+            prior = prior_observed
             transition = self.checks.record_transition(ObservableTransitionRequest(
                 transition_id=transition_id, definition_id=version.definition_id,
                 definition_version_id=version.version_id, check_outcome_id=outcome_id,

@@ -35,7 +35,7 @@ from newsroom.checks.types import (
     ObservableTransitionId,
     OperationalFindingId,
 )
-from newsroom.sources import CheckOutcomeId, SourceDefinitionId, SourceItemId, SourceRevision
+from newsroom.sources import CheckOutcomeId, SourceDefinitionId, SourceItemId, SourceRevisionId
 
 
 class GovernedChecks:
@@ -77,7 +77,7 @@ class GovernedChecks:
         request: Callable[..., CheckRequest],
         attempt: Callable[..., CheckAttempt],
         outcome: Callable[..., CheckOutcome],
-        observed_prior_revision: Callable[..., SourceRevision | None],
+        observed_prior_revision: Callable[..., SourceRevisionId | None],
         attempts: Callable[..., tuple[CheckAttempt, ...]],
         outcomes: Callable[..., tuple[CheckOutcome, ...]],
         baseline: Callable[..., BaselineDecision],
@@ -209,7 +209,7 @@ class GovernedChecks:
         self, item_id: SourceItemId, *, request_id: CheckRequestId,
         outcome_id: CheckOutcomeId, completed_at: UtcTimestamp,
         proof: AuthenticationProof,
-    ) -> SourceRevision | None:
+    ) -> SourceRevisionId | None:
         return self.__observed_prior_revision(
             item_id, request_id, outcome_id, completed_at, proof,
         )

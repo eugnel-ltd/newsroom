@@ -46,7 +46,7 @@ from newsroom.checks.types import (
     ObservableTransitionId,
     OperationalFindingId,
 )
-from newsroom.sources import CheckOutcomeId, SourceDefinitionId, SourceItemId, SourceRevision
+from newsroom.sources import CheckOutcomeId, SourceDefinitionId, SourceItemId, SourceRevisionId
 
 
 _Record = TypeVar("_Record")
@@ -360,7 +360,7 @@ class _CheckBoundary:
         self, item_id: SourceItemId, request_id: CheckRequestId,
         outcome_id: CheckOutcomeId, completed_at: UtcTimestamp,
         proof: AuthenticationProof,
-    ) -> SourceRevision | None:
+    ) -> SourceRevisionId | None:
         if not isinstance(item_id, SourceItemId) or not isinstance(request_id, CheckRequestId):
             raise TypeError("observed prior requires typed Item and Check Request identities")
         if not isinstance(outcome_id, CheckOutcomeId) or not isinstance(completed_at, UtcTimestamp):

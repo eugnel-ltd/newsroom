@@ -6,7 +6,7 @@ import pytest
 
 from newsroom.authority.persistence import AuthorityPersistenceError
 from newsroom.checks import CheckOutcomeId, CheckRequestId, CheckStateError
-from newsroom.sources import SourceItemId
+from newsroom.sources import SourceItemId, SourceRevisionId
 from newsroom.tests.check_3c_authority_helpers import open_check_system, proof, scopes, item_request
 from newsroom.tests.check_3c_helpers import ITEM_ID, REQUEST_ID, OUTCOME_ID, NOW, LATER
 from newsroom.tests.test_check_3c_authority_store import seed_complete_fixture
@@ -21,6 +21,19 @@ def _read(system, **changes):
     return system.checks.observed_prior_revision(arguments.pop("item_id", ITEM_ID), **arguments)
 
 
+def test_check_only_reader_receives_lineage_id_not_sensitive_source_record(tmp_path):
+    database = tmp_path / "authority.sqlite3"
+    seed_complete_fixture(database)
+    with open_check_system(database, granted_scopes=frozenset({
+        "authority.checks.read", "authority.checks.read_sensitive",
+    })) as system:
+        prior = _read(system)
+        assert isinstance(prior, SourceRevisionId)
+        assert not hasattr(prior, "request")
+        with pytest.raises(PermissionError):
+            system.sources.revision(prior, proof=proof())
+
+
 def test_observed_prior_read_is_typed_authenticated_and_has_no_write_effect(tmp_path):
     database = tmp_path / "authority.sqlite3"
     seed_complete_fixture(database)
@@ -28,7 +41,7 @@ def test_observed_prior_read_is_typed_authenticated_and_has_no_write_effect(tmp_
         count = connection.execute("SELECT COUNT(*) FROM ledger_events").fetchone()[0]
     with open_check_system(database) as system:
         prior = _read(system)
-        assert prior.request.item_id == ITEM_ID
+        assert isinstance(prior, SourceRevisionId)
         assert _read(system, outcome_id=OUTCOME_ID) is None
         with pytest.raises(TypeError, match="typed"):
             _read(system, item_id=str(ITEM_ID))

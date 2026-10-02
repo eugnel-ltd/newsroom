@@ -30,8 +30,8 @@ class _CheckAdmissionLookupMixin:
     def observed_prior_revision(
         self, item_id: SourceItemId, *, request_id: CheckRequestId,
         outcome_id: CheckOutcomeId, completed_at: UtcTimestamp,
-    ) -> SourceRevision | None:
-        """Resolve observed lineage at an exact Check boundary, not ingest order."""
+    ) -> SourceRevisionId | None:
+        """Return only the observed lineage ID, not a sensitive Source record."""
         with self._lock:
             item = self.source_item(item_id)
             request = self.check_request(request_id)
@@ -103,7 +103,7 @@ class _CheckAdmissionLookupMixin:
                 or occurrence.observed_at != observed_outcome.request.completed_at
             ):
                 raise CheckStateError("observed prior differs from exact Check source lineage")
-            return prior
+            return prior.request.revision_id
 
     def _prior_outcome_predicate(
         self,

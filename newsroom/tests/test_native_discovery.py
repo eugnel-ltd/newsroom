@@ -679,7 +679,7 @@ def test_inconsistent_retained_unchanged_outcome_is_not_rewritten_on_recovery(tm
         # Reproduce the old producer's "ever observed" classification while
         # leaving the real transition guard in place.
         with monkeypatch.context() as patch:
-            patch.setattr(GovernedChecks, "observed_prior_revision", lambda *args, **kwargs: older_record)
+            patch.setattr(GovernedChecks, "observed_prior_revision", lambda *args, **kwargs: older_record.request.revision_id)
             with pytest.raises(CheckVersionConflict, match="latest observed source state"):
                 controller.deliver(historical, now=later, proof=proof())
         with sqlite3.connect(database) as connection:
