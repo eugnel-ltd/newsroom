@@ -234,7 +234,13 @@ def test_final_persisted_backing_validation_failure_rolls_back_entire_new_write(
             assert store._connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
 
 
-def test_logical_reference_scanner_uses_original_authority_bytes_and_keeps_physical_hash_contract(tmp_path):
+def test_physical_reference_scanner_preserves_v38_and_v41_tokens_without_redecoding(tmp_path, monkeypatch):
+    from newsroom.authority import audit_retention
+
+    def unexpected_decode(*args, **kwargs):
+        raise AssertionError("Physical reference collection must not replay historical codecs")
+
+    monkeypatch.setattr(audit_retention, "_logical_storage_values", unexpected_decode)
     path, _, _, _ = _old_path(tmp_path, count=1)
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TEMP TABLE _audit_tokens(id TEXT PRIMARY KEY) WITHOUT ROWID")
@@ -294,6 +300,20 @@ def test_result_marker_cannot_rebind_a_different_command_row(tmp_path):
             reader._decode_result(bytes(rows[1]["result_bytes"]), str(rows[1]["result_digest"]), replayed=False, connection=connection, command_id=str(rows[0]["command_id"]))
         with pytest.raises(AuthorityPersistenceError):
             _scan_business(connection, logical_storage=True)
+
+        # Retention preserves untouched bytes/references; it is not a repeat
+        # audit of all old codecs. Normal consumers still reject this marker.
+        before = _scan_business(connection)
+        connection.execute("CREATE TEMP TABLE _audit_tokens(id TEXT PRIMARY KEY) WITHOUT ROWID")
+        assert _scan_business(connection, tokens=connection) == before
+        assert connection.execute(
+            "SELECT result_bytes,result_digest FROM authority_commands WHERE command_id=?",
+            (rows[0]["command_id"],),
+        ).fetchone()[:] == (rows[1]["result_bytes"], rows[1]["result_digest"])
+        tokens = {row[0] for row in connection.execute("SELECT id FROM _audit_tokens")}
+        assert {row["command_id"] for row in rows} <= tokens
+        with pytest.raises(AuthorityPersistenceError):
+            reader._decode_result(bytes(rows[1]["result_bytes"]), str(rows[1]["result_digest"]), replayed=False, connection=connection, command_id=str(rows[0]["command_id"]))
 
 
 def test_876_delivery_command_cohort_preserves_logical_authority_across_keyset_batches(tmp_path, record_property):
