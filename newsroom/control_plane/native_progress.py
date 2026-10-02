@@ -301,9 +301,11 @@ class NativeRevisionJournal:
             if value['stage'] in {'EMBEDDING_STARTED', 'ASSESSMENT_STARTED', 'PUBLICATION_STARTED', 'ACKNOWLEDGED', 'COPY_CORRECTION_PREPARED'}:
                 diagnostic['facts'] = inline
         try:
+            if not self._connection.in_transaction:
+                self._connection.execute('BEGIN IMMEDIATE')
+            from .native_progress_state import require_ready
+            require_ready(self._connection)
             if kind == STATE and 'facts' not in diagnostic:
-                if not self._connection.in_transaction:
-                    self._connection.execute('BEGIN IMMEDIATE')
                 seq, digest = 0, digest_bytes(canonical_json_bytes(diagnostic))
             else:
                 append_ledger(self._connection, kind, diagnostic)

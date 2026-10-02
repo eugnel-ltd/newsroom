@@ -287,7 +287,7 @@ def test_settled_history_growth_does_not_increase_default_guard_work(tmp_path):
         connection.close()
 
 
-def test_selected_no_retry_survives_expired_proof_without_loading_unrelated_dispositions(tmp_path, monkeypatch):
+def test_no_retry_reads_current_reservations_without_historical_source_proof(tmp_path, monkeypatch):
     from newsroom.tests.test_native_reported_output_disposition import _failed, _dispose
     case = _failed(tmp_path, monkeypatch)
     try:
@@ -298,7 +298,10 @@ def test_selected_no_retry_survives_expired_proof_without_loading_unrelated_disp
         assert m.reported_output_rejected_ingests(case.connection, ingest_ids=(case.unit.ingest_id,)) == {case.unit.ingest_id}
         case.connection.execute("UPDATE model_usage_reported_output_dispositions SET record_json='{}'")
         case.connection.commit()
-        assert m.reported_output_rejected_ingests(case.connection, ingest_ids=("unrelated",)) == set()
+        # A malformed current reservation has no trustworthy selector; it
+        # must not disappear merely because a different ingest was requested.
+        with pytest.raises(m.ModelUsageIntegrityError):
+            m.reported_output_rejected_ingests(case.connection, ingest_ids=("unrelated",))
         with pytest.raises(m.ModelUsageIntegrityError):
             m.reported_output_rejected_ingests(case.connection, ingest_ids=(case.unit.ingest_id,))
         with pytest.raises(m.ModelUsageIntegrityError):
@@ -354,5 +357,25 @@ def test_legacy_import_authenticates_compact_settlement_not_membership(tmp_path,
             case.usage.import_current_state()
         assert case.connection.execute("SELECT COUNT(*) FROM model_usage_current").fetchone()[0] == 0
         assert case.connection.execute("SELECT 1 FROM model_usage_migrations WHERE migration_id=?", (CURRENT_MIGRATION_ID,)).fetchone() is None
+    finally:
+        case.connection.close()
+
+
+@pytest.mark.parametrize('column', ('authority_digest', 'approved_plan_digest', 'approved_by', 'approval_reference', 'approved_at', 'observed_at'))
+def test_native_legacy_import_binds_compact_sql_approval_fields(tmp_path, monkeypatch, column):
+    from newsroom.control_plane.model_usage_current import CURRENT_MIGRATION_ID
+    from newsroom.tests.test_native_graphiti_embedding_disposition import _cancelled, _dispose
+    case = _cancelled(tmp_path, monkeypatch)
+    try:
+        _dispose(case)
+        case.connection.execute(f'UPDATE model_usage_conservative_dispositions SET {column}=?', ('different-binding',))
+        case.connection.execute('DELETE FROM model_usage_current')
+        case.connection.execute('DELETE FROM model_usage_current_inventory')
+        case.connection.execute('DELETE FROM model_usage_migrations WHERE migration_id=?', (CURRENT_MIGRATION_ID,))
+        case.connection.commit()
+        with pytest.raises((m.ModelUsageIntegrityError, ValueError), match='current'):
+            case.usage.import_current_state()
+        assert case.connection.execute('SELECT count(*) FROM model_usage_current').fetchone()[0] == 0
+        assert case.connection.execute('SELECT 1 FROM model_usage_migrations WHERE migration_id=?', (CURRENT_MIGRATION_ID,)).fetchone() is None
     finally:
         case.connection.close()

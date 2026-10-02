@@ -392,3 +392,26 @@ def test_full_advance_excludes_disposed_failed_ingest_but_dispatches_healthy_pee
     finally:
         connection.close()
         case.connection.close()
+
+
+@pytest.mark.parametrize('changed', ('envelope', 'disposition', 'both'))
+def test_selected_no_retry_authenticates_current_ingest_before_filtering(tmp_path, monkeypatch, changed):
+    case = _failed(tmp_path, monkeypatch)
+    try:
+        _dispose(case)
+        assert m.reported_output_rejected_ingests(case.connection, ingest_ids=(case.unit.ingest_id,)) == {case.unit.ingest_id}
+        for table, key, identity in (
+            ('model_work_envelopes', 'envelope_id', case.envelope.envelope_id),
+            ('model_usage_reported_output_dispositions', 'invocation_id', case.allocation.invocation_id),
+        ):
+            if changed != 'both' and (changed == 'envelope') != (table == 'model_work_envelopes'):
+                continue
+            raw = case.connection.execute(f'SELECT record_json FROM {table} WHERE {key}=?', (identity,)).fetchone()[0]
+            record = json.loads(raw)
+            record['ingest_id'] = 'different-ingest'
+            case.connection.execute(f'UPDATE {table} SET record_json=? WHERE {key}=?', (m._json(record), identity))
+        case.connection.commit()
+        with pytest.raises(m.ModelUsageIntegrityError):
+            m.reported_output_rejected_ingests(case.connection, ingest_ids=(case.unit.ingest_id,))
+    finally:
+        case.connection.close()

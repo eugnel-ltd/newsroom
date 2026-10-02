@@ -1066,6 +1066,25 @@ class _EntityReadMixin:
                 projected_through_ledger_seq=int(row["projected_through_ledger_seq"]),
             )
             self.entity(result.entity_id)
+            if self._current_state_only:
+                head = self._entity_head_row(self._connection, entity_id)
+                latest = self._connection.execute(
+                    "SELECT * FROM entity_projection_events WHERE entity_id=? "
+                    "ORDER BY source_ledger_seq DESC,projection_event_id DESC LIMIT 1", (str(entity_id),),
+                ).fetchone()
+                if latest is None:
+                    raise AuthorityPersistenceError("current entity lacks latest projection authority")
+                event = self._projection_event_from_row(self._connection, latest)
+                self._validate_retained_event(str(event.source_event_id))
+                if (
+                    str(result.current_entity_version_id) != head["current_entity_version_id"]
+                    or result.lifecycle.value != head["lifecycle"]
+                    or str(event.entity_version_id) != head["current_entity_version_id"]
+                    or event.lifecycle.value != head["lifecycle"]
+                    or str(event.preferred_entity_id) != str(result.preferred_entity_id)
+                    or event.source_ledger_seq != result.projected_through_ledger_seq
+                ):
+                    raise AuthorityPersistenceError("current entity preferred projection differs from latest authority")
             return result
 
     def merge_decision(

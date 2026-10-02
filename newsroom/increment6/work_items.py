@@ -2652,7 +2652,8 @@ class TriageWorkItemStore:
             if gate is None or gate[0] != lead.gate_decision_id:
                 reasons.append(f"gate:{lead.lead_id}")
             source = self._connection.execute(
-                "SELECT current_version_id FROM source_definition_version_heads WHERE definition_id=?",
+                "SELECT h.current_version_id FROM source_definition_version_heads h WHERE h.definition_id=? "
+                "AND h.current_version_number=(SELECT MAX(version_number) FROM source_definition_versions WHERE definition_id=h.definition_id)",
                 (lead.definition_id,),
             ).fetchone()
             if source is None or source[0] != lead.definition_version_id:
@@ -2683,8 +2684,8 @@ class TriageWorkItemStore:
             if gate is None or gate[0] != lead.gate_decision_id:
                 reasons.append(f"gate:{lead.lead_id}")
             source = self._connection.execute(
-                "SELECT current_version_id FROM source_definition_version_heads "
-                "WHERE definition_id=?",
+                "SELECT h.current_version_id FROM source_definition_version_heads h WHERE h.definition_id=? "
+                "AND h.current_version_number=(SELECT MAX(version_number) FROM source_definition_versions WHERE definition_id=h.definition_id)",
                 (lead.definition_id,),
             ).fetchone()
             if source is None or source[0] != lead.definition_version_id:

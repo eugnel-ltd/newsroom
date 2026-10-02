@@ -411,6 +411,8 @@ class _EntityStoreSupport:
         if row is None:
             raise EntityStateError("canonical entity is not retained")
         entity = self._entity_from_row(conn, row)
+        if self._current_state_only:
+            self._entity_head_row(conn, entity_id)
 
         if entity.created_by_kind is EntityCreationDecisionKind.RESOLUTION:
             decision = conn.execute(
@@ -508,11 +510,14 @@ class _EntityStoreSupport:
         conn: sqlite3.Connection, entity_id: CanonicalEntityId
     ) -> sqlite3.Row:
         row = conn.execute(
-            "SELECT * FROM canonical_entity_heads WHERE entity_id=?",
+            "SELECT h.*,(SELECT MAX(version_number) FROM canonical_entity_versions "
+            "WHERE entity_id=h.entity_id) AS selected_max_version FROM canonical_entity_heads h WHERE entity_id=?",
             (str(entity_id),),
         ).fetchone()
         if row is None:
             raise EntityStateError("canonical entity is not retained")
+        if row["current_version_number"] != row["selected_max_version"]:
+            raise AuthorityPersistenceError("current canonical entity head is not the latest version")
         return row
 
     @classmethod

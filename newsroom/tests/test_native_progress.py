@@ -946,3 +946,24 @@ def test_current_boot_does_not_commit_or_rollback_callers_transaction(tmp_path):
     connection.rollback()
     assert connection.execute('SELECT count(*) FROM caller_work').fetchone()[0] == 0
     connection.close()
+
+
+def test_unrelated_current_write_does_not_mask_missing_ack_head(tmp_path):
+    first = _native('missing-ack')
+    second = _native('other-ack')
+    connection = connect(str(tmp_path / 'missing-current.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    for unit in (first, second):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage='ACKNOWLEDGED', facts={'receipt': unit.ingest_id})
+    inventory = connection.execute('SELECT * FROM native_current_meta').fetchall()
+    second_before = connection.execute('SELECT * FROM native_current_heads WHERE revision_id=?', (second.revision_id,)).fetchone()
+    connection.execute('DELETE FROM native_current_heads WHERE revision_id=?', (first.revision_id,))
+    connection.commit()
+    with pytest.raises(ValueError, match='CURRENT inventory'):
+        journal.advance(second.revision_id, stage='ACKNOWLEDGED', facts={'receipt': second.ingest_id, 'changed': True})
+    assert connection.execute('SELECT * FROM native_current_meta').fetchall() == inventory
+    assert connection.execute('SELECT * FROM native_current_heads WHERE revision_id=?', (second.revision_id,)).fetchone() == second_before
+    with pytest.raises(ValueError, match='CURRENT inventory'):
+        NativeRevisionJournal(connection)
+    connection.close()

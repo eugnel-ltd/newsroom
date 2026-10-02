@@ -1325,35 +1325,50 @@ def reported_output_rejected_ingests(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_usage_reported_output_dispositions'"
     ).fetchone() is None:
         return frozenset()
+    selected = None if ingest_ids is None else frozenset(ingest_ids)
     result = set()
-    batches = (None,) if ingest_ids is None else tuple(
-        ingest_ids[start:start + 400] for start in range(0, len(ingest_ids), 400)
-    )
-    for batch in batches:
-        query = "SELECT d.invocation_id,d.disposition_digest,d.record_json FROM model_usage_reported_output_dispositions d"
-        if batch is not None:
-            # Select via the independent retained envelope identity. A damaged
-            # disposition ingest field must not silently remove its no-retry hold.
-            query = (
-                "SELECT d.invocation_id,d.disposition_digest,d.record_json FROM model_work_envelopes e "
-                "JOIN model_invocation_allocations a ON a.envelope_id=e.envelope_id "
-                "JOIN model_usage_reported_output_dispositions d ON d.invocation_id=a.invocation_id "
-                "WHERE e.workload_class='GRAPHITI_CHAT_PRIMARY' "
-                "AND json_extract(e.record_json,'$.ingest_id') IN (" + ",".join("?" for _ in batch) + ")"
-            )
-        for invocation_id, digest, raw in connection.execute(
-            query,
-            () if batch is None else batch,
+    # These are current no-retry reservations, not settled diagnostic history.
+    # Authenticate compact selectors before filtering: damaged JSON must never
+    # make an existing reservation disappear from its original ingest.
+    for row in connection.execute(
+        "SELECT d.invocation_id,d.disposition_digest,d.record_json,"
+        "a.envelope_id,a.canonical_digest,a.record_json,"
+        "e.envelope_id,e.cycle_id,e.workload_class,e.admitted_at,e.canonical_digest,e.record_json "
+        "FROM model_usage_reported_output_dispositions d "
+        "LEFT JOIN model_invocation_allocations a ON a.invocation_id=d.invocation_id "
+        "LEFT JOIN model_work_envelopes e ON e.envelope_id=a.envelope_id"
+    ):
+        invocation_id, digest, raw = row[:3]
+        record = _object(raw)
+        unsigned = dict(record)
+        retained_digest = unsigned.pop("disposition_digest", None)
+        if (retained_digest != digest or digest_canonical(unsigned) != digest
+                or record.get("invocation_id") != invocation_id
+                or record.get("schema_version") != REPORTED_OUTPUT_DISPOSITION_SCHEMA
+                or record.get("authority_scope") != "NATIVE_REPORTED_OUTPUT_ONLY_CANDIDATE_FAILURE"
+                or record.get("retry_authorised") is not False or raw != _json(record)
+                or any(value is None for value in row[3:])):
+            raise ModelUsageIntegrityError("current no-retry disposition differs")
+        allocation_record = _object(row[5])
+        allocation = _allocation_from_record(allocation_record)
+        envelope_record = _object(row[11])
+        envelope = _envelope_from_record(envelope_record)
+        if (
+            (allocation.invocation_id, allocation.envelope_id, allocation.canonical_digest)
+            != (invocation_id, row[3], row[4])
+            or allocation.canonical_digest != record.get("allocation_digest")
+            or _json(allocation_record) != row[5]
+            or tuple(row[6:11]) != (envelope.envelope_id, envelope.cycle_id,
+                envelope.workload_class.value, _utc_text(envelope.admitted_at), envelope.canonical_digest)
+            or _json(envelope_record) != row[11]
+            or envelope.canonical_digest != record.get("envelope_digest")
+            or envelope.workload_class is not WorkloadClass.GRAPHITI_CHAT_PRIMARY
+            or envelope.ingest_id != record.get("ingest_id")
         ):
-            record = _object(raw)
-            unsigned = dict(record)
-            retained_digest = unsigned.pop("disposition_digest", None)
-            if (retained_digest != digest or digest_canonical(unsigned) != digest
-                    or record.get("invocation_id") != invocation_id
-                    or (batch is not None and record.get("ingest_id") not in batch)
-                    or record.get("retry_authorised") is not False or raw != _json(record)):
-                raise ModelUsageIntegrityError("current no-retry disposition differs")
-            result.add(_token(record.get("ingest_id"), field="current no-retry ingest"))
+            raise ModelUsageIntegrityError("current no-retry selection binding differs")
+        ingest_id = _token(record.get("ingest_id"), field="current no-retry ingest")
+        if selected is None or ingest_id in selected:
+            result.add(ingest_id)
     return frozenset(result)
 
 

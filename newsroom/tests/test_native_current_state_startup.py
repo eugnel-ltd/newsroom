@@ -445,3 +445,120 @@ def test_native_pending_projection_delivery_reopens_without_lifecycle_replay(nat
         assert reopened.increment4.generation_status(generation_id, proof=proof()).generation.state is ProjectionGenerationState.BUILDING
         reopened.increment4.build_current_and_promote(request, proof=proof())
         assert reopened.increment4.generation_status(generation_id, proof=proof()).generation.state is ProjectionGenerationState.ACTIVE
+
+
+@pytest.mark.parametrize("tamper", ("revoked_state", "rewound_head"))
+def test_native_current_admission_cannot_resurrect_revocation(tmp_path, native_open, tamper) -> None:
+    with native_open() as system:
+        admitted = system.objects.admit(
+            ObjectAdmissionRequest("source.capture", "revocation-current-proof"),
+            b"current source bytes", proof=proof(),
+        ).admission
+        system.objects.revoke(
+            admitted.admission_id, reason_code="FIXTURE_REVOKED", idempotency_key="revoke-1", proof=proof(),
+        )
+    if tamper == "revoked_state":
+        _change(
+            tmp_path / "authority.sqlite3", "object_admission_versions",
+            "UPDATE object_admission_versions SET state='ACTIVE' WHERE admission_id=? AND lifecycle_version=2",
+            (str(admitted.admission_id),),
+        )
+    else:
+        with sqlite3.connect(tmp_path / "authority.sqlite3") as connection:
+            trigger = "object_admission_head_update_guard"
+            definition = connection.execute("SELECT sql FROM sqlite_schema WHERE name=?", (trigger,)).fetchone()[0]
+            connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute(
+                "UPDATE object_admission_heads SET current_version=1 WHERE admission_id=?",
+                (str(admitted.admission_id),),
+            )
+            connection.execute(definition)
+    with pytest.raises(AuthorityPersistenceError):
+        with native_open() as reopened:
+            reopened.objects.hydrate(HydrationRequest(admitted.admission_id, "project.discovery"), proof=proof())
+    with sqlite3.connect(tmp_path / "authority.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM object_access_decisions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("reopen", (False, True))
+def test_native_source_current_head_cannot_rewind_to_valid_old_version(tmp_path, native_open, reopen) -> None:
+    from newsroom.tests import source_3a_helpers as source
+    with native_open() as system:
+        system.sources.register_definition(source.definition_request(), proof=proof())
+        system.sources.record_definition_version(source.version_request(), proof=proof())
+        system.sources.record_definition_version(source.version_request(
+            version_id=source.VERSION_2_ID, version_number=2, previous_version_id=source.VERSION_1_ID,
+            locator="fixture://increment-3a/maintained-guidance-v2", key="source-definition-version-v2",
+        ), proof=proof())
+    def rewind():
+        with sqlite3.connect(tmp_path / "authority.sqlite3") as connection:
+            triggers = connection.execute(
+                "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='source_definition_version_heads'"
+            ).fetchall()
+            for name, _ in triggers:
+                connection.execute(f'DROP TRIGGER "{name}"')
+            connection.execute(
+                "UPDATE source_definition_version_heads SET current_version_id=?,current_version_number=1 WHERE definition_id=?",
+                (str(source.VERSION_1_ID), str(source.DEFINITION_ID)),
+            )
+            for _, sql in triggers:
+                connection.execute(sql)
+    if reopen:
+        rewind()
+        with pytest.raises(AuthorityPersistenceError):
+            with native_open() as current:
+                current.sources.current_summary(source.DEFINITION_ID, proof=proof())
+    else:
+        with native_open() as current:
+            rewind()
+            with pytest.raises(AuthorityPersistenceError):
+                current.sources.current_summary(source.DEFINITION_ID, proof=proof())
+
+
+def test_native_current_deletion_and_blob_states_cannot_resurrect_tombstone(tmp_path, native_open) -> None:
+    with native_open() as system:
+        admitted = system.objects.admit(
+            ObjectAdmissionRequest("source.capture", "tombstone-current-proof"), b"source bytes", proof=proof(),
+        ).admission
+        deletion = system.objects.request_deletion(
+            admitted.blob.blob_digest, reason_code="DELETE", idempotency_key="delete", proof=proof(),
+        )
+        system.objects.tombstone(
+            deletion.deletion_id, reason_code="TOMBSTONE", idempotency_key="tombstone", proof=proof(),
+        )
+    _change(
+        tmp_path / "authority.sqlite3", "object_deletion_versions",
+        "UPDATE object_deletion_versions SET state='REQUESTED' WHERE deletion_id=? AND lifecycle_version=2",
+        (str(deletion.deletion_id),),
+    )
+    _change(
+        tmp_path / "authority.sqlite3", "blob_lifecycle_versions",
+        "UPDATE blob_lifecycle_versions SET state='ACTIVE' WHERE blob_digest=? AND lifecycle_version=4",
+        (admitted.blob.blob_digest,),
+    )
+    with pytest.raises(AuthorityPersistenceError):
+        with native_open() as reopened:
+            reopened.objects.hydrate(HydrationRequest(admitted.admission_id, "project.discovery"), proof=proof())
+
+
+def test_native_entity_version_and_current_preferred_keep_their_typed_read_contracts(tmp_path, native_open) -> None:
+    from newsroom.tests import entity_4b_helpers as entity
+    from newsroom.entities import EntityResolutionDecisionAction, EntityAliasKind
+    from newsroom.tests.source_3a_helpers import SOURCE_NOW
+    state = entity.seed_entity_fixture(tmp_path)
+    with entity.open_entity_system(state) as system:
+        system.entities.admit_mention(entity.mention_request(
+            state.en_source, mention_id=entity.EN_MENTION_ID, language="en-GB", key="mention-en-v1",
+        ), proof=proof())
+        proposal = system.entities.propose_resolution(entity.new_entity_proposal_request(state), proof=proof())
+        system.entities.decide_resolution(entity.decision_request(
+            proposal, action=EntityResolutionDecisionAction.ACCEPT,
+            entity_id=entity.ENTITY_ID, version_id=entity.ENTITY_VERSION_ID,
+            alias_id=entity.EN_ALIAS_ID, alias_kind=EntityAliasKind.PRIMARY_NAME, key="accept-entity-v1",
+        ), proof=proof())
+    with native_open(
+        path=state.extraction.database, registry=state.extraction.commands, payload_schemas=state.extraction.schemas,
+        authorizer=entity.entity_authorizer(), clock=lambda: SOURCE_NOW,
+    ) as current:
+        assert current.entities.entity_version(entity.ENTITY_VERSION_ID, proof=proof()).entity_version_id == entity.ENTITY_VERSION_ID
+        assert current.entities.preferred(entity.ENTITY_ID, proof=proof()).current_entity_version_id == entity.ENTITY_VERSION_ID

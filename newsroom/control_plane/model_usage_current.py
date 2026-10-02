@@ -263,7 +263,7 @@ def refresh(connection: sqlite3.Connection, invocation_id: str, *, importing: bo
             raise CurrentUsageIntegrityError("current reconciliation telemetry binding differs")
     disposition = connection.execute(
         "SELECT disposition_digest,terminal_digest,allocation_digest,policy_digest,usage_status,record_json,"
-        "approved_plan_digest,authority_digest,approved_by,approval_reference,approved_at "
+        "approved_plan_digest,authority_digest,approved_by,approval_reference,approved_at,observed_at "
         "FROM model_usage_conservative_dispositions WHERE invocation_id=?", (invocation_id,),
     ).fetchone()
     expected = {"invocation_id": invocation_id, "allocation_digest": row[1], "terminal_digest": row[3], "policy_digest": row[6]}
@@ -301,7 +301,7 @@ def refresh(connection: sqlite3.Connection, invocation_id: str, *, importing: bo
         )
         scope = record.get("authority_scope")
         if scope is None:
-            if tuple(disposition[6:]) != tuple(record.get(key) for key in (
+            if tuple(disposition[6:11]) != tuple(record.get(key) for key in (
                 "approved_plan_digest", "authority_digest", "approved_by", "approval_reference", "approved_at",
             )):
                 raise CurrentUsageIntegrityError("current conservative approved plan SQL binding differs")
@@ -309,6 +309,51 @@ def refresh(connection: sqlite3.Connection, invocation_id: str, *, importing: bo
         elif scope not in {NATIVE_AUTONOMOUS_USAGE_SCOPE, NATIVE_EMBEDDING_TIMEOUT_USAGE_SCOPE,
                           NATIVE_GRAPHITI_EMBEDDING_CANCELLATION_USAGE_SCOPE, NATIVE_GRAPHITI_FALLBACK_CANCELLATION_USAGE_SCOPE}:
             raise CurrentUsageIntegrityError("current conservative authority scope is unrecognised")
+        else:
+            from .model_usage import (_instant, _native_conservative_subscription_leaf,
+                GraphitiLeafClass, UsageStatus, WorkloadClass)
+            from newsroom.authority.canonical import validate_sha256_digest
+            scope_digest = record.get("native_scope_digest")
+            try:
+                validate_sha256_digest(scope_digest)
+                observed = _instant(str(record.get("observed_at")))
+            except (TypeError, ValueError) as exc:
+                raise CurrentUsageIntegrityError("current native approval value differs") from exc
+            if (tuple(disposition[6:]) != (scope_digest, scope_digest, scope, scope,
+                    record.get("observed_at"), record.get("observed_at"))
+                    or record.get("authority_digest") != scope_digest
+                    or observed < terminal.observed_at or not policy.qualified
+                    or terminal.usage_status is not UsageStatus.UNREPORTED
+                    or terminal.dispatch_at is None or terminal.pre_dispatch_zero_proved
+                    or terminal.policy_breach is not None
+                    or terminal.provider_telemetry_digest is not None
+                    or terminal.raw_telemetry_pointer is not None
+                    or terminal.components.total_tokens is not None):
+                raise CurrentUsageIntegrityError("current native approval SQL binding differs")
+            leaf = _native_conservative_subscription_leaf(allocation)
+            if scope == NATIVE_AUTONOMOUS_USAGE_SCOPE:
+                eligible = leaf is not None and terminal.subscription_cli_chat_not_cash_debited
+            elif scope == NATIVE_GRAPHITI_FALLBACK_CANCELLATION_USAGE_SCOPE:
+                eligible = (leaf is GraphitiLeafClass.FALLBACK
+                    and terminal.outcome == "CANCELLED"
+                    and terminal.failure_class == "MISSING_PROVIDER_TELEMETRY"
+                    and terminal.subscription_cli_chat_not_cash_debited)
+            else:
+                graphiti = scope == NATIVE_GRAPHITI_EMBEDDING_CANCELLATION_USAGE_SCOPE
+                workload = WorkloadClass.GRAPHITI_EMBEDDING if graphiti else WorkloadClass.NATIVE_RETRIEVAL_EMBEDDING
+                eligible = (allocation.workload_class is workload
+                    and allocation.route == workload.value and allocation.provider == "openrouter"
+                    and allocation.model == "openai/text-embedding-3-large"
+                    and terminal.outcome == ("CANCELLED" if graphiti else "NATIVE_EMBEDDING_FAILED")
+                    and terminal.failure_class == ("MISSING_PROVIDER_TELEMETRY" if graphiti else "TimeoutError")
+                    and not terminal.subscription_cli_chat_not_cash_debited)
+            if not eligible:
+                raise CurrentUsageIntegrityError("current native settlement scope target differs")
+            expected_calculation = ("QUALIFIED_POLICY_MAX_TOTAL_TOKENS_CONSERVATIVE_UPPER_BOUND"
+                if scope in {NATIVE_AUTONOMOUS_USAGE_SCOPE, NATIVE_GRAPHITI_FALLBACK_CANCELLATION_USAGE_SCOPE}
+                else "MAX_QUALIFIED_POLICY_TOTAL_OR_EXACT_REQUEST_UTF8_BYTES")
+            if record.get("estimate_calculation") != expected_calculation:
+                raise CurrentUsageIntegrityError("current native estimate calculation differs")
         total = (max(policy.max_total_tokens, allocation.prompt_bytes)
                  if scope in {NATIVE_EMBEDDING_TIMEOUT_USAGE_SCOPE, NATIVE_GRAPHITI_EMBEDDING_CANCELLATION_USAGE_SCOPE}
                  else policy.max_total_tokens)
