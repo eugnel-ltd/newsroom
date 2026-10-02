@@ -44,7 +44,7 @@ _PHASE_LOG = logging.getLogger("newsroom.authority.projection")
 
 
 @contextmanager
-def _projection_phase(phase: str, *, generation_id: str):
+def _projection_phase(phase: str, *, generation_id: str | None = None):
     """Optional inclusive wall/process CPU timing; nested spans are not additive."""
     started = None
     try:
@@ -63,7 +63,7 @@ def _projection_phase(phase: str, *, generation_id: str):
             try:
                 _PHASE_LOG.info(
                     "projection_phase phase=%s generation_id=%s status=%s elapsed_ms=%d cpu_ms=%d cpu_scope=PROCESS failure_class=%s",
-                    phase, generation_id[:128], status,
+                    phase, generation_id[:128] if generation_id is not None else None, status,
                     (perf_counter_ns() - started[0]) // 1_000_000,
                     (process_time_ns() - started[1]) // 1_000_000, failure,
                 )
@@ -305,7 +305,7 @@ class _Increment4ProjectionAuthorityStore(
         )
 
     @contextmanager
-    def _increment4_projection_read(self, *, generation_id: ProjectionGenerationId):
+    def _increment4_projection_read(self):
         # Pin current rights/state and historical provenance together. A caller's
         # transaction belongs to the caller; never commit or roll it back here.
         with self._lock:
@@ -313,7 +313,7 @@ class _Increment4ProjectionAuthorityStore(
             nested = conn.in_transaction
             conn.execute("SAVEPOINT increment4_current_build" if nested else "BEGIN")
             try:
-                with _projection_phase("CURRENT_STATE", generation_id=str(generation_id)):
+                with _projection_phase("CURRENT_STATE"):
                     states = self._increment4_admitted_states()
                 yield (conn, *states)
             finally:
@@ -329,7 +329,7 @@ class _Increment4ProjectionAuthorityStore(
         generation_id: ProjectionGenerationId,
         family: ProjectionFamilyDefinition,
     ) -> _Increment4CurrentBuildInputs:
-        with self._increment4_projection_read(generation_id=generation_id) as (conn, entities, relations, watermark):
+        with self._increment4_projection_read() as (conn, entities, relations, watermark):
             with _projection_phase("HEADER_COMMITMENT", generation_id=str(generation_id)):
                 provenance, snapshot_digest = _stream_admitted_provenance(
                     entities=entities,
@@ -355,7 +355,7 @@ class _Increment4ProjectionAuthorityStore(
         generation_id: ProjectionGenerationId,
         family: ProjectionFamilyDefinition,
     ) -> tuple[StructuralBatch, ...]:
-        with self._increment4_projection_read(generation_id=generation_id) as (conn, entities, relations, watermark):
+        with self._increment4_projection_read() as (conn, entities, relations, watermark):
             # Reconciliation has no full-history digest. Read its exact current
             # provenance through the existing unique event index, not every
             # historical control/audit event. The build-input path stays full.
