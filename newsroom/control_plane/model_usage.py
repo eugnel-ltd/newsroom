@@ -47,6 +47,11 @@ MODEL_USAGE_SCHEMA_VERSION = "newsroom.model-usage.v3"
 MODEL_USAGE_INTERFACE_SCHEMA_VERSION = "newsroom.model-usage.v5"
 MODEL_USAGE_MIGRATION_ID = "model-usage-v5-reported-output-disposition"
 REPORTED_OUTPUT_DISPOSITION_SCHEMA = "newsroom.model-usage.reported-output-disposition.v1"
+REPORTED_SUBSCRIPTION_OVERRUN_SCHEMA = "newsroom.model-usage.reported-output-disposition.v2"
+_REPORTED_OUTPUT_DISPOSITION_SCOPES = {
+    REPORTED_OUTPUT_DISPOSITION_SCHEMA: "NATIVE_REPORTED_OUTPUT_ONLY_CANDIDATE_FAILURE",
+    REPORTED_SUBSCRIPTION_OVERRUN_SCHEMA: "NATIVE_REPORTED_SUBSCRIPTION_BUDGET_CANDIDATE_FAILURE",
+}
 CONSERVATIVE_DISPOSITION_SCHEMA_VERSION = (
     "newsroom.model-usage.conservative-disposition.v2"
 )
@@ -928,8 +933,12 @@ def _valid_native_graphiti_fallback_cancellation_disposition_record(
 
 def _reported_output_disposition_authority(
     connection: sqlite3.Connection, *, invocation_id: str, revision_id: str,
+    schema_version: str = REPORTED_OUTPUT_DISPOSITION_SCHEMA,
 ) -> dict[str, object]:
     """Prove a settled native SDK output rejection, never reclassify its usage."""
+    if type(schema_version) is not str or schema_version not in _REPORTED_OUTPUT_DISPOSITION_SCOPES:
+        raise ModelUsageIntegrityError("reported output disposition version differs")
+    subscription_overrun = schema_version == REPORTED_SUBSCRIPTION_OVERRUN_SCHEMA
     allocation, terminal = _retained_terminal_allocation(connection, invocation_id)
     policy = _policy_for_allocation(connection, allocation)
     components = terminal.components
@@ -942,7 +951,10 @@ def _reported_output_disposition_authority(
         or terminal.outcome != "OUTPUT_LIMIT_EXCEEDED"
         or terminal.failure_class is not None
         or terminal.usage_status is not UsageStatus.REPORTED
-        or terminal.policy_breach != "REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED"
+        or terminal.policy_breach not in ({
+            "REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED", "MAX_OUTPUT_TOKENS_EXCEEDED",
+            "MAX_TOTAL_TOKENS_EXCEEDED",
+        } if subscription_overrun else {"REQUESTED_MAX_OUTPUT_TOKENS_EXCEEDED"})
         or components.provenance != "PROVIDER_REPORTED"
         or any(type(getattr(components, name)) is not int for name in counters)
         or _invalid_reported_components(terminal) is not None
@@ -951,13 +963,15 @@ def _reported_output_disposition_authority(
         or allocation.prompt_bytes > policy.max_prompt_bytes
         or allocation.max_output_tokens is None or policy.max_output_tokens is None
         or allocation.max_output_tokens > policy.max_output_tokens
-        or components.output_tokens <= allocation.max_output_tokens
+        or (components.output_tokens <= allocation.max_output_tokens
+            and not (subscription_overrun and components.total_tokens > policy.max_total_tokens))
         or components.total_tokens != (components.input_tokens + components.output_tokens
                                         + components.cached_read_tokens + components.cached_write_tokens)
-        or components.total_tokens > policy.max_total_tokens
+        or (not subscription_overrun and components.total_tokens > policy.max_total_tokens)
         # Without a context measurement, require the entire reported run to
         # fit the context bound; missing context is not represented as zero.
-        or (components.context_tokens is None and components.total_tokens > policy.max_context_tokens)
+        or (not subscription_overrun and components.context_tokens is None
+            and components.total_tokens > policy.max_context_tokens)
         or (components.context_tokens is not None and components.context_tokens > policy.max_context_tokens)
         or (components.reasoning_tokens is not None and components.reasoning_tokens > components.output_tokens)
         or allocation.context_identity not in policy.allowed_context_identities
@@ -968,6 +982,14 @@ def _reported_output_disposition_authority(
         ))
     ):
         raise ModelUsageAdmissionError("reported output-only disposition is ineligible")
+    # SDK usage is cumulative consumption, not a measured context window.
+    # v1 remains frozen; v2 isolates an accounted failed subscription unit,
+    # without pretending its prompt targets were enforced by the provider.
+    if subscription_overrun and ModelUsageService._validate_terminal(
+        terminal, allocation.workload_class, policy,
+        requested_max_output_tokens=allocation.max_output_tokens,
+    ) != terminal.policy_breach:
+        raise ModelUsageIntegrityError("reported subscription overrun policy differs")
     if not _has_exact_dispatch(connection, terminal):
         raise ModelUsageIntegrityError("reported output disposition lacks exact dispatch")
     dispatches = connection.execute(
@@ -1066,8 +1088,8 @@ def _reported_output_disposition_authority(
     ):
         raise ModelUsageIntegrityError("reported output failed-attempt closure differs")
     return {
-        "schema_version": REPORTED_OUTPUT_DISPOSITION_SCHEMA,
-        "authority_scope": "NATIVE_REPORTED_OUTPUT_ONLY_CANDIDATE_FAILURE",
+        "schema_version": schema_version,
+        "authority_scope": _REPORTED_OUTPUT_DISPOSITION_SCOPES[schema_version],
         "invocation_id": invocation_id, "route": allocation.route,
         "terminal_outcome": terminal.outcome, "allocation_digest": allocation.canonical_digest,
         "terminal_digest": terminal.terminal_digest, "policy_digest": policy.canonical_digest,
@@ -1344,8 +1366,9 @@ def reported_output_rejected_ingests(
         retained_digest = unsigned.pop("disposition_digest", None)
         if (retained_digest != digest or digest_canonical(unsigned) != digest
                 or record.get("invocation_id") != invocation_id
-                or record.get("schema_version") != REPORTED_OUTPUT_DISPOSITION_SCHEMA
-                or record.get("authority_scope") != "NATIVE_REPORTED_OUTPUT_ONLY_CANDIDATE_FAILURE"
+                or type(record.get("schema_version")) is not str
+                or record.get("schema_version") not in _REPORTED_OUTPUT_DISPOSITION_SCOPES
+                or record.get("authority_scope") != _REPORTED_OUTPUT_DISPOSITION_SCOPES.get(record.get("schema_version"))
                 or record.get("retry_authorised") is not False or raw != _json(record)
                 or any(value is None for value in row[3:])):
             raise ModelUsageIntegrityError("current no-retry disposition differs")
@@ -6610,23 +6633,26 @@ class ModelUsageService:
     ) -> dict[str, object]:
         """Isolate one accounted FAILED candidate; neither accept nor retry it.
 
-        This versioned exception is restricted to the SDK's soft requested
-        output target. All usage and the old OPEN/FAILED records stay intact.
+        SDK output/total targets are not provider-enforced limits. A fully
+        reported subscription overrun fails only that unit; all usage and the
+        old OPEN/FAILED records stay intact. v1 records retain their old proof.
         """
         connection = self._connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            prior = connection.execute(
+                "SELECT disposition_digest,record_json FROM model_usage_reported_output_dispositions WHERE invocation_id=?",
+                (invocation_id,),
+            ).fetchone()
             authority = _reported_output_disposition_authority(
                 connection, invocation_id=invocation_id, revision_id=revision_id,
+                schema_version=(_object(prior[1]).get("schema_version") if prior
+                                else REPORTED_SUBSCRIPTION_OVERRUN_SCHEMA),
             )
             if (authority["terminal_digest"] != expected_terminal_digest
                     or authority["allocation_digest"] != expected_allocation_digest
                     or observed_at < _instant(str(authority["failure_settled_at"]))):
                 raise ModelUsageIntegrityError("reported output disposition binding differs")
-            prior = connection.execute(
-                "SELECT disposition_digest,record_json FROM model_usage_reported_output_dispositions WHERE invocation_id=?",
-                (invocation_id,),
-            ).fetchone()
             if prior is None:
                 record = {**authority, "observed_at": _utc_text(observed_at)}
                 record["disposition_digest"] = digest_canonical(record)

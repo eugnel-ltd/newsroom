@@ -365,12 +365,15 @@ def refresh(connection: sqlite3.Connection, invocation_id: str, *, importing: bo
         unresolved = False
     reported = connection.execute("SELECT disposition_digest,record_json FROM model_usage_reported_output_dispositions WHERE invocation_id=?", (invocation_id,)).fetchone()
     if reported is not None:
-        from .model_usage import _retained_terminal_allocation
+        from .model_usage import _retained_terminal_allocation, _REPORTED_OUTPUT_DISPOSITION_SCOPES
         _, terminal = _retained_terminal_allocation(connection, invocation_id)
-        _bound_record(reported[1], reported[0], "disposition_digest", {**expected, "usage_status": "REPORTED",
+        record = _bound_record(reported[1], reported[0], "disposition_digest", {**expected, "usage_status": "REPORTED",
             "retry_authorised": False, "components": terminal.components.as_record(),
             "policy_breach": terminal.policy_breach, "unknown_spend_released": False})
-        if terminal.usage_status.value != "REPORTED":
+        if (terminal.usage_status.value != "REPORTED"
+                or type(record.get("schema_version")) is not str
+                or record.get("schema_version") not in _REPORTED_OUTPUT_DISPOSITION_SCOPES
+                or record.get("authority_scope") != _REPORTED_OUTPUT_DISPOSITION_SCOPES.get(record.get("schema_version"))):
             raise CurrentUsageIntegrityError("current reported settlement usage differs")
         breach = False
     if breach and _table(connection, "ledger"):

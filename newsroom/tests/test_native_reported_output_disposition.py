@@ -21,6 +21,7 @@ ROUTE = 'GRAPHITI_CHAT_PRIMARY'
 
 
 def _failed(tmp_path, monkeypatch, *, output=20_336, total=None, context=None,
+            input_tokens=41_710, cache_read_tokens=25_376,
             reported=True, outcome='OUTPUT_LIMIT_EXCEEDED', settled=True, sdk_status='finished', active_peer=False):
     monkeypatch.setattr('newsroom.control_plane.graphiti._graphiti_implementation_identity', lambda: ('a' * 40, True))
     path = str(tmp_path/'private.sqlite3'); connection = connect(path)
@@ -69,9 +70,9 @@ def _failed(tmp_path, monkeypatch, *, output=20_336, total=None, context=None,
         )
         peer_observer.transport_dispatch_started(peer_allocation)
     observer.transport_dispatch_started(allocation)
-    telemetry = dict(usage_basis='PROVIDER_REPORTED', input_tokens=41_710, output_tokens=output,
-                     cached_read_tokens=25_376, cached_write_tokens=0, reasoning_tokens=None,
-                     total_tokens=67_086+output if total is None else total)
+    telemetry = dict(usage_basis='PROVIDER_REPORTED', input_tokens=input_tokens, output_tokens=output,
+                     cached_read_tokens=cache_read_tokens, cached_write_tokens=0, reasoning_tokens=None,
+                     total_tokens=input_tokens+cache_read_tokens+output if total is None else total)
     if context is not None: telemetry['context_tokens'] = context
     binding = observer.after_cli_invocation(allocation, outcome=outcome,
         usage=telemetry if reported else {'usage_basis': 'UNREPORTED'})
@@ -145,8 +146,7 @@ def test_reported_output_rejection_keeps_failure_and_usage_then_releases_only_pr
 
 @pytest.mark.parametrize('changes', [
     {'reported': False}, {'outcome': 'CANCELLED'}, {'output': 16_384},
-    {'context': 131_073}, {'total': 200_000, 'output': 132_914},
-    {'total': 140_000, 'output': 72_914}, {'total': 87_423},
+    {'context': 131_073}, {'total': 87_423},
     {'settled': False}, {'sdk_status': 'cancelled'},
 ])
 def test_other_failures_and_uncertainty_remain_blocked(tmp_path, monkeypatch, changes):
@@ -354,14 +354,16 @@ def test_reported_nested_receipt_telemetry_keeps_valid_binding(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize('authority_failed', [False, True])
-def test_full_advance_excludes_disposed_failed_ingest_but_dispatches_healthy_peer(tmp_path, monkeypatch, authority_failed):
+@pytest.mark.parametrize('budget_overrun', [False, True])
+def test_full_advance_excludes_disposed_failed_ingest_but_dispatches_healthy_peer(tmp_path, monkeypatch, authority_failed, budget_overrun):
     from newsroom.tests.test_native_graphiti import _open
     from newsroom.control_plane.store import record_graphiti_failure
     from newsroom.graphiti_adapter.types import GraphitiAdapterOutcome
     from newsroom.graphiti_adapter.identity import typed_id
     from newsroom.extraction.types import ExtractionRunId
 
-    case = _failed(tmp_path, monkeypatch)
+    case = _failed(tmp_path, monkeypatch, **(dict(input_tokens=70_691, cache_read_tokens=60_544,
+        output=20_287, total=151_522) if budget_overrun else {}))
     queued = []
     processor, connection, _calls = _open(
         tmp_path, monkeypatch,
@@ -413,5 +415,178 @@ def test_selected_no_retry_authenticates_current_ingest_before_filtering(tmp_pat
         case.connection.commit()
         with pytest.raises(m.ModelUsageIntegrityError):
             m.reported_output_rejected_ingests(case.connection, ingest_ids=(case.unit.ingest_id,))
+    finally:
+        case.connection.close()
+
+
+def test_exact_reported_subscription_total_overrun_isolates_failed_ingest(tmp_path, monkeypatch):
+    # Retained 2026-10-02 leaf: one SDK usage event, not a measured context.
+    case = _failed(tmp_path, monkeypatch, input_tokens=70_691, cache_read_tokens=60_544,
+                   output=20_287, total=151_522)
+    try:
+        case.usage.open_route_circuit(route='GRAPHITI_CHAT_FALLBACK', reason='MISSING_PROVIDER_TELEMETRY',
+                                      invocation_id=None, recorded_at=T0+timedelta(seconds=11))
+        assert case.terminal.policy_breach == 'MAX_TOTAL_TOKENS_EXCEEDED'
+        before = _history(case)
+        record = _dispose(case)
+        assert record['schema_version'] == 'newsroom.model-usage.reported-output-disposition.v2'
+        assert record['policy_breach'] == 'MAX_TOTAL_TOKENS_EXCEEDED'
+        assert record['components'] == case.terminal.components.as_record()
+        assert record['components']['context_tokens'] is None
+        assert record['components']['reasoning_tokens'] is None
+        assert record['retry_authorised'] is False and record['unknown_spend_released'] is False
+        assert _history(case) == before
+        assert case.usage.route_state(ROUTE)['state'] == 'CLOSED'
+        assert case.usage.route_state('GRAPHITI_CHAT_FALLBACK')['state'] == 'OPEN'
+        assert m.reported_output_rejected_ingests(case.connection, ingest_ids=(case.unit.ingest_id,)) == {case.unit.ingest_id}
+        assert m.ModelUsageService(case.usage.path).route_state(ROUTE)['state'] == 'CLOSED'
+        assert _dispose(case) == record
+        assert case.connection.execute('SELECT count(*) FROM model_usage_reported_output_dispositions').fetchone() == (1,)
+        assert case.connection.execute("SELECT count(*) FROM model_usage_route_circuit_events WHERE state='CLOSED'").fetchone() == (1,)
+    finally:
+        case.connection.close()
+
+
+def test_current_processor_settles_exact_total_overrun_without_retry(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_graphiti import NativeGraphitiProcessor
+    case = _failed(tmp_path, monkeypatch, input_tokens=70_691, cache_read_tokens=60_544,
+                   output=20_287, total=151_522)
+    try:
+        processor = object.__new__(NativeGraphitiProcessor)
+        processor._connection = case.connection
+        processor._usage = case.usage
+        processor._clock = lambda: T0+timedelta(seconds=12)
+        checks = []
+        processor._stop_check = lambda: checks.append('checked')
+        before = _history(case)
+        processor._settle_missing_subscription_usage((case.unit,))
+        assert checks == ['checked']
+        assert _history(case) == before
+        assert case.usage.route_state(ROUTE)['state'] == 'CLOSED'
+        assert m.reported_output_rejected_ingests(case.connection) == {case.unit.ingest_id}
+        processor._settle_missing_subscription_usage((case.unit,))
+        assert checks == ['checked']
+        assert case.connection.execute('SELECT count(*) FROM model_usage_reported_output_dispositions').fetchone() == (1,)
+    finally:
+        case.connection.close()
+
+
+def test_retained_v1_disposition_replays_exact_bytes_and_keeps_old_bounds(tmp_path, monkeypatch):
+    case = _failed(tmp_path, monkeypatch)
+    try:
+        authority = m._reported_output_disposition_authority(case.connection,
+            invocation_id=case.allocation.invocation_id, revision_id=case.unit.revision_id)
+        assert authority['schema_version'] == m.REPORTED_OUTPUT_DISPOSITION_SCHEMA
+        record = {**authority, 'observed_at': m._utc_text(T0+timedelta(seconds=12))}
+        record['disposition_digest'] = digest_canonical(record)
+        raw = m._json(record)
+        case.connection.execute('INSERT INTO model_usage_reported_output_dispositions VALUES(?,?,?)',
+                                (case.allocation.invocation_id,record['disposition_digest'],raw))
+        case.connection.commit()
+        assert _dispose(case) == record
+        assert case.connection.execute('SELECT record_json FROM model_usage_reported_output_dispositions').fetchone() == (raw,)
+        assert m.reported_output_rejected_ingests(case.connection) == {case.unit.ingest_id}
+    finally:
+        case.connection.close()
+    (tmp_path/'overrun').mkdir()
+    overrun = _failed(tmp_path/'overrun', monkeypatch, input_tokens=70_691, cache_read_tokens=60_544,
+                      output=20_287, total=151_522)
+    try:
+        with pytest.raises(m.ModelUsageAdmissionError, match='ineligible'):
+            m._reported_output_disposition_authority(overrun.connection,
+                invocation_id=overrun.allocation.invocation_id, revision_id=overrun.unit.revision_id)
+    finally:
+        overrun.connection.close()
+
+
+@pytest.mark.parametrize('changes', [
+    {'total': 200_000, 'output': 132_914},
+    {'total': 140_000, 'output': 72_914},
+    # A reported total-target overrun need not also exceed the output target.
+    {'input_tokens': 150_000, 'cache_read_tokens': 0, 'output': 10, 'total': 150_010},
+])
+def test_reported_subscription_targets_are_not_global_circuit_latches(tmp_path, monkeypatch, changes):
+    case = _failed(tmp_path, monkeypatch, **changes)
+    try:
+        before = _history(case)
+        record = _dispose(case)
+        assert record['retry_authorised'] is False
+        assert record['components']['total_tokens'] == changes['total']
+        assert _history(case) == before
+        assert case.usage.route_state(ROUTE)['state'] == 'CLOSED'
+    finally:
+        case.connection.close()
+
+
+def test_exact_total_overrun_with_measured_context_breach_remains_blocked(tmp_path, monkeypatch):
+    case = _failed(tmp_path, monkeypatch, input_tokens=70_691, cache_read_tokens=60_544,
+                   output=20_287, total=151_522, context=131_073)
+    try:
+        before = _history(case)
+        with pytest.raises(m.ModelUsageAdmissionError, match='ineligible'):
+            _dispose(case)
+        assert _history(case) == before
+        assert case.usage.route_state(ROUTE)['state'] == 'OPEN'
+        assert case.connection.execute('SELECT count(*) FROM model_usage_reported_output_dispositions').fetchone() == (0,)
+    finally:
+        case.connection.close()
+
+
+@pytest.mark.parametrize('failure_point', ['current', 'circuit'])
+def test_total_disposition_and_route_closure_rollback_together(tmp_path, monkeypatch, failure_point):
+    case = _failed(tmp_path, monkeypatch, input_tokens=70_691, cache_read_tokens=60_544,
+                   output=20_287, total=151_522)
+    try:
+        before = _history(case)
+        current = case.connection.execute('SELECT * FROM model_usage_current').fetchall()
+        circuits = case.connection.execute('SELECT * FROM model_usage_route_circuit_events').fetchall()
+        if failure_point == 'current':
+            def interrupt(*_args, **_kwargs):
+                raise RuntimeError('fixture interruption after disposition insertion')
+            monkeypatch.setattr(m, '_refresh_current_usage', interrupt)
+        else:
+            append = case.usage._append_route_state
+            def interrupt(*args, **kwargs):
+                append(*args, **kwargs)
+                raise RuntimeError('fixture interruption after circuit append')
+            monkeypatch.setattr(case.usage, '_append_route_state', interrupt)
+        with pytest.raises(RuntimeError, match='fixture interruption'):
+            _dispose(case)
+        assert _history(case) == before
+        assert case.connection.execute('SELECT * FROM model_usage_current').fetchall() == current
+        assert case.connection.execute('SELECT * FROM model_usage_route_circuit_events').fetchall() == circuits
+        assert case.connection.execute('SELECT count(*) FROM model_usage_reported_output_dispositions').fetchone() == (0,)
+    finally:
+        case.connection.close()
+
+
+@pytest.mark.parametrize('defect', ['wrong-scope', 'wrong-version', 'cash'])
+def test_total_overrun_disposition_keeps_scope_and_cash_boundaries(tmp_path, monkeypatch, defect):
+    case = _failed(tmp_path, monkeypatch, input_tokens=70_691, cache_read_tokens=60_544,
+                   output=20_287, total=151_522)
+    try:
+        if defect == 'cash':
+            # Re-sign to exercise the authority rule, not only digest corruption.
+            terminal = case.terminal.as_record()
+            terminal['subscription_cli_chat_not_cash_debited'] = False
+            terminal['terminal_digest'] = digest_canonical({**terminal, 'terminal_digest': ''})
+            case.connection.execute('UPDATE model_invocation_terminals SET terminal_digest=?,record_json=? WHERE invocation_id=?',
+                (terminal['terminal_digest'],m._json(terminal),case.allocation.invocation_id))
+            case.connection.commit()
+            with pytest.raises(m.ModelUsageAdmissionError, match='ineligible'):
+                _dispose(case, expected_terminal_digest=terminal['terminal_digest'])
+            assert case.connection.execute('SELECT count(*) FROM model_usage_reported_output_dispositions').fetchone() == (0,)
+        else:
+            record = _dispose(case)
+            record['authority_scope' if defect == 'wrong-scope' else 'schema_version'] = 'UNRECOGNISED'
+            record.pop('disposition_digest')
+            record['disposition_digest'] = digest_canonical(record)
+            case.connection.execute('UPDATE model_usage_reported_output_dispositions SET disposition_digest=?,record_json=?',
+                                    (record['disposition_digest'],m._json(record)))
+            case.connection.commit()
+            with pytest.raises(m.ModelUsageIntegrityError):
+                m.reported_output_rejected_ingests(case.connection, ingest_ids=('unrelated',))
+            with pytest.raises(m.ModelUsageIntegrityError):
+                m._refresh_current_usage(case.connection, case.allocation.invocation_id)
     finally:
         case.connection.close()
