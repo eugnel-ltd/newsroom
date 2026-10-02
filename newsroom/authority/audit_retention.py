@@ -182,7 +182,11 @@ def _scan_business(
         for row in cursor:
             rows += 1
             digest.update(b"r")
-            logical = _logical_storage_values(source, table, names, row) if logical_storage or tokens is not None else tuple(row)
+            # Reference closure uses physical values, including codec backing
+            # IDs and residual/scope rows. It does not re-audit untouched old
+            # codecs; explicit logical comparisons and selected-candidate
+            # authentication retain their existing checks.
+            logical = _logical_storage_values(source, table, names, row) if logical_storage else tuple(row)
             hashed = logical if logical_storage else row
             fields = dict(zip(names, row, strict=True)) if logical_storage or retired_chains else {}
             for name, value in zip(names, hashed, strict=True):
@@ -199,7 +203,7 @@ def _scan_business(
                 digest.update(len(raw).to_bytes(8, "big"))
                 digest.update(raw)
             if tokens is not None:
-                if retired_chains and table == "authorization_requests" and fields.get("storage_request_marker") == b"v41":
+                if logical_storage and retired_chains and table == "authorization_requests" and fields.get("storage_request_marker") == b"v41":
                     # Logical JSON omits the physical command-bound backing;
                     # a retained request still needs that exact command.
                     pending.extend(_reference_tokens(bytes(fields["storage_request_residual"])))
