@@ -802,11 +802,69 @@ def _drop_empty_v28_coverage_schema(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA user_version=27")
 
 
+def _preflight_empty_v25_feedback_schema(connection: sqlite3.Connection):
+    """Preserve the historical boundary's exact diagnostics before successors."""
+    from newsroom.authority.evaluation_feedback_migrations import (
+        EVALUATION_FEEDBACK_MIGRATION_CHECKSUM,
+        EVALUATION_FEEDBACK_MIGRATION_NAME,
+        EVALUATION_FEEDBACK_MIGRATION_STATEMENTS,
+    )
+
+    def normalise_sql(value: str) -> str:
+        return " ".join(value.split()).replace(" IF NOT EXISTS", "")
+
+    objects = connection.execute(
+        "SELECT type,name,sql FROM sqlite_master WHERE "
+        "tbl_name IN ('evaluation_feedback','evaluation_reconciliation_obligations',"
+        "'evaluation_reconciliation_dispositions') AND type IN ('table','trigger')"
+    ).fetchall()
+    expected_names = {
+        "evaluation_feedback",
+        "evaluation_reconciliation_obligations",
+        "evaluation_reconciliation_dispositions",
+        "immutable_evaluation_feedback",
+        "retained_evaluation_feedback",
+        "immutable_evaluation_obligation",
+        "retained_evaluation_obligation",
+        "immutable_evaluation_disposition",
+        "retained_evaluation_disposition",
+        "evaluation_disposition_predecessor_guard",
+    }
+    if (
+        connection.execute(
+            "SELECT name,checksum FROM authority_migrations WHERE version=25"
+        ).fetchone()
+        != (
+            EVALUATION_FEEDBACK_MIGRATION_NAME,
+            EVALUATION_FEEDBACK_MIGRATION_CHECKSUM,
+        )
+        or {str(row[1]) for row in objects} != expected_names
+        or {normalise_sql(str(row[2])) for row in objects}
+        != {
+            normalise_sql(statement)
+            for statement in EVALUATION_FEEDBACK_MIGRATION_STATEMENTS
+        }
+    ):
+        raise sqlite3.DatabaseError(
+            "downgrade requires exact empty v25 Feedback schema"
+        )
+    for table in (
+        "evaluation_feedback",
+        "evaluation_reconciliation_obligations",
+        "evaluation_reconciliation_dispositions",
+    ):
+        if connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone() != (0,):
+            raise sqlite3.DatabaseError("v25 Feedback tables must be empty")
+    return objects
+
+
 def drop_empty_v23_lineage_schema(connection: sqlite3.Connection) -> None:
     """Remove exact empty v24/v23 schemas as one rollback-safe operation."""
     savepoint = "checked_candidate_lineage_downgrade"
     connection.execute(f"SAVEPOINT {savepoint}")
     try:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 25:
+            _preflight_empty_v25_feedback_schema(connection)
         _drop_empty_v23_lineage_schema(connection)
     except Exception:
         connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -921,57 +979,7 @@ def _drop_empty_v23_lineage_schema(connection: sqlite3.Connection) -> None:
         connection.execute(guard)
         connection.execute("PRAGMA user_version=25")
     if int(connection.execute("PRAGMA user_version").fetchone()[0]) == 25:
-        from newsroom.authority.evaluation_feedback_migrations import (
-            EVALUATION_FEEDBACK_MIGRATION_CHECKSUM,
-            EVALUATION_FEEDBACK_MIGRATION_NAME,
-            EVALUATION_FEEDBACK_MIGRATION_STATEMENTS,
-        )
-
-        def normalise_sql(value: str) -> str:
-            return " ".join(value.split()).replace(" IF NOT EXISTS", "")
-
-        objects = connection.execute(
-            "SELECT type,name,sql FROM sqlite_master WHERE "
-            "tbl_name IN ('evaluation_feedback','evaluation_reconciliation_obligations',"
-            "'evaluation_reconciliation_dispositions') AND type IN ('table','trigger')"
-        ).fetchall()
-        expected_names = {
-            "evaluation_feedback",
-            "evaluation_reconciliation_obligations",
-            "evaluation_reconciliation_dispositions",
-            "immutable_evaluation_feedback",
-            "retained_evaluation_feedback",
-            "immutable_evaluation_obligation",
-            "retained_evaluation_obligation",
-            "immutable_evaluation_disposition",
-            "retained_evaluation_disposition",
-            "evaluation_disposition_predecessor_guard",
-        }
-        if (
-            connection.execute(
-                "SELECT name,checksum FROM authority_migrations WHERE version=25"
-            ).fetchone()
-            != (
-                EVALUATION_FEEDBACK_MIGRATION_NAME,
-                EVALUATION_FEEDBACK_MIGRATION_CHECKSUM,
-            )
-            or {str(row[1]) for row in objects} != expected_names
-            or {normalise_sql(str(row[2])) for row in objects}
-            != {
-                normalise_sql(statement)
-                for statement in EVALUATION_FEEDBACK_MIGRATION_STATEMENTS
-            }
-        ):
-            raise sqlite3.DatabaseError(
-                "downgrade requires exact empty v25 Feedback schema"
-            )
-        for table in (
-            "evaluation_feedback",
-            "evaluation_reconciliation_obligations",
-            "evaluation_reconciliation_dispositions",
-        ):
-            if connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone() != (0,):
-                raise sqlite3.DatabaseError("v25 Feedback tables must be empty")
+        objects = _preflight_empty_v25_feedback_schema(connection)
         guard = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='trigger' "
             "AND name='immutable_authority_migrations_delete'"
@@ -1172,6 +1180,45 @@ def _drop_empty_v23_lineage_schema(connection: sqlite3.Connection) -> None:
         connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
 
+def _preflight_empty_v22_relationship_schema(connection: sqlite3.Connection, relationship_table: str, relationship_triggers: tuple[str, ...]) -> None:
+    """Validate the unchanged v22 slice before any successor is stripped."""
+    v22_history = connection.execute(
+        "SELECT name,checksum FROM authority_migrations WHERE version=?",
+        (EVENT_HYPOTHESIS_RELATIONSHIP_SCHEMA_VERSION,),
+    ).fetchone()
+    if v22_history != (
+        EVENT_HYPOTHESIS_RELATIONSHIP_MIGRATION_NAME,
+        EVENT_HYPOTHESIS_RELATIONSHIP_MIGRATION_CHECKSUM,
+    ):
+        raise sqlite3.DatabaseError(
+            "downgrade requires exact v22 migration history"
+        )
+
+    required_objects = {
+        ("table", relationship_table, relationship_table),
+        *(
+            ("trigger", trigger, relationship_table)
+            for trigger in relationship_triggers
+        ),
+    }
+    present_objects = set(
+        connection.execute(
+            "SELECT type,name,tbl_name FROM sqlite_master "
+            f"WHERE name IN ({','.join('?' for _ in required_objects)})",
+            tuple(name for _, name, _ in required_objects),
+        ).fetchall()
+    )
+    if present_objects != required_objects:
+        raise sqlite3.DatabaseError(
+            "downgrade requires exact v22 relationship schema"
+        )
+    if connection.execute(
+        f'SELECT COUNT(*) FROM "{relationship_table}"'
+    ).fetchone() != (0,):
+        raise sqlite3.DatabaseError("v22 relationship table must be empty")
+
+
+
 def drop_empty_v22_relationship_schema(connection: sqlite3.Connection) -> None:
     """Remove an exact, empty v22 relationship schema atomically."""
 
@@ -1184,6 +1231,12 @@ def drop_empty_v22_relationship_schema(connection: sqlite3.Connection) -> None:
     )
     connection.execute(f"SAVEPOINT {savepoint}")
     try:
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        maximum_history_version = connection.execute("SELECT MAX(version) FROM authority_migrations").fetchone()[0]
+        if maximum_history_version != user_version:
+            raise sqlite3.DatabaseError("v22 schema version/history mismatch")
+        if user_version >= EVENT_HYPOTHESIS_RELATIONSHIP_SCHEMA_VERSION:
+            _preflight_empty_v22_relationship_schema(connection, relationship_table, relationship_triggers)
         drop_empty_v23_lineage_schema(connection)
         user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         maximum_history_version = connection.execute(
@@ -1196,41 +1249,6 @@ def drop_empty_v22_relationship_schema(connection: sqlite3.Connection) -> None:
             return
         if user_version != EVENT_HYPOTHESIS_RELATIONSHIP_SCHEMA_VERSION:
             raise sqlite3.DatabaseError("downgrade requires exact schema v22")
-
-        v22_history = connection.execute(
-            "SELECT name,checksum FROM authority_migrations WHERE version=?",
-            (EVENT_HYPOTHESIS_RELATIONSHIP_SCHEMA_VERSION,),
-        ).fetchone()
-        if v22_history != (
-            EVENT_HYPOTHESIS_RELATIONSHIP_MIGRATION_NAME,
-            EVENT_HYPOTHESIS_RELATIONSHIP_MIGRATION_CHECKSUM,
-        ):
-            raise sqlite3.DatabaseError(
-                "downgrade requires exact v22 migration history"
-            )
-
-        required_objects = {
-            ("table", relationship_table, relationship_table),
-            *(
-                ("trigger", trigger, relationship_table)
-                for trigger in relationship_triggers
-            ),
-        }
-        present_objects = set(
-            connection.execute(
-                "SELECT type,name,tbl_name FROM sqlite_master "
-                f"WHERE name IN ({','.join('?' for _ in required_objects)})",
-                tuple(name for _, name, _ in required_objects),
-            ).fetchall()
-        )
-        if present_objects != required_objects:
-            raise sqlite3.DatabaseError(
-                "downgrade requires exact v22 relationship schema"
-            )
-        if connection.execute(
-            f'SELECT COUNT(*) FROM "{relationship_table}"'
-        ).fetchone() != (0,):
-            raise sqlite3.DatabaseError("v22 relationship table must be empty")
 
         for trigger in relationship_triggers:
             connection.execute(f'DROP TRIGGER "{trigger}"')
@@ -1348,6 +1366,7 @@ def downgrade_empty_graphiti_adapter_schema_to_v15(database: Path) -> None:
 
 def _drop_v41_command_bound_storage(connection: sqlite3.Connection) -> None:
     """Restore exact v40 bytes/DDL for explicit historical-codec fixtures."""
+    _drop_v42_projection_retirement(connection)
     if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 41:
         return
     from newsroom.authority.command_bound_storage import command_request_bytes, command_result_bytes
@@ -1396,3 +1415,50 @@ def _drop_v41_command_bound_storage(connection: sqlite3.Connection) -> None:
         connection.execute("RELEASE SAVEPOINT checked_command_storage_downgrade")
         raise
     connection.execute("RELEASE SAVEPOINT checked_command_storage_downgrade")
+
+
+def _drop_v42_projection_retirement(connection: sqlite3.Connection) -> None:
+    """Remove schema-only v42 from full-history migration fixtures, never live data."""
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 42:
+        return
+    from newsroom.authority.migrations import MIGRATION_STATEMENTS, EXPECTED_MIGRATION_HISTORY, EXPECTED_SCHEMA_FINGERPRINT, schema_fingerprint
+    from newsroom.authority.projection_retirement_migrations import PROJECTION_RETIREMENT_PREDECESSOR_FINGERPRINT
+
+    if (schema_fingerprint(connection) != EXPECTED_SCHEMA_FINGERPRINT
+            or tuple(tuple(row) for row in connection.execute("SELECT version,name,checksum FROM authority_migrations ORDER BY version")) != EXPECTED_MIGRATION_HISTORY
+            or connection.execute("SELECT 1 FROM ledger_events WHERE retired_header_digest IS NOT NULL LIMIT 1").fetchone() is not None):
+        raise sqlite3.DatabaseError("historical fixture requires exact unexpired v42 authority")
+    connection.execute("SAVEPOINT checked_projection_retirement_downgrade")
+    try:
+        connection.execute("PRAGMA defer_foreign_keys=ON")
+        indices = tuple(row[0] for row in connection.execute("SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name='ledger_events' AND sql IS NOT NULL AND name<>'idx_retired_command_key'"))
+        sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='ledger_events'").fetchone()
+        connection.execute("CREATE TEMP TABLE predecessor_ledger AS SELECT * FROM ledger_events")
+        connection.execute("DROP TABLE ledger_events")
+        connection.execute(next(sql for sql in MIGRATION_STATEMENTS if sql.startswith("CREATE TABLE ledger_events(")))
+        names = ",".join(row[1] for row in connection.execute("PRAGMA table_info(ledger_events)"))
+        connection.execute(f"INSERT INTO ledger_events({names}) SELECT {names} FROM predecessor_ledger")
+        connection.execute("DROP TABLE predecessor_ledger")
+        if sequence is not None:
+            connection.execute("UPDATE sqlite_sequence SET seq=? WHERE name='ledger_events'", (sequence[0],))
+        for sql in MIGRATION_STATEMENTS:
+            if sql.startswith("CREATE TRIGGER") and " ON ledger_events" in sql:
+                connection.execute(sql)
+        for sql in indices:
+            connection.execute(sql)
+        connection.execute("DROP TRIGGER authority_commands_retired_key_guard")
+        connection.execute("DROP TRIGGER projection_diagnostic_expiry_insert_guard")
+        connection.execute("DROP TRIGGER projection_diagnostic_expiry_update_guard")
+        connection.execute("ALTER TABLE projection_generations DROP COLUMN diagnostic_history_expired")
+        guard = connection.execute("SELECT sql FROM sqlite_schema WHERE name='immutable_authority_migrations_delete'").fetchone()[0]
+        connection.execute("DROP TRIGGER immutable_authority_migrations_delete")
+        connection.execute("DELETE FROM authority_migrations WHERE version=42")
+        connection.execute(guard)
+        connection.execute("PRAGMA user_version=41")
+        if schema_fingerprint(connection) != PROJECTION_RETIREMENT_PREDECESSOR_FINGERPRINT or connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise sqlite3.DatabaseError("v42 fixture downgrade lost exact v41 authority")
+    except Exception:
+        connection.execute("ROLLBACK TO SAVEPOINT checked_projection_retirement_downgrade")
+        connection.execute("RELEASE SAVEPOINT checked_projection_retirement_downgrade")
+        raise
+    connection.execute("RELEASE SAVEPOINT checked_projection_retirement_downgrade")

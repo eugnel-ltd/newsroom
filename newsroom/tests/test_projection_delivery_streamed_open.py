@@ -100,14 +100,14 @@ def test_projection_delivery_open_streams_attempts_and_heads_together(tmp_path, 
         probe = _probe()
         verified = []
         hashes = 0
-        original_digest = projection_store.digest_canonical
+        original_digest = projection_store._event_digest
 
         def hash_source(value):
             nonlocal hashes
             hashes += 1
             return original_digest(value)
 
-        monkeypatch.setattr(projection_store, "digest_canonical", hash_source)
+        monkeypatch.setattr(projection_store, "_event_digest", hash_source)
 
         def verify_source(conn, row):
             verified.append(("attempt" if "attempt_number" in row.keys() else "state",

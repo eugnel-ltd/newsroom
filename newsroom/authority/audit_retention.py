@@ -1,8 +1,10 @@
 """Offline reclamation of obsolete native read diagnostics.
 
-This is not retention of commands, admissions, accounting or source history.
-The existing writer lock is held throughout, ordinary append-only triggers are
-restored transactionally, and no authority database copy is made.
+Default read-audit pruning preserves command history. The explicit retired
+projection mode expires only checked optional no-op diagnostic commands, not
+admissions, accounting, effects or source history. The existing writer lock is
+held throughout, append-only triggers are restored transactionally, and no
+authority database copy is made.
 """
 from __future__ import annotations
 
@@ -150,6 +152,7 @@ def _scan_business(
     exclude_audit: bool = False,
     exclude_projection_details: bool = False,
     logical_storage: bool = False,
+    retired_chains: bool = False,
 ) -> dict[str, object]:
     """Hash actual rows and collect references together, bounded by one row."""
     digest = hashlib.sha256()
@@ -166,21 +169,45 @@ def _scan_business(
             continue
         digest.update(table.encode() + b"\0")
         columns = source.execute(f"PRAGMA main.table_info({_q(table)})").fetchall()
-        names = tuple(c[1] for c in columns)
         primary = [c[1] for c in sorted(columns, key=lambda c: c[5]) if c[5]]
         order = ",".join(map(_q, primary)) if primary else "rowid"
-        for row in source.execute(f"SELECT * FROM main.{_q(table)} ORDER BY {order}"):
+        condition = "1"
+        if retired_chains:
+            from .projection_retirement import retained_condition
+            condition = retained_condition(table)
+        cursor = source.execute(f"SELECT * FROM main.{_q(table)} WHERE {condition} ORDER BY {order}")
+        # SELECT * includes generated columns but excludes hidden virtual-table
+        # columns. Its actual metadata is the shared authority/external contract.
+        names = tuple(column[0] for column in cursor.description)
+        for row in cursor:
             rows += 1
             digest.update(b"r")
             logical = _logical_storage_values(source, table, names, row) if logical_storage or tokens is not None else tuple(row)
             hashed = logical if logical_storage else row
-            for value in hashed:
+            fields = dict(zip(names, row, strict=True)) if logical_storage or retired_chains else {}
+            for name, value in zip(names, hashed, strict=True):
+                # Full v42 rows retain the original logical header exactly;
+                # schema-only storage columns are not new event provenance.
+                if logical_storage and table == "ledger_events" and fields.get("retired_header_digest") is None and name in {"retired_header_digest", "retired_namespace", "retired_key", "retired_record_digest", "live_command_id"}:
+                    continue
+                if logical_storage and table == "projection_generations" and name == "diagnostic_history_expired" and value == 0:
+                    continue
+                if retired_chains and table == "projection_generations" and name == "diagnostic_history_expired":
+                    value = 0
                 raw = _encoded(value)
                 byte_count += len(raw)
                 digest.update(len(raw).to_bytes(8, "big"))
                 digest.update(raw)
             if tokens is not None:
-                for value in logical:
+                if retired_chains and table == "authorization_requests" and fields.get("storage_request_marker") == b"v41":
+                    # Logical JSON omits the physical command-bound backing;
+                    # a retained request still needs that exact command.
+                    pending.extend(_reference_tokens(bytes(fields["storage_request_residual"])))
+                for name, value in zip(names, logical, strict=True):
+                    if retired_chains and table in {"projection_delivery_states", "projection_delivery_attempts"}:
+                        outcome = fields.get("current_outcome", fields.get("outcome"))
+                        if fields["required"] == 0 and outcome == "IGNORED_OPTIONAL" and name in {"source_event_id", "source_event_digest"}:
+                            continue
                     if isinstance(value, (str, bytes)):
                         pending.extend(_reference_tokens(value.encode("utf-8") if isinstance(value, str) else value))
                         if len(pending) >= 4096:
@@ -265,9 +292,9 @@ def _children(
 
 
 def _index_children(
-    conn: sqlite3.Connection, parent: str, indexes: list[str],
+    conn: sqlite3.Connection, parent: str, indexes: list[str], *, key: str | None = None,
 ) -> list[tuple[str, str]]:
-    children = _children(conn, parent)
+    children = _children(conn, parent, key=key)
     for table, column in children:
         existing = [row[1] for row in conn.execute(f"PRAGMA main.index_list({_q(table)})") if not row[4]]
         if any(
@@ -486,12 +513,15 @@ def _delete_projection_candidates(conn: sqlite3.Connection) -> int:
 
 def prune_native_diagnostic_audit(
     data_root: Path, *, apply: bool = False, clock=UtcTimestamp.now,
+    _retire_projection_chains: bool = False,
 ) -> dict[str, object]:
     """Dry-run by default; apply atomically prunes, then compacts in place.
 
     Required external roots are deliberately not optional CLI flags. The
     authority lifetime writer lock excludes ordinary engine writes throughout.
-    No provider, CAS mutation, command/history deletion or backup is performed.
+    No provider, CAS mutation or backup is performed. Default mode preserves
+    command history; the explicit retired projection wrapper expires only its
+    checked no-op chains.
     """
     started = time.monotonic_ns()
     graphiti_cutoff = UtcTimestamp(
@@ -525,16 +555,22 @@ def prune_native_diagnostic_audit(
         conn.execute("PRAGMA cache_size=-8192")
         if apply:
             conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
+        conn.execute("BEGIN EXCLUSIVE" if apply and _retire_projection_chains else "BEGIN IMMEDIATE" if apply else "BEGIN")
         try:
             _require_schema(conn)
             schema = _schema(conn)
             conn.execute("CREATE TEMP TABLE _audit_tokens(id TEXT PRIMARY KEY) WITHOUT ROWID")
-            _policies(conn)
+            if _retire_projection_chains:
+                from .projection_retirement import select_candidates, protect_candidates, expire_candidates
+                eligible_chains = select_candidates(conn)
+            else:
+                _policies(conn)
             _LOG.info("AUDIT_RETENTION_STAGE retained_authority_references")
             scan_started = time.monotonic_ns()
-            business = _scan_business(conn, tokens=conn, exclude_audit=True, exclude_projection_details=True)
-            _projection_references(conn)
+            business = _scan_business(conn, tokens=conn, exclude_audit=not _retire_projection_chains,
+                exclude_projection_details=not _retire_projection_chains, retired_chains=_retire_projection_chains)
+            if not _retire_projection_chains:
+                _projection_references(conn)
             _LOG.info("AUDIT_RETENTION_STAGE external_references")
             external_reports = {}
             readers = []
@@ -556,11 +592,19 @@ def prune_native_diagnostic_audit(
             cas_before = _fingerprint(cas_paths)
             cas_report = _scan_cas(cas, conn)
             scan_ms = (time.monotonic_ns() - scan_started) // 1_000_000
-            _LOG.info("AUDIT_RETENTION_STAGE classify_superseded_reads")
+            _LOG.info("AUDIT_RETENTION_STAGE %s", "classify_retired_projection_chains" if _retire_projection_chains else "classify_superseded_reads")
             candidates_started = time.monotonic_ns()
-            counts = _candidates(conn, graphiti_cutoff=graphiti_cutoff)
-            counts["prunable_projection_details"] = _projection_candidates(conn, cutoff=graphiti_cutoff)
-            protected_projection_details = _protected_projection_details(conn)
+            if _retire_projection_chains:
+                protected_chains = protect_candidates(conn)
+                counts = {"eligible_projection_chains": eligible_chains,
+                    "protected_projection_chains": protected_chains,
+                    "retired_projection_chains": conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0]}
+                business = _scan_business(conn, retired_chains=True)
+                protected_projection_details = None
+            else:
+                counts = _candidates(conn, graphiti_cutoff=graphiti_cutoff)
+                counts["prunable_projection_details"] = _projection_candidates(conn, cutoff=graphiti_cutoff)
+                protected_projection_details = _protected_projection_details(conn)
             report: dict[str, object] = {
                 "mode": "apply" if apply else "dry-run", "authority": str(authority),
                 "reference_scan_ms": scan_ms,
@@ -579,11 +623,17 @@ def prune_native_diagnostic_audit(
             if apply:
                 _LOG.info("AUDIT_RETENTION_STAGE prune_and_verify")
                 prune_started = time.monotonic_ns()
-                report["deleted"] = _delete_candidates(conn)
-                report["projection_details_deleted"] = _delete_projection_candidates(conn)
+                if _retire_projection_chains:
+                    report["deleted"] = expire_candidates(conn)
+                    report["retired_projection_chains"] = counts["retired_projection_chains"]
+                    report["projection_details_deleted"] = report["deleted"]["projection_delivery_attempts"]
+                else:
+                    report["deleted"] = _delete_candidates(conn)
+                    report["projection_details_deleted"] = _delete_projection_candidates(conn)
                 if (_schema(conn) != schema
-                        or _scan_business(conn, exclude_audit=True, exclude_projection_details=True) != business
-                        or _protected_projection_details(conn) != protected_projection_details):
+                        or _scan_business(conn, exclude_audit=not _retire_projection_chains,
+                            exclude_projection_details=not _retire_projection_chains, retired_chains=_retire_projection_chains) != business
+                        or (not _retire_projection_chains and _protected_projection_details(conn) != protected_projection_details)):
                     raise AuditRetentionError("retained business rows or schema changed; rolling back")
                 if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise AuditRetentionError("retained foreign-key integrity differs; rolling back")
@@ -637,3 +687,8 @@ def prune_native_diagnostic_audit(
     if not report["inode_preserved"]:
         report["compaction_error"] = "Pruning committed; authority inode unexpectedly changed" if report["committed"] else "Authority inode unexpectedly changed during inspection"
     return report
+
+
+def retire_native_projection_diagnostics(data_root: Path, *, apply: bool = False) -> dict[str, object]:
+    """Explicit retired-chain expiry; no age heuristic or effect authority."""
+    return prune_native_diagnostic_audit(data_root, apply=apply, _retire_projection_chains=True)

@@ -90,6 +90,9 @@ def test_v22_downgrade_preflight_preserves_state_when_table_is_not_empty() -> No
         },
         separators=(",", ":"),
     ).encode()
+    # Deliberate orphan injection exercises emptiness preflight, not valid
+    # authority adoption. Normal migrations retain native foreign keys.
+    connection.execute("PRAGMA foreign_keys=OFF")
     connection.execute(
         "INSERT INTO event_hypothesis_relationship_decisions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
@@ -113,6 +116,7 @@ def test_v22_downgrade_preflight_preserves_state_when_table_is_not_empty() -> No
             "2042-03-12T10:00:00Z",
         ),
     )
+    connection.execute("PRAGMA foreign_keys=ON")
     before = _retained_state(connection)
 
     with pytest.raises(sqlite3.DatabaseError, match="must be empty"):

@@ -9,7 +9,7 @@ from newsroom.authority import AuthorityPersistenceError
 from newsroom.authority.audit_retention import _scan_business
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from newsroom.authority import command_bound_storage_migrations as migration
-from newsroom.authority.migrations import SCHEMA_VERSION, apply_pending_migrations, schema_fingerprint
+from newsroom.authority.migrations import SCHEMA_VERSION, EXPECTED_MIGRATION_HISTORY, apply_pending_migrations, schema_fingerprint
 from newsroom.tests.authority_event_helpers import open_test_system
 from newsroom.tests.authority_helpers import FIXED_NOW, command, proof, make_service
 from newsroom.tests.test_authority_exact_event_closure import _store
@@ -27,7 +27,7 @@ def test_new_command_writes_compact_requests_and_results_with_exact_public_reads
     with sqlite3.connect(path) as connection:
         request = connection.execute("SELECT storage_request_marker,storage_request_residual FROM authorization_requests").fetchone()
         retained = connection.execute("SELECT result_bytes FROM authority_commands").fetchone()[0]
-        assert SCHEMA_VERSION == 41
+        assert SCHEMA_VERSION >= migration.COMMAND_BOUND_STORAGE_SCHEMA_VERSION
         assert request[0] == b"v41"
         assert len(request[1]) < 100
         assert len(retained) == 54
@@ -187,7 +187,7 @@ def test_keyset_conversion_does_not_fetchall_command_or_request_stream(tmp_path)
     path, _, _, _ = _old_path(tmp_path)
     with sqlite3.connect(path, factory=StreamingConnection) as connection:
         apply_pending_migrations(connection, applied_at="2026-10-01T00:00:00.000000Z")
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_standalone_evaluation_request_remains_v38_on_new_writes_and_upgrade(tmp_path):
@@ -247,7 +247,7 @@ def test_logical_reference_scanner_uses_original_authority_bytes_and_keeps_physi
         compact_tokens = tuple(connection.execute("SELECT id FROM _audit_tokens ORDER BY id"))
         # The new migration checksum is separately authenticated metadata.
         added = set(compact_tokens) - set(original_tokens)
-        assert added == {(migration.COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM,)}
+        assert added == {(checksum,) for version, _, checksum in EXPECTED_MIGRATION_HISTORY if version > 40}
         assert set(original_tokens) <= set(compact_tokens)
         assert original_physical != compact_physical
 

@@ -10,6 +10,7 @@ from newsroom.authority import authorization_request_storage_migrations as reque
 from newsroom.authority import command_bound_storage_migrations as command_migration
 from newsroom.authority import graphiti_recovered_ambiguous_migrations as recovery_migration
 from newsroom.authority import relationship_open_index_migrations as index_migration
+from newsroom.authority import projection_retirement_migrations as retirement_migration
 from newsroom.authority import security_record_migrations as migration
 from newsroom.authority.canonical import digest_bytes
 from newsroom.authority.migrations import (
@@ -64,6 +65,8 @@ def test_current_security_storage_is_compact_with_exact_public_provenance(tmp_pa
              index_migration.RELATIONSHIP_OPEN_INDEX_MIGRATION_CHECKSUM),
             (41, command_migration.COMMAND_BOUND_STORAGE_MIGRATION_NAME,
              command_migration.COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM),
+            (42, retirement_migration.PROJECTION_RETIREMENT_MIGRATION_NAME,
+             retirement_migration.PROJECTION_RETIREMENT_MIGRATION_CHECKSUM),
         )
         assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
     with open_test_system(path) as system:

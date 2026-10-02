@@ -17,6 +17,7 @@ from .persistence import (
     EventProvenanceRecord,
     EventReadPolicy,
     LedgerEventRecord,
+    RetiredLedgerEventRecord,
     MetadataClass,
 )
 from .policy import CommandRegistry, PayloadSchemaRegistry
@@ -143,7 +144,7 @@ class _ReadBoundary:
         ledger_seq: int,
         limit: int,
         proof: AuthenticationProof,
-    ) -> tuple[LedgerEventRecord, ...]:
+    ) -> tuple[LedgerEventRecord | RetiredLedgerEventRecord, ...]:
         self._policy.require_window(
             after_ledger_seq=ledger_seq, limit=limit
         )

@@ -357,8 +357,15 @@ from .triage_work_item_migrations import (
     triage_work_item_backup_paths,
 )
 
+from .projection_retirement_migrations import (
+    PROJECTION_RETIREMENT_SCHEMA_VERSION, PROJECTION_RETIREMENT_MIGRATION,
+    PROJECTION_RETIREMENT_MIGRATION_NAME, PROJECTION_RETIREMENT_MIGRATION_CHECKSUM,
+    PROJECTION_RETIREMENT_MIGRATION_STATEMENTS,
+    migrate_projection_retirement,
+)
+
 BASE_SCHEMA_VERSION = 1
-SCHEMA_VERSION = COMMAND_BOUND_STORAGE_SCHEMA_VERSION
+SCHEMA_VERSION = PROJECTION_RETIREMENT_SCHEMA_VERSION
 ISOLATED_SCHEMA_VERSION_RESERVATIONS = frozenset({33})
 MIGRATION_NAME = "authority_event_foundation_v1"
 
@@ -933,6 +940,12 @@ def apply_pending_migrations(conn: sqlite3.Connection, *, applied_at: str) -> No
         )
     if current == SCHEMA_VERSION:
         return
+    conn.execute("PRAGMA foreign_keys=ON")
+    # Fresh production connections stage ledger rows on disk. Changing this
+    # setting would discard a caller's existing temporary reference snapshot.
+    if conn.execute("SELECT 1 FROM sqlite_temp_schema LIMIT 1").fetchone() is None:
+        conn.execute("PRAGMA temp_store=FILE")
+    conn.execute("PRAGMA temp.cache_size=-8192")
     try:
         conn.execute("BEGIN EXCLUSIVE")
         if current == 0:
@@ -1739,6 +1752,17 @@ def apply_pending_migrations(conn: sqlite3.Connection, *, applied_at: str) -> No
                  COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM, applied_at),
             )
             current = COMMAND_BOUND_STORAGE_SCHEMA_VERSION
+        if current == COMMAND_BOUND_STORAGE_SCHEMA_VERSION:
+            migrate_projection_retirement(conn, expected_history=tuple(
+                (r.version, r.name, r.checksum) for r in MIGRATIONS
+                if r.version <= COMMAND_BOUND_STORAGE_SCHEMA_VERSION
+            ))
+            conn.execute(
+                "INSERT INTO authority_migrations(version,name,checksum,applied_at) VALUES(?,?,?,?)",
+                (PROJECTION_RETIREMENT_SCHEMA_VERSION, PROJECTION_RETIREMENT_MIGRATION_NAME,
+                 PROJECTION_RETIREMENT_MIGRATION_CHECKSUM, applied_at),
+            )
+            current = PROJECTION_RETIREMENT_SCHEMA_VERSION
         # fmt: on
         conn.execute(f"PRAGMA user_version={current}")
         conn.execute("COMMIT")
@@ -1789,6 +1813,7 @@ MIGRATIONS: tuple[MigrationRecord | object, ...] = (
     GRAPHITI_RECOVERED_AMBIGUOUS_MIGRATION,
     RELATIONSHIP_OPEN_INDEX_MIGRATION,
     COMMAND_BOUND_STORAGE_MIGRATION,
+    PROJECTION_RETIREMENT_MIGRATION,
 )
 
 
@@ -1991,5 +2016,7 @@ EXPECTED_MIGRATION_HISTORY: tuple[tuple[int, str, str], ...] = (
         COMMAND_BOUND_STORAGE_MIGRATION_NAME,
         COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM,
     ),
+    (PROJECTION_RETIREMENT_SCHEMA_VERSION, PROJECTION_RETIREMENT_MIGRATION_NAME,
+     PROJECTION_RETIREMENT_MIGRATION_CHECKSUM),
 )
 # fmt: on

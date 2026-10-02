@@ -91,6 +91,8 @@ def test_full_migrated_schema_and_persisted_orphan_are_checked(tmp_path):
         connection.execute('''CREATE TABLE test_leaf(
             ref TEXT REFERENCES authentication_contexts(authentication_context_id)
         ) STRICT''')
+        # Migration enables native FK enforcement; corrupt only this fixture.
+        connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("INSERT INTO test_leaf VALUES('absent')")
     with sqlite3.connect(database) as reopened:
         assert has_foreign_key_violation(reopened) is _native(reopened) is True

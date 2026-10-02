@@ -22,6 +22,10 @@ class AuthorityPersistenceError(RuntimeError):
     """Base failure for the authoritative SQLite event ledger."""
 
 
+class DiagnosticHistoryExpired(AuthorityPersistenceError):
+    """Full diagnostic provenance/result expired; its identity stays reserved."""
+
+
 class AuthoritySchemaError(AuthorityPersistenceError):
     """The authority database does not match the accepted schema contract."""
 
@@ -308,6 +312,20 @@ class LedgerEventRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class RetiredLedgerEventRecord:
+    """Routing and exact original-header identity, never synthetic provenance."""
+    ledger_seq: int
+    event_id: str
+    command_id: str
+    event_type: str
+    aggregate_type: str
+    aggregate_id: str
+    security_scope: str
+    trust_scope: str
+    original_header_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class AuthenticationContextRecord:
     authentication_context_id: str
     principal_id: str
@@ -393,7 +411,7 @@ class AuthorityEvents:
         policy_id: str,
         read: Callable[
             [int, int, AuthenticationProof],
-            tuple[LedgerEventRecord, ...],
+            tuple[LedgerEventRecord | RetiredLedgerEventRecord, ...],
         ],
         provenance: Callable[
             [str, AuthenticationProof], EventProvenanceRecord
@@ -414,7 +432,7 @@ class AuthorityEvents:
         *,
         limit: int = 100,
         proof: AuthenticationProof,
-    ) -> tuple[LedgerEventRecord, ...]:
+    ) -> tuple[LedgerEventRecord | RetiredLedgerEventRecord, ...]:
         return self.__read(ledger_seq, limit, proof)
 
     def provenance(
