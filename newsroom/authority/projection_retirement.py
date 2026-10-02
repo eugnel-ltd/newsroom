@@ -10,6 +10,8 @@ from .projection_retirement_migrations import RETIRED_FIELDS, retired_record_dig
 
 # These are disposable diagnostics. Current local FK, causation and watermark
 # consumers still protect their required rows; historical opaque links expire.
+# Generation/sequence keys are NOT NULL. EXISTS keeps unmatched composite keys
+# on the exact index lookup instead of row-value NOT IN's fallback scan.
 _EXCLUSIONS = {
     "ledger_events": "event_id IN (SELECT event_id FROM _retirement_candidates)",
     "authority_commands": "command_id IN (SELECT command_id FROM _retirement_candidates)",
@@ -19,9 +21,9 @@ _EXCLUSIONS = {
     "authorization_requests": "request_digest IN (SELECT authorization_request_digest FROM _retirement_candidates)",
     "authorization_decisions": "authorization_decision_id IN (SELECT authorization_decision_id FROM _retirement_candidates)",
     "authentication_contexts": "authentication_context_id IN (SELECT authentication_context_id FROM _retirement_candidates)",
-    "projection_delivery_states": "(generation_id,ledger_seq) IN (SELECT generation_id,source_seq FROM _retirement_candidates)",
-    "projection_delivery_attempts": "(generation_id,ledger_seq) IN (SELECT generation_id,source_seq FROM _retirement_candidates)",
-    "projection_checkpoint_versions": "(generation_id,checkpoint_version) IN (SELECT generation_id,checkpoint_version FROM _retirement_checkpoints)",
+    "projection_delivery_states": "EXISTS (SELECT 1 FROM _retirement_candidates x WHERE x.generation_id=projection_delivery_states.generation_id AND x.source_seq=projection_delivery_states.ledger_seq)",
+    "projection_delivery_attempts": "EXISTS (SELECT 1 FROM _retirement_candidates x WHERE x.generation_id=projection_delivery_attempts.generation_id AND x.source_seq=projection_delivery_attempts.ledger_seq)",
+    "projection_checkpoint_versions": "EXISTS (SELECT 1 FROM _retirement_checkpoints x WHERE x.generation_id=projection_checkpoint_versions.generation_id AND x.checkpoint_version=projection_checkpoint_versions.checkpoint_version)",
 }
 
 
