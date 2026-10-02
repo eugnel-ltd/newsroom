@@ -1478,3 +1478,157 @@ def test_pending_and_ready_spill_share_preference_and_toggle_only_once_per_tick(
         assert pending[1].revision_id not in journal.progress
     finally:
         connection.close()
+
+
+def test_ordinary_current_turn_precedes_archive_and_next_archive_turn_preserves_history(tmp_path, monkeypatch):
+    pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+    dispositions[0] = ()
+    archive = replace(_native("ordinary-archive"), published_at="2021-01-01T00:00:00Z", updated_at=None,
+                      observed_at="2026-10-02T00:00:00Z")
+    current = replace(_native("ordinary-current"), published_at="2026-10-01T00:00:00Z", updated_at=None,
+                      observed_at="2026-09-01T00:00:00Z")
+    pending = _native("ordinary-pending")
+    for unit in (archive, current):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage="CANDIDATE_ADMITTED", facts={
+            "candidate_version_id": "candidate:" + unit.item_key,
+            "graphiti_receipts": [{"retained": True}],
+        })
+    journal.land((pending,))
+    original = pipeline._publish.advance
+    def publish(**kwargs):
+        result = original(**kwargs)
+        now[0] += 301
+        return result
+    pipeline._publish = NS(advance=publish)
+    def graphiti(units, *, defer_before_unit, **kwargs):
+        for unit in units:
+            defer_before_unit(unit)
+        return tuple(NativeGraphitiOutcome(unit.ingest_id, "GRAPHITI_DEFERRED", None, "ROUTE_HOLD") for unit in units)
+    pipeline._graphiti = NS(advance=graphiti)
+    try:
+        pipeline.tick(cycle_id="ordinary-current")
+        assert [revision for kind, revision in calls if kind == "publish"] == [current.revision_id]
+        assert journal.progress[archive.revision_id]["stage"] == "CANDIDATE_ADMITTED"
+        assert pipeline._spill_archive_turn is True
+        pipeline.tick(cycle_id="ordinary-archive")
+        assert [revision for kind, revision in calls if kind == "publish"] == [current.revision_id, archive.revision_id]
+        assert set(journal.units) == {archive.revision_id, current.revision_id, pending.revision_id}
+    finally:
+        connection.close()
+
+
+def test_ordinary_current_turn_settles_unknown_before_fresh_ready_work(tmp_path, monkeypatch):
+    pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    unknown = replace(_native("ordinary-unknown"), published_at="2021-01-01T00:00:00Z", updated_at=None)
+    current = replace(_native("ordinary-fresh"), published_at="2026-10-01T00:00:00Z", updated_at=None)
+    for unit, stage in ((current, "CANDIDATE_ADMITTED"), (unknown, "ASSESSMENT_INTERRUPTED")):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage=stage, facts={
+            "candidate_version_id": "candidate:" + unit.item_key,
+            "graphiti_receipts": [{"retained": True}],
+        })
+    try:
+        pipeline.tick(cycle_id="ordinary-unknown-first")
+        assert [revision for kind, revision in calls if kind == "publish"] == [unknown.revision_id, current.revision_id]
+    finally:
+        connection.close()
+
+
+def test_ordinary_only_progress_alternates_without_a_pending_cohort(tmp_path, monkeypatch):
+    pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+    dispositions[0] = ()
+    archive = replace(_native("ordinary-only-archive"), updated_at="2021-01-01T00:00:00Z")
+    current = replace(_native("ordinary-only-current"), updated_at="2026-10-01T00:00:00Z")
+    for unit in (archive, current):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage="CANDIDATE_ADMITTED", facts={
+            "candidate_version_id": "candidate:" + unit.item_key,
+            "graphiti_receipts": [{"retained": True}],
+        })
+    original = pipeline._publish.advance
+    def publish(**kwargs):
+        result = original(**kwargs)
+        now[0] += 301
+        return result
+    pipeline._publish = NS(advance=publish)
+    try:
+        pipeline.tick(cycle_id="ordinary-only-current")
+        assert pipeline._spill_archive_turn is True
+        pipeline.tick(cycle_id="ordinary-only-archive")
+        assert [revision for kind, revision in calls if kind == "publish"] == [current.revision_id, archive.revision_id]
+        assert pipeline._spill_archive_turn is False
+    finally:
+        connection.close()
+
+
+def test_ordinary_unchanged_hold_does_not_consume_current_preference(tmp_path, monkeypatch):
+    pipeline, journal, connection, units, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    unit = units[0]
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="CANDIDATE_ADMITTED", facts={
+        "candidate_version_id": "candidate:" + unit.item_key,
+        "graphiti_receipts": [{"retained": True}],
+    })
+    before = journal.progress[unit.revision_id]
+    pipeline._publish = NS(advance=lambda **kwargs: None)
+    try:
+        pipeline.tick(cycle_id="ordinary-unchanged")
+        assert journal.progress[unit.revision_id] is before
+        assert pipeline._spill_archive_turn is False
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("mutate_public_ordinal", (False, True))
+def test_ordinary_deduplicated_journal_hold_does_not_consume_turn(tmp_path, monkeypatch, mutate_public_ordinal):
+    pipeline, journal, connection, units, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    unit = units[0]
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="DISCOVERY_HOLD", facts={
+        "graphiti_receipts": [{"retained": True}], "reason": "SOURCE_HOLD",
+    })
+    before_ordinal = journal._records[unit.revision_id].ordinal
+    if mutate_public_ordinal:
+        journal.progress[unit.revision_id]["ordinal"] = 999
+    pipeline._discovery = NS(
+        deliver=lambda unit, **kwargs: unit,
+        admit_lead=lambda *args, **kwargs: NS(lead=None, phase=NS(value="SOURCE_HOLD")),
+    )
+    try:
+        pipeline.tick(cycle_id="ordinary-deduplicated")
+        assert journal._records[unit.revision_id].ordinal == before_ordinal
+        assert pipeline._spill_archive_turn is False
+    finally:
+        connection.close()
+
+
+def test_ordinary_recovery_progress_consumes_turn_before_checked_partition_removal(tmp_path, monkeypatch):
+    pipeline, journal, connection, units, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    unit = units[0]
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+        "candidate_version_id": "candidate:" + unit.item_key,
+        "graphiti_receipts": [{"retained": True}], "failure_class": "NativeEvidenceError",
+    })
+    def recover(revision_ids, *, before_revision):
+        assert before_revision()
+        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
+            **journal.progress[unit.revision_id]["facts"], "reason": "ASSESSOR_PRE_DISPATCH_HOLD",
+        })
+        return (unit.revision_id,)
+    pipeline._publish = NS(recover_pre_dispatch=recover, advance=lambda **kwargs: pytest.fail("duplicate ordinary turn"))
+    try:
+        pipeline.tick(cycle_id="ordinary-recovery-turn")
+        assert journal._records[unit.revision_id].ordinal == 2
+        assert pipeline._spill_archive_turn is True
+    finally:
+        connection.close()

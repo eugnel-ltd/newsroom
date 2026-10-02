@@ -125,11 +125,17 @@ class NativePipeline:
             else:
                 cohort = ordinary
             cohort.append((revision_id, units))
-        # Interrupted/unknown effects settle before starting ordinary work. Each
-        # turn has the existing quantum; an atomic revision may overrun it.
+        # Use the same current/archive turn for already-admitted downstream
+        # work; recent source updates must not wait behind old recovery backlog.
+        if not self._spill_archive_turn:
+            ordinary.sort(key=_source_update_time, reverse=True)
+        # Interrupted/unknown effects still settle before ordinary work. The
+        # stable sort preserves source recency, or LAND order on archive turns.
+        # Each turn has the existing quantum; an atomic revision may overrun it.
         ordinary.sort(key=lambda item: self._journal.progress.get(item[0], {}).get("stage")
                       not in {"ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
         ordinary_deadline = self._monotonic_clock() + self._reassessment_quantum
+        ordinary_before = {revision: self._journal.progress_ordinal(revision) for revision, _ in ordinary}
         recover = getattr(self._publish, "recover_pre_dispatch", None)
         if callable(recover):
             def before_recovery() -> bool:
@@ -147,6 +153,10 @@ class NativePipeline:
         deadline_deferred_ready = self._advance_revisions(
             tuple(ordinary),
             work_deadline=ordinary_deadline,
+        )
+        ordinary_turn_taken = any(
+            self._journal.progress_ordinal(revision) != previous
+            for revision, previous in ordinary_before.items()
         )
         self._drain_between_work()
         # Reuse one current/archive preference for pending and ready work.
@@ -245,9 +255,9 @@ class NativePipeline:
             ready_spill + tuple(reassessments),
             work_deadline=self._monotonic_clock() + self._reassessment_quantum,
         )
-        if pending_turn_taken or len(deferred) < len(ready_spill):
+        if ordinary_turn_taken or pending_turn_taken or len(deferred) < len(ready_spill):
             # Consume the shared preference at most once after eligible pending
-            # work, newly completed admission or an actual ready-spill turn.
+            # work, ordinary progress or an actual ready-spill turn.
             # Restart resets this preference, never retained work.
             self._spill_archive_turn = not self._spill_archive_turn
         self._drain_between_work()
