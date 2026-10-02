@@ -35,12 +35,14 @@ def select_candidates(conn: sqlite3.Connection) -> int:
     from ._projection_retention import retired_ignored_attempt
     from ._projection_store import _ProjectionAuthorityStore
 
+    # Visit each generation's state range once, then its exact event-ID key.
+    # An event-first plan repeats the whole state range for every ledger event.
     conn.execute("""CREATE TEMP TABLE _retirement_candidates AS
         SELECT e.event_id,e.command_id,e.payload_id,e.authentication_context_id,
                e.authorization_request_digest,e.authorization_decision_id,
                s.generation_id,s.ledger_seq AS source_seq
-        FROM projection_generations g JOIN projection_delivery_states s ON s.generation_id=g.generation_id
-        JOIN ledger_events e ON e.event_id=s.last_authority_event_id
+        FROM projection_generations g CROSS JOIN projection_delivery_states s ON s.generation_id=g.generation_id
+        CROSS JOIN ledger_events e ON e.event_id=s.last_authority_event_id
         WHERE g.state='RETIRED' AND s.current_outcome='IGNORED_OPTIONAL'
           AND s.required=0 AND s.finalized=1 AND s.attempt_count=1 AND s.last_error_code IS NULL
           AND e.retired_header_digest IS NULL
