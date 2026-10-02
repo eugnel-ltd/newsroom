@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import perf_counter_ns, process_time_ns
 from pathlib import Path
 from typing import ContextManager
 
@@ -42,6 +43,36 @@ from .model_usage import ModelUsageAdmissionError, ModelUsageService, reported_o
 from .native_cycle import _uuid4_for
 from .store import append_ledger, graphiti_failure_state
 from .veto import OperatorDrainRequested, VetoError
+from .diagnostic_logging import emit_diagnostic
+
+
+@contextmanager
+def _native_phase(phase: str, *, cycle_id: str, cohort_count: int):
+    """Optional inclusive wall/process CPU timing, never admission evidence."""
+    started = None
+    try:
+        started = (perf_counter_ns(), process_time_ns())
+    except Exception:
+        pass
+    status, failure = "FAILED", "NONE"
+    try:
+        yield
+        status = "COMPLETE"
+    except BaseException as exc:
+        failure = type(exc).__name__
+        raise
+    finally:
+        if started is not None:
+            try:
+                emit_diagnostic("native_graphiti_phase", {
+                    "phase": phase, "cycle_id": cycle_id[:128], "cohort_count": cohort_count,
+                    "status": status, "failure_class": failure,
+                    "elapsed_ms": (perf_counter_ns() - started[0]) // 1_000_000,
+                    "cpu_ms": (process_time_ns() - started[1]) // 1_000_000,
+                    "cpu_scope": "PROCESS", "nested_spans_not_additive": True,
+                })
+            except Exception:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,118 +399,19 @@ class NativeGraphitiProcessor:
                 continue
             pending.append((cohort_id, exact))
         if pending:
-            if self._operator_drain_requested():
-                raise OperatorDrainRequested
-            self._stop_check()
-            admission_ready = []
-            queued = {}
-            for cohort_id, exact in pending:
-                try:
-                    self._admission.enqueue_complete_receipts(
-                        ingest_ids=exact
-                    )
-                except GraphitiAdmissionConsumerError as exc:
-                    for ingest in exact:
-                        statuses[ingest] = NativeGraphitiOutcome(
-                            ingest,
-                            "ADMISSION_HOLD",
-                            statuses[ingest].receipt_digest,
-                            str(exc),
-                        )
-                else:
-                    admission_ready.append((cohort_id, exact))
-                    queued[cohort_id] = self._connection.execute(
-                        "SELECT count(*) FROM unpublished_graphiti_admission_queue "
-                        "WHERE ingest_id IN ("
-                        + ",".join("?" for _ in exact)
-                        + ")",
-                        exact,
-                    ).fetchone()[0]
-            combined = tuple(
-                sorted(
-                    ingest
-                    for _, exact in admission_ready
-                    for ingest in exact
-                )
-            )
-            if not combined:
-                return tuple(statuses[ingest_id] for ingest_id in units_by_ingest)
-            self._admission.drain(
-                worker_id=cycle_id,
-                limit=max(1, sum(queued.values())),
-                ingest_ids=combined,
-            )
-            if self._operator_drain_requested():
-                raise OperatorDrainRequested
-            ready = []
-            with self._dispatch_fence():
-                for cohort_id, exact in admission_ready:
-                    if all(
-                        self._rights(units_by_ingest[ingest]) is not None
-                        for ingest in exact
-                    ):
-                        ready.append((cohort_id, exact))
-                    else:
-                        for ingest in exact:
-                            statuses[ingest] = NativeGraphitiOutcome(
-                                ingest,
-                                "ADMISSION_HOLD",
-                                statuses[ingest].receipt_digest,
-                                "CURRENT_RIGHTS_HOLD",
+            with _native_phase("ADMISSION", cycle_id=cycle_id, cohort_count=len(pending)):
+                if self._operator_drain_requested():
+                    raise OperatorDrainRequested
+                self._stop_check()
+                with _native_phase("QUEUE_AND_DECIDE", cycle_id=cycle_id, cohort_count=len(pending)):
+                    admission_ready = []
+                    queued = {}
+                    for cohort_id, exact in pending:
+                        try:
+                            self._admission.enqueue_complete_receipts(
+                                ingest_ids=exact
                             )
-                verified = []
-                for cohort_id, exact in ready:
-                    try:
-                        self._admission.preflight_decided_cohort(
-                            ingest_ids=exact
-                        )
-                    except GraphitiAdmissionConsumerError as exc:
-                        for ingest in exact:
-                            statuses[ingest] = NativeGraphitiOutcome(
-                                ingest,
-                                "ADMISSION_HOLD",
-                                statuses[ingest].receipt_digest,
-                                str(exc),
-                            )
-                    else:
-                        verified.append((cohort_id, exact))
-                ready = verified
-                if ready:
-                    final_ids = tuple(
-                        sorted(ingest for _, exact in ready for ingest in exact)
-                    )
-                    try:
-                        self._admission.finalise_decided_cohort(
-                            ingest_ids=final_ids
-                        )
-                        if (
-                            not sum(queued[cohort_id] for cohort_id, _ in ready)
-                            and not self._has_active_generation()
-                        ):
-                            # Zero proposals need no new entity/relation graph,
-                            # but a fresh native pipeline needs its first graph
-                            # for downstream retrieval. Retain the real build.
-                            frontier = digest_canonical(final_ids)
-                            generation_id = ProjectionGenerationId.parse(
-                                _uuid4_for({"native_zero_proposal_cohort": frontier})
-                            )
-                            built = self._system.increment4.build_current_and_promote(
-                                Increment4Neo4jCurrentBuildRequest(
-                                    generation_id,
-                                    "NATIVE_ZERO_PROPOSAL_COHORT",
-                                    f"native-empty-cohort:{frontier}",
-                                ),
-                                proof=self._proof,
-                            )
-                            if (
-                                built.generation.state
-                                is not ProjectionGenerationState.ACTIVE
-                            ):
-                                raise GraphitiAdmissionConsumerError(
-                                    "native empty-cohort graph is not active"
-                                )
-                    except GraphitiAdmissionConsumerError as exc:
-                        for _, exact in ready:
+                        except GraphitiAdmissionConsumerError as exc:
                             for ingest in exact:
                                 statuses[ingest] = NativeGraphitiOutcome(
                                     ingest,
@@ -487,18 +419,121 @@ class NativeGraphitiProcessor:
                                     statuses[ingest].receipt_digest,
                                     str(exc),
                                 )
-                        ready = []
-            for _, exact in ready:
-                self._cohort_state(exact, "COMPLETE")
-                for ingest in exact:
-                    statuses[ingest] = NativeGraphitiOutcome(
-                        ingest,
-                        "GRAPHITI_COMPLETE",
-                        statuses[ingest].receipt_digest,
-                        None,
+                        else:
+                            admission_ready.append((cohort_id, exact))
+                            queued[cohort_id] = self._connection.execute(
+                                "SELECT count(*) FROM unpublished_graphiti_admission_queue "
+                                "WHERE ingest_id IN ("
+                                + ",".join("?" for _ in exact)
+                                + ")",
+                                exact,
+                            ).fetchone()[0]
+                    combined = tuple(
+                        sorted(
+                            ingest
+                            for _, exact in admission_ready
+                            for ingest in exact
+                        )
                     )
-            if self._operator_drain_requested():
-                raise OperatorDrainRequested
+                    if not combined:
+                        return tuple(statuses[ingest_id] for ingest_id in units_by_ingest)
+                    self._admission.drain(
+                        worker_id=cycle_id,
+                        limit=max(1, sum(queued.values())),
+                        ingest_ids=combined,
+                    )
+                if self._operator_drain_requested():
+                    raise OperatorDrainRequested
+                ready = []
+                with self._dispatch_fence():
+                    for cohort_id, exact in admission_ready:
+                        if all(
+                            self._rights(units_by_ingest[ingest]) is not None
+                            for ingest in exact
+                        ):
+                            ready.append((cohort_id, exact))
+                        else:
+                            for ingest in exact:
+                                statuses[ingest] = NativeGraphitiOutcome(
+                                    ingest,
+                                    "ADMISSION_HOLD",
+                                    statuses[ingest].receipt_digest,
+                                    "CURRENT_RIGHTS_HOLD",
+                                )
+                    with _native_phase("PREFLIGHT", cycle_id=cycle_id, cohort_count=len(pending)):
+                        verified = []
+                        for cohort_id, exact in ready:
+                            try:
+                                self._admission.preflight_decided_cohort(
+                                    ingest_ids=exact
+                                )
+                            except GraphitiAdmissionConsumerError as exc:
+                                for ingest in exact:
+                                    statuses[ingest] = NativeGraphitiOutcome(
+                                        ingest,
+                                        "ADMISSION_HOLD",
+                                        statuses[ingest].receipt_digest,
+                                        str(exc),
+                                    )
+                            else:
+                                verified.append((cohort_id, exact))
+                        ready = verified
+                    if ready:
+                        final_ids = tuple(
+                            sorted(ingest for _, exact in ready for ingest in exact)
+                        )
+                        try:
+                            with _native_phase("FINALISE", cycle_id=cycle_id, cohort_count=len(ready)):
+                                self._admission.finalise_decided_cohort(
+                                    ingest_ids=final_ids
+                                )
+                                if (
+                                    not sum(queued[cohort_id] for cohort_id, _ in ready)
+                                    and not self._has_active_generation()
+                                ):
+                                    # Zero proposals need no new entity/relation graph,
+                                    # but a fresh native pipeline needs its first graph
+                                    # for downstream retrieval. Retain the real build.
+                                    frontier = digest_canonical(final_ids)
+                                    generation_id = ProjectionGenerationId.parse(
+                                        _uuid4_for({"native_zero_proposal_cohort": frontier})
+                                    )
+                                    built = self._system.increment4.build_current_and_promote(
+                                        Increment4Neo4jCurrentBuildRequest(
+                                            generation_id,
+                                            "NATIVE_ZERO_PROPOSAL_COHORT",
+                                            f"native-empty-cohort:{frontier}",
+                                        ),
+                                        proof=self._proof,
+                                    )
+                                    if (
+                                        built.generation.state
+                                        is not ProjectionGenerationState.ACTIVE
+                                    ):
+                                        raise GraphitiAdmissionConsumerError(
+                                            "native empty-cohort graph is not active"
+                                        )
+                        except GraphitiAdmissionConsumerError as exc:
+                            for _, exact in ready:
+                                for ingest in exact:
+                                    statuses[ingest] = NativeGraphitiOutcome(
+                                        ingest,
+                                        "ADMISSION_HOLD",
+                                        statuses[ingest].receipt_digest,
+                                        str(exc),
+                                    )
+                            ready = []
+                for _, exact in ready:
+                    self._cohort_state(exact, "COMPLETE")
+                    for ingest in exact:
+                        statuses[ingest] = NativeGraphitiOutcome(
+                            ingest,
+                            "GRAPHITI_COMPLETE",
+                            statuses[ingest].receipt_digest,
+                            None,
+                        )
+                if self._operator_drain_requested():
+                    raise OperatorDrainRequested
         return tuple(statuses[ingest_id] for ingest_id in units_by_ingest)
 
     def _has_active_generation(self) -> bool:
