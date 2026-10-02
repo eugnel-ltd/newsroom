@@ -76,7 +76,7 @@ def test_retirement_excludes_non_disposable_delivery(tmp_path, case):
 
 
 @pytest.mark.parametrize("reference", ["event", "command", "request", "attempt", "cas", "escaped"])
-def test_retirement_honours_external_and_nested_reference_roots(tmp_path, reference):
+def test_destructive_retirement_keeps_external_bytes_but_expires_diagnostic_links(tmp_path, reference):
     root, path, request, result = _fixture(tmp_path)
     with sqlite3.connect(path) as conn:
         row = conn.execute("SELECT command_id,authorization_request_digest FROM ledger_events WHERE event_id=?", (str(result.authority_event_id),)).fetchone()
@@ -90,9 +90,15 @@ def test_retirement_honours_external_and_nested_reference_roots(tmp_path, refere
     else:
         with sqlite3.connect(root / "unpublished_store.sqlite3") as conn:
             conn.execute("INSERT INTO retained_receipts VALUES (?)", (payload,))
-    assert retention.retire_native_projection_diagnostics(root, apply=True)["retired_projection_chains"] == 0
+    assert retention.retire_native_projection_diagnostics(root, apply=True)["retired_projection_chains"] == 1
+    if reference == "cas":
+        assert (root / "increment4/object_cas/receipt").read_bytes() == payload
+    else:
+        with sqlite3.connect(root / "unpublished_store.sqlite3") as conn:
+            assert conn.execute("SELECT payload FROM retained_receipts").fetchone()[0] == payload
     with open_projection_system(path) as system:
-        assert system.projections.record_delivery(request, proof=proof()) == result
+        with pytest.raises(DiagnosticHistoryExpired):
+            system.projections.record_delivery(request, proof=proof())
 
 
 def test_reserved_namespace_key_denies_changed_generation_and_native_insert(tmp_path):
@@ -124,17 +130,16 @@ def test_retired_digest_corruption_is_rejected_on_reopen(tmp_path):
 
 
 def test_retirement_transaction_rolls_back_rows_and_guards(tmp_path, monkeypatch):
+    from newsroom.authority import projection_retirement
+
     root, path, request, result = _fixture(tmp_path)
     before = _snapshot(path)
-    original = retention._fingerprint
-    calls = 0
-    def changed(paths):
-        nonlocal calls
-        calls += 1
-        value = original(paths)
-        return value if calls <= 2 else value + (("changed",),)
-    monkeypatch.setattr(retention, "_fingerprint", changed)
-    with pytest.raises(retention.AuditRetentionError, match="changed"):
+    original = projection_retirement.expire_candidates
+    def fail_after_deletion(connection):
+        original(connection)
+        raise RuntimeError("injected failure after diagnostic deletion")
+    monkeypatch.setattr(projection_retirement, "expire_candidates", fail_after_deletion)
+    with pytest.raises(RuntimeError, match="after diagnostic deletion"):
         retention.retire_native_projection_diagnostics(root, apply=True)
     assert _snapshot(path) == before
     with open_projection_system(path) as system:
@@ -192,8 +197,7 @@ def test_shared_authentication_parent_survives_chain_expiry(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("fault", ["payload", "audit", "version", "authentication", "request", "decision", "source"])
-def test_retirement_does_not_dispose_of_corrupt_candidate_authority(tmp_path, fault):
-    from newsroom.authority import AuthorityPersistenceError
+def test_destructive_retirement_does_not_reaudit_obsolete_diagnostic_detail(tmp_path, fault):
     root, path, _, result = _fixture(tmp_path)
     tables = {"payload": "authority_payloads", "audit": "authority_audit_events", "version": "authority_aggregate_versions",
               "authentication": "authentication_contexts", "request": "authorization_requests", "decision": "authorization_decisions", "source": "projection_delivery_states"}
@@ -215,10 +219,9 @@ def test_retirement_does_not_dispose_of_corrupt_candidate_authority(tmp_path, fa
         conn.execute(f"UPDATE {table} SET {field}=? WHERE {key}=?", (new, value))
         for _, sql in guards:
             conn.execute(sql)
-    with pytest.raises((AuthorityPersistenceError, retention.AuditRetentionError)):
-        retention.retire_native_projection_diagnostics(root, apply=True)
+    assert retention.retire_native_projection_diagnostics(root, apply=True)["retired_projection_chains"] == 1
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT retired_header_digest FROM ledger_events WHERE event_id=?", (str(result.authority_event_id),)).fetchone()[0] is None
+        assert conn.execute("SELECT retired_header_digest FROM ledger_events WHERE event_id=?", (str(result.authority_event_id),)).fetchone()[0] is not None
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -341,13 +344,13 @@ def test_current_optional_delivery_can_consume_expired_routing_identity(tmp_path
         pass
 
 
-def test_pinned_older_checkpoint_never_masquerades_as_current_expired_checkpoint(tmp_path):
+def test_discarded_checkpoint_history_never_masquerades_as_current(tmp_path):
     from newsroom.authority._projection_store import _ProjectionAuthorityStore
     root, path, request, _ = _fixture(tmp_path)
-    # Creation remains a full provenance root, so its older checkpoint stays.
+    # The retired diagnostic history is deliberately gone, not a current head.
     retention.retire_native_projection_diagnostics(root, apply=True)
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        assert conn.execute("SELECT 1 FROM projection_checkpoint_versions WHERE generation_id=?", (str(request.generation_id),)).fetchone() is not None
+        assert conn.execute("SELECT 1 FROM projection_checkpoint_versions WHERE generation_id=?", (str(request.generation_id),)).fetchone() is None
         with pytest.raises(DiagnosticHistoryExpired, match="checkpoint history expired"):
             _ProjectionAuthorityStore._checkpoint_seq(None, conn, str(request.generation_id))

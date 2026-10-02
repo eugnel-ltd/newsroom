@@ -8,8 +8,8 @@ from .canonical import digest_canonical
 from .projection_retirement_migrations import RETIRED_FIELDS, retired_record_digest
 
 
-# These are provisional disposable rows, not reference roots. Any retained
-# FK, causation, receipt or nested token below removes its candidate first.
+# These are disposable diagnostics. Current local FK, causation and watermark
+# consumers still protect their required rows; historical opaque links expire.
 _EXCLUSIONS = {
     "ledger_events": "event_id IN (SELECT event_id FROM _retirement_candidates)",
     "authority_commands": "command_id IN (SELECT command_id FROM _retirement_candidates)",
@@ -31,10 +31,6 @@ def retained_condition(table: str) -> str:
 
 
 def select_candidates(conn: sqlite3.Connection) -> int:
-    from .audit_retention import AuditRetentionError
-    from ._projection_retention import retired_ignored_attempt
-    from ._projection_store import _ProjectionAuthorityStore
-
     # Visit each generation's state range once, then its exact event-ID key.
     # An event-first plan repeats the whole state range for every ledger event.
     conn.execute("""CREATE TEMP TABLE _retirement_candidates AS
@@ -63,29 +59,6 @@ def select_candidates(conn: sqlite3.Connection) -> int:
         WHERE g.state='RETIRED' AND EXISTS(SELECT 1 FROM _retirement_candidates x WHERE x.generation_id=g.generation_id)
     """)
     conn.execute("CREATE UNIQUE INDEX _retirement_checkpoint_key ON _retirement_checkpoints(generation_id,checkpoint_version)")
-    # Authenticate the exact retained reconstruction, whether the dispensable
-    # attempt is still present or was already elided by earlier maintenance.
-    previous_factory = conn.row_factory
-    conn.row_factory = sqlite3.Row
-    try:
-        for event_id, generation_id, sequence in conn.execute(
-            "SELECT event_id,generation_id,source_seq FROM _retirement_candidates"
-        ):
-            state = conn.execute("SELECT * FROM projection_delivery_states WHERE generation_id=? AND ledger_seq=?", (generation_id, sequence)).fetchone()
-            _ProjectionAuthorityStore._require_delivery_source_integrity(conn, state)
-            reconstructed = retired_ignored_attempt(conn, event_id)
-            cursor = conn.execute(
-                "SELECT * FROM projection_delivery_attempts WHERE generation_id=? AND ledger_seq=?",
-                (generation_id, sequence),
-            )
-            names = tuple(column[0] for column in cursor.description)
-            attempts = cursor.fetchall()
-            if (reconstructed is None or len(attempts) > 1
-                    or any(reconstructed.get(name) != value for row in attempts
-                           for name, value in zip(names, row, strict=True) if name != "delivery_attempt_id")):
-                raise AuditRetentionError("retired projection candidate differs from exact authority")
-    finally:
-        conn.row_factory = previous_factory
     return int(conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0])
 
 
@@ -102,23 +75,8 @@ def protect_candidates(conn: sqlite3.Connection) -> int:
         ON e.ledger_seq=json_extract(CAST(v.canonical_bytes AS TEXT),'$.source_watermark_ledger_seq')
         UNION SELECT e.event_id FROM ledger_events e JOIN hybrid_retrieval_attempts r ON e.ledger_seq=r.authority_watermark
     )""")
-    # The protected tokens include external stores/CAS and retained business
-    # rows, not candidates' obsolete copies of their own identities.
-    conn.execute("""DELETE FROM _retirement_checkpoints WHERE authority_event_id IN (SELECT id FROM _audit_tokens)""")
     while True:
         before = int(conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0])
-        conn.execute("""DELETE FROM _retirement_candidates WHERE
-            event_id IN (SELECT id FROM _audit_tokens) OR command_id IN (SELECT id FROM _audit_tokens)
-            OR payload_id IN (SELECT id FROM _audit_tokens)
-            OR authorization_request_digest IN (SELECT id FROM _audit_tokens)
-            OR authorization_request_digest IN (SELECT request_digest FROM authorization_requests WHERE canonical_record_digest IN (SELECT id FROM _audit_tokens))
-            OR event_id IN (SELECT authority_event_id FROM projection_delivery_attempts WHERE delivery_attempt_id IN (SELECT id FROM _audit_tokens))
-            OR command_id IN (SELECT command_id FROM authority_commands WHERE result_digest IN (SELECT id FROM _audit_tokens)
-                OR stable_semantic_request_digest IN (SELECT id FROM _audit_tokens))
-            OR command_id IN (SELECT command_id FROM authority_audit_events WHERE audit_id IN (SELECT id FROM _audit_tokens)
-                OR detail_digest IN (SELECT id FROM _audit_tokens))
-            OR payload_id IN (SELECT payload_id FROM authority_payloads WHERE payload_digest IN (SELECT id FROM _audit_tokens))
-        """)
         for parent, key, candidate_key in (
             ("ledger_events", "event_id", "event_id"),
             ("authority_commands", "command_id", "command_id"),
@@ -150,32 +108,12 @@ def protect_candidates(conn: sqlite3.Connection) -> int:
     return initial - int(conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0])
 
 
-def _validation_reader(conn: sqlite3.Connection):
-    """Reuse exact event closure checks over the already writer-owned transaction."""
-    import threading
-    from ._event_store import _EventAuthorityStore
-    from .policy import CommandRegistry, PayloadSchemaRegistry
-    from newsroom.projection.policy import projection_command_definitions, projection_payload_contracts
-
-    reader = object.__new__(_EventAuthorityStore)
-    reader._conn, reader._closed, reader._lock = conn, False, threading.RLock()
-    reader._command_registry = CommandRegistry(projection_command_definitions())
-    reader._payload_schemas = PayloadSchemaRegistry(projection_payload_contracts())
-    return reader
-
-
-def _authenticate_chain(conn: sqlite3.Connection, event_id: str, reader):
-    reader._validate_retained_event(event_id)
-    event = conn.execute("SELECT * FROM ledger_events WHERE event_id=?", (event_id,)).fetchone()
-    command = conn.execute("SELECT * FROM authority_commands WHERE command_id=?", (event["command_id"],)).fetchone()
-    return event, command, reader._event_from_row(event)
-
-
 def expire_candidates(conn: sqlite3.Connection) -> dict[str, int]:
     from .audit_retention import _index_children, _q, _unreferenced
+    from ._event_store_read import _EventStoreReadMixin
 
     # This operation is called only inside the writer-owned transaction and
-    # checked reference closure. Ordinary writes retain all immutable guards.
+    # local reference protection. Ordinary writes retain all immutable guards.
     changed_tables = tuple(_EXCLUSIONS) + ("projection_generations",)
     guards = tuple(conn.execute(
         "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name IN (" + ",".join("?" for _ in changed_tables) + ") AND (sql LIKE '%BEFORE DELETE%' OR name IN ('immutable_ledger_events_update','projection_generation_update_guard','projection_diagnostic_expiry_update_guard'))",
@@ -188,16 +126,21 @@ def expire_candidates(conn: sqlite3.Connection) -> dict[str, int]:
     conn.execute("PRAGMA defer_foreign_keys=ON")
     previous_factory = conn.row_factory
     conn.row_factory = sqlite3.Row
-    reader = _validation_reader(conn)
     try:
-        for (event_id,) in conn.execute("SELECT event_id FROM _retirement_candidates ORDER BY event_id"):
-            event, command, header = _authenticate_chain(conn, event_id, reader)
+        # Stream original headers once; obsolete diagnostic payload/security
+        # history is deliberately discarded rather than reconstructed or audited.
+        for event in conn.execute("""SELECT e.*,c.idempotency_namespace AS expired_namespace,
+                c.idempotency_key AS expired_key
+            FROM ledger_events e CROSS JOIN _retirement_candidates x ON x.event_id=e.event_id
+            CROSS JOIN authority_commands c ON c.command_id=e.command_id
+            ORDER BY e.ledger_seq"""):
+            header = _EventStoreReadMixin._event_from_row(event)
             row = {name: event[name] for name in RETIRED_FIELDS if name not in {"retired_namespace", "retired_key"}}
-            row.update(retired_namespace=command["idempotency_namespace"], retired_key=command["idempotency_key"], retired_header_digest=bytes.fromhex(digest_canonical(asdict(header))[7:]))
+            row.update(retired_namespace=event["expired_namespace"], retired_key=event["expired_key"], retired_header_digest=bytes.fromhex(digest_canonical(asdict(header))[7:]))
             conn.execute(
                 "UPDATE ledger_events SET " + ",".join(name + "=NULL" for name in removed)
-                + ",retired_header_digest=?,retired_namespace=?,retired_key=?,retired_record_digest=? WHERE event_id=?",
-                (row["retired_header_digest"], row["retired_namespace"], row["retired_key"], retired_record_digest(row), event_id),
+                + ",retired_header_digest=?,retired_namespace=?,retired_key=?,retired_record_digest=? WHERE ledger_seq=?",
+                (row["retired_header_digest"], row["retired_namespace"], row["retired_key"], retired_record_digest(row), event["ledger_seq"]),
             )
     finally:
         conn.row_factory = previous_factory
@@ -221,10 +164,9 @@ def expire_candidates(conn: sqlite3.Connection) -> dict[str, int]:
             }[table]
             children = _index_children(conn, table, indexes, key=key)
             if table == "authority_payloads":
-                condition += " AND NOT EXISTS(SELECT 1 FROM _audit_tokens t WHERE t.id=authority_payloads.payload_id OR t.id=authority_payloads.payload_digest)"
                 condition += "".join(f" AND NOT EXISTS(SELECT 1 FROM {_q(child)} WHERE {_q(column)}=authority_payloads.payload_id)" for child, column in children)
             else:
-                condition += " AND " + _unreferenced(table, children)
+                condition += " AND " + _unreferenced(table, children, opaque_tokens=False)
         conn.execute(f"DELETE FROM {_q(table)} WHERE {condition}")
         deleted[table] = int(conn.execute("SELECT changes()").fetchone()[0])
     for name in indexes:

@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true",
                         help="Prune verified obsolete diagnostics and VACUUM in place; default is read-only inspection")
     parser.add_argument("--retired-projection-chains", action="store_true",
-                        help="Expire checked RETIRED single-final optional ignored diagnostic chains; retain namespace/key reservations")
+                        help="Destructively expire RETIRED optional ignored diagnostic chains; old diagnostic links may expire; retain namespace/key reservations")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     maintenance = retire_native_projection_diagnostics if args.retired_projection_chains else prune_native_diagnostic_audit
