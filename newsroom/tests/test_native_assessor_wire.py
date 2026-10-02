@@ -339,3 +339,60 @@ def test_current_selection_preserves_no_news_and_closed_source_contract(mutation
     else:
         with pytest.raises(SourceReferenceError):
             _materialise_reference_result(wire,view,'current-request',VERSION)
+
+
+def test_exact_v21_status_hold_replays_and_has_independent_status_qualification():
+    from dataclasses import replace
+    from pathlib import Path
+    from newsroom.control_plane.admission import _qualification_relation_is_proven
+    from newsroom.control_plane.evidence import QualificationEvidence
+    from newsroom.control_plane.native_assessor import _materialise_reference_result
+    from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
+    from newsroom.control_plane.native_weather_evidence import hko_evidence_body
+    from newsroom.increment10.evidence import _package_from_value
+
+    fixture = json.loads((Path(__file__).parent / 'fixtures/native_assessor_v21_status_hold.json').read_text())
+    body = hko_evidence_body(fixture['retained_warning_body'].encode()).decode()
+    receipt = fixture['materialisation_receipt']
+    assert digest_bytes(body.encode()) == receipt['body_digests'][0]
+    view = build_lossless_source_view((body,), (fixture['source_id'],))
+    materialised, derived = _materialise_reference_result(
+        fixture['raw_result_text'], view, receipt['request_identity'],
+        'newsroom.native-evidence-assessor.v21',
+    )
+    assert derived == receipt
+    assert materialised['package']['substantive_new_information'] == []
+    assert materialised['package']['qualification_evidence'] == []
+    # Predicate-only witness, not a fresh authority/admission or a rewrite of
+    # settled model output. The exact clause qualifies without an affected group.
+    template = _package_from_value(_retained_headline_fixture()['retained_package']).governed_claims[0]
+    clause = body.splitlines()[2]
+    claim = replace(template, claim=clause, supporting_excerpt=clause)
+    qualification = QualificationEvidence('LAW_RIGHT_STATUS_POLICY', claim.claim_id,
+        digest_bytes(b'fixture-status-qualification'), (
+            ('change_kind', 'STATUS'), ('event_polarity', 'AFFIRMED'),
+            ('change_relation', 'NEW_OR_CHANGED_STATE'),
+            ('material_relation_span', clause), ('new_state', 'issued'),
+        ))
+    assert _qualification_relation_is_proven(qualification, claim, source_context=body)
+    assert 'affected_group' not in dict(qualification.test_evidence)
+    # Metadata/update-only and standing guidance remain non-qualifying.
+    for ordinary in (body.splitlines()[4], 'The warning status remains unchanged.'):
+        assert not _qualification_relation_is_proven(
+            replace(qualification, test_evidence=tuple(
+                (key, ordinary if key == 'material_relation_span' else value)
+                for key, value in qualification.test_evidence
+            )), replace(claim, claim=ordinary, supporting_excerpt=ordinary),
+            source_context=ordinary,
+        )
+
+
+def test_current_prompt_uses_independent_qualification_tests_and_preserves_v21():
+    from newsroom.control_plane.native_assessor import SYSTEM, VERSION, _V21_SYSTEM
+    assert VERSION == 'newsroom.native-evidence-assessor.v22'
+    assert 'qualification tests are independent alternatives' in SYSTEM
+    assert 'STATUS is not restricted to laws, rights or public policy' in SYSTEM
+    assert 'Do not require affected_group for STATUS' in SYSTEM
+    assert 'An update is not a changed warning' in SYSTEM
+    assert 'Ordinary selection notes are not explicit_exclusions' in SYSTEM
+    assert digest_bytes(_V21_SYSTEM.encode()) == 'sha256:e8a8f919488537711b420c6e4ddee1e7bd88adc4b5334d31f514377887ebe2d8'

@@ -20,13 +20,13 @@ from .test_projection_b3_authority import (
 )
 
 
-def _seed(path, *, retire=True, activate=True, kind="ignored"):
+def _seed(path, *, retire=True, activate=True, kind="ignored", required=False, checkpoint_anchor=False):
     with open_projection_system(path) as system:
         _register(system)
         source_seq = 1
         if kind != "ignored":
             source_seq = system.commands.execute(SemanticCommand(
-                command_type="candidate.fixture.write", aggregate_id=AggregateId.new(),
+                command_type="source.item.write" if required else "candidate.fixture.write", aggregate_id=AggregateId.new(),
                 expected_aggregate_version=0, payload=InlinePayload({"headline": "optional", "count": 1}),
                 idempotency_key="optional-source",
             ), proof=proof()).ledger_seq
@@ -35,6 +35,7 @@ def _seed(path, *, retire=True, activate=True, kind="ignored"):
             "applied": (ProjectionDeliveryOutcome.APPLIED,),
             "failure": (ProjectionDeliveryOutcome.RETRYABLE_FAILURE,),
             "multiple": (ProjectionDeliveryOutcome.RETRYABLE_FAILURE, ProjectionDeliveryOutcome.IGNORED_OPTIONAL),
+            "retried_applied": (ProjectionDeliveryOutcome.RETRYABLE_FAILURE, ProjectionDeliveryOutcome.APPLIED),
         }[kind]
         prior = None
         first_request = first_result = None
@@ -52,6 +53,12 @@ def _seed(path, *, retire=True, activate=True, kind="ignored"):
                 result = system.projections.record_delivery(request, proof=proof())
                 if first_request is None:
                     first_request, first_result = request, result
+            if checkpoint_anchor:
+                system.projections.record_delivery(ProjectionDeliveryRequest(
+                    generation.generation_id, current().authority_aggregate_version,
+                    1 if source_seq != 1 else 2, ProjectionDeliveryOutcome.IGNORED_OPTIONAL,
+                    f"checkpoint-anchor-{index}",
+                ), proof=proof())
             if not activate:
                 continue
             with sqlite3.connect(path) as conn:

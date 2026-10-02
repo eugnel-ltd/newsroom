@@ -2084,7 +2084,7 @@ def test_passive_admission_phases_do_not_change_completion_or_ledger(tmp_path,mo
     try:
         outcome,=processor.advance((_native(),),cycle_id='phase-fixture')
         assert outcome.state=='GRAPHITI_COMPLETE'
-        assert {data['phase'] for event,data in events}=={'ADMISSION','QUEUE_AND_DECIDE','PREFLIGHT','FINALISE'}
+        assert {data['phase'] for event,data in events}=={'EXTRACTION','ADMISSION','QUEUE_AND_DECIDE','PREFLIGHT','FINALISE'}
         assert all(event=='native_graphiti_phase' and data['cycle_id']=='phase-fixture'
             and data['status']=='COMPLETE' and type(data['elapsed_ms']) is int
             and type(data['cpu_ms']) is int and data['cpu_scope']=='PROCESS' for event,data in events)

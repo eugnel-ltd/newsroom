@@ -1,0 +1,28 @@
+{
+  "source_id": "HK-02",
+  "revision_id": "f69dcf90-321d-4df5-bc12-c07792eae143",
+  "retained_warning_body": "{\"WRAIN\":{\"actionCode\":\"ISSUE\",\"code\":\"WRAINA\",\"issueTime\":\"2026-10-03T04:00:00+08:00\",\"name\":\"暴雨警告信號\",\"type\":\"黃色\",\"updateTime\":\"2026-10-03T04:00:00+08:00\"}}",
+  "raw_result_text": "{\"package\":{\"categories\":[],\"explicit_exclusions\":[],\"geography\":[],\"governed_claims\":[],\"qualification_evidence\":[],\"select_new_information\":false,\"selection_rationale\":\"The readable HKO sentences state that the 黃色暴雨警告信號 was issued, and that the warning record was issued and updated on 3 October 2026 at 04:00 (香港時間). Those sentences supply the issuance and the matching record time. They contain no complete affirmative clause that also names an affected group and a material safety effect, a disruption duration, a reader action, or a legal or policy new state. The same-time record update is record maintenance alongside the issuance. No governed claim is selected.\"}}",
+  "materialisation_receipt": {
+    "body_digests": [
+      "sha256:31a7c23f90ad59c8525f12ef0a096047007861e5cd456415dbb82128f4e3bff5"
+    ],
+    "claim_entity_order": [],
+    "manifest_digest": "sha256:d1ca6e9609ab2fab2f44935044cbaf44b0c95b4bc81d0d83b95ac8ed3e4852e5",
+    "materialised_text": "{\"package\":{\"categories\":[],\"explicit_exclusions\":[],\"geography\":[],\"governed_claims\":[],\"qualification_evidence\":[],\"selection_rationale\":\"The readable HKO sentences state that the 黃色暴雨警告信號 was issued, and that the warning record was issued and updated on 3 October 2026 at 04:00 (香港時間). Those sentences supply the issuance and the matching record time. They contain no complete affirmative clause that also names an affected group and a material safety effect, a disruption duration, a reader action, or a legal or policy new state. The same-time record update is record maintenance alongside the issuance. No governed claim is selected.\",\"substantive_new_information\":[]}}",
+    "ordered_entities": [
+      [
+        [
+          "香港",
+          "PLACE"
+        ]
+      ]
+    ],
+    "package_digest": "sha256:89568bdc2b066db49b78041be14bbf1a61d0cb9e86ca463b1c3b303df032e18e",
+    "provider_schema_digest": "sha256:19a551165b34c6c8da5fc7332b4c60122e6dda773626d59d85491f76c6d79903",
+    "raw_digest": "sha256:1749d35cc2fae08eef6cbb83f60e331820d310665f2d25491e0e54f89b759f31",
+    "receipt_digest": "sha256:252a0325600b4bb04d2831cc3a6f9e738332a79d59024b068703af98fe3b6598",
+    "request_identity": "sha256:f2e80d146a51af99227d9dc3b5e98f7ccce1be072b6ecb92f0de7e0e8c75b1c3",
+    "version": "newsroom.native-assessor-references.v1"
+  }
+}

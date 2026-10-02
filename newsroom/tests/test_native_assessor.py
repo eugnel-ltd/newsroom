@@ -271,7 +271,7 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     invalid_geography["geography"] = ["Britain"]
     with pytest.raises(ValidationError):
         validator.validate({"package": invalid_geography})
-    assert VERSION == "newsroom.native-evidence-assessor.v21"
+    assert VERSION == "newsroom.native-evidence-assessor.v22"
     assert "ASSESSOR_CLAIM_BINDING_HOLD" in REASSESSABLE_HOLDS
     legacy = native_assessor_module._V17_SYSTEM
     assert "whitespace, newlines and country labels exactly" in legacy
@@ -1520,7 +1520,7 @@ def test_native_assessor_input_bound_has_planning_headroom_not_an_output_limit(
     bound = native_assessment_input_bound(policy)
     assert bound['version'] == INPUT_BOUND_VERSION
     assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v3')
-    assert VERSION.endswith('.v21')
+    assert VERSION.endswith('.v22')
     assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
     assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
     assert bound['schema_digest'] == PROVIDER_SCHEMA_DIGEST
@@ -1535,7 +1535,9 @@ def test_native_assessor_input_bound_has_planning_headroom_not_an_output_limit(
         policy.max_prompt_bytes, policy.max_context_tokens - fixed,
         policy.max_total_tokens - fixed - bound['output_reserve_tokens'],
     )
-    assert bound['max_request_bytes'] == 61_726
+    assert bound['max_request_bytes'] == 61_726 - (
+        len(SYSTEM.encode()) - len(native_assessor_module._V21_SYSTEM.encode())
+    )
     assert native_assessment_input_bound(replace(
         policy, max_prompt_bytes=56_464,
     ))['max_request_bytes'] == 56_464
@@ -2817,7 +2819,7 @@ def test_literal_csv_names_survive_full_assessment_and_governed_records(retained
             AutonomousNativeEvidenceAssessor._validated_execution(NativeAssessmentExecution(canonical_json_bytes(altered).decode(), {}),candidate,base,(source,),(acquired,))
 
 
-def test_v21_profile_preserves_v15_v16_v17_v18_v19_v20_contracts():
+def test_current_profile_preserves_v15_v16_v17_v18_v19_v20_contracts():
     from newsroom.control_plane.native_assessor import (
         _V15_SYSTEM, _V15_SCHEMA_DIGEST, _V15_SCHEMA_BYTES, _V16_SYSTEM,
         _V17_SYSTEM, _V17_PROVIDER_SCHEMA_DIGEST,
@@ -2825,7 +2827,7 @@ def test_v21_profile_preserves_v15_v16_v17_v18_v19_v20_contracts():
         _V19_SYSTEM, _V19_PROVIDER_SCHEMA, _V19_PROVIDER_SCHEMA_DIGEST,
         _V20_SYSTEM, _V20_PROVIDER_SCHEMA, _V20_PROVIDER_SCHEMA_DIGEST,
     )
-    assert VERSION == 'newsroom.native-evidence-assessor.v21'
+    assert VERSION == 'newsroom.native-evidence-assessor.v22'
     assert digest_bytes(_V15_SYSTEM.encode()) == 'sha256:5788c3e827199e12932d106ad494c80b71b2691e3f9c7e535a44c5d09811d4a6'
     assert len(_V15_SYSTEM.encode()) == 6797
     assert SCHEMA_DIGEST == _V15_SCHEMA_DIGEST
@@ -2900,3 +2902,28 @@ def test_frozen_v20_retained_result_replays_under_v21_without_redispatch(tmp_pat
         assert assessor.assess_with_boundary(candidate,base,(),(),before_dispatch=None,cached_only=True) == result
     assert snapshot() == original
     connection.close()
+
+
+def test_v21_input_bound_remains_exact_after_producer_only_prompt_change(tmp_path, monkeypatch):
+    _service, usage = _usage(tmp_path, monkeypatch)
+    historical = replace(usage._policy,
+        prompt_contract_version='newsroom.native-evidence-assessor.v21')
+    bound = native_assessment_input_bound(historical)
+    assert bound['system_digest'] == 'sha256:e8a8f919488537711b420c6e4ddee1e7bd88adc4b5334d31f514377887ebe2d8'
+    assert bound['system_bytes'] == 5_018
+    assert bound['schema_digest'] == 'sha256:19a551165b34c6c8da5fc7332b4c60122e6dda773626d59d85491f76c6d79903'
+    assert bound['max_request_bytes'] == 61_726
+    assert native_assessment_input_bound(usage._policy)['max_request_bytes'] < 61_726
+
+
+@pytest.mark.parametrize('previous', [
+    'newsroom.native-evidence-assessor.v20', 'newsroom.native-evidence-assessor.v21',
+])
+def test_status_prompt_change_does_not_schedule_historical_reassessment(previous):
+    from newsroom.control_plane.native_assessor import assessment_revalidation_due
+    facts = {'assessment_contract_version': previous + '+consumer.v1',
+             'reason': 'ASSESSOR_QUALIFICATION_CONTRACT_HOLD'}
+    assert not assessment_revalidation_due(facts, VERSION + '+consumer.v1')
+    assert assessment_revalidation_due(facts, VERSION + '+consumer.v2')
+    facts['reason'] = 'NO_QUALIFYING_NEW_INFORMATION'
+    assert not assessment_revalidation_due(facts, VERSION + '+consumer.v1')

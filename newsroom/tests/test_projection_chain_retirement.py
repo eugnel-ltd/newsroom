@@ -65,13 +65,85 @@ def test_retirement_expires_chain_preserving_hash_keys_current_reads_and_reopen(
     assert retention.retire_native_projection_diagnostics(root, apply=True)["retired_projection_chains"] == 0
 
 
-@pytest.mark.parametrize("case", ["active", "building", "applied", "failure", "multiple"])
-def test_retirement_excludes_non_disposable_delivery(tmp_path, case):
-    root, path, _, _ = _fixture(tmp_path, retire=case not in {"active", "building"}, activate=case != "building", kind="ignored" if case in {"active", "building"} else case)
+@pytest.mark.parametrize("state,kind", [
+    ("ACTIVE", "ignored"), ("BUILDING", "ignored"),
+    ("ACTIVE", "applied"), ("BUILDING", "applied"),
+    ("RETIRED", "failure"), ("RETIRED", "multiple"), ("RETIRED", "retried_applied"),
+])
+def test_retirement_excludes_non_disposable_delivery(tmp_path, state, kind):
+    root, path, _, _ = _fixture(tmp_path, retire=state == "RETIRED", activate=state != "BUILDING", kind=kind)
     before = _snapshot(path)
     assert retention.retire_native_projection_diagnostics(root, apply=True)["retired_projection_chains"] == 0
     assert _snapshot(path) == before
     with open_projection_system(path):
+        pass
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_retired_applied_delivery_expires_single_attempt_and_keeps_current_proofs(tmp_path, required):
+    root, path, request, result = _fixture(tmp_path, kind="applied", required=required, checkpoint_anchor=True)
+    before, snapshot = _snapshot(path)
+    with sqlite3.connect(path) as conn:
+        checkpoint = conn.execute("SELECT * FROM projection_checkpoint_versions WHERE generation_id=? ORDER BY checkpoint_version DESC LIMIT 1", (str(request.generation_id),)).fetchone()
+        checkpoint_event = conn.execute("SELECT * FROM ledger_events WHERE event_id=?", (checkpoint[4],)).fetchone()
+        current = conn.execute("SELECT * FROM projection_delivery_states WHERE generation_id<>?", (str(request.generation_id),)).fetchall()
+        sources = conn.execute("SELECT * FROM ledger_events WHERE event_type IN ('source.item.versioned','candidate.derived')").fetchall()
+    report = retention.retire_native_projection_diagnostics(root, apply=True)
+    assert report["retired_projection_chains"] == 1
+    after, digest = _snapshot(path)
+    assert digest == snapshot
+    assert [event.ledger_seq for event in after] == [event.ledger_seq for event in before]
+    assert {event.event_id for event in after if isinstance(event, RetiredLedgerEventRecord)} == {str(result.authority_event_id)}
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT * FROM projection_checkpoint_versions WHERE generation_id=?", (str(request.generation_id),)).fetchall() == [checkpoint]
+        assert conn.execute("SELECT * FROM ledger_events WHERE event_id=?", (checkpoint[4],)).fetchone() == checkpoint_event
+        assert conn.execute("SELECT * FROM projection_delivery_states WHERE generation_id<>?", (str(request.generation_id),)).fetchall() == current
+        assert conn.execute("SELECT * FROM ledger_events WHERE event_type IN ('source.item.versioned','candidate.derived')").fetchall() == sources
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    with open_projection_system(path) as system:
+        with pytest.raises(DiagnosticHistoryExpired):
+            system.projections.record_delivery(request, proof=proof())
+    assert retention.retire_native_projection_diagnostics(root, apply=True)["retired_projection_chains"] == 0
+
+
+def test_retired_complete_family_keeps_contracts_validation_and_final_checkpoint(tmp_path):
+    from newsroom.projection import ProjectionGenerationState, ProjectionGenerationTransitionRequest
+    from newsroom.projection.neo4j import CompleteGenerationValidationRequest
+    from .complete_projection_2b_helpers import MemoryCompleteNeo4jAdapter, open_complete_test_system
+    from .test_complete_projection_2b_authority import _setup, _rebuild, _current
+    from .test_projection_b3_authority import _promote
+
+    root = tmp_path / "newsroom"
+    path, object_root, _, system, generation = _setup(root / "increment4")
+    with system:
+        rebuilt = _rebuild(system, generation, path)
+        current = _current(system, generation.generation_id)
+        validation = system.complete.validate_generation(CompleteGenerationValidationRequest(
+            generation_id=generation.generation_id,
+            expected_authority_version=current.authority_aggregate_version,
+            checkpoint_ledger_seq=rebuilt.checkpoint_ledger_seq,
+            reason_code="RETIRED_COMPLETE_TEST", idempotency_key="retired-complete-validate",
+        ), proof=proof())
+        active = _promote(system, _current(system, generation.generation_id), validation, "retired-complete-promote").generation
+        system.projections.transition_generation(ProjectionGenerationTransitionRequest(
+            generation.generation_id, active.authority_aggregate_version,
+            ProjectionGenerationState.RETIRED, "RETIRED_COMPLETE_TEST", "retired-complete-transition",
+        ), proof=proof())
+    tables = ("projection_family_complete_contracts", "projection_generation_complete_bindings",
+              "projection_generation_complete_validations", "projection_generation_validations",
+              "projection_generation_promotions")
+    with sqlite3.connect(path) as conn:
+        retained = {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+        checkpoint = conn.execute("SELECT * FROM projection_checkpoint_versions ORDER BY checkpoint_version DESC LIMIT 1").fetchone()
+        sources = conn.execute("SELECT * FROM ledger_events WHERE event_type!='projection.delivery.recorded'").fetchall()
+    report = retention.retire_native_projection_diagnostics(root, apply=True)
+    assert report["retired_projection_chains"] == rebuilt.recorded_delivery_count - 1 > 0
+    with sqlite3.connect(path) as conn:
+        assert {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables} == retained
+        assert conn.execute("SELECT * FROM projection_checkpoint_versions").fetchall() == [checkpoint]
+        assert conn.execute("SELECT * FROM ledger_events WHERE event_type!='projection.delivery.recorded'").fetchall() == sources
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    with open_complete_test_system(path, object_root=object_root, adapter=MemoryCompleteNeo4jAdapter()):
         pass
 
 
@@ -147,9 +219,10 @@ def test_retirement_transaction_rolls_back_rows_and_guards(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("kind", ["COMMAND", "EVENT"])
-def test_retained_causation_pins_full_diagnostic_chain(tmp_path, kind):
+@pytest.mark.parametrize("delivery", ["ignored", "applied"])
+def test_retained_causation_pins_full_diagnostic_chain(tmp_path, kind, delivery):
     from newsroom.authority import CausationKind, CausationRef
-    root, path, request, result = _fixture(tmp_path)
+    root, path, request, result = _fixture(tmp_path, kind=delivery, checkpoint_anchor=delivery == "applied")
     with sqlite3.connect(path) as conn:
         command_id = conn.execute("SELECT command_id FROM ledger_events WHERE event_id=?", (str(result.authority_event_id),)).fetchone()[0]
     with open_projection_system(path) as system:
@@ -163,16 +236,18 @@ def test_retained_causation_pins_full_diagnostic_chain(tmp_path, kind):
         assert system.projections.record_delivery(request, proof=proof()) == result
 
 
-def test_retained_foreign_key_consumer_pins_full_diagnostic_chain(tmp_path):
+@pytest.mark.parametrize("delivery", ["ignored", "applied"])
+def test_retained_foreign_key_consumer_pins_full_diagnostic_chain(tmp_path, delivery):
     from newsroom.authority.projection_retirement import select_candidates, protect_candidates
-    _, path, _, result = _fixture(tmp_path)
+    _, path, _, result = _fixture(tmp_path, kind=delivery, checkpoint_anchor=delivery == "applied")
     with sqlite3.connect(path) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("CREATE TABLE fixture_business_consumer(event_id TEXT REFERENCES ledger_events(event_id))")
         conn.execute("INSERT INTO fixture_business_consumer VALUES(?)", (str(result.authority_event_id),))
         conn.execute("CREATE TEMP TABLE _audit_tokens(id TEXT PRIMARY KEY) WITHOUT ROWID")
-        assert select_candidates(conn) == 1
-        assert protect_candidates(conn) == 1
+        eligible = select_candidates(conn)
+        assert eligible == (2 if delivery == "applied" else 1)
+        assert protect_candidates(conn) == eligible
         assert conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0] == 0
 
 

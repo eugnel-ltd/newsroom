@@ -103,8 +103,9 @@ _V17_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v17"
 _V18_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v18"
 _V19_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v19"
 _V20_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v20"
-_REFERENCE_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v21"
-_REFERENCE_PRODUCERS = (_V17_PRODUCER_VERSION, _V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, _V20_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION)
+_V21_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v21"
+_REFERENCE_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v22"
+_REFERENCE_PRODUCERS = (_V17_PRODUCER_VERSION, _V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, _V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION)
 VERSION = _REFERENCE_PRODUCER_VERSION
 MODEL = "grok-4.7"
 REASONING = "high"
@@ -128,10 +129,10 @@ REASSESSABLE_HOLDS = frozenset({
 def assessment_revalidation_due(facts: dict, contract_version: str | None) -> bool:
     previous = facts.get("assessment_contract_version")
     if (type(previous) is str and type(contract_version) is str
-            and previous.split("+", 1)[0] == _V20_PRODUCER_VERSION
-            and contract_version.split("+", 1)[0] == _REFERENCE_PRODUCER_VERSION
+            and previous.split("+", 1)[0] in {_V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION}
+            and contract_version.split("+", 1)[0] in {_V21_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION}
             and previous.partition("+")[2] == contract_version.partition("+")[2]):
-        # The new selection wire applies only to future outputs, not old HOLDs.
+        # Producer-only changes apply to future outputs, not settled old HOLDs.
         return False
     return (
         contract_version is not None
@@ -410,6 +411,19 @@ SYSTEM = _V20_SYSTEM.replace(
     "If no exact qualifying clause exists, set select_new_information false and return no "
     "qualification_evidence; governed_claims may be empty. ",
 )
+_V21_SYSTEM = SYSTEM
+SYSTEM += (
+    " EVID-012 qualification tests are independent alternatives, not cumulative "
+    "requirements. LAW_RIGHT_STATUS_POLICY with change_kind STATUS covers an "
+    "explicitly new or changed official status in a complete affirmative source "
+    "clause, including an official warning issued, reissued, extended or cancelled. "
+    "STATUS is not restricted to laws, rights or public policy. Do not require "
+    "affected_group for STATUS; require each test's own schema fields and exact "
+    "source witnesses, rather than fields belonging to another test. Every selected "
+    "headline must independently pass at least one test. This does not make a title, "
+    "standing guidance, first observation, unchanged status or record-update time "
+    "a qualifying change, and does not establish present safety after cancellation."
+)
 _V15_SCHEMA_DIGEST = "sha256:6f7e0726d3e35da1d5343b5b3dc162841c8262631ba7d00e3f71733aab14ea7f"
 _V15_SCHEMA_BYTES = 6976
 
@@ -574,7 +588,8 @@ _V19_PROVIDER_SCHEMA = _V18_PROVIDER_SCHEMA
 _V19_PROVIDER_SCHEMA_DIGEST = digest_canonical(_V19_PROVIDER_SCHEMA)
 _V20_PROVIDER_SCHEMA = _V18_PROVIDER_SCHEMA
 _V20_PROVIDER_SCHEMA_DIGEST = digest_canonical(_V20_PROVIDER_SCHEMA)
-PROVIDER_SCHEMA = make_v21_provider_schema(_V20_PROVIDER_SCHEMA)
+_V21_PROVIDER_SCHEMA = make_v21_provider_schema(_V20_PROVIDER_SCHEMA)
+PROVIDER_SCHEMA = _V21_PROVIDER_SCHEMA
 PROVIDER_SCHEMA_DIGEST = digest_canonical(PROVIDER_SCHEMA)
 INTEGRITY = (
     "ACCESS_COMPLETE",
@@ -707,11 +722,13 @@ def native_assessment_input_bound(policy: InvocationEfficiencyPolicy) -> dict[st
                      _V17_PRODUCER_VERSION: _V17_SYSTEM,
                      _V18_PRODUCER_VERSION: _V18_SYSTEM,
                      _V19_PRODUCER_VERSION: _V19_SYSTEM,
-                     _V20_PRODUCER_VERSION: _V20_SYSTEM}.get(contract, SYSTEM)).encode("utf-8")
+                     _V20_PRODUCER_VERSION: _V20_SYSTEM,
+                     _V21_PRODUCER_VERSION: _V21_SYSTEM}.get(contract, SYSTEM)).encode("utf-8")
     schema = {_V17_PRODUCER_VERSION: _V17_PROVIDER_SCHEMA,
               _V18_PRODUCER_VERSION: _V18_PROVIDER_SCHEMA,
               _V19_PRODUCER_VERSION: _V19_PROVIDER_SCHEMA,
-              _V20_PRODUCER_VERSION: _V20_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
+              _V20_PRODUCER_VERSION: _V20_PROVIDER_SCHEMA,
+              _V21_PRODUCER_VERSION: _V21_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
     schema_digest = _V15_SCHEMA_DIGEST if historical else digest_canonical(schema)
     schema_size = _V15_SCHEMA_BYTES if historical else len(canonical_json_bytes(schema))
     framing = 16_384 if historical else _FRAMING_RESERVE_TOKENS
@@ -746,10 +763,11 @@ def native_assessment_input_bound(policy: InvocationEfficiencyPolicy) -> dict[st
 def _materialise_reference_result(raw, view, request_identity, contract):
     if contract == _V17_PRODUCER_VERSION:
         return materialise_v17(raw, view, request_identity, provider_schema=_V17_PROVIDER_SCHEMA)
-    if contract in (_V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, _V20_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION):
+    if contract in (_V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, _V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION):
         schema = {_V18_PRODUCER_VERSION: _V18_PROVIDER_SCHEMA,
                   _V19_PRODUCER_VERSION: _V19_PROVIDER_SCHEMA,
-                  _V20_PRODUCER_VERSION: _V20_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
+                  _V20_PRODUCER_VERSION: _V20_PROVIDER_SCHEMA,
+                  _V21_PRODUCER_VERSION: _V21_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
         return materialise_v18(raw, view, request_identity,
                               provider_schema=schema, v17_schema=_V17_PROVIDER_SCHEMA)
     raise SourceReferenceError("unsupported reference producer contract")
@@ -860,7 +878,7 @@ class NativeAssessmentUsage:
                 REASONING,
             )
             or policy.prompt_contract_version != VERSION
-            or (VERSION in {_V20_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION}
+            or (VERSION in {_V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION}
                 and policy.max_output_tokens is not None)
             or policy.output_schema_digest != PROVIDER_SCHEMA_DIGEST
             or policy.command_flags != COMMAND_FLAGS

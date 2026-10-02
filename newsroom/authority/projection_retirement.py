@@ -1,4 +1,4 @@
-"""Expire only retired, single-final optional no-op diagnostic chains."""
+"""Expire single-attempt successful retired delivery diagnostics, retaining proof roots."""
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -8,8 +8,9 @@ from .canonical import digest_canonical
 from .projection_retirement_migrations import RETIRED_FIELDS, retired_record_digest
 
 
-# These are disposable diagnostics. Current local FK, causation and watermark
-# consumers still protect their required rows; historical opaque links expire.
+# These are retired delivery diagnostics, not the projected source authority.
+# Current local FK, causation and watermark consumers still protect required
+# rows; historical opaque diagnostic links expire.
 # Generation/sequence keys are NOT NULL. EXISTS keeps unmatched composite keys
 # on the exact index lookup instead of row-value NOT IN's fallback scan.
 _EXCLUSIONS = {
@@ -41,14 +42,12 @@ def select_candidates(conn: sqlite3.Connection) -> int:
                s.generation_id,s.ledger_seq AS source_seq
         FROM projection_generations g CROSS JOIN projection_delivery_states s ON s.generation_id=g.generation_id
         CROSS JOIN ledger_events e ON e.event_id=s.last_authority_event_id
-        WHERE g.state='RETIRED' AND s.current_outcome='IGNORED_OPTIONAL'
-          AND s.required=0 AND s.finalized=1 AND s.attempt_count=1 AND s.last_error_code IS NULL
+        WHERE g.state='RETIRED' AND s.current_outcome IN ('APPLIED','IGNORED_OPTIONAL')
+          AND s.finalized=1 AND s.attempt_count=1 AND s.last_error_code IS NULL
+          AND (s.current_outcome='APPLIED' OR s.required=0)
           AND e.retired_header_digest IS NULL
           AND e.event_type='projection.delivery.recorded' AND e.aggregate_type='projection_generation'
           AND e.aggregate_id=g.generation_id
-          AND NOT EXISTS(SELECT 1 FROM projection_families f
-              JOIN projection_family_complete_contracts b ON b.definition_digest=f.definition_digest
-              WHERE f.family_id=g.family_id)
           AND NOT EXISTS(SELECT 1 FROM projection_delivery_attempts a
               WHERE a.generation_id=s.generation_id AND a.ledger_seq=s.ledger_seq AND a.attempt_number<>1)
     """)
@@ -58,10 +57,17 @@ def select_candidates(conn: sqlite3.Connection) -> int:
     for column in ("payload_id", "authentication_context_id",
                    "authorization_request_digest", "authorization_decision_id"):
         conn.execute(f"CREATE INDEX _retirement_candidate_{column} ON _retirement_candidates({column})")
+    # Successful applied generations retain their final checkpoint and exact
+    # event envelope. The marker keeps that pin stable on repeat maintenance.
+    # Previously qualified ignored-only expiry retains its existing semantics.
     conn.execute("""CREATE TEMP TABLE _retirement_checkpoints AS
         SELECT c.generation_id,c.checkpoint_version,c.authority_event_id
         FROM projection_checkpoint_versions c JOIN projection_generations g USING(generation_id)
         WHERE g.state='RETIRED' AND EXISTS(SELECT 1 FROM _retirement_candidates x WHERE x.generation_id=g.generation_id)
+          AND NOT (c.checkpoint_version=(SELECT max(last.checkpoint_version)
+                   FROM projection_checkpoint_versions last WHERE last.generation_id=c.generation_id)
+              AND (g.diagnostic_history_expired=1 OR EXISTS(SELECT 1 FROM projection_delivery_states s
+                  WHERE s.generation_id=g.generation_id AND s.current_outcome='APPLIED')))
     """)
     conn.execute("CREATE UNIQUE INDEX _retirement_checkpoint_key ON _retirement_checkpoints(generation_id,checkpoint_version)")
     return int(conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0])

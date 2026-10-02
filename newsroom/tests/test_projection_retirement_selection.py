@@ -135,7 +135,7 @@ def _cohort(count, density):
             event_type, aggregate_type, aggregate_id, retired = "projection.delivery.recorded", "projection_generation", generation, None
             if density == "sparse" and ordinal % 16:
                 event_type = "projection.generation.transitioned"
-            # Distinct demonstrations of every exclusion in the same rowsets.
+            # Successful APPLIED and complete families are now eligible; failures stay excluded.
             if ordinal == 1: outcome = "APPLIED"
             elif ordinal == 2: required = 1
             elif ordinal == 3: finalized = 0
@@ -153,7 +153,7 @@ def _cohort(count, density):
             connection.execute("INSERT INTO projection_delivery_states VALUES(?,?,?,?,?,?,?,?)", (
                 generation, ordinal, event, outcome, required, finalized, attempts, error,
             ))
-            if (state == "RETIRED" and family == "structural" and ordinal > 10
+            if (state == "RETIRED" and (ordinal == 1 or ordinal > 10)
                     and (density == "dense" or ordinal % 16 == 0)):
                 expected.add(event)
     return connection, expected
