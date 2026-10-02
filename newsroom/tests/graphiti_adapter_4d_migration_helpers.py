@@ -1348,6 +1348,7 @@ def downgrade_empty_graphiti_adapter_schema_to_v15(database: Path) -> None:
 
 def _drop_v41_command_bound_storage(connection: sqlite3.Connection) -> None:
     """Restore exact v40 bytes/DDL for explicit historical-codec fixtures."""
+    _drop_v42_projection_retirement(connection)
     if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 41:
         return
     from newsroom.authority.command_bound_storage import command_request_bytes, command_result_bytes
@@ -1396,3 +1397,50 @@ def _drop_v41_command_bound_storage(connection: sqlite3.Connection) -> None:
         connection.execute("RELEASE SAVEPOINT checked_command_storage_downgrade")
         raise
     connection.execute("RELEASE SAVEPOINT checked_command_storage_downgrade")
+
+
+def _drop_v42_projection_retirement(connection: sqlite3.Connection) -> None:
+    """Remove schema-only v42 from full-history migration fixtures, never live data."""
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 42:
+        return
+    from newsroom.authority.migrations import MIGRATION_STATEMENTS, EXPECTED_MIGRATION_HISTORY, EXPECTED_SCHEMA_FINGERPRINT, schema_fingerprint
+    from newsroom.authority.projection_retirement_migrations import PROJECTION_RETIREMENT_PREDECESSOR_FINGERPRINT
+
+    if (schema_fingerprint(connection) != EXPECTED_SCHEMA_FINGERPRINT
+            or tuple(tuple(row) for row in connection.execute("SELECT version,name,checksum FROM authority_migrations ORDER BY version")) != EXPECTED_MIGRATION_HISTORY
+            or connection.execute("SELECT 1 FROM ledger_events WHERE retired_header_digest IS NOT NULL LIMIT 1").fetchone() is not None):
+        raise sqlite3.DatabaseError("historical fixture requires exact unexpired v42 authority")
+    connection.execute("SAVEPOINT checked_projection_retirement_downgrade")
+    try:
+        connection.execute("PRAGMA defer_foreign_keys=ON")
+        indices = tuple(row[0] for row in connection.execute("SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name='ledger_events' AND sql IS NOT NULL AND name<>'idx_retired_command_key'"))
+        sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='ledger_events'").fetchone()
+        connection.execute("CREATE TEMP TABLE predecessor_ledger AS SELECT * FROM ledger_events")
+        connection.execute("DROP TABLE ledger_events")
+        connection.execute(next(sql for sql in MIGRATION_STATEMENTS if sql.startswith("CREATE TABLE ledger_events(")))
+        names = ",".join(row[1] for row in connection.execute("PRAGMA table_info(ledger_events)"))
+        connection.execute(f"INSERT INTO ledger_events({names}) SELECT {names} FROM predecessor_ledger")
+        connection.execute("DROP TABLE predecessor_ledger")
+        if sequence is not None:
+            connection.execute("UPDATE sqlite_sequence SET seq=? WHERE name='ledger_events'", (sequence[0],))
+        for sql in MIGRATION_STATEMENTS:
+            if sql.startswith("CREATE TRIGGER") and " ON ledger_events" in sql:
+                connection.execute(sql)
+        for sql in indices:
+            connection.execute(sql)
+        connection.execute("DROP TRIGGER authority_commands_retired_key_guard")
+        connection.execute("DROP TRIGGER projection_diagnostic_expiry_insert_guard")
+        connection.execute("DROP TRIGGER projection_diagnostic_expiry_update_guard")
+        connection.execute("ALTER TABLE projection_generations DROP COLUMN diagnostic_history_expired")
+        guard = connection.execute("SELECT sql FROM sqlite_schema WHERE name='immutable_authority_migrations_delete'").fetchone()[0]
+        connection.execute("DROP TRIGGER immutable_authority_migrations_delete")
+        connection.execute("DELETE FROM authority_migrations WHERE version=42")
+        connection.execute(guard)
+        connection.execute("PRAGMA user_version=41")
+        if schema_fingerprint(connection) != PROJECTION_RETIREMENT_PREDECESSOR_FINGERPRINT or connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise sqlite3.DatabaseError("v42 fixture downgrade lost exact v41 authority")
+    except Exception:
+        connection.execute("ROLLBACK TO SAVEPOINT checked_projection_retirement_downgrade")
+        connection.execute("RELEASE SAVEPOINT checked_projection_retirement_downgrade")
+        raise
+    connection.execute("RELEASE SAVEPOINT checked_projection_retirement_downgrade")

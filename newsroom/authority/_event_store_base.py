@@ -28,6 +28,7 @@ from .migrations import (
 from .models import CommittedCommandIdentity
 from .persistence import (
     AuthorityPersistenceError,
+    DiagnosticHistoryExpired,
     AuthoritySchemaError,
     AuthorityWriterBusy,
 )
@@ -484,10 +485,20 @@ class _EventStoreBase:
     ) -> None:
         self.close()
 
+    def _require_unexpired_key(self, conn, namespace: str, key: str) -> None:
+        row = conn.execute(
+            "SELECT * FROM ledger_events WHERE retired_namespace=? AND retired_key=? "
+            "AND retired_header_digest IS NOT NULL", (namespace, key),
+        ).fetchone()
+        if row is not None:
+            self._event_from_row(row)
+            raise DiagnosticHistoryExpired("command diagnostic history expired; identity remains reserved")
+
     def find(
         self, *, idempotency_namespace: str, idempotency_key: str
     ) -> CommittedCommandIdentity | None:
         with self._lock:
+            self._require_unexpired_key(self._connection, idempotency_namespace, idempotency_key)
             row = self._connection.execute(
                 "SELECT c.command_id,c.command_type,"
                 "c.command_definition_version,"

@@ -6,7 +6,9 @@ import json
 import logging
 from pathlib import Path
 
-from newsroom.authority.audit_retention import prune_native_diagnostic_audit
+from newsroom.authority.audit_retention import (
+    prune_native_diagnostic_audit, retire_native_projection_diagnostics,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -15,9 +17,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="Exact Newsroom data directory containing increment4 and native stores")
     parser.add_argument("--apply", action="store_true",
                         help="Prune verified obsolete diagnostics and VACUUM in place; default is read-only inspection")
+    parser.add_argument("--retired-projection-chains", action="store_true",
+                        help="Expire checked RETIRED single-final optional ignored diagnostic chains; retain namespace/key reservations")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    report = prune_native_diagnostic_audit(args.data_root, apply=args.apply)
+    maintenance = retire_native_projection_diagnostics if args.retired_projection_chains else prune_native_diagnostic_audit
+    report = maintenance(args.data_root, apply=args.apply)
     print(json.dumps(report, sort_keys=True, indent=2))
     return 1 if report.get("compaction_error") else 0
 

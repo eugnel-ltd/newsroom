@@ -261,6 +261,9 @@ class _ExactAuthorityGuards:
             ).fetchone()
             if event_row is None:
                 raise AuthorityPersistenceError("retained event is missing")
+            if event_row["retired_header_digest"] is not None:
+                self._validate_event_types(event_row)  # type: ignore[attr-defined]
+                return
             self._validate_event_types(event_row)  # type: ignore[attr-defined]
             policy = EventReadPolicy(
                 policy_id="exact-retained-event-v1",
@@ -676,7 +679,8 @@ class _ExactAuthorityGuards:
                     else ("ledger_events", "event_id")
                 )
                 if conn.execute(
-                    f"SELECT 1 FROM {table} WHERE {column}=?",
+                    f"SELECT 1 FROM {table} WHERE {column}=?"
+                    + (" AND retired_header_digest IS NULL" if table == "ledger_events" else ""),
                     (event.causation_identifier,),
                 ).fetchone() is None:
                     raise AuthorityPersistenceError(

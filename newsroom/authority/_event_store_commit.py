@@ -17,6 +17,7 @@ from .command_bound_storage import (
 )
 from .persistence import (
     AuthorityPersistenceError,
+    DiagnosticHistoryExpired,
     CommittedCommand,
     ExpectedVersionConflict,
     IdempotencyConflict,
@@ -66,6 +67,7 @@ class _EventStoreCommitMixin:
         """Commit an authorised command into an already-open authority transaction."""
 
         self._issuer.verify(grant)
+        self._require_unexpired_key(conn, grant.idempotency_namespace, grant.idempotency_key)
         existing = conn.execute(
             "SELECT command_id,command_definition_version,"
             "command_definition_digest,stable_semantic_request_digest,"
@@ -567,14 +569,18 @@ class _EventStoreCommitMixin:
                 (grant.causation_identifier,),
             ).fetchone()
             if row is None:
+                if conn.execute("SELECT 1 FROM ledger_events WHERE command_id=? AND retired_header_digest IS NOT NULL", (grant.causation_identifier,)).fetchone() is not None:
+                    raise DiagnosticHistoryExpired("causation command diagnostic history expired")
                 raise UnknownCausation("causation command does not resolve")
         elif grant.causation_kind == "EVENT":
             row = conn.execute(
-                "SELECT 1 FROM ledger_events WHERE event_id=?",
+                "SELECT retired_header_digest FROM ledger_events WHERE event_id=?",
                 (grant.causation_identifier,),
             ).fetchone()
             if row is None:
                 raise UnknownCausation("causation event does not resolve")
+            if row["retired_header_digest"] is not None:
+                raise DiagnosticHistoryExpired("causation event diagnostic history expired")
 
     @staticmethod
     def _resolve_version(

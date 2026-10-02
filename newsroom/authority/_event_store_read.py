@@ -8,6 +8,8 @@ from .canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from .persistence import (
     AuthenticationContextRecord,
     AuthorityPersistenceError,
+    DiagnosticHistoryExpired,
+    RetiredLedgerEventRecord,
     AuthorizationDecisionRecord,
     AuthorizationRequestRecord,
     CommandDefinitionRecord,
@@ -27,7 +29,17 @@ class _EventStoreReadMixin:
     """Policy-filtered metadata reads and exact provenance reconstruction."""
 
     @staticmethod
-    def _event_from_row(row: sqlite3.Row) -> LedgerEventRecord:
+    def _event_from_row(row: sqlite3.Row) -> LedgerEventRecord | RetiredLedgerEventRecord:
+        if "retired_header_digest" in row.keys() and row["retired_header_digest"] is not None:
+            from .projection_retirement_migrations import retired_record_digest
+            if retired_record_digest(row) != bytes(row["retired_record_digest"]):
+                raise AuthorityPersistenceError("retired record digest differs")
+            return RetiredLedgerEventRecord(
+                **{name: row[name] for name in (
+                    "ledger_seq", "event_id", "command_id", "event_type", "aggregate_type",
+                    "aggregate_id", "security_scope", "trust_scope",
+                )}, original_header_digest="sha256:" + bytes(row["retired_header_digest"]).hex(),
+            )
         return LedgerEventRecord(
             ledger_seq=int(row["ledger_seq"]),
             event_id=str(row["event_id"]),
@@ -98,7 +110,7 @@ class _EventStoreReadMixin:
         *,
         limit: int,
         policy: EventReadPolicy,
-    ) -> tuple[LedgerEventRecord, ...]:
+    ) -> tuple[LedgerEventRecord | RetiredLedgerEventRecord, ...]:
         policy.require_metadata_class(MetadataClass.ROUTING)
         policy.require_window(after_ledger_seq=ledger_seq, limit=limit)
         security, trust = self._policy_lists(policy)
@@ -169,6 +181,8 @@ class _EventStoreReadMixin:
         with self._lock:
             event_row = self._visible_event_row(policy=policy, event_id=event_id)
             event = self._event_from_row(event_row)
+            if isinstance(event, RetiredLedgerEventRecord):
+                raise DiagnosticHistoryExpired("event diagnostic provenance expired")
             auth_row = self._connection.execute(
                 "SELECT * FROM authentication_contexts "
                 "WHERE authentication_context_id=?",
@@ -261,6 +275,9 @@ class _EventStoreReadMixin:
         policy.require_metadata_class(MetadataClass.RESULT)
         with self._lock:
             event = self._visible_event_row(policy=policy, command_id=command_id)
+            if event["retired_header_digest"] is not None:
+                self._event_from_row(event)
+                raise DiagnosticHistoryExpired("command diagnostic result expired")
             if self._current_state_only:
                 self._validate_retained_event(str(event["event_id"]))
             row = self._connection.execute(
