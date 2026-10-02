@@ -91,7 +91,7 @@ def test_shared_metadata_preserves_reference_closure_and_same_count_mutation_det
         portfolio_reference = journal.portfolio_reference(journal.portfolio)
         rows = connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall()
         reopened = NativeRevisionJournal(connection)
-        assert reopened.progress == journal.progress
+        assert reopened.current(revision) == journal.current(revision)
         assert reopened.observations == {reference[1]: reference}
         assert reopened.portfolio_reference(reopened.portfolio) == portfolio_reference
         assert reopened.units[revision][0].coverage_first_observed_at == units[0].coverage_first_observed_at
@@ -99,12 +99,86 @@ def test_shared_metadata_preserves_reference_closure_and_same_count_mutation_det
         with pytest.raises(ValueError, match="chunk coverage"):
             reopened.land(changed)
         assert connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall() == rows
-        facts = reopened.progress[revision]["facts"]
+        facts = reopened.current(revision)["facts"]
         facts["retrieval_binding"]["request"]["nodes"][0] = "Changed same-count evidence"
         result = reopened.advance(revision, stage="EVIDENCE_HOLD", facts=facts)
         assert result["ordinal"] == 3
         encoded = json.loads(connection.execute("SELECT payload_json FROM ledger ORDER BY seq DESC LIMIT 1").fetchone()[0])
         assert "retrieval_facts_ref" not in encoded
-        assert NativeRevisionJournal(connection).progress == reopened.progress
+        assert NativeRevisionJournal(connection).current(revision) == reopened.current(revision)
     finally:
         connection.close()
+
+
+def test_cold_current_retrieval_pairs_do_not_remain_in_journal_heap(tmp_path):
+    import gc
+    import tracemalloc
+    from newsroom.control_plane.native_progress import STATE
+    from newsroom.tests.test_native_graphiti import _native
+
+    connection = connect(str(tmp_path / "cold-pairs.sqlite3"))
+    inventory = [{
+        "revision_id": f"revision-{number}", "ingest_id": f"ingest-{number}",
+        "state": "INCLUDED", "reason": None,
+        "document_digest": "sha256:" + f"{number:064x}",
+        "current_rights_digest": "sha256:" + f"{number + 1000:064x}",
+    } for number in range(360)]
+    facts = {**_retrieval_facts(), "retrieval_rights_inventory": inventory}
+    expected_pair_bytes = len(canonical_json_bytes(facts)) * 24
+    revisions = []
+    for number in range(24):
+        unit = _native(f"cold-{number}")
+        revisions.append(unit.revision_id)
+        append_ledger(connection, LAND, {"revision_id": unit.revision_id, "units": [asdict(unit)]})
+        append_ledger(connection, STATE, {
+            "revision_id": unit.revision_id, "ordinal": 1,
+            "stage": "EVIDENCE_HOLD", "facts": facts,
+        })
+    connection.commit()
+    gc.collect()
+    tracemalloc.start()
+    try:
+        journal = NativeRevisionJournal(connection)
+        gc.collect()
+        retained, _ = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # Only the journal replay allocation is measured, after its existing string
+    # sharing. The input fixture and SQLite storage pre-date tracing.
+    assert retained < expected_pair_bytes / 3
+    for revision in revisions:
+        assert journal.current(revision)["facts"] == facts
+        assert "retrieval_rights_inventory" not in journal.summary(revision)["facts"]
+    connection.close()
+
+
+def test_equal_bodies_across_distinct_revisions_share_only_immutable_text(tmp_path):
+    from newsroom.tests.test_native_graphiti import _native
+
+    connection = connect(str(tmp_path / "equal-bodies.sqlite3"))
+    journal = NativeRevisionJournal(connection)
+    first = _native("first-source-item")
+    second = _native("second-source-item")
+    first = replace(first, body=first.body.encode().decode())
+    second = replace(second, body=second.body.encode().decode())
+    assert first.body == second.body and first.body is not second.body
+    assert first.revision_id != second.revision_id
+    for unit in (first, second):
+        journal.land((unit,))
+    retained = [journal.units[unit.revision_id][0] for unit in (first, second)]
+    assert retained[0].body is retained[1].body
+    assert canonical_json_bytes([asdict(unit) for unit in retained]) == canonical_json_bytes([asdict(first), asdict(second)])
+    assert retained[0].authority.item_id != retained[1].authority.item_id
+    assert retained[0].authority.admission_id != retained[1].authority.admission_id
+    assert retained[0].authority.access_decision_id != retained[1].authority.access_decision_id
+    assert retained[0].authority.records is not retained[1].authority.records
+    assert all(left is not right for left, right in zip(retained[0].authority.records, retained[1].authority.records, strict=True))
+    rows = connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall()
+    retained[0].authority.records[-1]["rights_gate_reason"] = "changed caller metadata"
+    assert retained[1].authority.records[-1].get("rights_gate_reason") != "changed caller metadata"
+    reopened = NativeRevisionJournal(connection)
+    assert reopened.units[first.revision_id][0].body is reopened.units[second.revision_id][0].body
+    assert reopened.units[first.revision_id] == (first,)
+    assert reopened.units[second.revision_id] == (second,)
+    assert connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall() == rows
+    connection.close()

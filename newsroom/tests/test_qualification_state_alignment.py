@@ -147,4 +147,4 @@ def test_service_continues_two_real_report_cycles_without_qualifying_pending_cop
         ).fetchall()
         assert all(json.loads(raw)["pipeline"]["revision_states"] == states for raw, in terminal)
         retained = NativeRevisionJournal(connection)
-        assert retained.progress[units[1].revision_id]["stage"] == "COPY_CORRECTION_PREPARED"
+        assert retained.summary(units[1].revision_id)["stage"] == "COPY_CORRECTION_PREPARED"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import uuid
 from dataclasses import replace
 from types import SimpleNamespace
@@ -38,6 +39,75 @@ from newsroom.tests.test_native_graphiti import _native
 
 
 GENERATION = "native-generation-v1"
+
+
+@pytest.mark.parametrize("historical_held", (False, True))
+def test_subject_inventory_keeps_cold_pairs_unexpanded_until_an_exclusion_changes(historical_held):
+    units = (_native("cold-first"), _native("cold-second"))
+    snapshots = {}
+    for unit in units:
+        receipt = NativeDocumentReceipt(
+            "fixture-event", "fixture-command", AggregateId.new(), 1,
+            ObjectAdmissionId.new(), digest_bytes(unit.ingest_id.encode()),
+            ObjectAdmissionId.new(), ObjectAdmissionId.new(),
+        )
+        snapshots[unit.revision_id] = {
+            "stage": "EVIDENCE_HOLD",
+            "facts": {
+                "retrieval_documents": {unit.ingest_id: {
+                    "receipt": receipt.projection_value(), "graph_root_id": "fixture-root",
+                }},
+                "retrieval_binding": {"retained": [unit.revision_id]},
+                "retrieval_rights_inventory": [{"retained": unit.ingest_id}],
+                "unknown_fact": {"preserve": [1, 2]},
+            },
+        }
+    full_reads, writes, rights_calls = [], [], []
+
+    def summary(revision):
+        value = deepcopy(snapshots[revision])
+        for name in ("retrieval_binding", "retrieval_rights_inventory"):
+            value["facts"].pop(name)
+        return value
+
+    def current(revision):
+        full_reads.append(revision)
+        assert historical_held and revision == units[0].revision_id
+        return deepcopy(snapshots[revision])
+
+    def advance(revision, *, stage, facts):
+        writes.append((revision, stage, facts))
+        snapshots[revision] = {"stage": stage, "facts": deepcopy(facts)}
+
+    def rights(unit):
+        rights_calls.append(unit.ingest_id)
+        if historical_held and unit == units[0]:
+            raise NativeRetrievalHold("CURRENT_RIGHTS_HOLD")
+        return digest_bytes(unit.ingest_id.encode())
+
+    journal = SimpleNamespace(
+        units={unit.revision_id: (unit,) for unit in units},
+        summary=summary, current=current, advance=advance,
+    )
+    continuation = NativeRetrievalContinuation(
+        system=object(), documents=object(), journal=journal,
+        connection=object(), embedder=object(), generation_id=GENERATION,
+        port_for=lambda *_args: pytest.fail("inventory opened a retrieval port"),
+        rights_check=rights,
+    )
+    subjects, inventory = continuation._current_subjects()
+    assert rights_calls == [unit.ingest_id for unit in units]
+    assert len(subjects) == (1 if historical_held else 2)
+    assert len(inventory) == 2
+    assert full_reads == ([units[0].revision_id] if historical_held else [])
+    assert len(writes) == int(historical_held)
+    if historical_held:
+        revision, stage, facts = writes[0]
+        assert stage == "EVIDENCE_HOLD"
+        assert facts["retrieval_binding"] == {"retained": [revision]}
+        assert facts["retrieval_rights_inventory"] == [{"retained": units[0].ingest_id}]
+        assert facts["unknown_fact"] == {"preserve": [1, 2]}
+        assert facts["retrieval_exclusions"][units[0].ingest_id]["reason"] == "CURRENT_RIGHTS_HOLD"
 
 
 def _lead(unit):
@@ -357,7 +427,7 @@ def test_recovered_attempt_uses_admitted_extraction_identity_without_redispatch(
             unit.revision_id,
             stage="EMBEDDING_RETAINED",
             facts={
-                **journal.progress[unit.revision_id]["facts"],
+                **journal.current(unit.revision_id)["facts"],
                 "retrieval_embeddings": {
                     unit.ingest_id: {
                         "state": "RETAINED",
@@ -436,7 +506,6 @@ def test_fulltext_query_is_checked_before_embedding(
         units = (unit, replace(unit, headline="A different retained headline"))
     journal = SimpleNamespace(
         units={unit.revision_id: units},
-        progress={},
     )
     embedder = _Embedder()
     continuation = NativeRetrievalContinuation(
@@ -502,7 +571,7 @@ def test_multi_chunk_embeddings_and_context_are_reused_across_restart(tmp_path):
         for ordinal, unit in enumerate(units)
     ]
     assert len(subjects) == 1 and len(subjects[0]) == 2
-    facts = journal.progress[base.revision_id]["facts"]
+    facts = journal.current(base.revision_id)["facts"]
     assert facts["graphiti_receipts"] == [unit.ingest_id for unit in units]
     assert set(facts["retrieval_documents"]) == {
         unit.ingest_id for unit in units
@@ -539,7 +608,7 @@ def test_multi_chunk_embeddings_and_context_are_reused_across_restart(tmp_path):
         assert len(embedder.calls) == len(documents.admit_calls) == 2
         assert len(replay_subjects) == 1 and len(replay_subjects[0]) == 2
         assert len(documents.context_reads) == 1
-        replay_facts = replay.progress[base.revision_id]["facts"]
+        replay_facts = replay.current(base.revision_id)["facts"]
         replay.advance(
             base.revision_id,
             stage="CANDIDATE_ADMITTED",
@@ -566,7 +635,7 @@ def test_multi_chunk_embeddings_and_context_are_reused_across_restart(tmp_path):
         assert fresh_requests == []
         assert len(documents.require_calls) == full_inventory_reads
         assert len(documents.context_reads) == 2
-        replay_facts = final_journal.progress[base.revision_id]["facts"]
+        replay_facts = final_journal.current(base.revision_id)["facts"]
         assert replay_facts["candidate_version_id"] == "candidate-version-1"
         assert replay_facts["graphiti_receipts"] == [
             unit.ingest_id for unit in units
@@ -626,7 +695,7 @@ def test_started_embedding_holds_without_redispatch(
             continuation.retrieve(lead, proof=proof())
         assert embedder.calls == []
         assert documents.admit_calls == []
-        assert journal.progress[unit.revision_id]["stage"] == "EMBEDDING_STARTED"
+        assert journal.current(unit.revision_id)["stage"] == "EMBEDDING_STARTED"
     finally:
         connection.close()
 
@@ -664,7 +733,7 @@ def test_exact_zero_dispatch_embedding_terminal_allows_one_new_attempt(tmp_path)
         ):
             continuation.retrieve(lead, proof=proof())
         assert embedder.calls == []
-        assert journal.progress[unit.revision_id]["facts"][
+        assert journal.current(unit.revision_id)["facts"][
             "retrieval_embeddings"
         ][unit.ingest_id]["attempt_number"] == 1
 
@@ -673,7 +742,7 @@ def test_exact_zero_dispatch_embedding_terminal_allows_one_new_attempt(tmp_path)
         assert [call["cycle_id"] for call in embedder.calls] == [
             f"native-passage:{unit.ingest_id}:retry:2"
         ]
-        assert journal.progress[unit.revision_id]["facts"][
+        assert journal.current(unit.revision_id)["facts"][
             "retrieval_embeddings"
         ][unit.ingest_id]["state"] == "RETAINED"
     finally:
@@ -737,10 +806,10 @@ def test_historical_rights_hold_is_excluded_and_invalidates_context_replay(tmp_p
             [current.revision_id]
         ]
         assert len(inventory_digests) == 1
-        exclusion = journal.progress[first.revision_id]["facts"][
+        exclusion = journal.current(first.revision_id)["facts"][
             "retrieval_exclusions"
         ][first.ingest_id]
-        first_receipt = next(iter(journal.progress[first.revision_id]["facts"][
+        first_receipt = next(iter(journal.current(first.revision_id)["facts"][
             "retrieval_documents"
         ].values()))["receipt"]
         assert exclusion == {
@@ -762,7 +831,7 @@ def test_historical_rights_hold_is_excluded_and_invalidates_context_replay(tmp_p
         ]]
         assert len(documents.require_calls) == full_inventory_reads + 2
         assert len(set(inventory_digests)) == 2
-        assert journal.progress[first.revision_id]["facts"]["retrieval_exclusions"] == {}
+        assert journal.current(first.revision_id)["facts"]["retrieval_exclusions"] == {}
 
         rights_digests[current.ingest_id] = "rights-b-v2"
         subjects.clear()

@@ -153,6 +153,10 @@ def test_continuation_retains_times_and_replays_without_evidence_redispatch(
         stage="CANDIDATE_ADMITTED",
         facts={"candidate_version_id": "candidate-version", "graphiti_receipts": [{}]},
     )
+    from newsroom.tests.test_native_progress import _retrieval_facts
+    pair = _retrieval_facts()
+    pair.update(journal.current(unit.revision_id)["facts"], unknown_inline={"retained": True})
+    journal.advance(unit.revision_id, stage="CANDIDATE_ADMITTED", facts=pair)
     package_id = ObjectAdmissionId.new()
     decision = _decision(package_id)
     evidence_calls = []
@@ -173,6 +177,18 @@ def test_continuation_retains_times_and_replays_without_evidence_redispatch(
         lambda *_args, **_kwargs: _Reader(),
     )
     authority, publication = _Authority(), _Publication()
+    apply = publication.advance
+
+    def apply_with_retained_inline_fact(*args, **kwargs):
+        # An effect may retain a newer inline fact before the continuation ACK.
+        # The ACK must refresh full facts, not overwrite it with an old snapshot.
+        current = journal.current(unit.revision_id)
+        journal.advance(unit.revision_id, stage=current["stage"], facts={
+            **current["facts"], "effect_marker": {"completed": True},
+        })
+        return apply(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "advance", apply_with_retained_inline_fact)
     runtime = SimpleNamespace(
         authority=authority,
         ingress=object(),
@@ -207,7 +223,7 @@ def test_continuation_retains_times_and_replays_without_evidence_redispatch(
         monkeypatch.setattr(publication, "advance", interrupted)
         with pytest.raises(RuntimeError, match="pre-effect interruption"):
             continuation.advance(revision_id=unit.revision_id, candidate_version_id="candidate-version")
-        legacy = dict(journal.progress[unit.revision_id]["facts"])
+        legacy = dict(journal.current(unit.revision_id)["facts"])
         legacy.pop("publication_started_at")
         legacy.update(publication_applied_at="2026-09-08T12:04:00.000000Z",
                       publication_observed_at="2026-09-08T12:05:00.000000Z")
@@ -231,8 +247,11 @@ def test_continuation_retains_times_and_replays_without_evidence_redispatch(
          request["expected_delivery_evidence_version"])
         for request in publication.requests
     } == {(0, 0, 0)}
-    retained = journal.progress[unit.revision_id]
+    retained = journal.current(unit.revision_id)
     assert retained["stage"] == "ACKNOWLEDGED"
+    for key in ("retrieval_binding", "retrieval_rights_inventory", "unknown_inline"):
+        assert retained["facts"][key] == pair[key]
+    assert retained["facts"]["effect_marker"] == {"completed": True}
     assert retained["facts"]["intake_received_epoch_seconds"] == 1788868800
     assert retained["facts"]["assessment_started_at"] == "2026-09-08T12:01:00.000000Z"
     assert retained["facts"]["editorial_decision"] == json.loads(
@@ -309,7 +328,7 @@ def test_wrapped_transport_failure_retries_before_assessment_then_acknowledges(
     assert first.reason == "ACQUISITION_TRANSPORT_RETRY"
     assert second.state == "ACKNOWLEDGED"
     assert calls == ["acquire", "acquire"]
-    assert journal.progress[unit.revision_id]["facts"]["acquisition_attempt_count"] == 2
+    assert journal.current(unit.revision_id)["facts"]["acquisition_attempt_count"] == 2
     connection.close()
 
 
@@ -352,7 +371,7 @@ def test_transport_retry_is_bounded_and_preserves_failed_attempt_count(
     assert [item.state for item in results] == ["EVIDENCE_HOLD"] * 4
     assert results[-1].reason == "ACQUISITION_TRANSPORT_RETRY_EXHAUSTED"
     assert calls == ["acquire"] * 3
-    facts = journal.progress[unit.revision_id]["facts"]
+    facts = journal.current(unit.revision_id)["facts"]
     assert facts["acquisition_attempt_count"] == 3
     assert facts["acquisition_retryable"] is False
     connection.close()
@@ -396,7 +415,7 @@ def test_deterministic_acquisition_hold_is_not_retried(
     assert first.state == replay.state == "EVIDENCE_HOLD"
     assert first.reason == replay.reason == "GOVUK_EVIDENCE_METADATA_HOLD"
     assert calls == ["acquire"]
-    assert journal.progress[unit.revision_id]["facts"]["acquisition_retryable"] is False
+    assert journal.current(unit.revision_id)["facts"]["acquisition_retryable"] is False
     connection.close()
 
 
@@ -422,7 +441,7 @@ def test_superseded_assessment_revalidation_keeps_intake_and_prior_evidence(tmp_
     def acquire(_self, **request):
         calls.append(request["intake_receipt_id"])
         assert request["assessment_cached_only"] is True
-        assert "package_admission_id" not in journal.progress[unit.revision_id]["facts"]
+        assert "package_admission_id" not in journal.current(unit.revision_id)["facts"]
         raise NativeEvidenceHold("NO_QUALIFYING_NEW_INFORMATION", unit.source_id)
 
     monkeypatch.setattr(NativeEvidenceController, "acquire_and_retain", acquire)
@@ -443,7 +462,7 @@ def test_superseded_assessment_revalidation_keeps_intake_and_prior_evidence(tmp_
         for _ in range(2):
             result = continuation.advance(revision_id=unit.revision_id, candidate_version_id="candidate-version")
             assert result.reason == "NO_QUALIFYING_NEW_INFORMATION"
-        facts = journal.progress[unit.revision_id]["facts"]
+        facts = journal.current(unit.revision_id)["facts"]
         assert facts["assessment_superseded"]["package_admission_id"] == old_package
         assert facts["assessment_contract_version"] == (
             "newsroom.native-evidence-assessor.v12+newsroom.named-entity.v12+"
@@ -654,7 +673,7 @@ def test_post_assessment_dispatch_ambiguity_is_not_redispatched(
 
     assert first.state == second.state == "ASSESSMENT_INTERRUPTED"
     assert calls == ["assessor-dispatch"]
-    assert journal.progress[unit.revision_id]["stage"] == "ASSESSMENT_INTERRUPTED"
+    assert journal.current(unit.revision_id)["stage"] == "ASSESSMENT_INTERRUPTED"
     connection.close()
 
 
@@ -700,7 +719,7 @@ def test_retained_assessor_contract_failure_becomes_typed_hold(tmp_path) -> None
     assert first.state == replay.state == "EVIDENCE_HOLD"
     assert first.reason == replay.reason == "ASSESSOR_OUTPUT_CONTRACT_HOLD"
     assert calls == ["recover"]
-    facts = journal.progress[unit.revision_id]["facts"]
+    facts = journal.current(unit.revision_id)["facts"]
     assert facts["assessment_failure_envelope_id"] == "envelope"
     assert facts["assessment_failure_invocation_id"] == "invocation"
     assert facts["assessment_failure_allocation_digest"] == _DIGEST
@@ -769,14 +788,14 @@ def test_retained_zero_dispatch_assessor_failure_requires_exact_candidate(
     )
     if expected_state == "ASSESSMENT_INTERRUPTED":
         assert first.state == initial_stage
-        assert journal.progress[unit.revision_id]["stage"] == initial_stage
+        assert journal.current(unit.revision_id)["stage"] == initial_stage
         assert calls == ["checked"]
         connection.close()
         return
     assert first.state == expected_state
     assert first.reason == "ASSESSOR_PRE_DISPATCH_HOLD"
     assert calls == ["checked"]
-    facts = journal.progress[unit.revision_id]["facts"]
+    facts = journal.current(unit.revision_id)["facts"]
     assert facts["assessment_pre_dispatch_candidate_id"] == "candidate"
     assert facts["assessment_pre_dispatch_candidate_version_id"] == "candidate-version"
     assert facts["assessment_pre_dispatch_manifest_digest"] == _DIGEST
@@ -789,7 +808,7 @@ def test_retained_zero_dispatch_assessor_failure_requires_exact_candidate(
     assert acquisitions == (["attempted"] if retryable else [])
     if retryable:
         assert second.reason == "SOURCE_AUTHORITY_HOLD"
-        assert journal.progress[unit.revision_id]["facts"][
+        assert journal.current(unit.revision_id)["facts"][
             "acquisition_attempt_count"
         ] == 1
     else:
@@ -814,7 +833,7 @@ def test_unproved_assessment_interruption_has_no_follow_on_effect(
         "failure_class": failure_class,
         "reason": "ACQUISITION_RESULT_NOT_RETAINED",
     })
-    retained_ordinal = journal.progress[unit.revision_id]["ordinal"]
+    retained_ordinal = journal.current(unit.revision_id)["ordinal"]
     recovery_calls: list[str] = []
 
     def no_proof(_version):
@@ -841,7 +860,7 @@ def test_unproved_assessment_interruption_has_no_follow_on_effect(
     assert len(recovery_calls) == expected_recovery_calls
     assert authority.receives == 0
     assert publication.calls == 0
-    assert journal.progress[unit.revision_id]["ordinal"] == retained_ordinal
+    assert journal.current(unit.revision_id)["ordinal"] == retained_ordinal
     connection.close()
 
 
@@ -894,7 +913,7 @@ def test_typed_editorial_hold_is_durable_and_not_repeated(
     assert first.state == replay.state == "EVIDENCE_HOLD"
     assert first.reason == replay.reason == "FRESHNESS_NOT_PASS"
     assert publication.calls == 1
-    retained = journal.progress[unit.revision_id]
+    retained = journal.current(unit.revision_id)
     assert retained["stage"] == "EVIDENCE_HOLD"
     assert retained["facts"]["editorial_hold_reason_codes"] == [
         "FRESHNESS_NOT_PASS"
@@ -945,7 +964,7 @@ def test_generic_editorial_error_preserves_publication_intent_for_replay(
                 revision_id=unit.revision_id,
                 candidate_version_id="candidate-version",
             )
-        assert journal.progress[unit.revision_id]["stage"] == "PUBLICATION_STARTED"
+        assert journal.current(unit.revision_id)["stage"] == "PUBLICATION_STARTED"
 
     assert publication.calls == 2
     connection.close()
@@ -1045,7 +1064,7 @@ def test_same_candidate_successor_uses_authenticated_prior_versions_and_replays(
     continuation.advance(
         revision_id=second.revision_id, candidate_version_id="candidate-version-2"
     )
-    first_ordinal = journal.progress[second.revision_id]["ordinal"]
+    first_ordinal = journal.current(second.revision_id)["ordinal"]
     continuation.advance(
         revision_id=second.revision_id, candidate_version_id="candidate-version-2"
     )
@@ -1055,12 +1074,12 @@ def test_same_candidate_successor_uses_authenticated_prior_versions_and_replays(
         (request["expected_story_version"], request["expected_publication_version"])
         for request in publication.requests
     } == {(1, 2)}
-    facts = journal.progress[second.revision_id]["facts"]
+    facts = journal.current(second.revision_id)["facts"]
     assert facts["candidate_id"] == "candidate"
     assert facts["expected_story_version"] == 1
     assert facts["expected_publication_version"] == 2
     assert facts["expected_delivery_evidence_version"] == 0
-    assert journal.progress[second.revision_id]["ordinal"] == first_ordinal
+    assert journal.current(second.revision_id)["ordinal"] == first_ordinal
     connection.close()
 
 
@@ -1128,7 +1147,7 @@ def test_same_candidate_successor_rejects_wrong_prior_attempt_event(
         )
 
     assert publication.calls == 0
-    assert journal.progress[second.revision_id]["stage"] == "EVIDENCE_RETAINED"
+    assert journal.current(second.revision_id)["stage"] == "EVIDENCE_RETAINED"
     connection.close()
 
 
@@ -1166,12 +1185,48 @@ def test_started_acquisition_without_result_holds_without_redispatch(
     if owner_stop:
         with pytest.raises(VetoError, match="owner stop"):
             continuation.advance(revision_id=unit.revision_id, candidate_version_id="candidate-version")
-        assert journal.progress[unit.revision_id]["stage"] == "ACQUISITION_STARTED"
+        assert journal.current(unit.revision_id)["stage"] == "ACQUISITION_STARTED"
     else:
         result = continuation.advance(
             revision_id=unit.revision_id, candidate_version_id="candidate-version"
         )
         assert result.state == "ASSESSMENT_INTERRUPTED"
-        assert journal.progress[unit.revision_id]["stage"] == "ASSESSMENT_INTERRUPTED"
+        assert journal.current(unit.revision_id)["stage"] == "ASSESSMENT_INTERRUPTED"
     assert runtime.publication.calls == 0
     connection.close()
+
+
+def test_ack_history_scans_inline_summaries_without_expanding_pairs(tmp_path, monkeypatch):
+    from newsroom.tests.test_native_progress import _retrieval_facts
+
+    connection = connect(str(tmp_path / "ack-history.sqlite3"))
+    journal = NativeRevisionJournal(connection)
+    units = tuple(_native(f"prior-{index}") for index in range(3))
+    for index, unit in enumerate(units):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage="ACKNOWLEDGED", facts={
+            **_retrieval_facts(), "candidate_id": "candidate" if index < 2 else "unrelated",
+            "story_event_id": f"story-{index}", "delivery_attempt_event_id": f"attempt-{index}",
+        })
+    continuation = NativePublicationContinuation(
+        journal=journal, runtime=SimpleNamespace(authority=object(), ingress=object(),
+            publication=object(), policies=SimpleNamespace(publication=SimpleNamespace(
+                editorial_story_command_definition_digest=_DIGEST,
+                serving_attempt_command_definition_digest=_DIGEST)), proof=proof()),
+        evidence_controller=object.__new__(NativeEvidenceController), sources={},
+    )
+    monkeypatch.setattr(journal, "current", lambda _: pytest.fail("ACK scan expanded a cold pair"))
+    calls = []
+
+    def prior_event(event_id, **_):
+        calls.append(event_id)
+        return SimpleNamespace(aggregate_version=int(event_id.rsplit("-", 1)[1]) + 1)
+
+    monkeypatch.setattr(continuation, "_prior_event", prior_event)
+    try:
+        assert continuation._prior_acknowledged_versions(
+            revision_id="new-revision", candidate_id="candidate",
+        ) == (2, 2)
+        assert calls == ["story-0", "attempt-0", "story-1", "attempt-1"]
+    finally:
+        connection.close()

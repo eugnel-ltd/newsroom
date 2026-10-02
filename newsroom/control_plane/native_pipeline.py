@@ -110,7 +110,7 @@ class NativePipeline:
         # Retained downstream work must not wait behind fresh model requests.
         ordinary, reassessments, pending_revisions = [], [], []
         for revision_id, units in self._journal.units.items():
-            previous = self._journal.progress.get(revision_id, {})
+            previous = self._journal.summary(revision_id)
             facts = previous.get("facts", {})
             if not facts.get("graphiti_receipts"):
                 cohort = pending_revisions
@@ -132,7 +132,7 @@ class NativePipeline:
         # Interrupted/unknown effects still settle before ordinary work. The
         # stable sort preserves source recency, or LAND order on archive turns.
         # Each turn has the existing quantum; an atomic revision may overrun it.
-        ordinary.sort(key=lambda item: self._journal.progress.get(item[0], {}).get("stage")
+        ordinary.sort(key=lambda item: self._journal.summary(item[0]).get("stage")
                       not in {"ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
         ordinary_deadline = self._monotonic_clock() + self._reassessment_quantum
         ordinary_before = {revision: self._journal.progress_ordinal(revision) for revision, _ in ordinary}
@@ -188,7 +188,6 @@ class NativePipeline:
                 by_ingest = {item.ingest_id: item for item in results}
                 for revision_id in dict.fromkeys(unit.revision_id for unit in pending):
                     outcomes = tuple(by_ingest[unit.ingest_id] for unit in self._journal.units[revision_id])
-                    facts = dict(self._journal.progress.get(revision_id, {}).get("facts", {}))
                     deferred = tuple(item for item in outcomes if item.state == "GRAPHITI_DEFERRED")
                     if deferred:
                         if any(item.reason != "WORK_QUANTUM_EXHAUSTED" or item.receipt_digest is not None
@@ -197,6 +196,7 @@ class NativePipeline:
                         # A scheduling decision is not a durable failure. Keep
                         # the exact previous stage/facts until a later tick.
                         continue
+                    facts = dict(self._journal.current(revision_id).get("facts", {}))
                     complete = all(item.state == "GRAPHITI_COMPLETE" for item in outcomes)
                     if complete:
                         facts.pop("graphiti_outcomes", None)
@@ -231,7 +231,7 @@ class NativePipeline:
                 raise
             except Exception as exc:
                 for revision_id in dict.fromkeys(unit.revision_id for unit in pending):
-                    facts = self._journal.progress.get(revision_id, {}).get("facts", {})
+                    facts = self._journal.current(revision_id).get("facts", {})
                     self._journal.advance(revision_id, stage="GRAPHITI_HOLD", facts={
                         **facts, "reason": type(exc).__name__,
                     })
@@ -262,7 +262,7 @@ class NativePipeline:
             self._spill_archive_turn = not self._spill_archive_turn
         self._drain_between_work()
         states = Counter(
-            self._journal.progress.get(revision_id, {}).get("stage", "QUEUED")
+            self._journal.summary(revision_id).get("stage", "QUEUED")
             for revision_id in self._journal.units
         )
         return NativePipelineReport(
@@ -278,7 +278,7 @@ class NativePipeline:
         for revision_id, units in revisions:
             self._drain_between_work()
             self._check()
-            previous = self._journal.progress.get(revision_id, {})
+            previous = self._journal.summary(revision_id)
             if self._monotonic_clock() >= work_deadline:
                 if (previous.get("stage") == "GRAPHITI_COMPLETE"
                         and previous.get("facts", {}).get("graphiti_receipts")
@@ -336,6 +336,7 @@ class NativePipeline:
                         delivered, now=now, proof=self._runtime.proof,
                     )
                     if status.lead is None:
+                        facts = self._journal.current(revision_id).get("facts", {})
                         self._journal.advance(revision_id, stage="DISCOVERY_HOLD", facts={
                             **facts, "reason": status.phase.value,
                         })
@@ -348,7 +349,7 @@ class NativePipeline:
                         actor_identity_digest=self._actor, proof=self._runtime.proof,
                         owner_stop_check=self._check, owner_stop_fence=self._fence,
                     )
-                    facts = dict(self._journal.progress.get(revision_id, {}).get("facts", facts))
+                    facts = dict(self._journal.current(revision_id).get("facts", {}))
                     if len(outcomes) != 1 or outcomes[0].revision_id != revision_id:
                         raise ValueError("native Candidate continuation partition differs")
                     outcome = outcomes[0]
@@ -372,7 +373,7 @@ class NativePipeline:
             except Exception as exc:
                 # Do not overwrite a more precise durable provider-dispatch or
                 # publication intent marker with a generic outer-loop failure.
-                retained = self._journal.progress.get(revision_id, {})
+                retained = self._journal.summary(revision_id)
                 if retained.get("stage") in {
                     "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "ASSESSMENT_INTERRUPTED",
                     "COPY_CORRECTION_PREPARED", "ACKNOWLEDGED",
@@ -382,14 +383,14 @@ class NativePipeline:
                 ):
                     if isinstance(exc, NativeEvidenceHold):
                         self._journal.advance(revision_id, stage=retained["stage"], facts={
-                            **retained.get("facts", {}),
+                            **self._journal.current(revision_id).get("facts", {}),
                             "last_continuation_hold": {
                                 "reason": exc.reason_code, "source_id": exc.source_id,
                             },
                         })
                     continue
                 self._journal.advance(revision_id, stage=f"{stage}_HOLD", facts={
-                    **self._journal.progress.get(revision_id, {}).get("facts", facts),
+                    **self._journal.current(revision_id).get("facts", {}),
                     "reason": getattr(exc, "reason", getattr(exc, "reason_code", type(exc).__name__)),
                 })
         self._drain_between_work()

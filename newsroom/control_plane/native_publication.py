@@ -627,7 +627,7 @@ class NativePublicationContinuation:
         """Consume one finite proof-only snapshot before ordinary effects."""
         selected = []
         for revision_id in revision_ids:
-            progress = self._journal.progress.get(revision_id, {})
+            progress = self._journal.summary(revision_id)
             facts = progress.get("facts", {})
             if not (
                 (progress.get("stage") == "ASSESSMENT_INTERRUPTED"
@@ -689,7 +689,9 @@ class NativePublicationContinuation:
         for (revision_id, progress, version), failure in zip(selected, failures, strict=True):
             if not before_revision() and attempted:
                 break
-            if self._journal.progress.get(revision_id, {}) != progress:
+            # The thin snapshot includes the ordinal: even a pair-only STATE
+            # change invalidates this proof without expanding either pair.
+            if self._journal.summary(revision_id) != progress:
                 continue
             if failure is None and not assessment_revalidation_due(
                 progress.get("facts", {}), self._assessment_contract_version,
@@ -703,7 +705,6 @@ class NativePublicationContinuation:
             try:
                 result = self._retain_pre_dispatch_hold(
                     revision_id, version.version_id, version, failure,
-                    dict(progress.get("facts", {})),
                 )
             except (OperatorDrainRequested, VetoError):
                 raise
@@ -718,8 +719,17 @@ class NativePublicationContinuation:
                 checked.append(revision_id)
         return tuple(checked)
 
+    def _current_candidate_facts(self, revision_id, candidate_version_id, candidate_id) -> dict:
+        facts = dict(self._journal.current(revision_id).get("facts", {}))
+        if facts.get("candidate_version_id") not in (None, candidate_version_id):
+            raise NativePublicationError("native continuation Candidate differs")
+        if facts.get("candidate_id") not in (None, candidate_id):
+            raise NativePublicationError("native continuation stable Candidate differs")
+        facts.update(candidate_version_id=candidate_version_id, candidate_id=candidate_id)
+        return facts
+
     def _retain_pre_dispatch_hold(
-        self, revision_id, candidate_version_id, version, pre_dispatch, facts,
+        self, revision_id, candidate_version_id, version, pre_dispatch,
     ) -> NativePublicationContinuationResult | None:
         candidate_id = version.candidate_id
         if not (
@@ -730,6 +740,7 @@ class NativePublicationContinuation:
             == version.governing_manifest.canonical_digest
         ):
             return None
+        facts = self._current_candidate_facts(revision_id, candidate_version_id, candidate_id)
         attempt_count = facts.get("acquisition_attempt_count", 0)
         if type(attempt_count) is not int or attempt_count < 0:
             raise NativePublicationError("native acquisition attempt differs")
@@ -751,7 +762,7 @@ class NativePublicationContinuation:
     ) -> NativePublicationContinuationResult:
         if revision_id not in self._journal.units:
             raise NativePublicationError("native continuation revision differs")
-        progress = self._journal.progress.get(revision_id, {})
+        progress = self._journal.current(revision_id)
         facts = dict(progress.get("facts", {}))
         admission_recovery = (
             progress.get("stage") == "EVIDENCE_HOLD"
@@ -774,16 +785,20 @@ class NativePublicationContinuation:
             raise NativePublicationError("native continuation stable Candidate differs")
         facts["candidate_id"] = candidate_id
 
+        def current_facts() -> dict:
+            return self._current_candidate_facts(revision_id, candidate_version_id, candidate_id)
+
         if progress.get("stage") == "COPY_CORRECTION_PREPARED" or (
             progress.get("stage") == "ACKNOWLEDGED"
             and (self.copy_correction_due(facts) or facts.get("copy_correction_of"))
         ):
-            return self._advance_copy_correction(revision_id, candidate_version_id, facts, progress)
+            return self._advance_copy_correction(revision_id, candidate_version_id, facts, progress, current_facts)
 
         if (
             progress.get("stage") == "EVIDENCE_HOLD"
             and assessment_revalidation_due(facts, self._assessment_contract_version)
         ):
+            facts = current_facts()
             # Retain the superseded references before clearing continuation-only
             # fields. Intake identity and all original ledger/accounting remain.
             facts["assessment_superseded"] = {
@@ -819,6 +834,7 @@ class NativePublicationContinuation:
             ):
                 retained_failure = self._assessment_contract_failure(version)
             if type(retained_failure) is RetainedAssessorContractFailure:
+                facts = current_facts()
                 facts.update(
                     reason="ASSESSOR_OUTPUT_CONTRACT_HOLD",
                     acquisition_retryable=False,
@@ -847,7 +863,7 @@ class NativePublicationContinuation:
             ):
                 pre_dispatch = self._assessment_pre_dispatch_failure(version)
             retained = self._retain_pre_dispatch_hold(
-                revision_id, candidate_version_id, version, pre_dispatch, facts,
+                revision_id, candidate_version_id, version, pre_dispatch,
             )
             if retained is not None:
                 return retained
@@ -863,6 +879,7 @@ class NativePublicationContinuation:
             if request_id is None or received is None:
                 received = int(self._clock().value.timestamp())
                 request_id = f"native-intake:{candidate_version_id}"
+                facts = current_facts()
                 facts.update(
                     intake_request_id=request_id,
                     intake_received_epoch_seconds=received,
@@ -880,6 +897,7 @@ class NativePublicationContinuation:
                 request_id=str(request_id),
                 received_epoch_seconds=int(received),
             )
+            facts = current_facts()
             facts["intake_receipt_id"] = acknowledgement.receipt_id
             self._journal.advance(
                 revision_id, stage="INTAKE_ACKNOWLEDGED", facts=facts
@@ -901,6 +919,7 @@ class NativePublicationContinuation:
                 "ASSESSMENT_STARTED",
                 "ASSESSMENT_INTERRUPTED",
             }:
+                facts = current_facts()
                 facts["reason"] = "ACQUISITION_RESULT_NOT_RETAINED"
                 self._journal.advance(
                     revision_id, stage="ASSESSMENT_INTERRUPTED", facts=facts
@@ -924,6 +943,7 @@ class NativePublicationContinuation:
                 raise NativePublicationError("native acquisition attempt differs")
             attempt_count += 1
             acquisition_started_at = self._clock().to_text()
+            facts = current_facts()
             facts.update(
                 acquisition_attempt_count=attempt_count,
                 acquisition_started_at=acquisition_started_at,
@@ -935,7 +955,8 @@ class NativePublicationContinuation:
             assessment_started = False
 
             def before_assessment() -> None:
-                nonlocal assessment_started
+                nonlocal assessment_started, facts
+                facts = current_facts()
                 assessment_started = True
                 facts["assessment_started_at"] = acquisition_started_at
                 if self._assessment_contract_version is not None:
@@ -947,6 +968,8 @@ class NativePublicationContinuation:
             def retain_acquisition_failure(
                 failure_class: str,
             ) -> NativePublicationContinuationResult:
+                nonlocal facts
+                facts = current_facts()
                 retryable = attempt_count < _MAX_ACQUISITION_ATTEMPTS
                 facts.update(
                     reason=(
@@ -990,6 +1013,7 @@ class NativePublicationContinuation:
                     and exc.reason_code in _RETRYABLE_ACQUISITION_HOLDS
                 ):
                     return retain_acquisition_failure(type(exc).__name__)
+                facts = current_facts()
                 facts["reason"] = exc.reason_code
                 facts["acquisition_retryable"] = False
                 self._journal.advance(
@@ -1000,6 +1024,7 @@ class NativePublicationContinuation:
                 )
             except OSError as exc:
                 if assessment_started:
+                    facts = current_facts()
                     facts["reason"] = "ACQUISITION_RESULT_NOT_RETAINED"
                     facts["failure_class"] = type(exc).__name__
                     self._journal.advance(
@@ -1010,6 +1035,7 @@ class NativePublicationContinuation:
                     )
                 return retain_acquisition_failure(type(exc).__name__)
             except Exception as exc:
+                facts = current_facts()
                 facts["reason"] = "ACQUISITION_RESULT_NOT_RETAINED"
                 facts["failure_class"] = type(exc).__name__
                 self._journal.advance(
@@ -1032,6 +1058,7 @@ class NativePublicationContinuation:
                 )
             decision = evidence.editorial_decision
             package_id = str(evidence.retained.package_admission_id)
+            facts = current_facts()
             facts.update(
                 package_admission_id=package_id,
                 editorial_decision=json.loads(decision.canonical_bytes()),
@@ -1064,6 +1091,7 @@ class NativePublicationContinuation:
             story_version, publication_version = self._prior_acknowledged_versions(
                 revision_id=revision_id, candidate_id=candidate_id
             )
+            facts = current_facts()
             facts.update(
                 expected_story_version=story_version,
                 expected_publication_version=publication_version,
@@ -1077,6 +1105,7 @@ class NativePublicationContinuation:
         # Legacy progress named its intent times applied/observed. Keep those
         # historical facts readable, but never use them as effect timestamps.
         if not any(key in facts for key in ("publication_started_at", "publication_applied_at")):
+            facts = current_facts()
             facts["publication_started_at"] = self._clock().to_text()
             self._journal.advance(
                 revision_id, stage="PUBLICATION_STARTED", facts=facts
@@ -1103,6 +1132,7 @@ class NativePublicationContinuation:
                 or any(type(reason) is not str or not reason for reason in reason_codes)
             ):
                 raise NativePublicationError("editorial HOLD reasons differ") from exc
+            facts = current_facts()
             facts.update(
                 reason=(
                     reason_codes[0]
@@ -1133,6 +1163,7 @@ class NativePublicationContinuation:
                 raise NativePublicationError("private delivery ACK is absent")
         finally:
             reader.close()
+        facts = current_facts()
         facts.update(
             story_event_id=published.story_receipt.event_id,
             publication_event_id=published.publication_receipt.event_id,
@@ -1144,7 +1175,7 @@ class NativePublicationContinuation:
         self._journal.advance(revision_id, stage="ACKNOWLEDGED", facts=facts)
         return NativePublicationContinuationResult("ACKNOWLEDGED", None, published)
 
-    def _advance_copy_correction(self, revision_id, candidate_version_id, facts, progress):
+    def _advance_copy_correction(self, revision_id, candidate_version_id, facts, progress, current_facts):
         """Append one authenticated v2-to-v3 correction; never replace an ACK."""
         predecessor = facts.get("copy_correction_of")
         prepared = (progress.get("stage") == "COPY_CORRECTION_PREPARED"
@@ -1155,6 +1186,7 @@ class NativePublicationContinuation:
                     facts["story_event_id"], proof=self._runtime.proof,
                 )
                 if writer_id in {"newsroom.offline-exact-copy.v1", "newsroom.offline-exact-copy.v3"}:
+                    facts = current_facts()
                     facts.update(writer_id=writer_id, copy_correction_checked_version="newsroom.offline-exact-copy.v3")
                     self._journal.advance(revision_id, stage="ACKNOWLEDGED", facts=facts)
                     return NativePublicationContinuationResult("ACKNOWLEDGED", None, None)
@@ -1175,6 +1207,7 @@ class NativePublicationContinuation:
                 raise NativePublicationError("copy correction immutable evidence differs")
             expected = (prior.story_receipt.aggregate_version, prior.attempt_receipt.aggregate_version, 0)
             if not prepared:
+                facts = current_facts()
                 facts.update(
                     copy_correction_of=predecessor,
                     expected_story_version=expected[0], expected_publication_version=expected[1],
@@ -1195,11 +1228,13 @@ class NativePublicationContinuation:
         except (OperatorDrainRequested, VetoError):
             raise
         except Exception as exc:
+            facts = current_facts()
             facts["copy_correction_hold_reason"] = f"COPY_CORRECTION_HOLD:{type(exc).__name__}"
             facts["copy_correction_failure_detail"] = str(exc)[:240]
             stage = "COPY_CORRECTION_PREPARED" if prepared else "ACKNOWLEDGED"
             self._journal.advance(revision_id, stage=stage, facts=facts)
             return NativePublicationContinuationResult(stage, facts["copy_correction_hold_reason"], None)
+        facts = current_facts()
         facts.pop("copy_correction_hold_reason", None)
         facts.pop("copy_correction_failure_detail", None)
         facts.update(
@@ -1217,7 +1252,7 @@ class NativePublicationContinuation:
         self, *, revision_id: str, candidate_id: str
     ) -> tuple[int, int]:
         prior: list[tuple[int, int]] = []
-        for other_revision_id, progress in self._journal.progress.items():
+        for other_revision_id, progress in self._journal.iter_summaries():
             if other_revision_id == revision_id or progress.get("stage") != "ACKNOWLEDGED":
                 continue
             retained = progress.get("facts", {})

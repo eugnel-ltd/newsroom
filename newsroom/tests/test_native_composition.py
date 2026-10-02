@@ -559,7 +559,7 @@ def test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(
                         },
                     )
                     retained_ordinals[unit.revision_id] = (
-                        pipeline._journal.progress[unit.revision_id]["ordinal"]
+                        pipeline._journal.current(unit.revision_id)["ordinal"]
                     )
 
                 def unexpected_hydration(**_arguments):
@@ -591,7 +591,7 @@ def test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(
                     )
                 assert recovery_sources == [{}, {}]
                 assert {
-                    revision_id: pipeline._journal.progress[revision_id]["ordinal"]
+                    revision_id: pipeline._journal.current(revision_id)["ordinal"]
                     for revision_id in retained_ordinals
                 } == retained_ordinals
                 acknowledged = _native("copy-ack")

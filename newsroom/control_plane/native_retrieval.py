@@ -80,7 +80,7 @@ class NativeRetrievalContinuation:
         self._generation, self._port_for, self._rights = generation_id, port_for, rights_check
 
     def _facts(self, revision_id: str) -> dict:
-        return dict(self._journal.progress.get(revision_id, {}).get("facts", {}))
+        return dict(self._journal.current(revision_id).get("facts", {}))
 
     def _save(self, revision_id: str, stage: str, **updates) -> None:
         self._journal.advance(revision_id, stage=stage, facts={**self._facts(revision_id), **updates})
@@ -166,10 +166,11 @@ class NativeRetrievalContinuation:
         # is removed from all real projection branches without blocking a new,
         # currently authorised revision from another source.
         for source_revision, source_units in self._journal.units.items():
-            records = self._facts(source_revision).get("retrieval_documents", {})
+            facts = self._journal.summary(source_revision).get("facts", {})
+            records = facts.get("retrieval_documents", {})
             if not records:
                 continue
-            exclusions = dict(self._facts(source_revision).get("retrieval_exclusions", {}))
+            exclusions = dict(facts.get("retrieval_exclusions", {}))
             for unit in source_units:
                 record = records.get(unit.ingest_id)
                 if record is None:
@@ -199,13 +200,15 @@ class NativeRetrievalContinuation:
                     "document_digest": receipt.document_digest,
                     "current_rights_digest": current_rights_digest,
                 })
-            facts = self._facts(source_revision)
             prior = facts.get("retrieval_exclusions", {})
             if exclusions != prior:
+                # A changed exclusion carries the complete retained pair;
+                # unchanged historical subjects never expand their cold facts.
+                current = self._journal.current(source_revision)
                 self._journal.advance(
                     source_revision,
-                    stage=self._journal.progress[source_revision]["stage"],
-                    facts={**facts, "retrieval_exclusions": exclusions},
+                    stage=current["stage"],
+                    facts={**current.get("facts", {}), "retrieval_exclusions": exclusions},
                 )
         return tuple(subjects), sorted(
             inventory, key=lambda item: (item["revision_id"], item["ingest_id"]),
