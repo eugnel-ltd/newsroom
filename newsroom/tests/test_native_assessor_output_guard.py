@@ -72,6 +72,12 @@ def _policy(**changes):
 
 
 def _usage(tmp_path, monkeypatch, policy):
+    # This requalification fixture is immutable v19 -> v20, not today's wire.
+    if policy.prompt_contract_version == native._V20_PRODUCER_VERSION:
+        monkeypatch.setattr(native, "VERSION", native._V20_PRODUCER_VERSION)
+        monkeypatch.setattr(native, "SYSTEM", native._V20_SYSTEM)
+        monkeypatch.setattr(native, "PROVIDER_SCHEMA", native._V20_PROVIDER_SCHEMA)
+        monkeypatch.setattr(native, "PROVIDER_SCHEMA_DIGEST", native._V20_PROVIDER_SCHEMA_DIGEST)
     monkeypatch.setattr(native, "read_grok_command_semantic_version", lambda: "1.0.10")
     monkeypatch.setattr(native, "cont_writer_implementation_identity", lambda: ("1" * 40, True))
     path = str(tmp_path / "output-guard.sqlite3")
@@ -101,6 +107,9 @@ def _fixture(tmp_path, monkeypatch, *, declared_cli="1.0.10", observed_cli="1.0.
     )
     with monkeypatch.context() as historical:
         historical.setattr(native, "VERSION", native._V19_PRODUCER_VERSION)
+        historical.setattr(native, "SYSTEM", native._V19_SYSTEM)
+        historical.setattr(native, "PROVIDER_SCHEMA", native._V19_PROVIDER_SCHEMA)
+        historical.setattr(native, "PROVIDER_SCHEMA_DIGEST", native._V19_PROVIDER_SCHEMA_DIGEST)
         historical.setattr(native, "MODEL", "grok-4.6")
         historical.setattr(native, "REASONING", "medium")
         historical.setattr(native, "COMMAND_FLAGS", old.command_flags)

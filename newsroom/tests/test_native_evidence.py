@@ -56,7 +56,7 @@ from newsroom.tests.test_increment10_editorial import _evidence_facade, _ready_p
 from newsroom.tests.test_increment10_ingress import _candidate, _receive
 from newsroom.tests.test_increment10_private_serving import _open
 from newsroom.tests.test_native_assessor import (
-    _model_package_value, _v18_wire_from_v17,
+    _model_package_value, _current_wire_from_v17,
 )
 from newsroom.tests.test_native_publication import _bindings
 
@@ -295,7 +295,7 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
             assert "".join(segment["text"] for segment in request["sources"][0]["segments"]) == passage
             return NativeAssessmentExecution(
                 canonical_json_bytes(
-                    _v18_wire_from_v17(reference_value(value))
+                    _current_wire_from_v17(reference_value(value))
                 ).decode(),
                 {},
             )

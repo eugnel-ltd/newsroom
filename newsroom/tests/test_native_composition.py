@@ -34,9 +34,9 @@ NOW = datetime(2026, 9, 8, 14, tzinfo=UTC)
 
 
 def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
-    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v20"
+    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v21"
     assert native_composition.ASSESSMENT_CONTRACT_VERSION == (
-        "newsroom.native-evidence-assessor.v20+newsroom.named-entity.v15+"
+        "newsroom.native-evidence-assessor.v21+newsroom.named-entity.v15+"
         "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
         "newsroom.qualification-relation.v3+newsroom.retained-assessment.v1+"
         "newsroom.native-assessor-spans.v1"

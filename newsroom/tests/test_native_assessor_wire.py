@@ -199,3 +199,143 @@ def test_v17_codec_schema_and_materialisation_remain_unchanged():
     package, receipt = materialise_v17(v17, view, 'request-digest', provider_schema=V17_SCHEMA)
     assert package['package']['governed_claims'][0]['claim'] == 'Alice Smith said the deadline changed.'
     assert receipt['raw_digest'] == digest_bytes(canonical_json_bytes(v17))
+
+
+def test_current_wire_derives_selected_news_once_from_claim_roles():
+    from newsroom.control_plane.native_assessor import (
+        VERSION, _materialise_reference_result,
+    )
+
+    wire = _wire()
+    wire['package'].pop('substantive_claim_indexes')
+    wire['package']['select_new_information'] = True
+    wire['package']['governed_claims'].append({
+        'source_range': {'first_span_id': 'S1L2', 'last_span_id': 'S1L2'},
+        'rendered_assertion_zh_hant_hk_fragments': ['下一行提及60分鐘。'],
+        'factual_localisations': [
+            {'source_lookup_key': '60 minutes', 'rendered_expression': '60分鐘'},
+        ],
+        'quotation_source_keys': [], 'status': 'CONFIRMED_FACT',
+        'claim_role': 'SUBSTANTIVE',
+    })
+    wire['package']['governed_claims'].append({
+        'source_range': {'first_span_id': 'S1L3', 'last_span_id': 'S1L3'},
+        'rendered_assertion_zh_hant_hk_fragments': ['原有指引維持不變。'],
+        'factual_localisations': [], 'quotation_source_keys': [],
+        'status': 'CONFIRMED_FACT', 'claim_role': 'CONTEXT',
+    })
+    raw = canonical_json_bytes(wire)
+    view = build_source_view((BODY + 'Existing guidance remains.\n',), ('NEWS-1',))
+    package, receipt = _materialise_reference_result(raw, view, 'request-digest', VERSION)
+
+    assert package['package']['substantive_new_information'] == [
+        'Alice Smith said the deadline changed.', 'Next line has 60 minutes.',
+    ]
+    assert [claim['claim_role'] for claim in package['package']['governed_claims']] == [
+        'HEADLINE', 'SUBSTANTIVE', 'CONTEXT',
+    ]
+    assert receipt['raw_digest'] == digest_bytes(raw)
+
+
+def _retained_headline_fixture():
+    from pathlib import Path
+    return json.loads((Path(__file__).parent / 'fixtures/native_assessor_v20_headline.json').read_text())
+
+
+def _headline_wire(fixture, selected):
+    wire = json.loads(fixture['raw_result_text'])
+    wire['package'].pop('substantive_claim_indexes')
+    wire['package']['select_new_information'] = selected
+    return wire
+
+
+@pytest.mark.parametrize('selected,expected', [(True, 'WRITE_READY'), (False, 'REJECT')])
+def test_current_selection_reaches_existing_admission_without_duplicate_inventory(selected, expected):
+    from dataclasses import replace
+    from newsroom.control_plane.native_assessor import VERSION, _materialise_reference_result
+    from newsroom.control_plane.admission import DeterministicWriteAdmission
+    from newsroom.control_plane.evidence import EvidenceGateEvidence, EVIDENCE_GATE_POLICY_VERSION
+    from newsroom.increment10.evidence import _package_from_value
+
+    fixture = _retained_headline_fixture()
+    wire = _headline_wire(fixture, selected)
+    # Non-canonical whitespace must bind the actual supplied bytes, not an intermediate wire.
+    raw = json.dumps(wire, ensure_ascii=False, indent=1).encode()
+    view = build_source_view(tuple(fixture['source_passages']), tuple(fixture['source_ids']))
+    materialised, receipt = _materialise_reference_result(raw, view, 'current-request', VERSION)
+    from newsroom.control_plane.native_assessor import PROVIDER_SCHEMA_DIGEST
+    assert receipt['raw_digest'] == digest_bytes(raw)
+    assert receipt['provider_schema_digest'] == PROVIDER_SCHEMA_DIGEST
+    assert receipt['request_identity'] == 'current-request'
+    assert receipt['receipt_digest'] == digest_canonical({k:v for k,v in receipt.items() if k != 'receipt_digest'})
+    previous = json.loads(fixture['materialisation_receipt']['materialised_text'])['package']['governed_claims']
+    assert [{key:value for key,value in claim.items() if key != 'claim_id'}
+            for claim in materialised['package']['governed_claims']] == [
+        {key:value for key,value in claim.items() if key != 'claim_id'} for claim in previous]
+    assert materialised['package']['qualification_evidence'][0]['governed_claim_id'] == materialised['package']['governed_claims'][0]['claim_id']
+    retained = _package_from_value(fixture['retained_package'])
+    policy = fixture['editorial_policy']
+    claims = tuple(claim.claim_id for claim in retained.governed_claims)
+    package = replace(retained,
+        substantive_new_information=tuple(materialised['package']['substantive_new_information']),
+        evidence_gate_results=tuple(map(tuple,policy['evidence_gate_results'])),
+        evidence_gate_evidence=tuple(EvidenceGateEvidence(gate,result,claims,EVIDENCE_GATE_POLICY_VERSION)
+                                    for gate,result in policy['evidence_gate_results']),
+        freshness_result='PASS',integrity_result='PASS')
+    admission = DeterministicWriteAdmission()
+    def decide(value):
+        return admission.decide_candidate_identity(candidate_id=value.candidate_id,
+            hypothesis_id=value.hypothesis_id,package=value,decided_at=policy['evaluated_at'])
+    result = decide(package)
+    assert result.decision == expected
+    if selected:
+        assert package.substantive_new_information == (
+            'Official status changed: 香港天文台 issued the 雷暴警告.',
+            'The 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間).',
+        )
+        assert decide(replace(package,qualification_evidence=())).stable_reason_codes == ('UNQUALIFIED_HEADLINE_CLAIM',)
+        missing_body = replace(package,governed_claims=tuple(c for c in package.governed_claims if c.claim_role=='HEADLINE'),
+            substantive_new_information=(package.substantive_new_information[0],),
+            evidence_gate_evidence=tuple(replace(g,governed_claim_ids=(claims[0],))for g in package.evidence_gate_evidence))
+        assert 'INVALID_SUBSTANTIVE_CLAIM_INVENTORY' in decide(missing_body).stable_reason_codes
+    else:
+        assert package.substantive_new_information == ()
+        assert package.qualification_evidence
+        assert result.stable_reason_codes == ('NO_SUBSTANTIVE_NEW_INFORMATION',)
+
+
+def test_original_v20_result_and_receipt_replay_without_selection_reinterpretation():
+    from newsroom.control_plane.native_assessor import _materialise_reference_result
+    fixture = _retained_headline_fixture()
+    view = build_source_view(tuple(fixture['source_passages']), tuple(fixture['source_ids']))
+    materialised, receipt = _materialise_reference_result(fixture['raw_result_text'],view,
+        fixture['materialisation_receipt']['request_identity'],'newsroom.native-evidence-assessor.v20')
+    assert digest_bytes(fixture['raw_result_text'].encode()) == 'sha256:cd98d36fedbfa2fdacb8e5ce0d3da749ca2c2d4c84f45bab7f60ba7494e5a48c'
+    assert receipt == fixture['materialisation_receipt']
+    assert materialised['package']['substantive_new_information'] == [
+        'The 雷暴警告 warning record was issued on 2 October 2026 at 15:55 (香港時間).',
+    ]
+
+
+@pytest.mark.parametrize('mutation', ['empty', 'integer', 'old_indexes', 'bad_source'])
+def test_current_selection_preserves_no_news_and_closed_source_contract(mutation):
+    from newsroom.control_plane.native_assessor import VERSION, _materialise_reference_result
+    fixture = _retained_headline_fixture()
+    wire = _headline_wire(fixture, False)
+    if mutation == 'empty':
+        wire['package']['governed_claims'] = []
+        wire['package']['qualification_evidence'] = []
+    elif mutation == 'integer':
+        wire['package']['select_new_information'] = 1
+    elif mutation == 'old_indexes':
+        wire['package']['substantive_claim_indexes'] = [1]
+    else:
+        wire['package']['governed_claims'][0]['source_range']['first_span_id'] = 'S9L1'
+    view = build_source_view(tuple(fixture['source_passages']),tuple(fixture['source_ids']))
+    if mutation == 'empty':
+        materialised,_ = _materialise_reference_result(wire,view,'current-request',VERSION)
+        assert materialised['package']['substantive_new_information'] == []
+        assert materialised['package']['governed_claims'] == []
+    else:
+        with pytest.raises(SourceReferenceError):
+            _materialise_reference_result(wire,view,'current-request',VERSION)

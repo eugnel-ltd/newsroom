@@ -43,7 +43,7 @@ from newsroom.tests.test_graphiti_adapter_4d_outcomes import (
     _production_shaped_execution,
 )
 from newsroom.tests.test_native_composition import _arguments
-from newsroom.tests.test_native_assessor import _v18_wire_from_v17
+from newsroom.tests.test_native_assessor import _current_wire_from_v17
 from newsroom.tests.test_native_embeddings import _response as embedding_response
 from newsroom.tests.test_native_source_intake import ATOM, _document, _seed_uk01
 
@@ -361,7 +361,7 @@ def _install_boundaries(monkeypatch, counters):
         }
         return NativeAssessmentExecution(
             canonical_json_bytes(
-                _v18_wire_from_v17({"package": package})
+                _current_wire_from_v17({"package": package})
             ).decode(),
             {
                 "usage_basis": "PROVIDER_REPORTED",
