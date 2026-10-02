@@ -1966,6 +1966,15 @@ class Issue790CanaryRepository:
                     _json(record),
                 ),
             )
+            # A failed canary settles its legacy runtime blocker only after this
+            # exact outcome commits. Keep current usage in the same transaction.
+            from .model_usage import _refresh_current_usage
+
+            for allocation in connection.execute(
+                "SELECT invocation_id FROM model_invocation_allocations WHERE cycle_id=?",
+                (event_id,),
+            ).fetchall():
+                _refresh_current_usage(connection, str(allocation[0]))
             connection.commit()
             return record
         except Exception:

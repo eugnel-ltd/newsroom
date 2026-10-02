@@ -232,11 +232,9 @@ def test_native_qualification_reproves_embedding_disposition_authority(
         case.connection.commit()
         with pytest.raises(NativeQualificationError):
             _invocations(case.connection, case.journal)
-        if field == "native_scope_digest":
-            with pytest.raises(ModelUsageIntegrityError):
-                case.usage.route_state(ROUTE)
-        else:
-            assert case.usage.route_state(ROUTE)["state"] == "OPEN"
+        assert case.usage.route_state(ROUTE)["state"] == "CLOSED"
+        with pytest.raises(ModelUsageIntegrityError):
+            _dispose(case)
     finally:
         case.connection.close()
 
@@ -257,7 +255,7 @@ def test_native_embedding_cancellation_does_not_replay_native_progress(
         case.connection.close()
 
 
-def test_route_state_snapshot_keeps_native_accounting_and_rechecks_same_count_mutation(
+def test_route_state_snapshot_keeps_current_accounting_without_settled_history_replay(
     tmp_path, monkeypatch,
 ):
     case = _cancelled(tmp_path, monkeypatch)
@@ -297,13 +295,13 @@ def test_route_state_snapshot_keeps_native_accounting_and_rechecks_same_count_mu
             "SELECT count(*) FROM model_usage_conservative_dispositions"
         ).fetchone() == (1,)
         assert _immutable_snapshot(case) == before
-        with pytest.raises(ModelUsageIntegrityError, match="native conservative disposition differs"):
-            with case.usage.route_state_snapshot():
-                pytest.fail("changed historical authority entered a new snapshot")
+        with case.usage.route_state_snapshot() as read:
+            assert read(ROUTE)["state"] == "CLOSED"
         assert len(calls) == 2
-        with pytest.raises(ModelUsageIntegrityError, match="native conservative disposition differs"):
-            case.usage.route_state("GRAPHITI_CHAT_PRIMARY")
+        assert case.usage.route_state("GRAPHITI_CHAT_PRIMARY")["state"] == "CLOSED"
         assert len(calls) == 3
+        with pytest.raises(ModelUsageIntegrityError, match="native conservative disposition differs"):
+            _dispose(case)
     finally:
         case.connection.close()
 

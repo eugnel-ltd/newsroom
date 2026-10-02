@@ -117,6 +117,7 @@ def test_native_runtime_builds_dependencies_from_opened_base_before_children(
         return retrieval, collision, citations
 
     args["native_dependency_factory"] = build_dependencies
+    boot_records, history_records = [], []
     with open_native_runtime(**args) as runtime:
         assert len(captured) == 1
         objects, extraction, commands, events = captured[0]
@@ -125,26 +126,36 @@ def test_native_runtime_builds_dependencies_from_opened_base_before_children(
         assert commands is runtime.authority.commands
         assert events is runtime.authority.events
         seed_check_lineage(runtime.authority)
+        boot_records.extend(r for r in caplog.records if r.name == "newsroom.authority.open")
+        before_history = len(caplog.records)
+        runtime.authority.validate_retained_history()
+        history_records.extend(r for r in caplog.records[before_history:] if r.name == "newsroom.authority.open")
 
+    before_reopen = len(caplog.records)
     with open_native_runtime(**args) as reopened:
         assert len(captured) == 2
         assert captured[1][2] is reopened.authority.commands
         assert captured[1][3] is reopened.authority.events
+        boot_records.extend(r for r in caplog.records[before_reopen:] if r.name == "newsroom.authority.open")
+        before_history = len(caplog.records)
+        reopened.authority.validate_retained_history()
+        history_records.extend(r for r in caplog.records[before_history:] if r.name == "newsroom.authority.open")
 
     records = [r for r in caplog.records if r.name == "newsroom.authority.open"]
-    stages = (
+    historical_stages = (
         "extraction_integrity", "entity_integrity", "editorial_relation_integrity",
         "graphiti_integrity", "source_integrity", "check_integrity", "discovery_integrity",
-        "projection_integrity", "cas_reconciliation", "native_dependencies",
-        "native_semantic_stores", "native_relationships", "native_lineage", "native_candidates",
     )
-    for stage in stages:
-        selected = [r for r in records if r.args[0] == stage]
-        assert [r.args[1] if len(r.args) > 1 else "STARTED" for r in selected] == [
-            "STARTED", "COMPLETE", "STARTED", "COMPLETE",
-        ]
-    # Nested phase totals overlap. A stack proves the hierarchy rather than
-    # summing the enclosing validation and its child elapsed times.
+    startup_stages = ("projection_integrity", "cas_reconciliation", "native_dependencies", "native_semantic_stores")
+    assert not any(r.args[0] in historical_stages for r in boot_records)
+    for selected_records, stages in ((history_records, historical_stages), (boot_records, startup_stages)):
+        for stage in stages:
+            selected = [r for r in selected_records if r.args[0] == stage]
+            assert [r.args[1] if len(r.args) > 1 else "STARTED" for r in selected] == [
+                "STARTED", "COMPLETE", "STARTED", "COMPLETE",
+            ]
+    # Historical integrity still runs explicitly. Its nested phase totals
+    # remain inclusive, and CURRENT boot does not silently run those sweeps.
     stack = []
     for record in records:
         assert record.levelno == logging.INFO
@@ -155,8 +166,10 @@ def test_native_runtime_builds_dependencies_from_opened_base_before_children(
             assert stack.pop() == stage
             assert type(record.args[-1]) is int and record.args[-1] >= 0
     assert stack == []
-    messages = [r.getMessage() for r in records]
-    validation_end = next(i for i, r in enumerate(records) if r.args[:2] == ("validation", "COMPLETE"))
+    messages = [r.getMessage() for r in boot_records]
+    validation_end = next(i for i, r in enumerate(boot_records) if r.args[:2] == ("validation", "COMPLETE"))
+    # CURRENT projection integrity remains an actual boot boundary, not a
+    # retired-history sweep. Do not waive it alongside historical children.
     assert messages.index("authority_open stage=projection_integrity status=STARTED") < validation_end
     assert messages.index("authority_open stage=cas_reconciliation status=STARTED") > validation_end
     assert messages.index("authority_open stage=native_semantic_stores status=STARTED") > validation_end
@@ -188,7 +201,7 @@ def test_native_runtime_factory_failure_closes_base_writer(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("failure", (None, "relationship", "lineage", "candidate"))
-def test_native_open_shares_only_one_stable_validation_transaction(
+def test_explicit_native_history_shares_only_one_stable_validation_transaction(
     tmp_path, monkeypatch, failure, caplog
 ):
     from newsroom.authority import _hermes_native_system as native
@@ -241,18 +254,19 @@ def test_native_open_shares_only_one_stable_validation_transaction(
         scoped.setattr(native._SharedLineageStore, "_verify", lineage)
         scoped.setattr(native._SharedCandidateStore, "_verify", candidate)
         if failure is None:
-            with open_native_runtime(**args):
+            with open_native_runtime(**args) as runtime:
+                assert visited == []
+                runtime.authority.validate_retained_history()
                 assert visited == ["relationship", "lineage", "candidate"]
                 assert not connection.in_transaction
                 assert "ROLLBACK" not in statements
                 assert statements.count("COMMIT") == 1
         else:
             with pytest.raises(ValueError, match="injected composed validation failure") as raised:
-                open_native_runtime(**args)
+                with open_native_runtime(**args) as runtime:
+                    assert visited == []
+                    runtime.authority.validate_retained_history()
             assert raised.value is injected
-            assert [r.args[0] for r in caplog.records if "status=FAILED" in r.getMessage()] == [
-                {"relationship": "native_relationships", "lineage": "native_lineage", "candidate": "native_candidates"}[failure],
-            ]
             assert visited == ["relationship", "lineage", "candidate"][:1 + ("relationship", "lineage", "candidate").index(failure)]
             assert statements[-1] == "ROLLBACK"
         # Success and every failure path release the root writer.
@@ -295,10 +309,13 @@ def test_native_open_phase_failure_retains_exact_exception(tmp_path, monkeypatch
     )
     monkeypatch.setattr(owner, method, fail)
     with pytest.raises(RuntimeError) as raised:
-        open_native_runtime(**args)
+        with open_native_runtime(**args) as runtime:
+            if phase == "graphiti_integrity":
+                assert calls == []
+                runtime.authority.validate_retained_history()
     assert raised.value is failure
     assert calls == [phase]
     records = [r for r in caplog.records if r.name == "newsroom.authority.open"]
     failed = [r.args[0] for r in records if "status=FAILED" in r.getMessage()]
-    assert failed == ([phase, "validation"] if phase == "graphiti_integrity" else [phase])
+    assert failed == [phase]
     assert all(str(failure) not in r.getMessage() for r in records)

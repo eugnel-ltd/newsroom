@@ -25,8 +25,11 @@ from .source_3a_helpers import (
 def test_source_system_open_retains_page_and_foreign_key_checks(tmp_path) -> None:
     from newsroom.authority._event_store_base import _EventStoreBase
 
-    source = inspect.getsource(_EventStoreBase._validate_schema_and_integrity)
-    assert 'execute("PRAGMA quick_check")' in source
+    source = inspect.getsource(_EventStoreBase._validate_retained_database_history)
+    assert "_validate_retained_database_history" in source
+    assert _EventStoreBase._current_state_only is False
+    history = inspect.getsource(_EventStoreBase._validate_retained_database_history)
+    assert 'execute("PRAGMA quick_check")' in history
     database = tmp_path / "source.sqlite3"
     with open_source_system(database) as system:
         system.sources.register_definition(definition_request(), proof=proof())
@@ -53,8 +56,10 @@ def test_increment4_open_retains_row_integrity() -> None:
         is _EventStoreBase._should_validate_row_integrity
     )
     base = inspect.getsource(_EventStoreBase._validate_schema_and_integrity)
-    assert "_validate_immutable_records" in base
-    assert "_validate_relational_invariants" in base
+    assert "_validate_retained_database_history" in base
+    history = inspect.getsource(_EventStoreBase._validate_retained_database_history)
+    assert "_validate_immutable_records" in history
+    assert "_validate_relational_invariants" in history
 
 
 def test_checked_source_registry_migration_is_retained_in_v11(

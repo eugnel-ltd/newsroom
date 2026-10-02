@@ -558,7 +558,11 @@ def test_only_referenced_native_ledger_rows_enter_qualification(tmp_path):
             "WHERE kind='NATIVE_REVISION_PROGRESS'"
         )
         connection.commit()
-        with pytest.raises(NativeQualificationError, match="native ledger payload"):
+        # Ordinary continuation now lives in CURRENT rows, not STATE logs.
+        assert validate_qualification(connection, IDENTITY).cycle_id == 'qualification-cycle'
+        connection.execute("UPDATE native_current_heads SET state_json='{}'")
+        connection.commit()
+        with pytest.raises(NativeQualificationError, match='native revision|retained native qualification'):
             validate_qualification(connection, IDENTITY)
     finally:
         connection.close()
@@ -586,7 +590,7 @@ def test_qualification_retains_history_references_not_duplicate_payloads(tmp_pat
         connection.close()
 
 
-@pytest.mark.parametrize("kind", ["NATIVE_REVISION_LANDED", "NATIVE_REVISION_PROGRESS", "NATIVE_SOURCE_PORTFOLIO"])
+@pytest.mark.parametrize("kind", ["NATIVE_REVISION_LANDED", "NATIVE_SOURCE_PORTFOLIO"])
 def test_qualification_validates_payload_before_discarding_duplicate(kind, tmp_path):
     from newsroom.control_plane.native_qualification import _ledger
 
@@ -601,37 +605,16 @@ def test_qualification_validates_payload_before_discarding_duplicate(kind, tmp_p
         connection.close()
 
 
-def test_same_count_revision_fact_mutation_does_not_match_reference(tmp_path):
-    connection = _open(tmp_path / "revision-mutation.sqlite3")
+def test_same_count_current_revision_fact_mutation_does_not_match_reference(tmp_path):
+    connection = _open(tmp_path / 'current-revision-mutation.sqlite3')
     try:
         _cycle(connection)
         retained = record_qualification(connection, IDENTITY)
-        seq, at, kind, previous = connection.execute(
-            "SELECT seq,at,kind,prev_digest FROM ledger "
-            "WHERE kind='NATIVE_REVISION_PROGRESS'"
-        ).fetchone()
-        payload = {
-            "revision_id": next(iter(NativeRevisionJournal(connection).units)),
-            "ordinal": 1,
-            "stage": "EVIDENCE_HOLD",
-            "facts": {"reason": "DIFFERENT_RETAINED_HOLD"},
-        }
-        raw = canonical_json_bytes(payload)
-        payload_digest = digest_bytes(raw)
-        ledger_digest = digest_bytes(canonical_json_bytes({
-            "at": at, "kind": kind, "payload_digest": payload_digest,
-            "prev": previous,
-        }))
-        connection.execute(
-            "UPDATE ledger SET payload_json=?,payload_digest=?,digest=? WHERE seq=?",
-            (raw.decode(), payload_digest, ledger_digest, seq),
-        )
+        connection.execute("UPDATE native_current_heads SET state_json='{}'")
         connection.commit()
-        with pytest.raises(NativeQualificationError):
+        with pytest.raises(NativeQualificationError, match='native revision|retained native qualification'):
             validate_qualification(connection, IDENTITY)
-        assert retained.revision_inventory_digest != digest_canonical(
-            {"EVIDENCE_HOLD": 1}
-        )
+        assert retained.revision_inventory_digest != digest_canonical({'EVIDENCE_HOLD': 1})
     finally:
         connection.close()
 
@@ -750,33 +733,24 @@ def test_durable_continuation_defers_readiness_but_never_qualifies(tmp_path, sta
         connection.close()
 
 
-def test_qualification_accepts_shared_progress_and_rejects_broken_reference(tmp_path):
-    from newsroom.control_plane.native_progress import STATE
+def test_qualification_accepts_current_pairs_and_rejects_corrupt_current_root(tmp_path):
     from newsroom.tests.test_native_progress import _retrieval_facts
-
-    connection = _open(tmp_path / "shared-progress.sqlite3")
+    connection = _open(tmp_path / 'current-pairs.sqlite3')
     journal = NativeRevisionJournal(connection)
-    unit = _native("qualification-hold")
+    unit = _native('qualification-hold')
     journal.land((unit,))
     facts = _retrieval_facts()
-    journal.advance(unit.revision_id, stage="RETRIEVAL_COMPLETE", facts=facts)
+    journal.advance(unit.revision_id, stage='RETRIEVAL_COMPLETE', facts=facts)
     _cycle(connection, facts=facts)
-    latest = json.loads(connection.execute(
-        "SELECT payload_json FROM ledger WHERE kind=? ORDER BY seq DESC LIMIT 1",
-        (STATE,),
-    ).fetchone()[0])
-    assert "retrieval_facts_ref" in latest
-    assert NativeRevisionJournal(connection).current(unit.revision_id)["facts"] == facts
+    assert connection.execute("SELECT count(*) FROM ledger WHERE kind='NATIVE_REVISION_PROGRESS'").fetchone()[0] == 0
+    assert NativeRevisionJournal(connection).current(unit.revision_id)['facts'] == facts
     retained = record_qualification(connection, IDENTITY)
     assert validate_qualification(connection, IDENTITY) == retained
-    append_ledger(connection, STATE, {
-        "revision_id": unit.revision_id, "ordinal": 3, "stage": "EVIDENCE_HOLD",
-        "facts": {"reason": "SOURCE_LOCAL_EVIDENCE_HOLD"},
-        "retrieval_facts_ref": {"seq": 0, "ordinal": 2, "payload_digest": "sha256:" + "0" * 64},
-    })
+    connection.execute('PRAGMA foreign_keys=OFF')
+    connection.execute("UPDATE native_current_heads SET pair_digest='sha256:' || printf('%064d', 0)")
     connection.commit()
     before = connection.total_changes
-    with pytest.raises(NativeQualificationError, match="native revision"):
+    with pytest.raises(NativeQualificationError, match='native revision|retained native qualification'):
         record_qualification(connection, IDENTITY)
     with pytest.raises(NativeQualificationError):
         validate_qualification(connection, IDENTITY)
@@ -936,5 +910,22 @@ def test_terminal_inventory_checks_all_inline_holds_without_cold_pair_reads(tmp_
         retained, states = _revision_inventory(connection, (), {"EVIDENCE_HOLD": 1})
         assert states == {"EVIDENCE_HOLD": 1}
         assert retained.summary(unit.revision_id)["facts"]["unknown_inline"] == {"future": True}
+    finally:
+        connection.close()
+
+
+def test_legitimate_new_current_state_invalidates_old_qualification_binding(tmp_path):
+    connection = _open(tmp_path / 'new-current-state.sqlite3')
+    try:
+        _cycle(connection)
+        record_qualification(connection, IDENTITY)
+        journal = NativeRevisionJournal(connection)
+        revision = next(iter(journal.units))
+        current = journal.current(revision)
+        journal.advance(revision, stage=current['stage'], facts={
+            **current['facts'], 'reason': 'A_NEW_SOURCE_LOCAL_HOLD',
+        })
+        with pytest.raises(NativeQualificationError, match='qualification|inventory'):
+            validate_qualification(connection, IDENTITY)
     finally:
         connection.close()

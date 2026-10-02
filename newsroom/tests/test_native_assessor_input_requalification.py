@@ -56,6 +56,9 @@ def _fixture(tmp_path, monkeypatch):
         manifest.update(schema_version=old.context_manifest_schema_version, prompt_bytes=397_776, prompt_digest=digest_bytes(b'x' * 397_776))
         manifest['request_digest'] = digest_canonical({key: manifest[key] for key in ('provider','route','model','reasoning','command_semantic_version','command_flags','implementation_revision','system_digest','prompt_digest','output_schema_digest')})
         manifest['context_manifest_digest'] = digest_canonical(manifest)
+        c.execute('DELETE FROM model_usage_current WHERE invocation_id=?', (allocation.invocation_id,))
+        from newsroom.control_plane.model_usage_current import _set_inventory
+        _set_inventory(c, 0)
         c.execute('DELETE FROM model_invocation_allocations WHERE invocation_id=?', (allocation.invocation_id,))
     service.retain_context_manifest(manifest)
     values = asdict(allocation)
@@ -126,7 +129,7 @@ def test_requalification_rejects_lifted_or_uncorrected_bounds(tmp_path, monkeypa
         _recover(service, allocation, invalid)
 
 
-def test_corrupt_requalification_does_not_release_route_on_reopen(tmp_path, monkeypatch):
+def test_settled_requalification_history_stays_off_route_admission_but_replay_rechecks(tmp_path, monkeypatch):
     service, _usage_, _candidate_, _base_, allocation, policy = _fixture(tmp_path, monkeypatch)
     _recover(service, allocation, policy)
     with sqlite3.connect(service.path) as c:
@@ -134,8 +137,10 @@ def test_corrupt_requalification_does_not_release_route_on_reopen(tmp_path, monk
         record = json.loads(row[1]);record['candidate_id'] = 'different'
         raw = json.dumps(record,sort_keys=True,separators=(',',':'))
         c.execute('UPDATE ledger SET payload_json=?,payload_digest=? WHERE seq=?',(raw,digest_bytes(raw.encode()),row[0]))
-    with sqlite3.connect(service.path) as c, pytest.raises(ModelUsageIntegrityError):
-        service._route_state(c, policy.route)
+    with sqlite3.connect(service.path) as c:
+        assert service._route_state(c, policy.route)['state'] == 'CLOSED'
+    with pytest.raises(ModelUsageIntegrityError):
+        _recover(service, allocation, policy)
 
 
 @pytest.mark.parametrize('unreported', (False, True))

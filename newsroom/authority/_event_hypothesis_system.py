@@ -191,6 +191,7 @@ class _HypothesisStore:
         _open_verification: list[
             tuple[dict[str, EventHypothesisVersion], tuple[int, int, int]]
         ] | None = None,
+        _validate_on_open: bool = True,
     ) -> None:
         if (
             type(connection) is not sqlite3.Connection
@@ -248,12 +249,11 @@ class _HypothesisStore:
                 _require_verification_snapshot(
                     connection, verified_disposition_snapshot
                 )
-            verified = self._verify(
-                verified_dispositions=verified_dispositions
-            )
-            snapshot = _verification_snapshot(connection)
+            if _validate_on_open:
+                verified = self._verify(verified_dispositions=verified_dispositions)
+                snapshot = _verification_snapshot(connection)
             self._commit()
-            if _open_verification is not None:
+            if _open_verification is not None and _validate_on_open:
                 _open_verification.append((verified, snapshot))
         except BaseException as exc:
             self._rollback()

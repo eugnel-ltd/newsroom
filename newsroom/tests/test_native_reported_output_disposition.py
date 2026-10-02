@@ -204,7 +204,7 @@ def test_changed_authority_fails_closed(tmp_path, monkeypatch, defect):
         case.connection.close()
 
 
-def test_reopen_revalidates_disposition_and_does_not_duplicate_closure(tmp_path, monkeypatch):
+def test_reopen_reads_current_disposition_without_duplicate_closure_and_replay_rechecks(tmp_path, monkeypatch):
     case = _failed(tmp_path, monkeypatch)
     try:
         record = _dispose(case)
@@ -214,8 +214,9 @@ def test_reopen_revalidates_disposition_and_does_not_duplicate_closure(tmp_path,
         assert case.connection.execute("SELECT count(*) FROM model_usage_route_circuit_events WHERE state='CLOSED'").fetchone() == (1,)
         case.connection.execute("UPDATE model_usage_reported_output_dispositions SET record_json='{}'")
         case.connection.commit()
+        assert reopened.route_state(ROUTE)['state'] == 'CLOSED'
         with pytest.raises((m.ModelUsageIntegrityError, ValueError, KeyError)):
-            reopened.route_state(ROUTE)
+            _dispose(case)
     finally:
         case.connection.close()
 
@@ -329,8 +330,9 @@ def test_disposition_rechecks_conflicting_landing_via_scoped_index(tmp_path, mon
         landing['units'][0]['observed_at'] = '2026-09-01T00:00:00Z'
         append_ledger(case.connection, 'NATIVE_REVISION_LANDED', landing)
         case.connection.commit()
+        assert case.usage.route_state(ROUTE)['state'] == 'CLOSED'
         with pytest.raises(m.ModelUsageIntegrityError):
-            case.usage.route_state(ROUTE)
+            _dispose(case)
     finally:
         case.connection.close()
 
@@ -389,4 +391,27 @@ def test_full_advance_excludes_disposed_failed_ingest_but_dispatches_healthy_pee
         assert _history(case) == before
     finally:
         connection.close()
+        case.connection.close()
+
+
+@pytest.mark.parametrize('changed', ('envelope', 'disposition', 'both'))
+def test_selected_no_retry_authenticates_current_ingest_before_filtering(tmp_path, monkeypatch, changed):
+    case = _failed(tmp_path, monkeypatch)
+    try:
+        _dispose(case)
+        assert m.reported_output_rejected_ingests(case.connection, ingest_ids=(case.unit.ingest_id,)) == {case.unit.ingest_id}
+        for table, key, identity in (
+            ('model_work_envelopes', 'envelope_id', case.envelope.envelope_id),
+            ('model_usage_reported_output_dispositions', 'invocation_id', case.allocation.invocation_id),
+        ):
+            if changed != 'both' and (changed == 'envelope') != (table == 'model_work_envelopes'):
+                continue
+            raw = case.connection.execute(f'SELECT record_json FROM {table} WHERE {key}=?', (identity,)).fetchone()[0]
+            record = json.loads(raw)
+            record['ingest_id'] = 'different-ingest'
+            case.connection.execute(f'UPDATE {table} SET record_json=? WHERE {key}=?', (m._json(record), identity))
+        case.connection.commit()
+        with pytest.raises(m.ModelUsageIntegrityError):
+            m.reported_output_rejected_ingests(case.connection, ingest_ids=(case.unit.ingest_id,))
+    finally:
         case.connection.close()

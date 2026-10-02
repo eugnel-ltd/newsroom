@@ -16,6 +16,15 @@ from scripts.hermes_native import main
 from newsroom.authority.canonical import digest_canonical
 
 
+def _diagnostics(tmp_path):
+    path = tmp_path / "diagnostics/native.log"
+    if not path.exists():
+        return []
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    return [(record["event"], record["data"]) for record in records
+            if record.get("event", "").startswith("NATIVE_SERVICE_CYCLE_")]
+
+
 @pytest.mark.parametrize("pending", [
     "QUEUED", "GRAPHITI_COMPLETE", "ASSESSMENT_INTERRUPTED",
     "ASSESSMENT_STARTED", "PUBLICATION_STARTED",
@@ -124,10 +133,11 @@ def test_native_service_runs_two_ticks_without_story_cap_and_closes(tmp_path, mo
     with sqlite3.connect(tmp_path / "unpublished.sqlite3") as connection:
         assert connection.execute(
             "SELECT kind FROM ledger WHERE kind LIKE 'NATIVE_SERVICE_%' ORDER BY seq"
-        ).fetchall() == [
-            ("NATIVE_SERVICE_CYCLE_STARTED",), ("NATIVE_SERVICE_CYCLE_TERMINAL",),
-            ("NATIVE_SERVICE_CYCLE_STARTED",), ("NATIVE_SERVICE_CYCLE_TERMINAL",),
-        ]
+        ).fetchall() == []
+    assert [kind for kind, _ in _diagnostics(tmp_path)] == [
+        "NATIVE_SERVICE_CYCLE_STARTED", "NATIVE_SERVICE_CYCLE_TERMINAL",
+        "NATIVE_SERVICE_CYCLE_STARTED", "NATIVE_SERVICE_CYCLE_TERMINAL",
+    ]
 
 
 def test_native_service_interval_is_measured_from_cycle_start(tmp_path, monkeypatch):
@@ -197,9 +207,7 @@ def test_continuous_service_qualifies_first_complete_cycle_before_second_tick(
 
     def qualify(connection, actual_identity):
         assert actual_identity == identity
-        assert connection.execute(
-            "SELECT kind FROM ledger ORDER BY seq DESC LIMIT 1"
-        ).fetchone()[0] == "NATIVE_SERVICE_CYCLE_TERMINAL"
+        assert connection.execute("SELECT count(*) FROM ledger WHERE kind LIKE 'NATIVE_SERVICE_CYCLE_%'").fetchone()[0] == 0
         order.append("qualified")
 
     waits = []
@@ -247,12 +255,7 @@ def test_continuous_qualification_failure_closes_without_second_cycle(
 
     assert ticks == ["cycle-1"]
     assert opened == ["open", "close"]
-    with sqlite3.connect(tmp_path / "unpublished.sqlite3") as connection:
-        terminal = connection.execute(
-            "SELECT json_extract(payload_json,'$.outcome') FROM ledger "
-            "WHERE kind='NATIVE_SERVICE_CYCLE_TERMINAL'"
-        ).fetchone()
-        assert terminal == ("COMPLETE",)
+    assert _diagnostics(tmp_path)[-1][1]["outcome"] == "COMPLETE"
 
 
 @pytest.mark.parametrize("settle_after_first_tick,once,corrupt_total", [
@@ -358,11 +361,8 @@ def test_native_service_failure_is_terminal_then_restart_continues(tmp_path, mon
         tmp_path, factory, cycle_id_factory=lambda: "restart-cycle",
     ).run(once=True)
     assert complete.outcome == "COMPLETE"
-    with sqlite3.connect(tmp_path / "unpublished.sqlite3") as connection:
-        terminals = [json.loads(row[0]) for row in connection.execute(
-            "SELECT payload_json FROM ledger "
-            "WHERE kind='NATIVE_SERVICE_CYCLE_TERMINAL' ORDER BY seq"
-        )]
+    terminals = [payload for kind, payload in _diagnostics(tmp_path)
+                 if kind == "NATIVE_SERVICE_CYCLE_TERMINAL"]
     assert [(item["cycle_id"], item["outcome"]) for item in terminals] == [
         ("failed-cycle", "FAILED"), ("restart-cycle", "COMPLETE"),
     ]
@@ -377,10 +377,7 @@ def test_native_service_preserves_veto_and_singleton_lock(tmp_path, monkeypatch)
     with pytest.raises(VetoError, match="signed stop"):
         service.run(once=True)
     assert opened == ["open", "close"]
-    with sqlite3.connect(tmp_path / "unpublished.sqlite3") as connection:
-        records = [(kind, json.loads(payload)) for kind, payload in connection.execute(
-            "SELECT kind, payload_json FROM ledger ORDER BY seq"
-        )]
+    records = _diagnostics(tmp_path)
     assert [kind for kind, _ in records] == [
         "NATIVE_SERVICE_CYCLE_STARTED", "NATIVE_SERVICE_CYCLE_TERMINAL",
     ]
@@ -415,11 +412,7 @@ def test_native_service_operator_drain_is_terminal_without_qualification(
     assert report == NativeServiceReport("drained-cycle", "DRAINED", None, None)
     assert qualified == []
     assert opened == ["open", "close"]
-    with sqlite3.connect(tmp_path / "unpublished.sqlite3") as connection:
-        terminal = json.loads(connection.execute(
-            "SELECT payload_json FROM ledger "
-            "WHERE kind='NATIVE_SERVICE_CYCLE_TERMINAL'"
-        ).fetchone()[0])
+    terminal = _diagnostics(tmp_path)[-1][1]
     assert terminal == {
         "cycle_id": "drained-cycle", "outcome": "DRAINED",
         "failure_class": None, "pipeline": None,
@@ -460,15 +453,12 @@ def test_native_service_binds_both_cycle_records_to_runtime_identity(tmp_path, m
     qualified = []
 
     def qualify(connection, digest):
-        assert connection.execute("SELECT kind FROM ledger ORDER BY seq DESC LIMIT 1").fetchone()[0] == "NATIVE_SERVICE_CYCLE_TERMINAL"
+        assert connection.execute("SELECT count(*) FROM ledger WHERE kind LIKE 'NATIVE_SERVICE_CYCLE_%'").fetchone()[0] == 0
         qualified.append(digest)
 
     _service(tmp_path, bound, qualify_once=qualify).run(once=True)
     assert qualified == [identity]
-    with sqlite3.connect(tmp_path / "unpublished.sqlite3") as connection:
-        records = tuple(json.loads(row[0]) for row in connection.execute(
-            "SELECT payload_json FROM ledger WHERE kind LIKE 'NATIVE_SERVICE_%' ORDER BY seq"
-        ))
+    records = tuple(payload for _, payload in _diagnostics(tmp_path))
     assert len(records) == 2
     assert all(record["runtime_identity_digest"] == identity for record in records)
 
@@ -715,12 +705,12 @@ def test_terminal_references_retained_portfolio_without_changing_logical_report(
             "SELECT seq,payload_digest FROM ledger WHERE kind='NATIVE_SOURCE_PORTFOLIO'"
         ).fetchall()
         assert len(portfolio) == 1
-        terminals = connection.execute(
-            "SELECT payload_json FROM ledger WHERE kind='NATIVE_SERVICE_CYCLE_TERMINAL' "
-            "ORDER BY seq DESC LIMIT 2"
-        ).fetchall()
-        for (raw,) in terminals:
-            pipeline = json.loads(raw)["pipeline"]
+        terminals = [payload for kind, payload in _diagnostics(tmp_path)
+                     if kind == "NATIVE_SERVICE_CYCLE_TERMINAL"]
+        assert len(terminals) == 2
+        for terminal in terminals:
+            raw = json.dumps(terminal)
+            pipeline = terminal["pipeline"]
             assert pipeline == {
                 "source_portfolio_ref": {"seq": portfolio[0][0], "payload_digest": portfolio[0][1]},
                 "revision_states": {"EVIDENCE_HOLD": 1}, "unclassified_revisions": 0,

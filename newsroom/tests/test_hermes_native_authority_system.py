@@ -102,9 +102,9 @@ def test_hermes_composition_opens_one_writer_and_all_native_facades(
     original_work_item_init = TriageWorkItemStore.__init__
     original_context_require = RetrievalContextAuthority.verify_retained_integrity
 
-    def counted_work_item_init(self, connection, retrieval_authority=None):
+    def counted_work_item_init(self, connection, retrieval_authority=None, **kwargs):
         work_item_constructions.append(connection)
-        original_work_item_init(self, connection, retrieval_authority)
+        original_work_item_init(self, connection, retrieval_authority, **kwargs)
 
     def counted_context_require(self, connection, binding):
         context_authentications.append(binding.context_id)
@@ -216,8 +216,9 @@ def test_hermes_composition_opens_one_writer_and_all_native_facades(
     reopened = open_hermes_native_authority_system(**kwargs)
     try:
         assert len(work_item_constructions) == 1
-        # The one currentness read also authenticates retained integrity.
-        assert context_authentications == [retrieval_binding.context_id]
+        # Native construction does not authenticate unused Work Item history.
+        # The current read proves its selected immutable lineage below.
+        assert context_authentications == []
         with sqlite3.connect(tmp_path / "authority.sqlite3") as connection:
             trigger_name = "immutable_triage_work_item_versions_update"
             trigger_sql = connection.execute(
@@ -238,5 +239,6 @@ def test_hermes_composition_opens_one_writer_and_all_native_facades(
         "newsroom.authority._graphiti_increment4_system._open_structural_graph_adapter",
         lambda _: MemoryNeo4jAdapter(),
     )
-    with pytest.raises(WorkItemContractError, match="fields are not exact"):
-        open_hermes_native_authority_system(**kwargs)
+    with open_hermes_native_authority_system(**kwargs) as current:
+        with pytest.raises(WorkItemContractError, match="fields are not exact"):
+            current.work_items.current_version(item.work_item_id)

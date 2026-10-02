@@ -226,14 +226,22 @@ class _SourceRegistryStoreSupport:
         conn: sqlite3.Connection,
         definition_id: SourceDefinitionId,
     ) -> sqlite3.Row | None:
-        return conn.execute(
-            "SELECT h.current_version_number,h.current_version_id,v.* "
+        row = conn.execute(
+            "SELECT h.current_version_number,h.current_version_id,v.*,"
+            "(SELECT MAX(version_number) FROM source_definition_versions WHERE definition_id=h.definition_id) AS selected_max_version "
             "FROM source_definition_version_heads h "
             "JOIN source_definition_versions v "
             "ON v.version_id=h.current_version_id "
             "WHERE h.definition_id=?",
             (str(definition_id),),
         ).fetchone()
+        if row is not None and (
+            row["definition_id"] != str(definition_id)
+            or row["version_number"] != row["current_version_number"]
+            or row["version_number"] != row["selected_max_version"]
+        ):
+            raise AuthorityPersistenceError("current source version head is not the exact latest producer")
+        return row
 
     @staticmethod
     def _require_current_version(

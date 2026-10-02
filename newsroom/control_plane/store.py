@@ -684,6 +684,13 @@ def connect(path: str) -> sqlite3.Connection:
     assert_private_store(path)
     connection = sqlite3.connect(path)
     apply_control_plane_sqlite_profile(connection)
+    existed = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone()
+    has_current_schema = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_current_meta'"
+    ).fetchone()
+    fresh_current = not existed or (
+        not has_current_schema and not connection.execute('SELECT 1 FROM ledger LIMIT 1').fetchone()
+    )
     connection.execute(_GRAPHITI_REVISION_EVENTS_SQL)
     connection.executescript(_PAYLOAD_SQL)
     expected_ledger_info = (
@@ -796,6 +803,10 @@ def connect(path: str) -> sqlite3.Connection:
             connection.execute(
                 f"ALTER TABLE unpublished_graphiti_spend ADD COLUMN {column} {declaration}"
             )
+    from .native_progress_state import ensure_schema
+    # Only a genuinely new/empty store may initialise empty state. An existing
+    # CURRENT schema with a missing marker is corruption, not a legacy fallback.
+    ensure_schema(connection, initialise_empty=fresh_current and not has_current_schema)
     return connection
 
 

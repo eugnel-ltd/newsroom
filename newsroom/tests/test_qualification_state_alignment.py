@@ -138,13 +138,14 @@ def test_service_continues_two_real_report_cycles_without_qualifying_pending_cop
     with sqlite3.connect(tmp_path / "unpublished.sqlite3") as connection:
         assert connection.execute(
             "SELECT kind FROM ledger WHERE kind LIKE 'NATIVE_SERVICE_%' ORDER BY seq"
-        ).fetchall() == [
-            ("NATIVE_SERVICE_CYCLE_STARTED",), ("NATIVE_SERVICE_CYCLE_TERMINAL",),
-            ("NATIVE_SERVICE_CYCLE_STARTED",), ("NATIVE_SERVICE_CYCLE_TERMINAL",),
+        ).fetchall() == []
+        from newsroom.tests.test_native_service import _diagnostics
+        records = _diagnostics(tmp_path)
+        assert [kind for kind, _ in records] == [
+            "NATIVE_SERVICE_CYCLE_STARTED", "NATIVE_SERVICE_CYCLE_TERMINAL",
+            "NATIVE_SERVICE_CYCLE_STARTED", "NATIVE_SERVICE_CYCLE_TERMINAL",
         ]
-        terminal = connection.execute(
-            "SELECT payload_json FROM ledger WHERE kind='NATIVE_SERVICE_CYCLE_TERMINAL'"
-        ).fetchall()
-        assert all(json.loads(raw)["pipeline"]["revision_states"] == states for raw, in terminal)
+        terminal = [payload for kind, payload in records if kind == "NATIVE_SERVICE_CYCLE_TERMINAL"]
+        assert all(payload["pipeline"]["revision_states"] == states for payload in terminal)
         retained = NativeRevisionJournal(connection)
         assert retained.summary(units[1].revision_id)["stage"] == "COPY_CORRECTION_PREPARED"

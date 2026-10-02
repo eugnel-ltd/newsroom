@@ -75,6 +75,30 @@ class _GraphitiIncrement4AuthorityStore(
 ):
     """One existing authority SQLite/CAS writer for Increment 4."""
 
+    def __init__(self, *args, _native_current_state: bool = False, **kwargs):
+        self._current_state_only = _native_current_state
+        super().__init__(*args, **kwargs)
+
+    def _signal_from_row(self, conn, row, *, replayed):
+        self._prove_current_record(row)
+        return _DiscoveryAuthorityStore._signal_from_row.__func__(type(self), conn, row, replayed=replayed)
+
+    def _gate_from_row(self, conn, row, *, replayed):
+        self._prove_current_record(row)
+        return _DiscoveryAuthorityStore._gate_from_row.__func__(type(self), conn, row, replayed=replayed)
+
+    def _lead_from_row(self, conn, row, *, replayed):
+        self._prove_current_record(row)
+        return _DiscoveryAuthorityStore._lead_from_row.__func__(type(self), conn, row, replayed=replayed)
+
+    def _watch_from_row(self, conn, row, *, replayed):
+        self._prove_current_record(row)
+        return _DiscoveryAuthorityStore._watch_from_row.__func__(type(self), conn, row, replayed=replayed)
+
+    def _disposition_from_row(self, conn, row, *, replayed):
+        self._prove_current_record(row)
+        return _DiscoveryAuthorityStore._disposition_from_row.__func__(type(self), conn, row, replayed=replayed)
+
     _SOURCE_TABLES = frozenset(
         {
             "discovery_occurrences",
@@ -328,6 +352,7 @@ def _open_with_adapter(
     clock: Callable[[], UtcTimestamp] = UtcTimestamp.now,
     cas_fault_hook: Callable[[str], None] | None = None,
     disk_usage: Callable[[Path], Any] | None = None,
+    _native_current_state: bool = False,
 ) -> GovernedGraphitiIncrement4AuthoritySystem:
     store: _GraphitiIncrement4AuthorityStore | None = None
     try:
@@ -384,6 +409,7 @@ def _open_with_adapter(
             command_service_version=command_service_version,
             busy_timeout_ms=busy_timeout_ms,
             clock=clock,
+            _native_current_state=_native_current_state,
         )
         command_service = CommandService(
             registry=merged_registry,
@@ -635,6 +661,7 @@ def open_governed_graphiti_increment4_authority_system(
     clock: Callable[[], UtcTimestamp] = UtcTimestamp.now,
     cas_fault_hook: Callable[[str], None] | None = None,
     disk_usage: Callable[[Path], Any] | None = None,
+    _native_current_state: bool = False,
 ) -> GovernedGraphitiIncrement4AuthoritySystem:
     """Open the explicit, effectful Increment 4 authority and graph runtime."""
 
@@ -673,6 +700,7 @@ def open_governed_graphiti_increment4_authority_system(
         clock=clock,
         cas_fault_hook=cas_fault_hook,
         disk_usage=disk_usage,
+        _native_current_state=_native_current_state,
     )
 
 

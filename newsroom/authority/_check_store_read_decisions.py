@@ -41,6 +41,7 @@ class _CheckStoreReadDecisionMixin:
         *,
         replayed: bool,
     ) -> BaselineDecision:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="Baseline Decision")
         event = self._validate_record_envelope(
             conn,
@@ -143,6 +144,7 @@ class _CheckStoreReadDecisionMixin:
         *,
         replayed: bool,
     ) -> ObservableTransition:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="Observable Transition")
         event = self._validate_record_envelope(
             conn,
@@ -245,6 +247,7 @@ class _CheckStoreReadDecisionMixin:
         *,
         replayed: bool,
     ) -> OperationalFinding:
+        self._prove_current_record(row)
         value = canonical_row_value(row, identity="Operational Finding")
         event = self._validate_record_envelope(
             conn,
@@ -310,6 +313,7 @@ class _CheckStoreReadDecisionMixin:
         *,
         replayed: bool,
     ) -> OperationalFindingOccurrence:
+        self._prove_current_record(row)
         value = canonical_row_value(
             row, identity="Operational Finding occurrence"
         )

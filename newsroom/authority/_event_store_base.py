@@ -70,6 +70,8 @@ _INCOMPLETE_COMMAND_QUERY = (
 class _EventStoreBase:
     """SQLite lifecycle, migration, validation and writer ownership."""
 
+    _current_state_only = False
+
     def __init__(
         self,
         path: Path,
@@ -253,6 +255,20 @@ class _EventStoreBase:
                 raise AuthoritySchemaError(
                     "authority schema fingerprint mismatch"
                 )
+        if not self._current_state_only:
+            self._validate_retained_database_history(conn)
+        with _validation_stage("connection_settings"):
+            if not bool(conn.execute("PRAGMA foreign_keys").fetchone()[0]):
+                raise AuthoritySchemaError("SQLite foreign keys are not enabled")
+            if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
+                raise AuthoritySchemaError("SQLite WAL mode is not active")
+            if int(conn.execute("PRAGMA synchronous").fetchone()[0]) != 2:
+                raise AuthoritySchemaError("SQLite synchronous=FULL is not active")
+        with _validation_stage("registry_coverage"):
+            self._validate_registry_coverage(conn)
+
+    def _validate_retained_database_history(self, conn: sqlite3.Connection) -> None:
+        """Historical maintenance, separate from native current-state startup."""
         with _validation_stage("quick_check"):
             quick = [
                 str(row[0])
@@ -267,30 +283,28 @@ class _EventStoreBase:
                 raise AuthoritySchemaError(
                     "authority foreign-key check failed"
                 )
-        with _validation_stage("connection_settings"):
-            if not bool(conn.execute("PRAGMA foreign_keys").fetchone()[0]):
-                raise AuthoritySchemaError(
-                    "SQLite foreign keys are not enabled"
-                )
-            if (
-                str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-                != "wal"
-            ):
-                raise AuthoritySchemaError("SQLite WAL mode is not active")
-            if int(conn.execute("PRAGMA synchronous").fetchone()[0]) != 2:
-                raise AuthoritySchemaError(
-                    "SQLite synchronous=FULL is not active"
-                )
         with _validation_stage("relational_invariants"):
             self._validate_relational_invariants(conn)
-        if self._should_validate_row_integrity():
-            with _validation_stage("immutable_records"):
-                self._validate_immutable_records(conn)
-        with _validation_stage("registry_coverage"):
-            self._validate_registry_coverage(conn)
+        with _validation_stage("immutable_records"):
+            self._validate_immutable_records(conn)
+
+    def validate_retained_history(self) -> None:
+        """Run the complete retained-history checks explicitly under writer ownership."""
+        with self._lock:
+            current_state_only = self._current_state_only
+            self._current_state_only = False
+            try:
+                self._validate_schema_and_integrity()
+            finally:
+                self._current_state_only = current_state_only
 
     def _should_validate_row_integrity(self) -> bool:
-        return True
+        return not self._current_state_only
+
+    def _prove_current_record(self, row: sqlite3.Row) -> None:
+        """A selected business row needs its exact event proof, not a boot-time sweep."""
+        if self._current_state_only:
+            self._validate_retained_event(str(row["authority_event_id"]))
 
     @staticmethod
     def _validate_relational_invariants(conn: sqlite3.Connection) -> None:

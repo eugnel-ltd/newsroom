@@ -113,6 +113,7 @@ class _TriageExecutionStore:
         clock: Callable[[], UtcTimestamp],
         lease_ttl_seconds: int,
         work_items: TriageWorkItemStore | None = None,
+        _validate_on_open: bool = True,
     ) -> None:
         if (
             type(connection) is not sqlite3.Connection
@@ -146,7 +147,10 @@ class _TriageExecutionStore:
                 connection, retrieval_authority
             )
             self._begin()
-            self._verify_integrity()
+            if _validate_on_open:
+                self._verify_integrity()
+            else:
+                self._verify_pending_leases()
             self._commit()
         except BaseException as exc:
             self._rollback()
@@ -744,6 +748,25 @@ class _TriageExecutionStore:
                 raise
             raise TriageExecutionAuthorityError("Worker Attempt restart failed") from exc
 
+    def _verify_pending_leases(self) -> None:
+        """Verify recoverable lease obligations, not terminal execution diagnostics."""
+        from newsroom.increment6.execution import LeaseLifecycle
+
+        for row in self._connection.execute(
+            "SELECT lease_id FROM triage_work_item_leases WHERE lifecycle='CLAIMED'"
+        ):
+            lease, batch_id = self._load_lease(str(row[0]))
+            if lease.lifecycle is not LeaseLifecycle.CLAIMED:
+                raise TriageExecutionAuthorityError("pending Lease lifecycle differs")
+            attempt, retained_batch_id = self._require_lease_attempt(lease)
+            if retained_batch_id != batch_id:
+                raise TriageExecutionAuthorityError("pending Lease Batch differs")
+            batch = self._load_batch(batch_id)
+            member = self._batch_member(batch, attempt)
+            version = self._work_items.load_version(member.work_item_version_id)
+            if not self._version_matches_member(version, member):
+                raise TriageExecutionAuthorityError("pending Lease Work Item differs")
+
     def _verify_integrity(self) -> None:
         from newsroom.increment6.execution import ExecutionBatch, WorkItemLease, WorkerAttempt
 
@@ -975,6 +998,7 @@ def _open_on_connection(
     clock: Callable[[], UtcTimestamp] = UtcTimestamp.now,
     lease_ttl_seconds: int = 300,
     work_items: TriageWorkItemStore | None = None,
+    _validate_on_open: bool = True,
 ) -> TriageExecutionAuthority:
     store = _TriageExecutionStore(
         connection,
@@ -983,6 +1007,7 @@ def _open_on_connection(
         clock=clock,
         lease_ttl_seconds=lease_ttl_seconds,
         work_items=work_items,
+        _validate_on_open=_validate_on_open,
     )
     return TriageExecutionAuthority(store, lambda: None)
 

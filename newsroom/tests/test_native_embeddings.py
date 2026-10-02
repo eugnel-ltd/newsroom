@@ -59,13 +59,9 @@ def _embedding_started(connection, *, unit_id, passage_id, cycle_id, revision_id
             }
         }
     }
-    append_ledger(connection, "NATIVE_REVISION_PROGRESS", {
-        "revision_id": revision_id,
-        "ordinal": 1,
-        "stage": "EMBEDDING_STARTED",
-        "facts": facts,
-    })
-    connection.commit()
+    NativeRevisionJournal(connection).advance(
+        revision_id, stage='EMBEDDING_STARTED', facts=facts,
+    )
     return facts
 
 

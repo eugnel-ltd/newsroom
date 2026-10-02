@@ -127,6 +127,9 @@ class _EventStoreReadMixin:
                 + " ORDER BY ledger_seq LIMIT ?",
                 tuple(values),
             ).fetchall()
+            if self._current_state_only:
+                for row in rows:
+                    self._validate_retained_event(str(row["event_id"]))
             return tuple(self._event_from_row(row) for row in rows)
 
     def _visible_event_row(
@@ -257,7 +260,9 @@ class _EventStoreReadMixin:
     ) -> CommandResultRecord:
         policy.require_metadata_class(MetadataClass.RESULT)
         with self._lock:
-            self._visible_event_row(policy=policy, command_id=command_id)
+            event = self._visible_event_row(policy=policy, command_id=command_id)
+            if self._current_state_only:
+                self._validate_retained_event(str(event["event_id"]))
             row = self._connection.execute(
                 "SELECT command_id,result_digest,result_bytes "
                 "FROM authority_commands WHERE command_id=?",

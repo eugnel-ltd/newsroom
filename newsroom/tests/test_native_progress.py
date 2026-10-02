@@ -20,7 +20,7 @@ def test_native_journal_reopens_progress_without_repeating_landing_or_state(tmp_
     assert journal.units[unit.revision_id] == (unit,)
     journal.land((unit,))
     journal.advance(unit.revision_id, stage="GRAPHITI_HOLD", facts={"reason": "RIGHTS_HOLD"})
-    assert connection.execute("SELECT count(*) FROM ledger").fetchone()[0] == 2
+    assert connection.execute("SELECT count(*) FROM ledger").fetchone()[0] == 1
     journal.advance(unit.revision_id, stage="GRAPHITI_COMPLETE", facts={"receipt": unit.digest})
     assert journal.current(unit.revision_id)["ordinal"] == 2
     connection.close()
@@ -85,7 +85,7 @@ def test_native_journal_reopen_retains_one_body_per_multichunk_revision(tmp_path
 def test_native_journal_rejects_tampered_payload_on_reopen(tmp_path):
     connection = connect(str(tmp_path / "private.sqlite3"))
     NativeRevisionJournal(connection).land((_native(),))
-    connection.execute("UPDATE ledger SET payload_json='{}'")
+    connection.execute("UPDATE native_current_sources SET content_json='{}'")
     connection.commit()
     with pytest.raises(ValueError, match="payload differs"):
         NativeRevisionJournal(connection)
@@ -120,24 +120,19 @@ def _retrieval_facts():
     }
 
 
-def test_unchanged_retrieval_pair_references_previous_record_but_returns_full_facts(tmp_path):
-    import json
-
-    connection = connect(str(tmp_path / "private.sqlite3"))
+def test_unchanged_retrieval_pair_is_content_addressed_and_returns_complete_facts(tmp_path):
+    connection = connect(str(tmp_path / 'pairs.sqlite3'))
     journal = NativeRevisionJournal(connection)
-    revision = _native().revision_id
-    journal.land((_native(),))
+    unit = _native()
+    journal.land((unit,))
     facts = _retrieval_facts()
-    journal.advance(revision, stage="RETRIEVAL_COMPLETE", facts=facts)
-    previous = connection.execute("SELECT seq,payload_digest FROM ledger ORDER BY seq DESC LIMIT 1").fetchone()
-    result = journal.advance(revision, stage="EVIDENCE_HOLD", facts=facts)
-    raw = json.loads(connection.execute("SELECT payload_json FROM ledger ORDER BY seq DESC LIMIT 1").fetchone()[0])
-    assert raw["retrieval_facts_ref"] == {"seq": previous[0], "payload_digest": previous[1], "ordinal": 1}
-    assert "retrieval_binding" not in raw["facts"]
-    assert "retrieval_rights_inventory" not in raw["facts"]
-    assert raw["facts"]["retrieval_embeddings"] == facts["retrieval_embeddings"]
-    assert result["facts"] == facts
-    assert result == NativeRevisionJournal(connection).current(revision)
+    journal.advance(unit.revision_id, stage='RETRIEVAL_COMPLETE', facts=facts)
+    result = journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=facts)
+    assert connection.execute('SELECT count(*) FROM native_current_pairs').fetchone()[0] == 1
+    assert connection.execute('SELECT count(*) FROM ledger').fetchone()[0] == 1
+    assert 'retrieval_binding' not in journal.summary(unit.revision_id)['facts']
+    assert result['facts'] == facts
+    assert NativeRevisionJournal(connection).current(unit.revision_id) == result
     connection.close()
 
 
@@ -158,25 +153,23 @@ def test_mutated_previous_pair_is_not_mistaken_for_committed_content(tmp_path):
     connection.close()
 
 
-def test_failed_append_rolls_back_without_advancing_reference(tmp_path, monkeypatch):
-    import newsroom.control_plane.native_progress as progress
-
-    connection = connect(str(tmp_path / "private.sqlite3"))
+def test_failed_current_write_rolls_back_without_advancing_state(tmp_path, monkeypatch):
+    from newsroom.control_plane import native_progress_state as state
+    connection = connect(str(tmp_path / 'rollback.sqlite3'))
     journal = NativeRevisionJournal(connection)
-    revision = _native().revision_id
-    journal.land((_native(),))
-    before = journal.advance(revision, stage="RETRIEVAL_COMPLETE", facts=_retrieval_facts())
-    original = progress.append_ledger
-    def fail_after_insert(*args):
-        original(*args)
-        raise RuntimeError("injected append failure")
-    monkeypatch.setattr(progress, "append_ledger", fail_after_insert)
-    with pytest.raises(RuntimeError, match="injected"):
-        journal.advance(revision, stage="EVIDENCE_HOLD", facts=_retrieval_facts())
+    unit = _native()
+    journal.land((unit,))
+    before = journal.advance(unit.revision_id, stage='RETRIEVAL_COMPLETE', facts=_retrieval_facts())
+    original = state.retain_head
+    def fail_after_insert(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError('injected current-write failure')
+    monkeypatch.setattr(state, 'retain_head', fail_after_insert)
+    with pytest.raises(RuntimeError, match='injected'):
+        journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=_retrieval_facts())
     assert not connection.in_transaction
-    assert connection.execute("SELECT count(*) FROM ledger").fetchone()[0] == 2
-    assert journal.current(revision) == before
-    assert NativeRevisionJournal(connection).current(revision) == before
+    assert journal.current(unit.revision_id) == before
+    assert NativeRevisionJournal(connection).current(unit.revision_id) == before
     connection.close()
 
 
@@ -193,20 +186,20 @@ def test_progress_requires_object_facts_before_append(tmp_path, facts):
 
 
 @pytest.mark.parametrize("facts", [[], [["reason", "HOLD"]], None, "facts"])
-def test_replay_rejects_non_object_facts(tmp_path, facts):
-    from newsroom.control_plane.native_progress import STATE
+def test_explicit_legacy_import_rejects_non_object_facts(tmp_path, facts):
+    from dataclasses import asdict
+    from newsroom.control_plane.native_progress import LAND, STATE, import_legacy_native_progress
     from newsroom.control_plane.store import append_ledger
-
-    connection = connect(str(tmp_path / "private.sqlite3"))
-    journal = NativeRevisionJournal(connection)
-    journal.land((_native(),))
-    append_ledger(connection, STATE, {
-        "revision_id": _native().revision_id, "ordinal": 1,
-        "stage": "EVIDENCE_HOLD", "facts": facts,
-    })
+    connection = connect(str(tmp_path / 'legacy-invalid.sqlite3'))
+    connection.execute('DELETE FROM native_current_meta')
+    unit = _native()
+    append_ledger(connection, LAND, {'revision_id': unit.revision_id, 'units': [asdict(unit)]})
+    append_ledger(connection, STATE, {'revision_id': unit.revision_id, 'ordinal': 1, 'stage': 'EVIDENCE_HOLD', 'facts': facts})
     connection.commit()
-    with pytest.raises(ValueError, match="facts"):
-        NativeRevisionJournal(connection)
+    with pytest.raises(ValueError, match='facts'):
+        import_legacy_native_progress(connection)
+    assert connection.execute('SELECT count(*) FROM native_current_sources').fetchone()[0] == 0
+    assert connection.execute('SELECT count(*) FROM native_current_meta').fetchone()[0] == 0
     connection.close()
 
 
@@ -215,61 +208,43 @@ def test_replay_rejects_non_object_facts(tmp_path, facts):
     "no_prior_pair", "first", "null", "list", "extra", "bool_seq",
     "bool_ordinal", "inline_binding", "inline_rights",
 ])
-def test_replay_rejects_invalid_retrieval_reference(tmp_path, case):
-    from newsroom.control_plane.native_progress import STATE
+def test_explicit_legacy_import_rejects_invalid_retrieval_reference(tmp_path, case):
+    from dataclasses import asdict
+    from newsroom.control_plane.native_progress import LAND, STATE, import_legacy_native_progress
     from newsroom.control_plane.store import append_ledger
-
-    connection = connect(str(tmp_path / "private.sqlite3"))
-    journal = NativeRevisionJournal(connection)
-    unit, other = _native(), _native("other")
-    journal.land((unit,))
-    journal.land((other,))
-    journal.advance(other.revision_id, stage="RETRIEVAL_COMPLETE", facts=_retrieval_facts())
-    other_record = journal._records[other.revision_id].reference()
-    if case != "first":
-        journal.advance(unit.revision_id, stage="RETRIEVAL_COMPLETE", facts=(
-            {} if case == "no_prior_pair" else _retrieval_facts()
-        ))
-    reference = (other_record if case == "first"
-                 else journal._records[unit.revision_id].reference())
-    ordinal = 1 if case == "first" else 2
-    facts = {"reason": "EVIDENCE_NOT_READY"}
-    if case == "absent":
-        reference["seq"] = 0
-    elif case == "forward":
-        reference["seq"] += 1
-    elif case == "cross_revision":
-        reference = other_record
-    elif case == "digest":
-        reference["payload_digest"] = "sha256:" + "0" * 64
-    elif case == "ordinal":
-        reference["ordinal"] += 1
-    elif case == "older":
-        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=_retrieval_facts())
-        ordinal = 3
-    elif case == "null":
-        reference = None
-    elif case == "list":
-        reference = list(reference.items())
-    elif case == "extra":
-        reference["extra"] = "not part of the reference"
-    elif case == "bool_seq":
-        reference["seq"] = True
-    elif case == "bool_ordinal":
-        reference["ordinal"] = True
-    elif case == "inline_binding":
-        facts["retrieval_binding"] = {}
-    elif case == "inline_rights":
-        facts["retrieval_rights_inventory"] = []
-    append_ledger(connection, STATE, {
-        "revision_id": unit.revision_id, "ordinal": ordinal,
-        "stage": "EVIDENCE_HOLD", "facts": facts, "retrieval_facts_ref": reference,
-    })
+    connection = connect(str(tmp_path / 'legacy-reference.sqlite3'))
+    connection.execute('DELETE FROM native_current_meta')
+    unit, other = _native(), _native('other')
+    for candidate in (unit, other):
+        append_ledger(connection, LAND, {'revision_id': candidate.revision_id, 'units': [asdict(candidate)]})
+    append_ledger(connection, STATE, {'revision_id': other.revision_id, 'ordinal': 1, 'stage': 'RETRIEVAL_COMPLETE', 'facts': _retrieval_facts()})
+    if case != 'first':
+        append_ledger(connection, STATE, {'revision_id': unit.revision_id, 'ordinal': 1, 'stage': 'RETRIEVAL_COMPLETE', 'facts': {} if case == 'no_prior_pair' else _retrieval_facts()})
     connection.commit()
-    before = connection.total_changes
-    with pytest.raises(ValueError, match="retrieval facts reference"):
-        NativeRevisionJournal(connection)
-    assert connection.total_changes == before
+    legacy = NativeRevisionJournal(connection, _legacy=True)
+    reference = legacy._records[other.revision_id if case == 'first' else unit.revision_id].reference()
+    ordinal = 1 if case == 'first' else 2
+    facts = {'reason': 'EVIDENCE_NOT_READY'}
+    if case == 'absent': reference['seq'] = 0
+    elif case == 'forward': reference['seq'] += 1
+    elif case == 'cross_revision': reference = legacy._records[other.revision_id].reference()
+    elif case == 'digest': reference['payload_digest'] = 'sha256:' + '0' * 64
+    elif case == 'ordinal': reference['ordinal'] += 1
+    elif case == 'older':
+        append_ledger(connection, STATE, {'revision_id': unit.revision_id, 'ordinal': 2, 'stage': 'EVIDENCE_HOLD', 'facts': _retrieval_facts()})
+        ordinal = 3
+    elif case == 'null': reference = None
+    elif case == 'list': reference = list(reference.items())
+    elif case == 'extra': reference['extra'] = 'not part of reference'
+    elif case == 'bool_seq': reference['seq'] = True
+    elif case == 'bool_ordinal': reference['ordinal'] = True
+    elif case == 'inline_binding': facts['retrieval_binding'] = {}
+    elif case == 'inline_rights': facts['retrieval_rights_inventory'] = []
+    append_ledger(connection, STATE, {'revision_id': unit.revision_id, 'ordinal': ordinal, 'stage': 'EVIDENCE_HOLD', 'facts': facts, 'retrieval_facts_ref': reference})
+    connection.commit()
+    with pytest.raises(ValueError, match='retrieval facts reference'):
+        import_legacy_native_progress(connection)
+    assert connection.execute('SELECT count(*) FROM native_current_meta').fetchone()[0] == 0
     connection.close()
 
 
@@ -292,8 +267,7 @@ def test_changed_or_absent_pair_is_retained_inline(tmp_path, field, remove):
     raw = json.loads(connection.execute(
         "SELECT payload_json FROM ledger ORDER BY seq DESC LIMIT 1"
     ).fetchone()[0])
-    assert "retrieval_facts_ref" not in raw
-    assert raw["facts"] == facts
+    assert result['facts'] == facts
     assert NativeRevisionJournal(connection).current(revision) == result
     connection.close()
 
@@ -318,8 +292,8 @@ def test_mutated_returned_pair_does_not_rebind_original_input(tmp_path, changed_
         "SELECT payload_json FROM ledger ORDER BY seq DESC LIMIT 1"
     ).fetchone()[0])
     # Mutating a detached result never mutates the retained pair root.
-    assert ("retrieval_facts_ref" in raw) is changed_stage
-    assert connection.execute("SELECT count(*) FROM ledger").fetchone()[0] == (3 if changed_stage else 2)
+    assert connection.execute('SELECT count(*) FROM native_current_pairs').fetchone()[0] == 1
+    assert connection.execute("SELECT count(*) FROM ledger").fetchone()[0] == 1
     connection.close()
 
 
@@ -338,41 +312,29 @@ def test_input_mutation_cannot_change_committed_or_live_facts(tmp_path):
     connection.close()
 
 
-def test_reference_chain_replays_in_one_query_and_preserves_original_records(tmp_path):
-    from newsroom.control_plane.native_progress import STATE
+def test_current_boot_cost_is_independent_of_large_obsolete_history(tmp_path):
     from newsroom.control_plane.store import append_ledger
-
-    path = str(tmp_path / "private.sqlite3")
-    connection = connect(path)
+    connection = connect(str(tmp_path / 'bounded-boot.sqlite3'))
     journal = NativeRevisionJournal(connection)
-    units = (_native(), _native("other"))
-    for unit in units:
-        journal.land((unit,))
-        # An old inline record is already sufficient; history is not rewritten.
-        append_ledger(connection, STATE, {
-            "revision_id": unit.revision_id, "ordinal": 1,
-            "stage": "RETRIEVAL_COMPLETE", "facts": _retrieval_facts(),
-        })
-        connection.commit()
-    history = connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall()
-    journal = NativeRevisionJournal(connection)
-    for number in range(40):
-        unit = units[number % 2]
-        facts = {**_retrieval_facts(), "reason": f"HELD_{number}"}
-        last = journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=facts)
-    assert connection.execute("SELECT * FROM ledger ORDER BY seq LIMIT ?", (len(history),)).fetchall() == history
-    expected = {unit.revision_id: journal.current(unit.revision_id) for unit in units}
-    connection.close()
-    connection = connect(path)
+    unit = _native()
+    journal.land((unit,))
+    expected = journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=_retrieval_facts())
+    for number in range(1000):
+        append_ledger(connection, 'NATIVE_REVISION_PROGRESS', {'old_debug': 'obsolete body ' * 500, 'ordinal': number})
+    connection.commit()
     statements = []
+    steps = [0]
     connection.set_trace_callback(statements.append)
+    def count_steps():
+        steps[0] += 1
+        return steps[0] > 500
+    connection.set_progress_handler(count_steps, 100)
     reopened = NativeRevisionJournal(connection)
     connection.set_trace_callback(None)
-    assert len(statements) == 1
-    assert all(reopened.current(unit.revision_id) == expected[unit.revision_id] for unit in units)
-    before = connection.total_changes
-    assert reopened.advance(units[1].revision_id, stage="EVIDENCE_HOLD", facts=facts) == last
-    assert connection.total_changes == before
+    connection.set_progress_handler(None, 0)
+    assert not any('FROM ledger' in statement for statement in statements)
+    assert steps[0] < 50
+    assert reopened.current(unit.revision_id) == expected
     connection.close()
 
 
@@ -395,44 +357,37 @@ def test_embedding_consumer_reads_inline_facts_from_shared_progress(tmp_path):
     envelope = SimpleNamespace(ingest_id="passage", cycle_id=cycle_id)
     binding = _native_embedding_progress_binding(connection, envelope=envelope)
     assert binding["revision_id"] == unit.revision_id
-    assert binding["progress_seq"] == 3
+    assert binding["progress_seq"] == 2
     assert _native_embedding_progress_binding(
         connection, envelope=envelope, retained_progress=binding,
     ) == binding
     connection.close()
 
 
-def test_commit_failure_rolls_back_reference_and_allows_retry(tmp_path, monkeypatch):
+def test_current_commit_failure_rolls_back_and_allows_retry(tmp_path, monkeypatch):
     import sqlite3
-    import newsroom.control_plane.native_progress as progress
-
-    connection = connect(str(tmp_path / "private.sqlite3"))
+    from newsroom.control_plane import native_progress_state as state
+    connection = connect(str(tmp_path / 'commit-failure.sqlite3'))
+    connection.execute('CREATE TABLE test_parent(id INTEGER PRIMARY KEY)')
+    connection.execute('CREATE TABLE test_child(parent_id INTEGER REFERENCES test_parent(id) DEFERRABLE INITIALLY DEFERRED)')
     journal = NativeRevisionJournal(connection)
-    revision = _native().revision_id
-    journal.land((_native(),))
-    before = journal.advance(revision, stage="RETRIEVAL_COMPLETE", facts=_retrieval_facts())
-    connection.execute("CREATE TABLE test_parent(id INTEGER PRIMARY KEY)")
-    connection.execute(
-        "CREATE TABLE test_child(parent_id INTEGER REFERENCES test_parent(id) "
-        "DEFERRABLE INITIALLY DEFERRED)"
-    )
-    append = progress.append_ledger
-
-    def fail_at_commit(*args):
-        append(*args)
-        connection.execute("INSERT INTO test_child VALUES(1)")
-
+    unit = _native()
+    journal.land((unit,))
+    before = journal.advance(unit.revision_id, stage='RETRIEVAL_COMPLETE', facts=_retrieval_facts())
+    original = state.retain_head
+    def fail_at_commit(*args, **kwargs):
+        original(*args, **kwargs)
+        connection.execute('INSERT INTO test_child VALUES(1)')
     with monkeypatch.context() as patch:
-        patch.setattr(progress, "append_ledger", fail_at_commit)
+        patch.setattr(state, 'retain_head', fail_at_commit)
         with pytest.raises(sqlite3.IntegrityError):
-            journal.advance(revision, stage="EVIDENCE_HOLD", facts=_retrieval_facts())
+            journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=_retrieval_facts())
     assert not connection.in_transaction
-    assert connection.execute("SELECT count(*) FROM ledger").fetchone()[0] == 2
-    assert connection.execute("SELECT count(*) FROM test_child").fetchone()[0] == 0
-    assert journal.current(revision) == before
-    after = journal.advance(revision, stage="EVIDENCE_HOLD", facts=_retrieval_facts())
-    assert after["ordinal"] == 2
-    assert NativeRevisionJournal(connection).current(revision) == after
+    assert connection.execute('SELECT count(*) FROM test_child').fetchone()[0] == 0
+    assert journal.current(unit.revision_id) == before
+    after = journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=_retrieval_facts())
+    assert after['ordinal'] == 2
+    assert NativeRevisionJournal(connection).current(unit.revision_id) == after
     connection.close()
 
 
@@ -539,7 +494,10 @@ def test_multichunk_land_persists_body_once_with_exact_legacy_replay(tmp_path):
     journal.land(units)
     assert connection.execute('SELECT count(*) FROM ledger').fetchone()[0] == 1
     legacy = connect(str(tmp_path / 'legacy.sqlite3'))
+    from newsroom.control_plane.native_progress import import_legacy_native_progress
+    legacy.execute('DELETE FROM native_current_meta')
     append_ledger(legacy, LAND, old); legacy.commit()
+    import_legacy_native_progress(legacy)
     assert NativeRevisionJournal(legacy).units == journal.units
     legacy.close(); connection.close()
 
@@ -560,9 +518,11 @@ def test_shared_landing_rejects_ambiguous_or_corrupted_body(tmp_path, mutation):
     elif mutation == 'type': value['shared_body'] = 123
     # A correct ledger hash does not excuse an ambiguous storage encoding.
     other = connect(str(tmp_path / 'bad.sqlite3'))
+    from newsroom.control_plane.native_progress import import_legacy_native_progress
+    other.execute('DELETE FROM native_current_meta')
     append_ledger(other, LAND, value); other.commit()
     with pytest.raises((ValueError, KeyError, TypeError)):
-        NativeRevisionJournal(other)
+        import_legacy_native_progress(other)
     other.close(); connection.close()
 
 
@@ -586,63 +546,35 @@ def test_summary_and_current_are_detached_and_preserve_unknown_and_partial_facts
 
 
 @pytest.mark.parametrize("mutation", (
-    "missing_root", "foreign_root", "obsolete_same_revision", "bool_seq",
-    "missing_row", "kind", "payload_header", "same_count_body",
-    "self_consistent_unknown_body", "inline_state",
+    "missing_row", "same_count_body", "inline_state", "foreign_digest", "malformed_json",
 ))
-def test_selected_current_and_unchanged_pair_advance_deny_tampering_before_write(tmp_path, mutation):
-    import json
-    from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
-
-    connection = connect(str(tmp_path / "private.sqlite3"))
+def test_selected_current_pair_and_live_metadata_deny_tampering_before_write(tmp_path, mutation):
+    from newsroom.authority.canonical import canonical_json_bytes
+    connection = connect(str(tmp_path / 'selected-pair.sqlite3'))
     journal = NativeRevisionJournal(connection)
-    unit, other = _native(), _native("other")
-    for candidate in (unit, other):
-        journal.land((candidate,))
-        journal.advance(candidate.revision_id, stage="RETRIEVAL_COMPLETE", facts=_retrieval_facts())
-        journal.advance(candidate.revision_id, stage="EVIDENCE_HOLD", facts=_retrieval_facts())
-    original_root = journal._pair_roots[unit.revision_id]
-    facts = journal.current(unit.revision_id)["facts"]
-    if mutation == "missing_root":
-        del journal._pair_roots[unit.revision_id]
-    elif mutation == "foreign_root":
-        journal._pair_roots[unit.revision_id] = journal._pair_roots[other.revision_id]
-    elif mutation == "obsolete_same_revision":
-        facts["retrieval_binding"]["request"]["nodes"][0] = "Changed same-count canonical context"
-        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=facts)
-        journal._pair_roots[unit.revision_id] = original_root
-    elif mutation == "bool_seq":
-        journal._pair_roots[unit.revision_id] = replace(original_root, seq=True)
-    elif mutation == "missing_row":
-        connection.execute("DELETE FROM ledger WHERE seq=?", (original_root.seq,))
-    elif mutation == "kind":
-        connection.execute("UPDATE ledger SET kind='OTHER' WHERE seq=?", (original_root.seq,))
-    elif mutation == "payload_header":
-        connection.execute("UPDATE ledger SET payload_digest=? WHERE seq=?", ("sha256:" + "0" * 64, original_root.seq))
-    elif mutation == "inline_state":
-        journal._summaries[unit.revision_id]["facts"]["reason"] = "Changed same-count live metadata"
+    unit = _native()
+    journal.land((unit,))
+    facts = _retrieval_facts()
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=facts)
+    digest = journal._records[unit.revision_id].pair_digest
+    if mutation == 'missing_row':
+        connection.execute('PRAGMA foreign_keys=OFF')
+        connection.execute('DELETE FROM native_current_pairs WHERE pair_digest=?', (digest,))
+    elif mutation == 'inline_state':
+        journal._summaries[unit.revision_id]['facts']['reason'] = 'Changed live metadata'
+    elif mutation == 'foreign_digest':
+        journal._records[unit.revision_id] = replace(journal._records[unit.revision_id], pair_digest='sha256:' + 'f' * 64)
+    elif mutation == 'malformed_json':
+        connection.execute("UPDATE native_current_pairs SET pair_json='not JSON' WHERE pair_digest=?", (digest,))
     else:
-        raw = connection.execute("SELECT payload_json FROM ledger WHERE seq=?", (original_root.seq,)).fetchone()[0]
-        value = json.loads(raw)
-        if mutation == "self_consistent_unknown_body":
-            value["facts"]["reason"] = "Changed same-count original inline fact"
-        else:
-            value["facts"]["retrieval_rights_inventory"][0]["rights"] = "revoked"
-        altered = canonical_json_bytes(value).decode()
-        altered_digest = digest_bytes(altered.encode())
-        connection.execute("UPDATE ledger SET payload_json=?,payload_digest=? WHERE seq=?", (altered, altered_digest, original_root.seq))
-        if mutation == "self_consistent_unknown_body":
-            # A coherent byte/header hash is still bound to the original root's
-            # complete logical state, not just to its unchanged retrieval pair.
-            journal._pair_roots[unit.revision_id] = replace(original_root, payload_digest=altered_digest)
+        changed = {key: facts[key] for key in ('retrieval_binding', 'retrieval_rights_inventory')}
+        changed['retrieval_rights_inventory'][0]['rights'] = 'revoked'
+        connection.execute('UPDATE native_current_pairs SET pair_json=? WHERE pair_digest=?', (canonical_json_bytes(changed).decode(), digest))
     connection.commit()
     before = connection.total_changes
-    with pytest.raises(ValueError, match="(pair root|logical state)"):
-        journal.current(unit.revision_id)
-    with pytest.raises(ValueError, match="(pair root|logical state)"):
-        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=facts)
-    with pytest.raises(ValueError, match="(pair root|logical state)"):
-        journal.advance(unit.revision_id, stage="PUBLICATION_HOLD", facts=facts)
+    for call in (lambda: journal.current(unit.revision_id), lambda: journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=_retrieval_facts()), lambda: journal.advance(unit.revision_id, stage='PUBLICATION_HOLD', facts=_retrieval_facts())):
+        with pytest.raises(ValueError, match='(pair|logical state)'):
+            call()
     assert connection.total_changes == before
     connection.close()
 
@@ -664,7 +596,7 @@ def test_metadata_iteration_is_bounded_and_selected_current_uses_one_root_pk(tmp
     assert all("retrieval_binding" not in value["facts"] for _, value in snapshots)
     assert statements == []
     first_current = journal.current(first.revision_id)
-    assert len(statements) == 1 and "WHERE seq=" in statements[0]
+    assert len(statements) == 1 and "WHERE pair_digest=" in statements[0]
     second_current = journal.current(first.revision_id)
     assert len(statements) == 2
     first_current["facts"]["retrieval_rights_inventory"][0]["rights"] = "caller only"
@@ -701,36 +633,337 @@ def test_known_state_missing_its_metadata_denies_reads_and_writes(tmp_path, miss
 
 
 @pytest.mark.parametrize("referenced", (False, True))
-def test_equal_digest_aba_pair_binds_latest_exact_root_before_reads_or_writes(tmp_path, referenced):
-    connection = connect(str(tmp_path / "private.sqlite3"))
+def test_equal_digest_aba_pair_reuses_immutable_content_not_old_diagnostics(tmp_path, referenced):
+    connection = connect(str(tmp_path / 'aba.sqlite3'))
     journal = NativeRevisionJournal(connection)
     unit = _native()
     journal.land((unit,))
-    first = {**_retrieval_facts(), "reason": "A1"}
-    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=first)
-    obsolete = journal._pair_roots[unit.revision_id]
-    changed = {**_retrieval_facts(), "retrieval_binding": {"request": {"nodes": ["B2 different context"]}}, "reason": "B2"}
-    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=changed)
-    latest = {**_retrieval_facts(), "reason": "A3"}
-    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=latest)
-    actual = journal._pair_roots[unit.revision_id]
-    assert actual.pair_digest == obsolete.pair_digest and actual.seq != obsolete.seq
+    first = {**_retrieval_facts(), 'reason': 'A1'}
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=first)
+    changed = {**_retrieval_facts(), 'retrieval_binding': {'request': {'nodes': ['B2 different context']}}, 'reason': 'B2'}
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=changed)
+    latest = {**_retrieval_facts(), 'reason': 'A3'}
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=latest)
     if referenced:
-        latest = {**latest, "reason": "A4 references A3"}
-        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=latest)
-        assert journal._pair_roots[unit.revision_id] == actual
-    assert NativeRevisionJournal(connection).current(unit.revision_id)["facts"] == latest
-    journal._pair_roots[unit.revision_id] = obsolete
+        latest = {**latest, 'reason': 'A4'}
+        journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=latest)
+    assert connection.execute('SELECT count(*) FROM native_current_pairs').fetchone()[0] == 1
+    assert connection.execute('SELECT count(*) FROM ledger').fetchone()[0] == 1
+    assert NativeRevisionJournal(connection).current(unit.revision_id)['facts'] == latest
+    assert journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=latest)['facts'] == latest
+    connection.close()
+
+
+def test_current_journal_boot_does_not_read_or_depend_on_debug_history(tmp_path):
+    connection = connect(str(tmp_path / "current.sqlite3"))
+    journal = NativeRevisionJournal(connection)
+    unit = _native()
+    journal.land((unit,))
+    expected = journal.advance(unit.revision_id, stage="ACKNOWLEDGED", facts=_retrieval_facts())
+    # Debug payload loss/corruption is independent of durable CURRENT state.
+    connection.execute("UPDATE ledger SET payload_json=NULL WHERE kind='NATIVE_REVISION_PROGRESS'")
+    connection.commit()
     statements = []
     connection.set_trace_callback(statements.append)
-    before = connection.total_changes
-    with pytest.raises(ValueError, match="pair root"):
-        journal.current(unit.revision_id)
-    with pytest.raises(ValueError, match="pair root"):
-        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=latest)
-    with pytest.raises(ValueError, match="pair root"):
-        journal.advance(unit.revision_id, stage="PUBLICATION_HOLD", facts=latest)
-    assert connection.total_changes == before
-    assert statements == []
+    reopened = NativeRevisionJournal(connection)
     connection.set_trace_callback(None)
+    assert reopened.current(unit.revision_id) == expected
+    assert not any("FROM ledger" in statement for statement in statements)
+    assert reopened.advance(unit.revision_id, stage="ACKNOWLEDGED", facts=_retrieval_facts()) == expected
+    connection.close()
+
+
+def test_ordinary_progress_diagnostic_has_bounded_metadata_not_full_facts(tmp_path, caplog):
+    import json
+    connection = connect(str(tmp_path / "compact.sqlite3"))
+    journal = NativeRevisionJournal(connection)
+    unit = _native()
+    journal.land((unit,))
+    facts = _retrieval_facts()
+    facts['large_other_fact'] = 'complete current state ' * 2000
+    expected = journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=facts)
+    assert connection.execute('SELECT count(*) FROM ledger').fetchone()[0] == 1
+    assert NativeRevisionJournal(connection).current(unit.revision_id) == expected
+    connection.close()
+
+
+def test_current_state_and_pair_corruption_fail_closed_without_history_fallback(tmp_path):
+    connection = connect(str(tmp_path / 'corrupt-current.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    unit = _native()
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=_retrieval_facts())
+    connection.execute("UPDATE native_current_heads SET state_json='{}'")
+    connection.commit()
+    with pytest.raises(ValueError, match='CURRENT'):
+        NativeRevisionJournal(connection)
+    connection.close()
+
+
+def test_explicit_legacy_import_is_required_and_preserves_source_state_and_pairs(tmp_path):
+    from dataclasses import asdict
+    from newsroom.control_plane.native_progress import LAND, STATE, import_legacy_native_progress
+    from newsroom.control_plane.store import append_ledger
+    connection = connect(str(tmp_path / 'legacy.sqlite3'))
+    connection.execute('DELETE FROM native_current_meta')
+    unit = _native()
+    append_ledger(connection, LAND, {'revision_id': unit.revision_id, 'units': [asdict(unit)]})
+    expected = {'revision_id': unit.revision_id, 'ordinal': 1, 'stage': 'EVIDENCE_HOLD', 'facts': _retrieval_facts()}
+    append_ledger(connection, STATE, expected)
+    connection.commit()
+    with pytest.raises(ValueError, match='explicit legacy import'):
+        NativeRevisionJournal(connection)
+    receipt = import_legacy_native_progress(connection)
+    assert not receipt['already_current']
+    assert NativeRevisionJournal(connection).current(unit.revision_id) == expected
+    assert NativeRevisionJournal(connection).units[unit.revision_id] == (unit,)
+    assert import_legacy_native_progress(connection)['already_current']
+    connection.execute('UPDATE ledger SET payload_json=NULL WHERE kind=?', (STATE,))
+    connection.commit()
+    assert NativeRevisionJournal(connection).current(unit.revision_id) == expected
+    connection.close()
+
+
+def test_selected_business_landing_uses_current_ingest_key_and_exact_ledger_pin(tmp_path):
+    from newsroom.control_plane.model_usage import _native_landed_source_unit, ModelUsageIntegrityError
+    connection = connect(str(tmp_path / 'selected-source.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    unit = _native()
+    journal.land((unit,))
+    statements = []
+    connection.set_trace_callback(statements.append)
+    assert _native_landed_source_unit(connection, ingest_id=unit.ingest_id) == unit
+    connection.set_trace_callback(None)
+    assert not any("FROM ledger WHERE kind" in statement for statement in statements)
+    connection.execute("UPDATE ledger SET payload_json='{}' WHERE kind='NATIVE_REVISION_LANDED'")
+    connection.commit()
+    assert NativeRevisionJournal(connection).units[unit.revision_id] == (unit,)
+    with pytest.raises(ModelUsageIntegrityError, match='source landing'):
+        _native_landed_source_unit(connection, ingest_id=unit.ingest_id)
+    connection.close()
+
+
+def test_selected_embedding_business_pin_survives_ordinary_diagnostic_loss(tmp_path):
+    from types import SimpleNamespace
+    from newsroom.control_plane.model_usage import _native_embedding_progress_binding
+    connection = connect(str(tmp_path / 'selected-embedding.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    unit = _native()
+    journal.land((unit,))
+    cycle = f'native-passage:{unit.ingest_id}'
+    facts = _retrieval_facts()
+    facts['retrieval_embeddings'] = {unit.ingest_id: {
+        'state': 'STARTED', 'passage_id': 'passage', 'cycle_id': cycle, 'attempt_number': 1,
+    }}
+    journal.advance(unit.revision_id, stage='EMBEDDING_STARTED', facts=facts)
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=facts)
+    envelope = SimpleNamespace(ingest_id='passage', cycle_id=cycle)
+    statements = []
+    connection.set_trace_callback(statements.append)
+    binding = _native_embedding_progress_binding(connection, envelope=envelope)
+    connection.set_trace_callback(None)
+    assert binding['progress_seq'] == 2
+    assert not any('payload_json LIKE' in statement for statement in statements)
+    assert _native_embedding_progress_binding(connection, envelope=envelope, retained_progress=binding) == binding
+    connection.close()
+
+
+@pytest.mark.parametrize('table', ['native_current_sources', 'native_current_heads', 'native_current_pairs', 'native_current_units', 'native_current_observations', 'native_current_portfolio'])
+def test_current_inventory_detects_missing_rows_before_boot(tmp_path, table):
+    from newsroom.control_plane.native_source_intake import NativeSourceDisposition
+    connection = connect(str(tmp_path / f'missing-{table}.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    unit = _native()
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=_retrieval_facts())
+    reference = ('https://example.test/item', 'sha256:' + 'e' * 64, 'admission', 'access')
+    journal.sources((NativeSourceDisposition('UK-01', 'READY', 'UNCHANGED', observations=(reference,)),))
+    connection.execute('PRAGMA foreign_keys=OFF')
+    connection.execute(f'DELETE FROM {table}')
+    connection.commit()
+    with pytest.raises(ValueError, match='CURRENT inventory'):
+        NativeRevisionJournal(connection)
+    connection.close()
+
+
+def test_missing_current_marker_is_not_silently_reimported_or_reinitialised(tmp_path):
+    from newsroom.control_plane.native_progress import import_legacy_native_progress
+    path = str(tmp_path / 'missing-marker.sqlite3')
+    connection = connect(path)
+    journal = NativeRevisionJournal(connection)
+    journal.land((_native(),))
+    connection.execute('DELETE FROM native_current_meta')
+    connection.commit()
+    with pytest.raises(ValueError, match='CURRENT'):
+        NativeRevisionJournal(connection)
+    with pytest.raises(ValueError, match='CURRENT.*recovery'):
+        import_legacy_native_progress(connection)
+    connection.close()
+    connection = connect(path)
+    with pytest.raises(ValueError, match='CURRENT'):
+        NativeRevisionJournal(connection)
+    connection.close()
+
+
+def test_legacy_import_failure_is_atomic_and_leaves_old_business_records_untouched(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    from newsroom.control_plane import native_progress_state as state
+    from newsroom.control_plane.native_progress import LAND, STATE, import_legacy_native_progress
+    from newsroom.control_plane.store import append_ledger
+    connection = connect(str(tmp_path / 'import-rollback.sqlite3'))
+    connection.execute('DELETE FROM native_current_meta')
+    unit = _native()
+    append_ledger(connection, LAND, {'revision_id': unit.revision_id, 'units': [asdict(unit)]})
+    append_ledger(connection, STATE, {'revision_id': unit.revision_id, 'ordinal': 1, 'stage': 'EVIDENCE_HOLD', 'facts': _retrieval_facts()})
+    connection.commit()
+    before = connection.execute('SELECT * FROM ledger ORDER BY seq').fetchall()
+    original = state.retain_head
+    def fail_after_write(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError('injected import failure')
+    with monkeypatch.context() as patch:
+        patch.setattr(state, 'retain_head', fail_after_write)
+        with pytest.raises(RuntimeError, match='injected'):
+            import_legacy_native_progress(connection)
+    for table in (*state.TABLES, 'native_current_units', 'native_current_meta'):
+        assert connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 0
+    assert connection.execute('SELECT * FROM ledger ORDER BY seq').fetchall() == before
+    import_legacy_native_progress(connection)
+    assert NativeRevisionJournal(connection).current(unit.revision_id)['ordinal'] == 1
+    connection.close()
+
+
+def test_legacy_embedding_pin_remains_exact_after_current_import_and_diagnostic_retirement(tmp_path):
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    from newsroom.control_plane.native_progress import LAND, STATE, import_legacy_native_progress
+    from newsroom.control_plane.model_usage import _native_embedding_progress_binding, ModelUsageIntegrityError
+    from newsroom.control_plane.native_progress_state import current_state_retained_sequences
+    from newsroom.control_plane.store import append_ledger
+    connection = connect(str(tmp_path / 'legacy-pins.sqlite3'))
+    connection.execute('DELETE FROM native_current_meta')
+    unit = _native()
+    cycle = f'native-passage:{unit.ingest_id}'
+    facts = _retrieval_facts()
+    facts['retrieval_embeddings'] = {unit.ingest_id: {'state': 'STARTED', 'passage_id': 'passage', 'cycle_id': cycle, 'attempt_number': 1}}
+    append_ledger(connection, LAND, {'revision_id': unit.revision_id, 'units': [asdict(unit)]})
+    append_ledger(connection, STATE, {'revision_id': unit.revision_id, 'ordinal': 1, 'stage': 'EMBEDDING_STARTED', 'facts': facts})
+    append_ledger(connection, STATE, {'revision_id': unit.revision_id, 'ordinal': 2, 'stage': 'EVIDENCE_HOLD', 'facts': facts})
+    connection.commit()
+    envelope = SimpleNamespace(ingest_id='passage', cycle_id=cycle)
+    # Immutable selected witness exists before CURRENT conversion as well.
+    expected = {'revision_id': unit.revision_id, 'unit_ingest_id': unit.ingest_id, 'passage_id': 'passage', 'embedding_cycle_id': cycle, 'embedding_attempt_number': 1, 'progress_seq': 2}
+    import_legacy_native_progress(connection)
+    actual = _native_embedding_progress_binding(connection, envelope=envelope)
+    assert all(actual[key] == value for key, value in expected.items())
+    assert current_state_retained_sequences(connection) == frozenset({1, 2})
+    connection.execute('UPDATE ledger SET payload_json=NULL WHERE seq=3')
+    connection.commit()
+    assert NativeRevisionJournal(connection).current(unit.revision_id)['ordinal'] == 2
+    assert _native_embedding_progress_binding(connection, envelope=envelope, retained_progress=actual) == actual
+    connection.execute("UPDATE ledger SET payload_json='{}' WHERE seq=2")
+    connection.commit()
+    with pytest.raises(ModelUsageIntegrityError, match='progress'):
+        _native_embedding_progress_binding(connection, envelope=envelope, retained_progress=actual)
+    connection.close()
+
+
+def test_current_source_index_rebinding_fails_closed_even_with_equal_counts(tmp_path):
+    connection = connect(str(tmp_path / 'source-index.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    first, second = _native(), _native('other')
+    journal.land((first,))
+    journal.land((second,))
+    connection.execute('UPDATE native_current_units SET revision_id=? WHERE ingest_id=?', (second.revision_id, first.ingest_id))
+    connection.commit()
+    with pytest.raises(ValueError, match='CURRENT source.*binding'):
+        NativeRevisionJournal(connection)
+    connection.close()
+
+
+def test_optional_diagnostic_failure_does_not_undo_committed_current_state(tmp_path, monkeypatch):
+    from newsroom.control_plane import diagnostic_logging
+    connection = connect(str(tmp_path / 'log-failure.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    unit = _native()
+    journal.land((unit,))
+    def broken_sink(*_args):
+        raise RuntimeError('optional diagnostic failure')
+    monkeypatch.setattr(diagnostic_logging, 'emit_diagnostic', broken_sink)
+    expected = journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=_retrieval_facts())
+    assert journal.current(unit.revision_id) == expected
+    assert NativeRevisionJournal(connection).current(unit.revision_id) == expected
+    assert connection.execute('SELECT count(*) FROM ledger').fetchone()[0] == 1
+    connection.close()
+
+
+def test_current_pair_roots_track_heads_not_transition_history(tmp_path):
+    connection = connect(str(tmp_path / 'current-pair-roots.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    first, second = _native(), _native('other')
+    original = _retrieval_facts()
+    changed = {**_retrieval_facts(), 'retrieval_binding': {'request': {'nodes': ['Changed exact context']}}}
+    for unit in (first, second):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=original)
+    assert connection.execute('SELECT count(*) FROM native_current_pairs').fetchone()[0] == 1
+    journal.advance(first.revision_id, stage='EVIDENCE_HOLD', facts=changed)
+    assert connection.execute('SELECT count(*) FROM native_current_pairs').fetchone()[0] == 2
+    assert journal.current(second.revision_id)['facts'] == original
+    journal.advance(second.revision_id, stage='EVIDENCE_HOLD', facts=changed)
+    assert connection.execute('SELECT count(*) FROM native_current_pairs').fetchone()[0] == 1
+    journal.advance(first.revision_id, stage='EVIDENCE_HOLD', facts={'reason': 'No current pair'})
+    journal.advance(second.revision_id, stage='EVIDENCE_HOLD', facts={'reason': 'No current pair'})
+    assert connection.execute('SELECT count(*) FROM native_current_pairs').fetchone()[0] == 0
+    assert NativeRevisionJournal(connection).current(first.revision_id)['facts'] == {'reason': 'No current pair'}
+    connection.close()
+
+
+def test_stale_current_writer_does_not_overwrite_a_newer_committed_ordinal(tmp_path):
+    connection = connect(str(tmp_path / 'writer-conflict.sqlite3'))
+    first = NativeRevisionJournal(connection)
+    unit = _native()
+    first.land((unit,))
+    first.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts={'reason': 'original'})
+    stale = NativeRevisionJournal(connection)
+    expected = first.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts={'reason': 'newer'})
+    with pytest.raises(ValueError, match='CURRENT.*ordinal'):
+        stale.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts={'reason': 'stale overwrite'})
+    assert not connection.in_transaction
+    assert NativeRevisionJournal(connection).current(unit.revision_id) == expected
+    connection.close()
+
+
+def test_current_boot_does_not_commit_or_rollback_callers_transaction(tmp_path):
+    connection = connect(str(tmp_path / 'caller-transaction.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    journal.land((_native(),))
+    connection.execute('CREATE TABLE caller_work(value TEXT)')
+    connection.execute("INSERT INTO caller_work VALUES('pending')")
+    assert connection.in_transaction
+    assert NativeRevisionJournal(connection).units == journal.units
+    assert connection.in_transaction
+    connection.rollback()
+    assert connection.execute('SELECT count(*) FROM caller_work').fetchone()[0] == 0
+    connection.close()
+
+
+def test_unrelated_current_write_does_not_mask_missing_ack_head(tmp_path):
+    first = _native('missing-ack')
+    second = _native('other-ack')
+    connection = connect(str(tmp_path / 'missing-current.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    for unit in (first, second):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage='ACKNOWLEDGED', facts={'receipt': unit.ingest_id})
+    inventory = connection.execute('SELECT * FROM native_current_meta').fetchall()
+    second_before = connection.execute('SELECT * FROM native_current_heads WHERE revision_id=?', (second.revision_id,)).fetchone()
+    connection.execute('DELETE FROM native_current_heads WHERE revision_id=?', (first.revision_id,))
+    connection.commit()
+    with pytest.raises(ValueError, match='CURRENT inventory'):
+        journal.advance(second.revision_id, stage='ACKNOWLEDGED', facts={'receipt': second.ingest_id, 'changed': True})
+    assert connection.execute('SELECT * FROM native_current_meta').fetchall() == inventory
+    assert connection.execute('SELECT * FROM native_current_heads WHERE revision_id=?', (second.revision_id,)).fetchone() == second_before
+    with pytest.raises(ValueError, match='CURRENT inventory'):
+        NativeRevisionJournal(connection)
     connection.close()

@@ -233,7 +233,85 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
         with _validation_stage("projection_integrity"):
             with self._transaction() as conn:
                 self._persist_projection_contracts(conn)
-            self._validate_projection_integrity()
+            if self._current_state_only:
+                self._validate_current_projection_heads()
+            else:
+                self._validate_projection_integrity()
+
+    def _validate_current_projection_heads(self) -> None:
+        """Prove live generation/checkpoint and unresolved obligations, not delivery logs."""
+        conn = self._connection
+        for generation in conn.execute(
+            "SELECT * FROM projection_generations WHERE state IN ('BUILDING','VALIDATING','ACTIVE')"
+        ):
+            generation_id = str(generation["generation_id"])
+            self._prove_projection_generation_head(conn, generation)
+            self._registered_family_definition(conn, str(generation["family_id"]))
+            family = conn.execute(
+                "SELECT registered_event_id FROM projection_families WHERE family_id=?",
+                (str(generation["family_id"]),),
+            ).fetchone()
+            self._validate_retained_event(str(family["registered_event_id"]))
+            self._validate_retained_event(str(generation["updated_event_id"]))
+            checkpoint = conn.execute(
+                "SELECT * FROM projection_checkpoint_versions WHERE generation_id=? "
+                "ORDER BY checkpoint_version DESC LIMIT 1", (generation_id,),
+            ).fetchone()
+            if checkpoint is None:
+                raise AuthorityPersistenceError("current projection generation lacks checkpoint")
+            self._validate_retained_event(str(checkpoint["authority_event_id"]))
+            if conn.execute(
+                "SELECT 1 FROM ledger_events WHERE event_id=? AND aggregate_type='projection_generation' "
+                "AND aggregate_id=? AND aggregate_version=?",
+                (str(checkpoint["authority_event_id"]), generation_id, int(checkpoint["authority_aggregate_version"])),
+            ).fetchone() is None:
+                raise AuthorityPersistenceError("current projection checkpoint authority differs")
+            sequence = int(checkpoint["contiguous_ledger_seq"])
+            maximum = int(conn.execute("SELECT COALESCE(MAX(ledger_seq),0) FROM ledger_events").fetchone()[0])
+            if sequence > maximum or conn.execute(
+                "SELECT 1 FROM projection_gaps WHERE generation_id=? AND state='OPEN' "
+                "AND required=1 AND ledger_seq_start<=? LIMIT 1", (generation_id, sequence),
+            ).fetchone() is not None:
+                raise AuthorityPersistenceError("current projection checkpoint crosses missing authority")
+            for gap in conn.execute(
+                "SELECT opened_event_id FROM projection_gaps WHERE generation_id=? AND state='OPEN'",
+                (generation_id,),
+            ):
+                self._validate_retained_event(str(gap["opened_event_id"]))
+            for letter in conn.execute(
+                "SELECT source_event_id,authority_event_id FROM projection_dead_letters WHERE generation_id=?",
+                (generation_id,),
+            ):
+                self._validate_retained_event(str(letter["source_event_id"]))
+                self._validate_retained_event(str(letter["authority_event_id"]))
+
+    def _prove_projection_generation_head(self, conn: sqlite3.Connection, generation: sqlite3.Row) -> None:
+        generation_id = str(generation["generation_id"])
+        version = conn.execute(
+            "SELECT * FROM projection_generation_versions WHERE generation_id=? AND lifecycle_version=?",
+            (generation_id, int(generation["lifecycle_version"])),
+        ).fetchone()
+        if version is None or any(version[name] != generation[name] for name in (
+            "state", "validated_through_ledger_seq",
+        )):
+            raise AuthorityPersistenceError("current projection generation head differs")
+        exact_head = conn.execute(
+            "SELECT 1 FROM authority_aggregates a JOIN ledger_events e "
+            "ON e.event_id=? AND e.aggregate_type=a.aggregate_type AND e.aggregate_id=a.aggregate_id "
+            "AND e.aggregate_version=? "
+            "WHERE a.aggregate_type='projection_generation' AND a.aggregate_id=? "
+            + ("AND a.current_version>=?" if conn.in_transaction else "AND a.current_version=?"),
+            (str(generation["updated_event_id"]), int(generation["authority_aggregate_version"]),
+             generation_id, int(generation["authority_aggregate_version"])),
+        ).fetchone()
+        if exact_head is None:
+            raise AuthorityPersistenceError("current projection generation authority head differs")
+        # A typed command advances the generic aggregate before updating the
+        # projection row inside its atomic write. Prove the exact retained
+        # generation event there; outside that write the two heads must agree.
+        # Delivery advances authority without changing the lifecycle version.
+        self._validate_retained_event(str(version["authority_event_id"]))
+        self._validate_retained_event(str(generation["updated_event_id"]))
 
     def _persist_projection_contracts(self, conn: sqlite3.Connection) -> None:
         recorded_at = self._clock().to_text()
@@ -3104,9 +3182,8 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
             raise ProjectionStateError("source ledger event does not exist")
         return self._event_from_row(row)
 
-    @staticmethod
     def _generation_row(
-        conn: sqlite3.Connection, generation_id: str
+        self, conn: sqlite3.Connection, generation_id: str
     ) -> sqlite3.Row:
         row = conn.execute(
             "SELECT * FROM projection_generations WHERE generation_id=?",
@@ -3114,6 +3191,8 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
         ).fetchone()
         if row is None:
             raise ProjectionStateError("projection generation does not exist")
+        if self._current_state_only:
+            self._prove_projection_generation_head(conn, row)
         return row
 
     def _checkpoint_seq(self, conn: sqlite3.Connection, generation_id: str) -> int:

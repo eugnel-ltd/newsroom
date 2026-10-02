@@ -92,6 +92,7 @@ class _ExtractionReadMixin:
         *,
         replayed: bool,
     ) -> ExtractorContract:
+        self._prove_current_record(row)
         value = self._canonical_row_value(row, identity="extractor contract")
         event = self._validate_record_envelope(
             conn,
@@ -553,6 +554,7 @@ class _ExtractionReadMixin:
         *,
         replayed: bool,
     ) -> ExtractionRunVersion:
+        self._prove_current_record(row)
         request = self._request_for_version_row(conn, row)
         contract = self._contract_row(conn, str(request.contract_id))
         contract_digest = str(contract["canonical_digest"])

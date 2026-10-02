@@ -237,6 +237,119 @@ class _ObjectStoreBase:
             )
         return value
 
+    def _verified_rights_value(self, rights: sqlite3.Row) -> dict[str, Any]:
+        """One exact rights record, shared by receipt reads and current effects."""
+        value = self._require_canonical_record(rights)
+        expected = {
+            field: rights[field]
+            for field in (
+                "rights_decision_id", "authentication_context_id",
+                "authorization_request_digest", "authorization_decision_id",
+                "rights_request_digest", "policy_contract_digest",
+                "admission_definition_digest", "object_class", "allowed_use",
+                "security_scope", "retention_scope", "reason_code",
+                "decided_at", "valid_from", "valid_until",
+            )
+        }
+        expected.update({
+            "blob": {"blob_digest": rights["blob_digest"], "size_bytes": rights["size_bytes"]},
+            "allowed": bool(rights["allowed"]),
+        })
+        if value != expected:
+            raise AuthorityPersistenceError("access decision rights indexed fields differ")
+        return value
+
+    def _prove_current_admission(self, conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+        rights = conn.execute(
+            "SELECT * FROM object_rights_decisions WHERE rights_decision_id=?", (row["rights_decision_id"],),
+        ).fetchone()
+        if rights is None:
+            raise AuthorityPersistenceError("current admission rights are absent")
+        value = self._verified_rights_value(rights)
+        if any(value[rights_field] != row[admission_field] for rights_field, admission_field in (
+            ("admission_definition_digest", "definition_digest"), ("object_class", "object_class"),
+            ("allowed_use", "allowed_use"), ("security_scope", "security_scope"),
+            ("retention_scope", "retention_scope"), ("valid_from", "valid_from"), ("valid_until", "valid_until"),
+        )) or value["blob"] != {"blob_digest": row["blob_digest"], "size_bytes": row["size_bytes"]}:
+            raise AuthorityPersistenceError("current admission differs from exact rights")
+        authentication = conn.execute(
+            "SELECT * FROM authentication_contexts WHERE authentication_context_id=?", (rights["authentication_context_id"],),
+        ).fetchone()
+        request = conn.execute(
+            "SELECT * FROM authorization_requests WHERE request_digest=?", (rights["authorization_request_digest"],),
+        ).fetchone()
+        decision = conn.execute(
+            "SELECT * FROM authorization_decisions WHERE authorization_decision_id=?", (rights["authorization_decision_id"],),
+        ).fetchone()
+        if any(record is None for record in (authentication, request, decision)):
+            raise AuthorityPersistenceError("current rights security closure is absent")
+        context = self._authentication_record_from_row(authentication)
+        requested = self._request_record_from_row(request, connection=conn)
+        authorised = self._decision_record_from_row(decision, connection=conn)
+        if (
+            not authorised.allowed
+            or requested.authentication_context_id != context.authentication_context_id
+            or authorised.authentication_context_id != context.authentication_context_id
+            or authorised.authorization_request_digest != requested.request_digest
+        ):
+            raise AuthorityPersistenceError("current rights security closure differs")
+        if row["event_id"] is None:
+            raise AuthorityPersistenceError("current admission activation is absent")
+        self._prove_admission_lifecycle(conn, row)
+
+    def _object_lifecycle_event(self, conn: sqlite3.Connection, event_id: str, identity: str):
+        self._validate_retained_event(event_id)
+        event = conn.execute(
+            "SELECT e.*,p.payload_bytes FROM ledger_events e "
+            "JOIN authority_payloads p ON p.payload_id=e.payload_id WHERE e.event_id=?",
+            (event_id,),
+        ).fetchone()
+        if event is None or event["aggregate_type"] != "governed_object_lifecycle" or event["aggregate_id"] != identity:
+            raise AuthorityPersistenceError("selected object lifecycle event identity differs")
+        return event, self._decode_canonical_object(bytes(event["payload_bytes"]))
+
+    def _prove_admission_lifecycle(self, conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+        version = conn.execute(
+            "SELECT v.*,h.updated_at AS head_updated_at FROM object_admission_versions v "
+            "JOIN object_admission_heads h ON h.admission_id=v.admission_id AND h.current_version=v.lifecycle_version "
+            "WHERE v.admission_id=? AND v.lifecycle_version="
+            "(SELECT MAX(lifecycle_version) FROM object_admission_versions WHERE admission_id=?)",
+            (row["admission_id"], row["admission_id"]),
+        ).fetchone()
+        if version is None or version["lifecycle_version"] != row["current_version"] or version["state"] != row["state"]:
+            raise AuthorityPersistenceError("current admission lifecycle head is not the exact latest version")
+        event, payload = self._object_lifecycle_event(conn, str(version["event_id"]), str(row["admission_id"]))
+        state = {
+            "governed_object.admission.activated": AdmissionState.ACTIVE.value,
+            "governed_object.admission.revoked": AdmissionState.REVOKED.value,
+        }.get(str(event["event_type"]))
+        head = conn.execute(
+            "SELECT current_version FROM authority_aggregates WHERE aggregate_type=? AND aggregate_id=?",
+            (event["aggregate_type"], event["aggregate_id"]),
+        ).fetchone()
+        if (
+            state != version["state"] or head is None or head["current_version"] != event["aggregate_version"]
+            or event["aggregate_version"] != version["lifecycle_version"]
+            or event["recorded_at"] != version["recorded_at"] or version["head_updated_at"] != version["recorded_at"]
+            or payload.get("admission_id") != row["admission_id"] or payload.get("operation_id") != version["operation_id"]
+        ):
+            raise AuthorityPersistenceError("current admission lifecycle differs from exact authority")
+        if state == AdmissionState.ACTIVE.value:
+            expected = {name: row[name] for name in (
+                "admission_id", "blob_digest", "size_bytes", "definition_digest", "rights_decision_id",
+                "object_class", "allowed_use", "security_scope", "retention_scope", "valid_from", "valid_until",
+            )}
+            expected["operation_id"] = version["operation_id"]
+            detail = {
+                "admission_id": row["admission_id"], "state": state, "event_id": str(version["event_id"]),
+                "rights_decision_id": row["rights_decision_id"],
+            }
+        else:
+            expected = {"admission_id": row["admission_id"], "operation_id": version["operation_id"], "reason_code": version["reason_code"]}
+            detail = expected
+        if payload != expected or digest_canonical(detail) != version["detail_digest"]:
+            raise AuthorityPersistenceError("current admission lifecycle payload differs")
+
     def _admission_row(
         self, admission_id: str, *, conn: sqlite3.Connection | None = None
     ) -> sqlite3.Row:
@@ -317,8 +430,7 @@ class _ObjectStoreBase:
     ) -> sqlite3.Row:
         selected = conn or self._connection
         row = selected.execute(
-            "SELECT b.size_bytes,h.current_version,v.state,v.integrity_state,"
-            "v.event_id,v.recorded_at FROM blob_identities b "
+            "SELECT b.size_bytes,h.current_version,h.updated_at AS head_updated_at,v.* FROM blob_identities b "
             "JOIN blob_lifecycle_heads h ON h.blob_digest=b.blob_digest "
             "JOIN blob_lifecycle_versions v "
             "ON v.blob_digest=h.blob_digest "
@@ -328,6 +440,44 @@ class _ObjectStoreBase:
         ).fetchone()
         if row is None:
             raise KeyError(blob_digest)
+        if self._current_state_only:
+            latest = selected.execute(
+                "SELECT MAX(lifecycle_version) FROM blob_lifecycle_versions WHERE blob_digest=?", (blob_digest,),
+            ).fetchone()[0]
+            if row["current_version"] != latest or row["head_updated_at"] != row["recorded_at"]:
+                raise AuthorityPersistenceError("current blob lifecycle head is not the exact latest version")
+            detail = {
+                "state": row["state"], "integrity_state": row["integrity_state"],
+                "operation_id": row["operation_id"], "event_id": row["event_id"],
+            }
+            if row["event_id"] is None:
+                expected = {"STAGING": "UNVERIFIED", "INSTALLED": "VERIFIED"}
+                if expected.get(str(row["state"])) != row["integrity_state"]:
+                    raise AuthorityPersistenceError("pending blob lifecycle state differs")
+                detail["blob"] = {"blob_digest": blob_digest, "size_bytes": row["size_bytes"]}
+            else:
+                self._validate_retained_event(str(row["event_id"]))
+                event = selected.execute(
+                    "SELECT e.*,p.payload_bytes FROM ledger_events e JOIN authority_payloads p "
+                    "ON p.payload_id=e.payload_id WHERE e.event_id=?", (row["event_id"],),
+                ).fetchone()
+                payload = self._decode_canonical_object(bytes(event["payload_bytes"]))
+                expected = {
+                    "governed_object.admission.activated": ("ACTIVE", "VERIFIED", "admission_id"),
+                    "governed_blob.deletion.tombstoned": ("DELETION_PENDING", "VERIFIED", "deletion_id"),
+                    "governed_blob.deletion.completed": ("DELETED", "MISSING", "deletion_id"),
+                    "governed_blob.orphan.removed": ("DELETED", "MISSING", "operation_id"),
+                }.get(str(event["event_type"]))
+                if expected is None or (row["state"], row["integrity_state"]) != expected[:2] \
+                        or payload.get(expected[2]) != event["aggregate_id"] or payload.get("blob_digest") != blob_digest \
+                        or payload.get("operation_id") != row["operation_id"] or event["recorded_at"] != row["recorded_at"]:
+                    raise AuthorityPersistenceError("current blob lifecycle differs from exact event")
+                if expected[0] == "ACTIVE":
+                    detail["blob"] = {"blob_digest": blob_digest, "size_bytes": row["size_bytes"]}
+                else:
+                    detail["blob_digest"] = blob_digest
+            if digest_canonical(detail) != row["detail_digest"]:
+                raise AuthorityPersistenceError("current blob lifecycle detail differs")
         return row
 
     @staticmethod
@@ -358,6 +508,8 @@ class _ObjectStoreBase:
         row = self._admission_row(admission_id, conn=conn)
         if require_active and str(row["state"]) != AdmissionState.ACTIVE.value:
             raise ObjectAdmissionDenied("object admission is not ACTIVE")
+        if self._current_state_only:
+            self._prove_current_admission(conn, row)
         valid_from = UtcTimestamp.parse(str(row["valid_from"]))
         valid_until = (
             None
@@ -587,7 +739,7 @@ class _ObjectStoreBase:
     def _active_deletion_for_blob(
         self, conn: sqlite3.Connection, blob_digest: str
     ) -> sqlite3.Row | None:
-        return conn.execute(
+        row = conn.execute(
             "SELECT d.deletion_id,h.current_version,v.state,v.recorded_at "
             "FROM object_deletions d "
             "JOIN object_deletion_heads h ON h.deletion_id=d.deletion_id "
@@ -595,10 +747,42 @@ class _ObjectStoreBase:
             "ON v.deletion_id=h.deletion_id "
             "AND v.lifecycle_version=h.current_version "
             "WHERE d.blob_digest=? "
-            "AND v.state!='PHYSICALLY_REMOVED' "
+            + ("AND v.state!='PHYSICALLY_REMOVED' " if not self._current_state_only else "") +
             "ORDER BY d.created_at DESC LIMIT 1",
             (blob_digest,),
         ).fetchone()
+        if row is not None and self._current_state_only:
+            self._prove_deletion_lifecycle(conn, row)
+        return row
+
+    def _prove_deletion_lifecycle(self, conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+        version = conn.execute(
+            "SELECT d.blob_digest,d.reason_code,h.updated_at AS head_updated_at,v.* FROM object_deletions d "
+            "JOIN object_deletion_heads h ON h.deletion_id=d.deletion_id "
+            "JOIN object_deletion_versions v ON v.deletion_id=h.deletion_id AND v.lifecycle_version=h.current_version "
+            "WHERE d.deletion_id=? AND v.lifecycle_version="
+            "(SELECT MAX(lifecycle_version) FROM object_deletion_versions WHERE deletion_id=d.deletion_id)",
+            (row["deletion_id"],),
+        ).fetchone()
+        if version is None or version["lifecycle_version"] != row["current_version"] or version["state"] != row["state"]:
+            raise AuthorityPersistenceError("current deletion head is not the exact latest version")
+        event, payload = self._object_lifecycle_event(conn, str(version["event_id"]), str(row["deletion_id"]))
+        states = {
+            "governed_blob.deletion.requested": "REQUESTED", "governed_blob.deletion.tombstoned": "TOMBSTONED",
+            "governed_blob.deletion.completed": "PHYSICALLY_REMOVED", "governed_blob.deletion.failed": "TOMBSTONED",
+        }
+        expected = {"operation_id": version["operation_id"], "deletion_id": version["deletion_id"], "blob_digest": version["blob_digest"]}
+        if event["event_type"] in {"governed_blob.deletion.requested", "governed_blob.deletion.tombstoned"}:
+            expected["reason_code"] = version["reason_code"]
+        elif event["event_type"] == "governed_blob.deletion.failed":
+            expected["error_code"] = version["error_code"]
+        if (
+            states.get(str(event["event_type"])) != version["state"] or payload != expected
+            or event["aggregate_version"] != version["lifecycle_version"]
+            or event["recorded_at"] != version["recorded_at"] or version["head_updated_at"] != version["recorded_at"]
+            or digest_canonical(payload) != version["detail_digest"]
+        ):
+            raise AuthorityPersistenceError("current deletion lifecycle differs from exact event")
 
     def _admission_view_from_row(self, row: sqlite3.Row) -> ObjectAdmissionView:
         activation_event = (
@@ -977,14 +1161,15 @@ class _ObjectStoreBase:
             self._reconcile_staging_records()
             # An install can complete durably before SQLite commit.  Such a file
             # has no authoritative blob identity and is safe to remove.
-            self._cas.cleanup_unreferenced_installed(
-                known_digests=frozenset(
-                    str(row["blob_digest"])
-                    for row in self._connection.execute(
-                        "SELECT blob_digest FROM blob_identities"
-                    ).fetchall()
+            if not self._current_state_only:
+                self._cas.cleanup_unreferenced_installed(
+                    known_digests=frozenset(
+                        str(row["blob_digest"])
+                        for row in self._connection.execute(
+                            "SELECT blob_digest FROM blob_identities"
+                        ).fetchall()
+                    )
                 )
-            )
             self._reconcile_blob_integrity()
             self._reconcile_expired_rights()
             self._reconcile_deletions()
@@ -992,6 +1177,7 @@ class _ObjectStoreBase:
     def _reconcile_staging_records(self) -> None:
         records = self._connection.execute(
             "SELECT stage_id,staged_name,state FROM object_staging_records"
+            + (" WHERE state='STAGED'" if self._current_state_only else "")
         ).fetchall()
         for row in records:
             state = str(row["state"])
@@ -1018,9 +1204,16 @@ class _ObjectStoreBase:
                 "SELECT staged_name FROM object_staging_records WHERE state='STAGED'"
             ).fetchall()
         )
-        self._cas.cleanup_staging(keep_names=keep)
+        if not self._current_state_only:
+            self._cas.cleanup_staging(keep_names=keep)
 
-    def _reconcile_blob_integrity(self) -> None:
+    def _reconcile_blob_integrity(self, *, _include_historical_active: bool = False) -> None:
+        # ACTIVE is retained admission state, not proof that an old input is
+        # part of today's work. Rehydrate pins/rehashes it before use. Native
+        # boot only reconciles pending install/deletion byte obligations.
+        states = "'INSTALLED','DELETION_PENDING'"
+        if _include_historical_active:
+            states = "'INSTALLED','ACTIVE','DELETION_PENDING'"
         rows = self._connection.execute(
             "SELECT b.blob_digest,b.size_bytes,v.state,v.integrity_state "
             "FROM blob_identities b "
@@ -1028,6 +1221,8 @@ class _ObjectStoreBase:
             "JOIN blob_lifecycle_versions v "
             "ON v.blob_digest=h.blob_digest "
             "AND v.lifecycle_version=h.current_version"
+            + (f" WHERE v.state IN ({states})"
+               if self._current_state_only else "")
         ).fetchall()
         for row in rows:
             state = BlobLifecycleState(str(row["state"]))
@@ -1061,20 +1256,21 @@ class _ObjectStoreBase:
 
     def _reconcile_expired_rights(self) -> None:
         now = self._clock().to_text()
-        invalid_active = self._connection.execute(
-            "SELECT a.admission_id FROM object_admissions a "
-            "JOIN object_admission_heads h ON h.admission_id=a.admission_id "
-            "JOIN object_admission_versions v "
-            "ON v.admission_id=h.admission_id "
-            "AND v.lifecycle_version=h.current_version "
-            "JOIN object_rights_decisions r "
-            "ON r.rights_decision_id=a.rights_decision_id "
-            "WHERE v.state='ACTIVE' AND r.allowed=0 LIMIT 1"
-        ).fetchone()
-        if invalid_active is not None:
-            raise AuthorityPersistenceError(
-                "ACTIVE admission references a denying rights decision"
-            )
+        if not self._current_state_only:
+            invalid_active = self._connection.execute(
+                "SELECT a.admission_id FROM object_admissions a "
+                "JOIN object_admission_heads h ON h.admission_id=a.admission_id "
+                "JOIN object_admission_versions v "
+                "ON v.admission_id=h.admission_id "
+                "AND v.lifecycle_version=h.current_version "
+                "JOIN object_rights_decisions r "
+                "ON r.rights_decision_id=a.rights_decision_id "
+                "WHERE v.state='ACTIVE' AND r.allowed=0 LIMIT 1"
+            ).fetchone()
+            if invalid_active is not None:
+                raise AuthorityPersistenceError(
+                    "ACTIVE admission references a denying rights decision"
+                )
 
         pending = self._connection.execute(
             "SELECT a.admission_id FROM object_admissions a "
@@ -1108,6 +1304,7 @@ class _ObjectStoreBase:
             "JOIN object_deletion_versions v "
             "ON v.deletion_id=h.deletion_id "
             "AND v.lifecycle_version=h.current_version"
+            + (" WHERE v.state!='PHYSICALLY_REMOVED'" if self._current_state_only else "")
         ).fetchall()
         for row in rows:
             state = DeletionState(str(row["state"]))

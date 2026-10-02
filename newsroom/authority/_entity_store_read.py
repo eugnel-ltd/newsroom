@@ -104,6 +104,7 @@ class _EntityReadMixin:
     def _mention_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EntityMention:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         payload = bytes(event["payload_bytes"])
         request_value = self._decode_json_blob(payload, identity="entity mention request")
@@ -186,6 +187,7 @@ class _EntityReadMixin:
     def _proposal_version_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EntityResolutionProposalVersion:
+        self._prove_current_record(row)
         request_bytes = bytes(row["request_bytes"])
         if digest_bytes(request_bytes) != str(row["request_digest"]):
             raise AuthorityPersistenceError("resolution proposal request digest mismatch")
@@ -331,6 +333,7 @@ class _EntityReadMixin:
     def _dependency_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EntityResolutionDependency:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         payload = bytes(event["payload_bytes"])
         request_value = self._decode_json_blob(
@@ -397,6 +400,7 @@ class _EntityReadMixin:
     def _decision_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EntityResolutionDecision:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         request_bytes = bytes(event["payload_bytes"])
         request_value = self._decode_json_blob(
@@ -478,6 +482,7 @@ class _EntityReadMixin:
     def _merge_decision_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EntityMergeDecision:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         request_bytes = bytes(event["payload_bytes"])
         request = decode_entity_merge_request(
@@ -577,6 +582,7 @@ class _EntityReadMixin:
     def _split_decision_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EntitySplitDecision:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         request_bytes = bytes(event["payload_bytes"])
         request = decode_entity_split_request(
@@ -671,6 +677,7 @@ class _EntityReadMixin:
     def _reversal_decision_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row, *, replayed: bool
     ) -> EntityReversalDecision:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         request_bytes = bytes(event["payload_bytes"])
         request = decode_entity_reversal_request(
@@ -760,6 +767,7 @@ class _EntityReadMixin:
         return result
 
     def _entity_from_row(self, conn: sqlite3.Connection, row: sqlite3.Row) -> CanonicalEntity:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         result = CanonicalEntity(
             entity_id=CanonicalEntityId.parse(str(row["entity_id"])),
@@ -783,6 +791,7 @@ class _EntityReadMixin:
     def _entity_version_from_row(
         self, conn: sqlite3.Connection, row: sqlite3.Row
     ) -> CanonicalEntityVersion:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         result = CanonicalEntityVersion(
             entity_version_id=CanonicalEntityVersionId.parse(
@@ -828,6 +837,7 @@ class _EntityReadMixin:
         return result
 
     def _alias_from_row(self, conn: sqlite3.Connection, row: sqlite3.Row) -> EntityAlias:
+        self._prove_current_record(row)
         event = self._record_context(conn, event_id=str(row["authority_event_id"]))
         uncertainty = self._decode_json_blob(
             bytes(row["uncertainty_codes_bytes"]), identity="entity alias uncertainty codes"
@@ -1056,6 +1066,25 @@ class _EntityReadMixin:
                 projected_through_ledger_seq=int(row["projected_through_ledger_seq"]),
             )
             self.entity(result.entity_id)
+            if self._current_state_only:
+                head = self._entity_head_row(self._connection, entity_id)
+                latest = self._connection.execute(
+                    "SELECT * FROM entity_projection_events WHERE entity_id=? "
+                    "ORDER BY source_ledger_seq DESC,projection_event_id DESC LIMIT 1", (str(entity_id),),
+                ).fetchone()
+                if latest is None:
+                    raise AuthorityPersistenceError("current entity lacks latest projection authority")
+                event = self._projection_event_from_row(self._connection, latest)
+                self._validate_retained_event(str(event.source_event_id))
+                if (
+                    str(result.current_entity_version_id) != head["current_entity_version_id"]
+                    or result.lifecycle.value != head["lifecycle"]
+                    or str(event.entity_version_id) != head["current_entity_version_id"]
+                    or event.lifecycle.value != head["lifecycle"]
+                    or str(event.preferred_entity_id) != str(result.preferred_entity_id)
+                    or event.source_ledger_seq != result.projected_through_ledger_seq
+                ):
+                    raise AuthorityPersistenceError("current entity preferred projection differs from latest authority")
             return result
 
     def merge_decision(

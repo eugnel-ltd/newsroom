@@ -1,11 +1,8 @@
-"""Native revision continuation in the existing append-only Control Plane ledger.
+"""Native continuation from durable CURRENT rows, not diagnostic-history replay.
 
-Load once at daemon start; append only changed state. Source bytes are retained
-once, never copied into each stage receipt. No additional database or schema.
-Unchanged retrieval binding/rights pairs refer to the previous same-revision
-progress record. Ordered replay verifies their original immutable root; selected
-reads restore complete detached facts without retaining every cold pair in RAM.
-The journal records work, not evidence/publication authority.
+The explicit legacy importer alone reads old diagnostics. Cold retrieval pairs
+remain content-addressed and are authenticated only when selected. Business
+provider pins remain immutable ledger records; ordinary logs are compact DTOs.
 """
 
 from __future__ import annotations
@@ -114,7 +111,7 @@ def _landed_units(
 
 
 class NativeRevisionJournal:
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(self, connection: sqlite3.Connection, *, _legacy: bool = False) -> None:
         self._connection = connection
         self.units: dict[str, tuple[CorpusIngestUnit, ...]] = {}
         # Share immutable equal body text only; every revision and authority
@@ -126,8 +123,18 @@ class NativeRevisionJournal:
         self.portfolio: tuple[dict, ...] = ()
         self._portfolio_record: tuple[int, str] | None = None
         self.observations: dict[str, tuple[str, str, str, str]] = {}
-        # ponytail: one startup replay; an indexed snapshot is warranted only
-        # after measured native history makes this bounded-kind scan material.
+        self._current_state = not _legacy
+        if not _legacy:
+            owns_read = not connection.in_transaction
+            if owns_read:
+                connection.execute('BEGIN')
+            try:
+                self._load_current()
+            finally:
+                if owns_read:
+                    connection.rollback()
+            _share_progress_strings(self._summaries)
+            return
         for seq, kind, raw, payload_digest in connection.execute(
             "SELECT seq,kind,payload_json,payload_digest FROM ledger "
             "WHERE kind IN (?,?,?) ORDER BY seq", (LAND, STATE, PORTFOLIO),
@@ -139,6 +146,47 @@ class NativeRevisionJournal:
                 raise ValueError("native progress ledger is not canonical")
             self._apply(kind, value, seq=seq, payload_digest=payload_digest)
         _share_progress_strings(self._summaries)
+
+    def _load_current(self) -> None:
+        from .native_progress_state import checked_json, require_ready
+        require_ready(self._connection)
+        for revision, seq, digest, raw, content_digest in self._connection.execute(
+            'SELECT revision_id,land_seq,land_digest,content_json,content_digest FROM native_current_sources ORDER BY land_seq'
+        ):
+            value = checked_json(raw, content_digest, label='source')
+            self._apply(LAND, value, seq=seq, payload_digest=digest)
+            if value['revision_id'] != revision:
+                raise ValueError('native CURRENT source identity differs')
+        expected_units = {unit.ingest_id: (unit.revision_id, digest_bytes(canonical_json_bytes(asdict(unit.effective_revision))))
+                          for units in self.units.values() for unit in units}
+        indexed_units = {ingest: (revision, digest) for ingest, revision, digest in self._connection.execute(
+            'SELECT ingest_id,revision_id,effective_revision_digest FROM native_current_units')}
+        if indexed_units != expected_units:
+            raise ValueError('native CURRENT source index binding differs')
+        for revision, ordinal, seq, digest, raw, state_digest, pair_digest in self._connection.execute(
+            'SELECT revision_id,ordinal,diagnostic_seq,diagnostic_digest,state_json,state_digest,pair_digest FROM native_current_heads ORDER BY diagnostic_seq'
+        ):
+            value = json.loads(raw)
+            if (type(value) is not dict or canonical_json_bytes(value).decode() != raw
+                    or value.get('revision_id') != revision or type(value.get('ordinal')) is not int
+                    or value['ordinal'] != ordinal or ordinal < 1 or type(seq) is not int or seq < 0
+                    or type(value.get('facts')) is not dict or not value.get('stage')
+                    or revision not in self.units
+                    or any(key in value['facts'] for key in _RETRIEVAL_FIELDS) and pair_digest is not None
+                    or digest_bytes(canonical_json_bytes({'state': value, 'pair_digest': pair_digest})) != state_digest):
+                raise ValueError('native CURRENT head payload differs')
+            self._records[revision] = _ProgressRecord(seq, digest, ordinal, pair_digest,
+                _state_digest(value['stage'], value['facts'], pair_digest), None)
+            self._summaries[revision] = value
+        row = self._connection.execute('SELECT diagnostic_seq,diagnostic_digest,portfolio_json,portfolio_digest FROM native_current_portfolio WHERE singleton=1').fetchone()
+        if row:
+            seq, digest, raw, content_digest = row
+            self._apply(PORTFOLIO, checked_json(raw, content_digest, label='portfolio'), seq=seq, payload_digest=digest)
+        for observation, raw, digest in self._connection.execute('SELECT observation_digest,reference_json,reference_digest FROM native_current_observations'):
+            value = checked_json(raw, digest, label='observation')['reference']
+            if len(value) != 4 or any(type(item) is not str or not item for item in value) or value[1] != observation:
+                raise ValueError('native CURRENT observation binding differs')
+            self.observations[observation] = tuple(value)
 
     def _apply(self, kind: str, value: dict, *, seq: int, payload_digest: str) -> None:
         if kind == LAND:
@@ -240,18 +288,55 @@ class NativeRevisionJournal:
             raise ValueError("native progress revision chunk coverage differs")
 
     def _retain(self, kind: str, value: dict) -> None:
-        # Existing store writer/chain semantics own the atomic append. Apply
-        # only after commit; an interrupted commit is reconstructed on reopen.
+        from .native_progress_state import (retain_source, retain_head, retain_portfolio,
+            retain_embedding_pins, write_counts)
+        diagnostic = value
+        pair_digest = _pair_digest(value.get('facts', {})) if kind == STATE else None
+        if kind == STATE:
+            inline = {key: item for key, item in value['facts'].items()
+                      if pair_digest is None or key not in _RETRIEVAL_FIELDS}
+            diagnostic = {key: value[key] for key in ('revision_id', 'ordinal', 'stage')}
+            diagnostic['state_digest'] = _state_digest(value['stage'], inline, pair_digest)
+            diagnostic['retrieval_pair_digest'] = pair_digest
+            if value['stage'] in {'EMBEDDING_STARTED', 'ASSESSMENT_STARTED', 'PUBLICATION_STARTED', 'ACKNOWLEDGED', 'COPY_CORRECTION_PREPARED'}:
+                diagnostic['facts'] = inline
         try:
-            append_ledger(self._connection, kind, value)
-            seq, payload_digest = self._connection.execute(
-                "SELECT seq,payload_digest FROM ledger WHERE seq=last_insert_rowid()"
-            ).fetchone()
+            if not self._connection.in_transaction:
+                self._connection.execute('BEGIN IMMEDIATE')
+            from .native_progress_state import require_ready
+            require_ready(self._connection)
+            if kind == STATE and 'facts' not in diagnostic:
+                seq, digest = 0, digest_bytes(canonical_json_bytes(diagnostic))
+            else:
+                append_ledger(self._connection, kind, diagnostic)
+                seq, digest = self._connection.execute('SELECT seq,payload_digest FROM ledger WHERE seq=last_insert_rowid()').fetchone()
+            if kind == LAND:
+                retain_source(self._connection, value, seq=seq, digest=digest, units=_landed_units(value))
+            elif kind == STATE:
+                retain_head(self._connection, value, seq=seq, digest=digest, pair_digest=pair_digest,
+                            expected_previous_ordinal=value['ordinal'] - 1)
+                retain_embedding_pins(self._connection, diagnostic, seq=seq, digest=digest)
+            else:
+                retain_portfolio(self._connection, value, seq=seq, digest=digest)
+            write_counts(self._connection)
             self._connection.commit()
         except BaseException:
             self._connection.rollback()
             raise
-        self._apply(kind, value, seq=seq, payload_digest=payload_digest)
+        if kind == STATE and seq == 0:
+            # Optional diagnostics happen after the business transaction. A
+            # missing/failed log sink must never roll back committed state.
+            try:
+                from .diagnostic_logging import emit_diagnostic
+                emit_diagnostic('native_revision_progress', diagnostic)
+            except Exception:
+                pass
+        if kind != STATE:
+            self._apply(kind, value, seq=seq, payload_digest=digest)
+        else:
+            self._records[value['revision_id']] = _ProgressRecord(seq, digest, value['ordinal'], pair_digest,
+                _state_digest(value['stage'], value['facts'], pair_digest), None)
+            self._summaries[value['revision_id']] = deepcopy({**value, 'facts': inline})
 
     def land(self, units: tuple[CorpusIngestUnit, ...]) -> None:
         units = tuple(sorted(units, key=lambda unit: unit.chunk_ordinal))
@@ -310,6 +395,15 @@ class NativeRevisionJournal:
 
     def _pair_facts(self, revision_id: str) -> dict:
         record = self._records[revision_id]
+        if self._current_state:
+            from .native_progress_state import checked_json
+            row = self._connection.execute('SELECT pair_json FROM native_current_pairs WHERE pair_digest=?', (record.pair_digest,)).fetchone()
+            if row is None:
+                raise ValueError('native CURRENT retrieval pair root is missing')
+            value = checked_json(row[0], record.pair_digest, label='retrieval pair')
+            if set(value) != set(_RETRIEVAL_FIELDS):
+                raise ValueError('native CURRENT retrieval pair fields differ')
+            return value
         root = self._pair_roots.get(revision_id)
         if (
             type(root) is not _ProgressRecord
@@ -368,14 +462,7 @@ class NativeRevisionJournal:
         if previous and _state_digest(stage, facts, pair_digest) == previous.state_digest:
             return logical
         logical["ordinal"] += 1
-        encoded = logical
-        if (
-            previous and pair_digest is not None and pair_digest == previous.pair_digest
-        ):
-            encoded = {**logical,
-                       "facts": {key: item for key, item in facts.items() if key not in _RETRIEVAL_FIELDS},
-                       "retrieval_facts_ref": previous.reference()}
-        self._retain(STATE, encoded)
+        self._retain(STATE, logical)
         return logical
 
     def sources(self, dispositions: tuple) -> None:
@@ -388,3 +475,42 @@ class NativeRevisionJournal:
         } for item in dispositions)
         if self._portfolio_record is None or values != self.portfolio:
             self._retain(PORTFOLIO, {"sources": list(values)})
+
+
+def import_legacy_native_progress(connection: sqlite3.Connection) -> dict:
+    """One explicit, checked, atomic conversion; ordinary boot never invokes it."""
+    import time
+    from .native_progress_state import (ensure_schema, require_ready, retain_source, retain_head,
+        retain_portfolio, retain_embedding_pins, write_counts)
+    started = time.monotonic()
+    ensure_schema(connection)
+    if connection.execute('SELECT 1 FROM native_current_meta WHERE singleton=1').fetchone():
+        return {'already_current': True, 'counts': require_ready(connection), 'elapsed_seconds': time.monotonic()-started}
+    from .native_progress_state import TABLES
+    if any(connection.execute(f'SELECT 1 FROM {table} LIMIT 1').fetchone()
+           for table in (*TABLES, 'native_current_units')):
+        raise ValueError('native CURRENT marker missing from populated state; explicit recovery required')
+    try:
+        connection.execute('BEGIN IMMEDIATE')
+        journal = NativeRevisionJournal(connection, _legacy=True)
+        for seq, raw, digest in connection.execute('SELECT seq,payload_json,payload_digest FROM ledger WHERE kind=? ORDER BY seq', (LAND,)):
+            value = json.loads(raw)
+            if not connection.execute('SELECT 1 FROM native_current_sources WHERE revision_id=?', (value['revision_id'],)).fetchone():
+                retain_source(connection, value, seq=seq, digest=digest, units=journal.units[value['revision_id']])
+        for revision, record in journal._records.items():
+            retain_head(connection, journal.current(revision), seq=record.seq, digest=record.payload_digest, pair_digest=record.pair_digest)
+        for seq, raw, digest in connection.execute("SELECT seq,payload_json,payload_digest FROM ledger WHERE kind=? AND json_extract(payload_json,'$.stage')='EMBEDDING_STARTED' ORDER BY seq", (STATE,)):
+            retain_embedding_pins(connection, json.loads(raw), seq=seq, digest=digest)
+        if journal._portfolio_record is not None:
+            seq, digest = journal._portfolio_record
+            retain_portfolio(connection, {'sources': list(journal.portfolio)}, seq=seq, digest=digest)
+        for reference in journal.observations.values():
+            raw = canonical_json_bytes({'reference': list(reference)}).decode()
+            connection.execute('INSERT OR IGNORE INTO native_current_observations VALUES(?,?,?)', (reference[1], raw, digest_bytes(raw.encode())))
+        write_counts(connection)
+        counts = require_ready(connection)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    return {'already_current': False, 'counts': counts, 'elapsed_seconds': time.monotonic()-started}

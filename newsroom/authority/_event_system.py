@@ -171,9 +171,12 @@ class _ReadBoundary:
             metadata_class=MetadataClass.PROVENANCE,
             semantic_value={"event_id": event_id},
         )
-        return self._store.event_provenance(
+        value = self._store.event_provenance(
             event_id=event_id, policy=self._policy
         )
+        if self._store._current_state_only:
+            self._store._validate_retained_event(event_id)
+        return value
 
     def command_result(
         self,

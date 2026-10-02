@@ -550,9 +550,12 @@ class _EventStoreCommitMixin:
             and str(row["command_id"]) != grant.replay_of_command_id
         ):
             raise IdempotencyConflict("replay command identity mismatch")
-        return self._decode_result(
+        result = self._decode_result(
             bytes(row["result_bytes"]), str(row["result_digest"]), replayed=True, command_id=str(row["command_id"])
         )
+        if self._current_state_only:
+            self._validate_retained_event(result.event_id)
+        return result
 
     @staticmethod
     def _validate_causation(

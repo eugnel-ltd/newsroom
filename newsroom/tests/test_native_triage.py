@@ -534,9 +534,9 @@ def test_shared_writer_advances_no_match_through_hypothesis_relationship(
         retrieval_authority,
         collision=enforcer,
     ) as restarted:
-        # Constructor validation remains complete; the final native transaction
-        # verifies relationship/lineage/Candidate upstream history only once.
-        assert verification_calls == {"hypothesis": 1, "disposition": 1}
+        # Native boot checks current heads, not unused historical bodies.
+        # The existing business reads below still verify their producer chains.
+        assert verification_calls == {"hypothesis": 0, "disposition": 0}
         restarted_admission = advance_native_triage(
             restarted,
             work=work,
@@ -592,12 +592,13 @@ def test_shared_writer_advances_no_match_through_hypothesis_relationship(
             admitted.candidate
         )
 
-    # The composed OPEN also rechecks the altered row and releases its writer
-    # on failure; restoring the exact bytes permits a fully checked reopen.
+    # Native OPEN no longer replays that historical body. The selected business
+    # read rejects it, and closing the facade still releases the sole writer.
     rewrite_relationship(b"{}")
     try:
-        with pytest.raises(ValueError, match="relationship"):
-            _shared_system(tmp_path, monkeypatch, retrieval_authority, collision=enforcer)
+        with _shared_system(tmp_path, monkeypatch, retrieval_authority, collision=enforcer) as quarantined:
+            with pytest.raises(ValueError, match="relationship|Candidate"):
+                quarantined.candidates.load_version(admitted.candidate.version_id)
     finally:
         rewrite_relationship(result.relationship.canonical_bytes)
     with _shared_system(
@@ -637,5 +638,6 @@ def test_shared_writer_advances_no_match_through_hypothesis_relationship(
             connection.execute(f"DROP TRIGGER {trigger_name}")
             connection.execute("DELETE FROM event_hypothesis_relationship_decisions")
             connection.execute(trigger_sql)
-    with pytest.raises((AuthoritySchemaError, ValueError), match="relationship|foreign"):
-        _shared_system(tmp_path, monkeypatch, retrieval_authority, collision=enforcer)
+    with _shared_system(tmp_path, monkeypatch, retrieval_authority, collision=enforcer) as quarantined:
+        with pytest.raises((AuthoritySchemaError, ValueError), match="relationship|foreign|Candidate"):
+            quarantined.candidates.load_version(admitted.candidate.version_id)

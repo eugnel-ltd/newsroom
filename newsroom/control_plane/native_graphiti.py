@@ -168,7 +168,7 @@ class NativeGraphitiProcessor:
         self._settle_missing_subscription_usage(units_by_ingest)
         terminal_holds = {
             ingest_id: "REPORTED_OUTPUT_REJECTION_NO_RETRY"
-            for ingest_id in reported_output_rejected_ingests(self._connection)
+            for ingest_id in reported_output_rejected_ingests(self._connection, ingest_ids=tuple(units_by_ingest))
             if ingest_id in units_by_ingest
         }
         recovered_ambiguous_attempts: dict[str, int] = {}
@@ -302,7 +302,7 @@ class NativeGraphitiProcessor:
         self._settle_missing_subscription_usage(units)
         terminal_holds.update({
             ingest_id: "REPORTED_OUTPUT_REJECTION_NO_RETRY"
-            for ingest_id in reported_output_rejected_ingests(self._connection)
+            for ingest_id in reported_output_rejected_ingests(self._connection, ingest_ids=tuple(units_by_ingest))
             if ingest_id in units_by_ingest
         })
         if self._operator_drain_requested():

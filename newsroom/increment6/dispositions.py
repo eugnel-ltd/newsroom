@@ -1446,6 +1446,7 @@ class ProposalDispositionStore:
         _open_verification: list[
             tuple[dict[str, ProposalDisposition], tuple[int, int, int]]
         ] | None = None,
+        _validate_on_open: bool = True,
     ) -> None:
         if (
             type(connection) is not sqlite3.Connection
@@ -1486,10 +1487,11 @@ class ProposalDispositionStore:
                 connection, retrieval_authority
             )
             self._begin()
-            verified = self._verify_integrity()
-            snapshot = _verification_snapshot(connection)
+            if _validate_on_open:
+                verified = self._verify_integrity()
+                snapshot = _verification_snapshot(connection)
             connection.execute("COMMIT")
-            if _open_verification is not None:
+            if _open_verification is not None and _validate_on_open:
                 _open_verification.append((verified, snapshot))
         except BaseException as exc:
             self._rollback()

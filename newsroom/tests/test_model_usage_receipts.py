@@ -257,6 +257,7 @@ def test_v1_store_replays_v2_context_manifest_migration_idempotently(
     }
     connection.close()
     assert migrations == [
+        ("model-usage-current-v1", "newsroom.model-usage.current.v1"),
         ("model-usage-v1", "newsroom.model-usage.v1"),
         ("model-usage-v2", "newsroom.model-usage.v2"),
         ("model-usage-v3", "newsroom.model-usage.v3"),
@@ -6430,7 +6431,9 @@ def test_native_landing_shared_body_decodes_on_both_accounting_read_paths(tmp_pa
 
 
 def test_native_accounting_rejects_mixed_shared_body_encoding(tmp_path):
+    from newsroom.control_plane.native_progress import import_legacy_native_progress
     connection = connect_unpublished_store(str(tmp_path / "private.sqlite3"))
+    connection.execute('DELETE FROM native_current_meta')
     first = replace(_native("selected"), chunk_count=2)
     second = replace(first, chunk_ordinal=2, predecessor_ingest_id=first.ingest_id)
     # The encoding is malformed even though its ledger hash was correctly made.
@@ -6439,9 +6442,6 @@ def test_native_accounting_rejects_mixed_shared_body_encoding(tmp_path):
         "units": [asdict(first), asdict(second)],
     })
     connection.commit()
-    with pytest.raises(ModelUsageIntegrityError, match="source landing differs"):
-        model_usage_module._native_landed_source_unit(
-            connection, ingest_id=second.ingest_id,
-            effective_revision_digest=_digest(asdict(second.effective_revision)),
-        )
+    with pytest.raises(ValueError, match='shared body'):
+        import_legacy_native_progress(connection)
     connection.close()
