@@ -285,6 +285,44 @@ def test_reference_scan_uses_actual_generated_and_virtual_selected_columns():
         assert retention._scan_business(conn) == first
 
 
+def test_physical_scan_streams_rows_but_logical_scan_keeps_primary_key_order(monkeypatch):
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE retained(id TEXT PRIMARY KEY, body TEXT)")
+        conn.executemany("INSERT INTO retained VALUES(?,?)", [("z", "last"), ("a", "first")])
+        statements = []
+        conn.set_trace_callback(statements.append)
+        physical = retention._scan_business(conn)
+        query = next(sql for sql in statements if sql.startswith('SELECT * FROM main."retained"'))
+        assert 'ORDER BY "rowid"' in query
+        assert not any("USING INDEX" in row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + query))
+        statements.clear()
+        logical = retention._scan_business(conn, logical_storage=True)
+        assert any('ORDER BY "id"' in sql for sql in statements)
+        assert physical["sha256"] != logical["sha256"]
+        assert physical["rows"] == logical["rows"] == 2
+        # Optional table progress never changes the comparison or gates work.
+        monkeypatch.setattr(retention._LOG, "info", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("log unavailable")))
+        assert retention._scan_business(conn) == physical
+
+
+@pytest.mark.parametrize("declaration,suffix,ordering", [
+    ('id TEXT PRIMARY KEY, rowid TEXT', '', '"_rowid_"'),
+    ('id TEXT PRIMARY KEY, rowid TEXT GENERATED ALWAYS AS (id) VIRTUAL', '', '"_rowid_"'),
+    ('id TEXT PRIMARY KEY, rowid TEXT, _rowid_ TEXT, oid TEXT', '', '"id"'),
+    ('id TEXT PRIMARY KEY', ' WITHOUT ROWID', '"id"'),
+])
+def test_physical_scan_preserves_shadowed_and_without_rowid_tables(declaration, suffix, ordering):
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE retained(" + declaration + ")" + suffix)
+        conn.execute("INSERT INTO retained(id) VALUES('retained')")
+        statements = []
+        conn.set_trace_callback(statements.append)
+        first = retention._scan_business(conn)
+        query = next(sql for sql in statements if sql.startswith('SELECT * FROM main."retained"'))
+        assert "ORDER BY " + ordering in query
+        assert retention._scan_business(conn) == first
+
+
 def test_current_optional_delivery_can_consume_expired_routing_identity(tmp_path):
     from newsroom.projection import ProjectionDeliveryRequest, ProjectionDeliveryOutcome
     root, path, _, result = _fixture(tmp_path)
