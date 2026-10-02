@@ -53,6 +53,9 @@ def select_candidates(conn: sqlite3.Connection) -> int:
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_event ON _retirement_candidates(event_id)")
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_command ON _retirement_candidates(command_id)")
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_source ON _retirement_candidates(generation_id,source_seq)")
+    for column in ("payload_id", "authentication_context_id",
+                   "authorization_request_digest", "authorization_decision_id"):
+        conn.execute(f"CREATE INDEX _retirement_candidate_{column} ON _retirement_candidates({column})")
     conn.execute("""CREATE TEMP TABLE _retirement_checkpoints AS
         SELECT c.generation_id,c.checkpoint_version,c.authority_event_id
         FROM projection_checkpoint_versions c JOIN projection_generations g USING(generation_id)
@@ -67,8 +70,9 @@ def protect_candidates(conn: sqlite3.Connection) -> int:
 
     initial = int(conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0])
     conn.execute("""DELETE FROM _retirement_candidates WHERE event_id IN (
-        SELECT e.event_id FROM ledger_events e JOIN authority_aggregates a
+        SELECT e.event_id FROM authority_aggregates a CROSS JOIN ledger_events e
         ON a.aggregate_type=e.aggregate_type AND a.aggregate_id=e.aggregate_id AND a.current_version=e.aggregate_version
+        WHERE a.aggregate_type='projection_generation'
         UNION SELECT event_id FROM ledger_events WHERE ledger_seq=(SELECT max(ledger_seq) FROM ledger_events)
         UNION SELECT event_id FROM ledger_events WHERE ledger_seq=(SELECT max(ledger_seq) FROM ledger_events WHERE aggregate_type NOT IN ('projection_family','projection_generation'))
         UNION SELECT e.event_id FROM ledger_events e JOIN projection_generation_validations v
