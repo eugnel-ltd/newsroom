@@ -78,6 +78,7 @@ class _ProgressRecord:
     ordinal: int
     pair_digest: str | None
     state_digest: str
+    pair_root: tuple[int, str, int] | None
 
     def reference(self) -> dict:
         return {"seq": self.seq, "payload_digest": self.payload_digest,
@@ -178,13 +179,16 @@ class NativeRevisionJournal:
                 if revision_id not in self._pair_roots:
                     raise ValueError("native retrieval facts reference lacks its root")
                 pair_digest = previous.pair_digest
+                pair_root = previous.pair_root
             else:
                 pair_digest = _pair_digest(facts)
+                pair_root = None if pair_digest is None else (seq, payload_digest, ordinal)
             logical = {key: item for key, item in value.items() if key != "retrieval_facts_ref"}
             logical["facts"] = facts
             record = _ProgressRecord(
                 seq, payload_digest, ordinal, pair_digest,
                 _state_digest(value["stage"], facts, pair_digest),
+                pair_root,
             )
             self._records[revision_id] = record
             if pair_digest is None:
@@ -312,6 +316,7 @@ class NativeRevisionJournal:
             or type(root.seq) is not int or type(root.ordinal) is not int
             or root.seq < 1 or root.ordinal < 1
             or root.seq > record.seq or root.ordinal > record.ordinal
+            or (root.seq, root.payload_digest, root.ordinal) != record.pair_root
             or root.pair_digest != record.pair_digest
         ):
             raise ValueError("native retrieval pair root differs")

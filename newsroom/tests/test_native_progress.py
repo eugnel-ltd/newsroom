@@ -698,3 +698,39 @@ def test_known_state_missing_its_metadata_denies_reads_and_writes(tmp_path, miss
         journal.advance(unit.revision_id, stage="PUBLICATION_HOLD", facts=facts)
     assert connection.total_changes == before
     connection.close()
+
+
+@pytest.mark.parametrize("referenced", (False, True))
+def test_equal_digest_aba_pair_binds_latest_exact_root_before_reads_or_writes(tmp_path, referenced):
+    connection = connect(str(tmp_path / "private.sqlite3"))
+    journal = NativeRevisionJournal(connection)
+    unit = _native()
+    journal.land((unit,))
+    first = {**_retrieval_facts(), "reason": "A1"}
+    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=first)
+    obsolete = journal._pair_roots[unit.revision_id]
+    changed = {**_retrieval_facts(), "retrieval_binding": {"request": {"nodes": ["B2 different context"]}}, "reason": "B2"}
+    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=changed)
+    latest = {**_retrieval_facts(), "reason": "A3"}
+    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=latest)
+    actual = journal._pair_roots[unit.revision_id]
+    assert actual.pair_digest == obsolete.pair_digest and actual.seq != obsolete.seq
+    if referenced:
+        latest = {**latest, "reason": "A4 references A3"}
+        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=latest)
+        assert journal._pair_roots[unit.revision_id] == actual
+    assert NativeRevisionJournal(connection).current(unit.revision_id)["facts"] == latest
+    journal._pair_roots[unit.revision_id] = obsolete
+    statements = []
+    connection.set_trace_callback(statements.append)
+    before = connection.total_changes
+    with pytest.raises(ValueError, match="pair root"):
+        journal.current(unit.revision_id)
+    with pytest.raises(ValueError, match="pair root"):
+        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=latest)
+    with pytest.raises(ValueError, match="pair root"):
+        journal.advance(unit.revision_id, stage="PUBLICATION_HOLD", facts=latest)
+    assert connection.total_changes == before
+    assert statements == []
+    connection.set_trace_callback(None)
+    connection.close()
