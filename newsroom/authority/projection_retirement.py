@@ -206,6 +206,9 @@ def expire_candidates(conn: sqlite3.Connection) -> dict[str, int]:
     conn.execute("UPDATE projection_generations SET diagnostic_history_expired=1 WHERE generation_id IN (SELECT generation_id FROM _retirement_candidates)")
     deleted = {}
     indexes = []
+    # Reservations leave live_command_id NULL, but native parent DELETE still
+    # needs an indexed generated-child probe for each expired command.
+    _index_children(conn, "authority_commands", indexes, key="command_id")
     for table in (
         "projection_delivery_attempts", "projection_delivery_states", "projection_checkpoint_versions",
         "authority_audit_events", "authority_aggregate_versions", "authority_commands", "authority_payloads",
