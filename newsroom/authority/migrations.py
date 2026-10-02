@@ -360,6 +360,7 @@ from .triage_work_item_migrations import (
 from .projection_retirement_migrations import (
     PROJECTION_RETIREMENT_SCHEMA_VERSION, PROJECTION_RETIREMENT_MIGRATION,
     PROJECTION_RETIREMENT_MIGRATION_NAME, PROJECTION_RETIREMENT_MIGRATION_CHECKSUM,
+    PROJECTION_RETIREMENT_MIGRATION_STATEMENTS,
     migrate_projection_retirement,
 )
 

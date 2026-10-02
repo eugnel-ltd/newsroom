@@ -440,11 +440,12 @@ def test_trigger_preserving_fk_clean_aggregate_rewrite_fails_closed(
         "INSERT OR REPLACE INTO authority_aggregate_versions VALUES(?,?,?,?,?,?,?)",
         rewritten_row(version, aggregate_id=rewritten),
     )
+    # table_info excludes the generated full-record command FK.
+    event_columns = tuple(row[1] for row in connection.execute("PRAGMA table_info(ledger_events)"))
     connection.execute(
-        "INSERT OR REPLACE INTO ledger_events VALUES("
-        + ",".join("?" for _ in event.keys())  # noqa: SIM118
-        + ")",
-        rewritten_row(event, aggregate_id=rewritten),
+        "INSERT OR REPLACE INTO ledger_events(" + ",".join(event_columns) + ") VALUES("
+        + ",".join("?" for _ in event_columns) + ")",
+        tuple(rewritten if name == "aggregate_id" else event[name] for name in event_columns),
     )
     connection.execute(
         "INSERT OR REPLACE INTO event_hypothesis_lineage VALUES(?,?,?,?,?,?,?,?,?,?,?)",
