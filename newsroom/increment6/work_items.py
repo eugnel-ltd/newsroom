@@ -2641,6 +2641,14 @@ class TriageWorkItemStore:
         return reached is not None and reached[0] == 1
 
     def _upstream_reasons(self, v: TriageWorkItemVersion) -> list[str]:
+        # Native CURRENT owns the cumulative source registry and exact-event
+        # port; standalone stores use their checked source-head projection.
+        source_query = "SELECT current_version_id FROM source_definition_version_heads WHERE definition_id=?"
+        if self._current_state_only and self._validate_retained_event is not None:
+            source_query = (
+                "SELECT h.current_version_id FROM source_definition_version_heads h WHERE h.definition_id=? "
+                "AND h.current_version_number=(SELECT MAX(version_number) FROM source_definition_versions WHERE definition_id=h.definition_id)"
+            )
         reasons: list[str] = []
         for lead in v.decision_leads:
             if not self._lead_retained(lead):
@@ -2651,11 +2659,7 @@ class TriageWorkItemStore:
             ).fetchone()
             if gate is None or gate[0] != lead.gate_decision_id:
                 reasons.append(f"gate:{lead.lead_id}")
-            source = self._connection.execute(
-                "SELECT h.current_version_id FROM source_definition_version_heads h WHERE h.definition_id=? "
-                "AND h.current_version_number=(SELECT MAX(version_number) FROM source_definition_versions WHERE definition_id=h.definition_id)",
-                (lead.definition_id,),
-            ).fetchone()
+            source = self._connection.execute(source_query, (lead.definition_id,)).fetchone()
             if source is None or source[0] != lead.definition_version_id:
                 reasons.append(f"source:{lead.lead_id}")
             disp = self._connection.execute(
@@ -2683,11 +2687,7 @@ class TriageWorkItemStore:
             ).fetchone()
             if gate is None or gate[0] != lead.gate_decision_id:
                 reasons.append(f"gate:{lead.lead_id}")
-            source = self._connection.execute(
-                "SELECT h.current_version_id FROM source_definition_version_heads h WHERE h.definition_id=? "
-                "AND h.current_version_number=(SELECT MAX(version_number) FROM source_definition_versions WHERE definition_id=h.definition_id)",
-                (lead.definition_id,),
-            ).fetchone()
+            source = self._connection.execute(source_query, (lead.definition_id,)).fetchone()
             if source is None or source[0] != lead.definition_version_id:
                 reasons.append(f"source:{lead.lead_id}")
         if v.watch is not None:
