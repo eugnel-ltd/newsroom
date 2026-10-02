@@ -163,6 +163,7 @@ def open_governed_check_authority_system(
                 request=check_boundary.request,
                 attempt=check_boundary.attempt,
                 outcome=check_boundary.outcome,
+                observed_prior_revision=check_boundary.observed_prior_revision,
                 attempts=check_boundary.attempts,
                 outcomes=check_boundary.outcomes,
                 baseline=check_boundary.baseline,

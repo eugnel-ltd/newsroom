@@ -515,3 +515,178 @@ def test_gate_reuse_rechecks_freshness_and_compares_effective_policy(tmp_path, m
         assert stale.current_gate.request.decision_ordinal == 3
         assert stale.current_gate.request.basis.time_validity.value == "STALE"
         assert stale.current_gate.request.outcome is GateOutcome.OPERATIONAL_HOLD
+
+
+def test_backlog_delivery_uses_observed_predecessor_not_canonical_ingestion(tmp_path):
+    from newsroom.sources import SourceRevisionId
+
+    at = UtcTimestamp.parse("2026-09-02T13:00:00.000000Z")
+    later = UtcTimestamp.parse("2026-09-02T13:01:00.000000Z")
+    with sqlite3.connect(":memory:") as proving, open_discovery_system(
+        tmp_path / "authority.sqlite3", clock=lambda: later
+    ) as system:
+        older = _unit()
+        newer = _next_revision(older)
+        _seed(system, older)
+        _seed(system, newer, SourceRevisionId.parse(older.authority.revision_id))
+        controller = _controller(system, proving)
+        first = controller.deliver(newer, now=at, proof=proof())
+        assert first.transition.request.kind is ObservableTransitionKind.FIRST_OBSERVED
+        historical = controller.deliver(older, now=later, proof=proof())
+        assert historical.transition.request.kind is ObservableTransitionKind.REVISED
+        assert historical.transition.request.prior_revision_id == first.transition.request.current_revision_id
+        assert system.sources.latest_revision(first.transition.request.item_id, proof=proof()).request.revision_id == first.transition.request.current_revision_id
+
+
+def _reparsed_unit(system, unit, parser_version):
+    from newsroom.sources import DiscoveryRepresentationId
+
+    request = _source_requests(unit, _rights())[-1]
+    representation = replace(
+        request, representation_id=DiscoveryRepresentationId.new(),
+        parser_version=parser_version, idempotency_key=f"reparse:{parser_version}",
+    )
+    system.sources.record_representation(representation, proof=proof())
+    return replace(
+        unit, authority=replace(unit.authority, representation_id=str(representation.representation_id)),
+    )
+
+
+def test_seen_revision_after_different_observed_state_is_changed_not_reobserved(tmp_path):
+    from newsroom.checks import CheckOutcomeKind
+
+    later = UtcTimestamp.parse("2026-09-02T13:00:00.000000Z")
+    with sqlite3.connect(":memory:") as proving, open_discovery_system(
+        tmp_path / "authority.sqlite3", clock=lambda: later
+    ) as system:
+        older = _unit()
+        _seed(system, older)
+        controller = _controller(system, proving)
+        first = controller.deliver(older, now=NOW, proof=proof())
+        newer = _next_revision(older)
+        _seed(system, newer, first.transition.request.current_revision_id)
+        changed = controller.deliver(newer, now=later, proof=proof())
+        historical = controller.deliver(_reparsed_unit(system, older, "switch-back"), now=later, proof=proof())
+        assert historical.outcome.request.kind is CheckOutcomeKind.SUCCESS_CHANGED
+        assert historical.transition.request.kind is ObservableTransitionKind.REVISED
+        assert historical.transition.request.prior_revision_id == changed.transition.request.current_revision_id
+        assert historical.transition.request.current_revision_id == first.transition.request.current_revision_id
+
+
+def test_partial_delivery_repaired_as_of_original_outcome_and_replays_after_reopen(tmp_path, monkeypatch):
+    from newsroom.authority._check_facade import GovernedChecks
+    from newsroom.checks import CheckVersionConflict
+
+    database = tmp_path / "authority.sqlite3"
+    at = UtcTimestamp.parse("2026-09-02T13:00:00.000000Z")
+    later = UtcTimestamp.parse("2026-09-02T13:01:00.000000Z")
+    with sqlite3.connect(":memory:") as proving:
+        with open_discovery_system(database, clock=lambda: later) as system:
+            older = _unit()
+            _seed(system, older)
+            controller = _controller(system, proving)
+            first = controller.deliver(older, now=NOW, proof=proof())
+            newer = _next_revision(older)
+            _seed(system, newer, first.transition.request.current_revision_id)
+            def interrupt(*args, **kwargs):
+                raise CheckVersionConflict("fixture transition interruption")
+            with monkeypatch.context() as patch:
+                patch.setattr(GovernedChecks, "record_transition", interrupt)
+                with pytest.raises(CheckVersionConflict, match="fixture transition interruption"):
+                    controller.deliver(newer, now=at, proof=proof())
+            later_delivery = controller.deliver(_reparsed_unit(system, older, "after-interruption"), now=later, proof=proof())
+            assert later_delivery.transition.request.prior_revision_id != first.transition.request.current_revision_id
+        with sqlite3.connect(database) as connection:
+            tables = ("check_requests", "check_attempts", "check_outcomes", "discovery_occurrences", "observable_transitions")
+            counts = tuple(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables)
+            original_outcomes = connection.execute("SELECT outcome_id,canonical_bytes FROM check_outcomes ORDER BY outcome_id").fetchall()
+        with open_discovery_system(database, clock=lambda: later) as system:
+            controller = _controller(system, proving)
+            repaired = controller.deliver(newer, now=later, proof=proof())
+            assert repaired.outcome.request.completed_at == at
+            assert repaired.transition.request.prior_revision_id == first.transition.request.current_revision_id
+            assert repaired.transition.request.kind is ObservableTransitionKind.REVISED
+            assert controller.deliver(newer, now=later, proof=proof()).transition.request == repaired.transition.request
+            assert controller.deliver(older, now=later, proof=proof()).transition.request == first.transition.request
+            assert system.sources.latest_revision(first.transition.request.item_id, proof=proof()).request.revision_id == repaired.transition.request.current_revision_id
+        with sqlite3.connect(database) as connection:
+            assert tuple(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables) == (*counts[:-1], counts[-1] + 1)
+            assert connection.execute("SELECT outcome_id,canonical_bytes FROM check_outcomes ORDER BY outcome_id").fetchall() == original_outcomes
+
+
+def test_equal_completion_time_uses_ledger_order_and_replays_earlier_boundary(tmp_path):
+    later = UtcTimestamp.parse("2026-09-02T13:00:00.000000Z")
+    with sqlite3.connect(":memory:") as proving, open_discovery_system(
+        tmp_path / "authority.sqlite3", clock=lambda: later
+    ) as system:
+        older = _unit()
+        _seed(system, older)
+        controller = _controller(system, proving)
+        first = controller.deliver(older, now=later, proof=proof())
+        newer = _next_revision(older)
+        _seed(system, newer, first.transition.request.current_revision_id)
+        second = controller.deliver(newer, now=later, proof=proof())
+        assert second.transition.request.prior_revision_id == first.transition.request.current_revision_id
+        assert system.checks.observed_prior_revision(
+            first.transition.request.item_id, request_id=first.outcome.request.request_id,
+            outcome_id=first.outcome.request.outcome_id, completed_at=later, proof=proof(),
+        ) is None
+        assert controller.deliver(older, now=later, proof=proof()).transition.request == first.transition.request
+
+
+def test_unresolved_earlier_outcome_stops_before_new_outcome_or_occurrence(tmp_path, monkeypatch):
+    from newsroom.authority._source_registry_system import GovernedSources
+    from newsroom.checks import CheckStateError
+    from newsroom.sources import SourceRevisionId
+
+    database = tmp_path / "authority.sqlite3"
+    later = UtcTimestamp.parse("2026-09-02T13:00:00.000000Z")
+    with sqlite3.connect(":memory:") as proving, open_discovery_system(database, clock=lambda: later) as system:
+        older = _unit()
+        _seed(system, older)
+        controller = _controller(system, proving)
+        def interrupt(*args, **kwargs):
+            raise RuntimeError("fixture occurrence interruption")
+        with monkeypatch.context() as patch:
+            patch.setattr(GovernedSources, "record_occurrence", interrupt)
+            with pytest.raises(RuntimeError, match="fixture occurrence interruption"):
+                controller.deliver(older, now=NOW, proof=proof())
+        newer = _next_revision(older)
+        _seed(system, newer, SourceRevisionId.parse(older.authority.revision_id))
+        with pytest.raises(CheckStateError, match="prior observed Check Outcome lacks"):
+            controller.deliver(newer, now=later, proof=proof())
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM check_outcomes").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM discovery_occurrences").fetchone()[0] == 0
+
+
+def test_inconsistent_retained_unchanged_outcome_is_not_rewritten_on_recovery(tmp_path, monkeypatch):
+    from newsroom.authority._check_facade import GovernedChecks
+    from newsroom.checks import CheckContractError, CheckVersionConflict
+
+    database = tmp_path / "authority.sqlite3"
+    later = UtcTimestamp.parse("2026-09-02T13:00:00.000000Z")
+    with sqlite3.connect(":memory:") as proving, open_discovery_system(database, clock=lambda: later) as system:
+        older = _unit()
+        _seed(system, older)
+        controller = _controller(system, proving)
+        first = controller.deliver(older, now=NOW, proof=proof())
+        newer = _next_revision(older)
+        _seed(system, newer, first.transition.request.current_revision_id)
+        controller.deliver(newer, now=later, proof=proof())
+        historical = _reparsed_unit(system, older, "legacy-unchanged")
+        older_record = system.sources.revision(first.transition.request.current_revision_id, proof=proof())
+        # Reproduce the old producer's "ever observed" classification while
+        # leaving the real transition guard in place.
+        with monkeypatch.context() as patch:
+            patch.setattr(GovernedChecks, "observed_prior_revision", lambda *args, **kwargs: older_record.request.revision_id)
+            with pytest.raises(CheckVersionConflict, match="latest observed source state"):
+                controller.deliver(historical, now=later, proof=proof())
+        with sqlite3.connect(database) as connection:
+            original_outcomes = connection.execute("SELECT outcome_id,canonical_bytes FROM check_outcomes ORDER BY outcome_id").fetchall()
+            occurrences = connection.execute("SELECT COUNT(*) FROM discovery_occurrences").fetchone()[0]
+        with pytest.raises(CheckContractError, match="same Source Revision"):
+            controller.deliver(historical, now=later, proof=proof())
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT outcome_id,canonical_bytes FROM check_outcomes ORDER BY outcome_id").fetchall() == original_outcomes
+            assert connection.execute("SELECT COUNT(*) FROM discovery_occurrences").fetchone()[0] == occurrences

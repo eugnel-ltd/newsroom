@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Callable
 
 from newsroom.authority.auth import AuthenticationProof
+from newsroom.authority.types import UtcTimestamp
 from newsroom.checks.admission_models import (
     ProposalAdmissionRequest,
     ProposalAdmissionResult,
@@ -34,7 +35,7 @@ from newsroom.checks.types import (
     ObservableTransitionId,
     OperationalFindingId,
 )
-from newsroom.sources import CheckOutcomeId, SourceDefinitionId
+from newsroom.sources import CheckOutcomeId, SourceDefinitionId, SourceItemId, SourceRevisionId
 
 
 class GovernedChecks:
@@ -50,6 +51,7 @@ class GovernedChecks:
         "__request",
         "__attempt",
         "__outcome",
+        "__observed_prior_revision",
         "__attempts",
         "__outcomes",
         "__baseline",
@@ -75,6 +77,7 @@ class GovernedChecks:
         request: Callable[..., CheckRequest],
         attempt: Callable[..., CheckAttempt],
         outcome: Callable[..., CheckOutcome],
+        observed_prior_revision: Callable[..., SourceRevisionId | None],
         attempts: Callable[..., tuple[CheckAttempt, ...]],
         outcomes: Callable[..., tuple[CheckOutcome, ...]],
         baseline: Callable[..., BaselineDecision],
@@ -96,6 +99,7 @@ class GovernedChecks:
         self.__request = request
         self.__attempt = attempt
         self.__outcome = outcome
+        self.__observed_prior_revision = observed_prior_revision
         self.__attempts = attempts
         self.__outcomes = outcomes
         self.__baseline = baseline
@@ -200,6 +204,15 @@ class GovernedChecks:
         proof: AuthenticationProof,
     ) -> tuple[CheckAttempt, ...]:
         return self.__attempts(request_id, limit, proof)
+
+    def observed_prior_revision(
+        self, item_id: SourceItemId, *, request_id: CheckRequestId,
+        outcome_id: CheckOutcomeId, completed_at: UtcTimestamp,
+        proof: AuthenticationProof,
+    ) -> SourceRevisionId | None:
+        return self.__observed_prior_revision(
+            item_id, request_id, outcome_id, completed_at, proof,
+        )
 
     def outcomes(
         self,

@@ -6,10 +6,12 @@ from newsroom.checks.record_models import (
     OperationalFindingOccurrence,
 )
 from newsroom.checks.types import (
+    CheckRequestId,
     CheckStateError,
     OperationalFindingOccurrenceId,
 )
 from newsroom.sources import (
+    CheckOutcomeId,
     DiscoveryOccurrence,
     DiscoveryOccurrenceId,
     DiscoveryOccurrenceKind,
@@ -23,7 +25,85 @@ from newsroom.sources import (
 
 
 class _CheckAdmissionLookupMixin:
-    """Typed semantic lookups used only by deterministic proposal admission."""
+    """Typed semantic lookups for deterministic Check observation lineage."""
+
+    def observed_prior_revision(
+        self, item_id: SourceItemId, *, request_id: CheckRequestId,
+        outcome_id: CheckOutcomeId, completed_at: UtcTimestamp,
+    ) -> SourceRevisionId | None:
+        """Return only the observed lineage ID, not a sensitive Source record."""
+        with self._lock:
+            item = self.source_item(item_id)
+            request = self.check_request(request_id)
+            if item is None or request is None:
+                raise LookupError("observed prior requires a retained Item and Check Request")
+            if (
+                item.request.definition_id != request.request.definition_id
+                or item.request.definition_version_id != request.request.definition_version_id
+            ):
+                raise CheckStateError("observed prior Item differs from the Check source version")
+            current = self.check_outcome(outcome_id)
+            if current is not None and (
+                current.request.request_id != request_id
+                or current.request.definition_id != request.request.definition_id
+                or current.request.definition_version_id != request.request.definition_version_id
+                or current.request.completed_at != completed_at
+            ):
+                raise CheckStateError("observed prior boundary differs from retained Check Outcome")
+            if current is not None and self._connection.execute(
+                "SELECT COUNT(*) FROM check_outcome_observed_items "
+                "WHERE outcome_id=? AND item_id=?",
+                (str(outcome_id), str(item_id)),
+            ).fetchone()[0] != 1:
+                raise CheckStateError("observed prior Item is not observed by its Check Outcome")
+            if completed_at.value < request.request.requested_at.value:
+                raise CheckStateError("observed prior boundary precedes its Check Request")
+            if self.unresolved_prior_observed_outcome_for_item(
+                item_id, completed_at=completed_at, exclude_outcome_id=outcome_id,
+            ):
+                raise CheckStateError("prior observed Check Outcome lacks retained source Occurrence")
+            prior = self.latest_observed_source_revision(
+                item_id, exclude_outcome_id=outcome_id,
+                before_completed_at=completed_at,
+            )
+            predicate, parameters = self._prior_outcome_predicate(
+                outcome_alias="o", event_alias="e",
+                current_outcome_id=outcome_id, completed_at=completed_at,
+            )
+            observed = self._connection.execute(
+                "SELECT i.outcome_id FROM check_outcome_observed_items i "
+                "JOIN check_outcomes o ON o.outcome_id=i.outcome_id "
+                "JOIN ledger_events e ON e.event_id=o.authority_event_id "
+                f"WHERE i.item_id=? AND i.outcome_id<>? AND {predicate} "
+                "ORDER BY o.completed_at DESC,e.ledger_seq DESC LIMIT 1",
+                (str(item_id), str(outcome_id), *parameters),
+            ).fetchone()
+            if observed is None:
+                if prior is not None:
+                    raise CheckStateError("observed prior Occurrence lacks its observed Item")
+                return None
+            observed_id = CheckOutcomeId.parse(str(observed["outcome_id"]))
+            observed_outcome = self.check_outcome(observed_id)
+            occurrences = self._connection.execute(
+                "SELECT d.* FROM discovery_occurrences d "
+                "JOIN source_revisions r ON r.revision_id=d.revision_id "
+                "WHERE d.check_outcome_id=? AND r.item_id=? LIMIT 2",
+                (str(observed_id), str(item_id)),
+            ).fetchall()
+            if observed_outcome is None or len(occurrences) != 1:
+                raise CheckStateError("prior observed Check Outcome lacks one exact source Occurrence")
+            occurrence = self._occurrence_from_row(
+                self._connection, occurrences[0], replayed=False,
+            ).request
+            if (
+                prior is None or prior.request.revision_id != occurrence.revision_id
+                or prior.request.item_id != item_id
+                or observed_outcome.request.definition_id != item.request.definition_id
+                or observed_outcome.request.definition_version_id != occurrence.definition_version_id
+                or occurrence.observed_at != observed_outcome.request.completed_at
+            ):
+                raise CheckStateError("observed prior differs from exact Check source lineage")
+            return prior.request.revision_id
 
     def _prior_outcome_predicate(
         self,
