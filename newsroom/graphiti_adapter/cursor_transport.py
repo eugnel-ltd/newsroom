@@ -657,15 +657,21 @@ def _consume_run(
         mapped.usage = mapped.execution.usage
         raise mapped from exc
 
+    final_text = "".join(chunks) or _terminal_text(terminal)
+    # A runtime may report text only from wait(). It has the same actual UTF-8
+    # ceiling as streamed assistant text, independently of token consumption.
+    post_wait_output_bound = not cancel_class and len(final_text.encode("utf-8")) > max_output_bytes
+    if post_wait_output_bound:
+        cancel_class = "OUTPUT_BOUND"
     execution = _execution(
         run,
         qualification=qualification,
-        text="".join(chunks) or _terminal_text(terminal),
+        text=final_text,
         streamed_usage=streamed_usage,
         terminal=terminal,
         request_id=request_id,
         tool_call_count=tool_call_count,
-        cancelled=bool(cancel_class) or _terminal_status(terminal) == "cancelled",
+        cancelled=(bool(cancel_class) and not post_wait_output_bound) or _terminal_status(terminal) == "cancelled",
         classes=classes,
         error_class=cancel_class or _terminal_error_class(terminal),
         error_code=cancel_class or _terminal_error_code(terminal),

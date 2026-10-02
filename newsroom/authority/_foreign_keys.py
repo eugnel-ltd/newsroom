@@ -9,6 +9,64 @@ def _identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+
+def foreign_key_children(
+    connection: sqlite3.Connection, parent: str, *, key: str | None = None,
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Declared child lookup columns; a selected parent key is a scalar lookup."""
+    children = set()
+    tables = tuple(row[0] for row in connection.execute(
+        "SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ))
+    for table in tables:
+        groups = defaultdict(list)
+        for row in connection.execute(f"PRAGMA main.foreign_key_list({_identifier(table)})"):
+            if row[2] == parent:
+                groups[row[0]].append(row)
+        for rows in groups.values():
+            if key is None:
+                children.add((table, tuple(row[3] for row in sorted(rows, key=lambda row: row[1]))))
+            else:
+                children.update((table, (row[3],)) for row in rows if row[4] == key)
+    return sorted(children)
+
+
+def index_foreign_key_children(
+    connection: sqlite3.Connection, parent: str, indexes: list[str], *,
+    key: str | None = None, prefix: str = "_fk_maintenance_",
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Add only missing full-key lookup indexes; caller owns transaction/cleanup.
+
+    Native FK checks remain enabled and authoritative. These covering prefixes
+    avoid per-parent full child scans on authenticated matching-type BINARY authority keys.
+    Partial/expression/wrong-leading-column indexes are not a full-key lookup.
+    Composite equality keys can use an existing prefix in either column order.
+    """
+    children = foreign_key_children(connection, parent, key=key)
+    for table, columns in children:
+        existing = tuple(row[1] for row in connection.execute(
+            f"PRAGMA main.index_list({_identifier(table)})"
+        ) if not row[4])
+        if any(
+            len(info := tuple(row[2] for row in connection.execute(
+                f"PRAGMA main.index_info({_identifier(index)})"
+            ))) >= len(columns)
+            and set(info[:len(columns)]) == set(columns)
+            for index in existing
+        ):
+            continue
+        number = len(indexes)
+        name = f"{prefix}{number}"
+        while connection.execute("SELECT 1 FROM main.sqlite_schema WHERE name=?", (name,)).fetchone() is not None:
+            number += 1
+            name = f"{prefix}{number}"
+        connection.execute(
+            f"CREATE INDEX {_identifier(name)} ON {_identifier(table)}"
+            f"({','.join(_identifier(column) for column in columns)})"
+        )
+        indexes.append(name)
+    return children
+
 def has_foreign_key_violation(
     connection: sqlite3.Connection, *, table_names: tuple[str, ...] | None = None,
 ) -> bool:

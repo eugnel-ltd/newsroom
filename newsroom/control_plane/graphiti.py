@@ -47,6 +47,7 @@ from newsroom.control_plane.model_usage import (
     UsageStatus,
     WorkEnvelope,
     WorkloadClass,
+    native_sdk_reported_token_targets_are_advisory,
 )
 from newsroom.extraction.types import ExtractionRunId
 from newsroom.control_plane.store import GRAPHITI_MAX_FAILURES, LEDGER_GENESIS
@@ -778,6 +779,15 @@ class GraphitiModelUsageObserver:
             return
         if provider_attempt_number != self._provider_attempt_number:
             raise ValueError("Graphiti provider attempt identity changed after dispatch")
+
+    def reported_token_targets_are_advisory(self, token: object) -> bool:
+        """Bind future response semantics to this observer's exact allocation."""
+        if not isinstance(token, InvocationAllocation) or token not in self._allocations:
+            raise ModelUsageIntegrityError("Graphiti response contract allocation differs")
+        policy = self._policies[token.invocation_id]
+        if policy.canonical_digest != token.invocation_policy_digest:
+            raise ModelUsageIntegrityError("Graphiti response contract policy differs")
+        return native_sdk_reported_token_targets_are_advisory(policy)
 
     def before_cli_invocation(
         self,

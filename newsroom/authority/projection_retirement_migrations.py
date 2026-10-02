@@ -6,6 +6,7 @@ import sqlite3
 
 from .authorisation_scope_content_migrations import AuthorisationScopeContentMigrationRecord
 from .canonical import digest_canonical
+from ._foreign_keys import index_foreign_key_children
 
 PROJECTION_RETIREMENT_SCHEMA_VERSION = 42
 PROJECTION_RETIREMENT_MIGRATION_NAME = "retired_projection_diagnostic_reservations_v42"
@@ -67,6 +68,12 @@ def migrate_projection_retirement(connection: sqlite3.Connection, *, expected_hi
     guards = tuple(connection.execute(
         "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='ledger_events' ORDER BY name"
     ))
+    # Native DROP implicitly deletes every parent row; INSERT resolves its
+    # deferred counter. Both need indexed child lookups, not parent × child scans.
+    child_indexes: list[str] = []
+    index_foreign_key_children(
+        connection, "ledger_events", child_indexes, prefix="_projection_migration_fk_",
+    )
     # Keep native FKs ON. Recreate the original parent name before reinserting
     # IDs: a renamed replacement leaves SQLite's deferred counter unresolved.
     connection.execute("PRAGMA defer_foreign_keys=ON")
@@ -104,6 +111,8 @@ def migrate_projection_retirement(connection: sqlite3.Connection, *, expected_hi
         BEGIN SELECT RAISE(ABORT,'retirement requires checked maintenance'); END""")
     connection.execute("""CREATE TRIGGER projection_diagnostic_expiry_update_guard BEFORE UPDATE OF diagnostic_history_expired ON projection_generations
         BEGIN SELECT RAISE(ABORT,'retirement requires checked maintenance'); END""")
+    for name in child_indexes:
+        connection.execute('DROP INDEX "' + name.replace('"', '""') + '"')
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise sqlite3.IntegrityError("v42 retained foreign-key integrity differs")
 

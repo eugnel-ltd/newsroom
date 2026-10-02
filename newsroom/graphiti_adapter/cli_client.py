@@ -18,6 +18,7 @@ from newsroom.control_plane.graphiti_fallback_policy import (
     FallbackEligibility,
     classify_graphiti_fallback,
 )
+from newsroom.authority.canonical import digest_bytes
 from newsroom.graphiti_adapter.cli_process import (
     CliOutputBoundExceeded,
     CliOutputDecodeError,
@@ -907,6 +908,7 @@ def _invocation(
     receipt_binding: Mapping[str, str] | None = None,
     transport_diagnostic: Mapping[str, object] | None = None,
     process_exit_diagnostic: Mapping[str, object] | None = None,
+    response_quality: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     value: dict[str, object] = {
         "provider": provider,
@@ -919,6 +921,8 @@ def _invocation(
     }
     if receipt_binding is not None:
         value.update(receipt_binding)
+    if response_quality is not None:
+        value["response_quality"] = dict(response_quality)
     if execution is not None and execution.transport_qualification is not None:
         value["transport_qualification"] = retained_cli_qualification(
             execution.transport_qualification
@@ -1386,6 +1390,10 @@ async def run_cli_chain(
         )
     )
     cursor_transport_started = False
+    response_contract = getattr(invocation_observer, "reported_token_targets_are_advisory", None)
+    advisory_reported_tokens = (
+        response_contract(cursor_token) is True if callable(response_contract) else False
+    )
     cursor_started = time.monotonic()
 
     def mark_cursor_transport_started() -> None:
@@ -1673,10 +1681,23 @@ async def run_cli_chain(
     else:
         cursor_execution = _execution(cast(CliOutput, raw))
         payload = _parsed_object(cursor_execution.text)
+        schema_matches = payload is not None and (
+            not (fallback_permitted or advisory_reported_tokens)
+            or _payload_matches_response_schema(payload, schema)
+        )
+        response_quality = None
+        if advisory_reported_tokens:
+            final_bytes = cursor_execution.text.encode("utf-8")
+            response_quality = {
+                "final_utf8_bytes": len(final_bytes), "final_text_digest": digest_bytes(final_bytes),
+                "json_parse": "OBJECT" if payload is not None else "NOT_OBJECT",
+                "schema_status": ("NOT_CHECKED" if payload is None else "NOT_REQUIRED" if schema is None
+                                  else "VALID" if schema_matches else "INVALID"),
+            }
         if (
             payload is not None
-            and fallback_permitted
-            and not _payload_matches_response_schema(payload, schema)
+            and (fallback_permitted or advisory_reported_tokens)
+            and not schema_matches
         ):
             # Only demote to MALFORMED when Grok fallback can still run.
             # Canary keeps fallback_permitted=False, so invalid-but-parseable
@@ -1685,6 +1706,20 @@ async def run_cli_chain(
         output_limit_exceeded = _output_limit_exceeded(
             cursor_execution, max_tokens=max_tokens
         )
+        usage = cursor_execution.usage
+        counts = [usage.get(key) for key in (
+            "input_tokens", "output_tokens", "cached_read_tokens", "cached_write_tokens",
+        )]
+        reasoning = usage.get("reasoning_tokens")
+        fully_reported = (
+            usage.get("usage_basis") == "PROVIDER_REPORTED"
+            and all(type(value) is int and value >= 0 for value in counts)
+            and type(usage.get("total_tokens")) is int
+            and usage["total_tokens"] == sum(counts)
+            and (reasoning is None or (type(reasoning) is int and 0 <= reasoning <= counts[1]))
+        )
+        if advisory_reported_tokens and fully_reported:
+            output_limit_exceeded = False
         cursor_outcome = (
             "OUTPUT_LIMIT_EXCEEDED"
             if output_limit_exceeded
@@ -1707,6 +1742,7 @@ async def run_cli_chain(
                 execution=cursor_execution,
                 requested_max_tokens=max_tokens,
                 receipt_binding=binding,
+                response_quality=response_quality,
             )
         )
         if output_limit_exceeded:

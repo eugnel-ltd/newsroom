@@ -118,9 +118,10 @@ def test_checked_fallback_policy_is_bound_to_call_shape_and_729_release_order() 
         )
     primary = call_shape.route_for(GraphitiLeafClass.PRIMARY)
     assert primary.config_identity == "cursor-sdk-api-key-composer-floor-v2"
-    assert primary.command_semantic_version == (
-        "newsroom.graphiti-provider-dispatch.v12"
-    )
+    # Check current capabilities here; exact v12/v13 identity and replay are
+    # covered by the dedicated native SDK response-contract tests.
+    assert "REPORTED_OUTPUT_TOKENS=ADVISORY_INCLUDES_REASONING_V1" in primary.command_flags
+    assert "REPORTED_TOTAL_TOKENS=ADVISORY_CUMULATIVE_CONSUMPTION_V1" in primary.command_flags
     assert f"sdk={cursor_transport.MIN_SDK_REQUIREMENT}" in primary.command_flags
     assert "auth=CURSOR_API_KEY" in primary.command_flags
     assert "composer_floor>=2.5" in primary.command_flags

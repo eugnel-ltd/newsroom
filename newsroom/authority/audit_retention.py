@@ -294,18 +294,12 @@ def _children(
 def _index_children(
     conn: sqlite3.Connection, parent: str, indexes: list[str], *, key: str | None = None,
 ) -> list[tuple[str, str]]:
-    children = _children(conn, parent, key=key)
-    for table, column in children:
-        existing = [row[1] for row in conn.execute(f"PRAGMA main.index_list({_q(table)})") if not row[4]]
-        if any(
-            (info := conn.execute(f"PRAGMA main.index_info({_q(index)})").fetchone())
-            and info[2] == column for index in existing
-        ):
-            continue
-        name = f"_audit_maintenance_{len(indexes)}"
-        conn.execute(f"CREATE INDEX {_q(name)} ON {_q(table)}({_q(column)})")
-        indexes.append(name)
-    return children
+    from ._foreign_keys import index_foreign_key_children
+
+    children = index_foreign_key_children(
+        conn, parent, indexes, key=key or _AUDIT_KEYS[parent], prefix="_audit_maintenance_",
+    )
+    return [(table, columns[0]) for table, columns in children]
 
 
 def _unreferenced(parent: str, children: list[tuple[str, str]]) -> str:

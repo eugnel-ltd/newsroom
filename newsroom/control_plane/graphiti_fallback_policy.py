@@ -15,7 +15,7 @@ GRAPHITI_FALLBACK_CIRCUIT_SCHEMA_VERSION = (
 )
 _POLICY_PATH = Path(__file__).with_name("graphiti_fallback_circuit_policy_v1.json")
 _NATIVE_POLICY_PATH = Path(__file__).with_name(
-    "native_graphiti_fallback_circuit_policy_v1.json"
+    "native_graphiti_fallback_circuit_policy_v2.json"
 )
 
 
