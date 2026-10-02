@@ -285,10 +285,17 @@ class NativeDiscovery:
             item.identity_digest, representation.representation_digest,
         )
         outcome_id = _identity(CheckOutcomeId, "outcome", key)
+        prior_observed = self.checks.observed_prior_revision(
+            item.item_id, request_id=request_id, outcome_id=outcome_id,
+            completed_at=started, proof=proof,
+        )
         try:
             retained_outcome = self.checks.outcome(outcome_id, proof=proof)
         except LookupError:
-            reobserved = bool(self.sources.occurrences(revision.revision_id, limit=1, proof=proof))
+            reobserved = (
+                prior_observed is not None
+                and prior_observed.request.revision_id == revision.revision_id
+            )
         else:
             reobserved = retained_outcome.request.kind is CheckOutcomeKind.SUCCESS_UNCHANGED
         outcome = self.checks.record_outcome(CheckOutcomeRequest(
@@ -320,11 +327,9 @@ class NativeDiscovery:
         try:
             transition = self.checks.transition(transition_id, proof=proof)
         except LookupError:
-            # A retained historical revision is FIRST_OBSERVED in this native
-            # stream unless its predecessor has actually been delivered here.
-            prior = revision.revision_id if reobserved else revision.prior_revision_id
-            if prior is not None and not self.sources.occurrences(prior, limit=1, proof=proof):
-                prior = None
+            # Check lineage follows actual observations, which can arrive out
+            # of canonical ingestion order. Replay keeps its exact outcome bound.
+            prior = None if prior_observed is None else prior_observed.request.revision_id
             transition = self.checks.record_transition(ObservableTransitionRequest(
                 transition_id=transition_id, definition_id=version.definition_id,
                 definition_version_id=version.version_id, check_outcome_id=outcome_id,

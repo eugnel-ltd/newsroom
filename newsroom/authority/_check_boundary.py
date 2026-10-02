@@ -46,7 +46,7 @@ from newsroom.checks.types import (
     ObservableTransitionId,
     OperationalFindingId,
 )
-from newsroom.sources import CheckOutcomeId, SourceDefinitionId
+from newsroom.sources import CheckOutcomeId, SourceDefinitionId, SourceItemId, SourceRevision
 
 
 _Record = TypeVar("_Record")
@@ -355,6 +355,28 @@ class _CheckBoundary:
         if value is None:
             raise LookupError("Check Outcome is not retained")
         return value
+
+    def observed_prior_revision(
+        self, item_id: SourceItemId, request_id: CheckRequestId,
+        outcome_id: CheckOutcomeId, completed_at: UtcTimestamp,
+        proof: AuthenticationProof,
+    ) -> SourceRevision | None:
+        if not isinstance(item_id, SourceItemId) or not isinstance(request_id, CheckRequestId):
+            raise TypeError("observed prior requires typed Item and Check Request identities")
+        if not isinstance(outcome_id, CheckOutcomeId) or not isinstance(completed_at, UtcTimestamp):
+            raise TypeError("observed prior requires a typed Check Outcome and UTC boundary")
+        self._authorize_read(
+            proof, operation="read:discovery_checks:observed_prior_revision",
+            aggregate_type="check_request",
+            aggregate_id=digest_canonical({
+                "request_id": str(request_id), "item_id": str(item_id),
+                "outcome_id": str(outcome_id), "completed_at": completed_at.to_text(),
+            }), sensitive=True,
+        )
+        return self._store.observed_prior_revision(
+            item_id, request_id=request_id, outcome_id=outcome_id,
+            completed_at=completed_at,
+        )
 
     def attempts(
         self,

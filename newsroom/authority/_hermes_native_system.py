@@ -372,6 +372,7 @@ def open_hermes_native_authority_system(
             admit_proposal=proposal_admission.admit,
             request=check_boundary.request, attempt=check_boundary.attempt,
             outcome=check_boundary.outcome, attempts=check_boundary.attempts,
+            observed_prior_revision=check_boundary.observed_prior_revision,
             outcomes=check_boundary.outcomes, baseline=check_boundary.baseline,
             current_baseline=check_boundary.current_baseline,
             transition=check_boundary.transition, finding=check_boundary.finding,
