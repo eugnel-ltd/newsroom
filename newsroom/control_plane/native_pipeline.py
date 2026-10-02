@@ -135,6 +135,7 @@ class NativePipeline:
         ordinary.sort(key=lambda item: self._journal.progress.get(item[0], {}).get("stage")
                       not in {"ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
         ordinary_deadline = self._monotonic_clock() + self._reassessment_quantum
+        ordinary_before = {revision: self._journal.progress_ordinal(revision) for revision, _ in ordinary}
         recover = getattr(self._publish, "recover_pre_dispatch", None)
         if callable(recover):
             def before_recovery() -> bool:
@@ -149,13 +150,12 @@ class NativePipeline:
             # Reclassification is this revision's only turn in the tick, not
             # permission for a fresh source/model retry using the batch proof.
             ordinary = [item for item in ordinary if item[0] not in attempted]
-        ordinary_before = {revision: self._journal.progress.get(revision) for revision, _ in ordinary}
         deadline_deferred_ready = self._advance_revisions(
             tuple(ordinary),
             work_deadline=ordinary_deadline,
         )
         ordinary_turn_taken = any(
-            self._journal.progress.get(revision) is not previous
+            self._journal.progress_ordinal(revision) != previous
             for revision, previous in ordinary_before.items()
         )
         self._drain_between_work()

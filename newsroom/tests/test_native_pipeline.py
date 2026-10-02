@@ -1584,3 +1584,51 @@ def test_ordinary_unchanged_hold_does_not_consume_current_preference(tmp_path, m
         assert pipeline._spill_archive_turn is False
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("mutate_public_ordinal", (False, True))
+def test_ordinary_deduplicated_journal_hold_does_not_consume_turn(tmp_path, monkeypatch, mutate_public_ordinal):
+    pipeline, journal, connection, units, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    unit = units[0]
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="DISCOVERY_HOLD", facts={
+        "graphiti_receipts": [{"retained": True}], "reason": "SOURCE_HOLD",
+    })
+    before_ordinal = journal._records[unit.revision_id].ordinal
+    if mutate_public_ordinal:
+        journal.progress[unit.revision_id]["ordinal"] = 999
+    pipeline._discovery = NS(
+        deliver=lambda unit, **kwargs: unit,
+        admit_lead=lambda *args, **kwargs: NS(lead=None, phase=NS(value="SOURCE_HOLD")),
+    )
+    try:
+        pipeline.tick(cycle_id="ordinary-deduplicated")
+        assert journal._records[unit.revision_id].ordinal == before_ordinal
+        assert pipeline._spill_archive_turn is False
+    finally:
+        connection.close()
+
+
+def test_ordinary_recovery_progress_consumes_turn_before_checked_partition_removal(tmp_path, monkeypatch):
+    pipeline, journal, connection, units, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    unit = units[0]
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+        "candidate_version_id": "candidate:" + unit.item_key,
+        "graphiti_receipts": [{"retained": True}], "failure_class": "NativeEvidenceError",
+    })
+    def recover(revision_ids, *, before_revision):
+        assert before_revision()
+        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
+            **journal.progress[unit.revision_id]["facts"], "reason": "ASSESSOR_PRE_DISPATCH_HOLD",
+        })
+        return (unit.revision_id,)
+    pipeline._publish = NS(recover_pre_dispatch=recover, advance=lambda **kwargs: pytest.fail("duplicate ordinary turn"))
+    try:
+        pipeline.tick(cycle_id="ordinary-recovery-turn")
+        assert journal._records[unit.revision_id].ordinal == 2
+        assert pipeline._spill_archive_turn is True
+    finally:
+        connection.close()

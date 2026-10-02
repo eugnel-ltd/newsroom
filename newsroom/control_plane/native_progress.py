@@ -252,6 +252,11 @@ class NativeRevisionJournal:
                 del item["body"]
         self._retain(LAND, value)
 
+    def progress_ordinal(self, revision_id: str) -> int | None:
+        """Return retained progress identity, not mutable public logical facts."""
+        record = self._records.get(revision_id)
+        return None if record is None else record.ordinal
+
     def advance(self, revision_id: str, *, stage: str, facts: dict) -> dict:
         if revision_id not in self.units or not stage:
             raise ValueError("native progress stage lacks a landed revision")
