@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from newsroom.authority.projection_retirement import select_candidates
+from newsroom.authority.projection_retirement import select_candidates, protect_candidates, retained_condition
 from .test_retired_projection_audit import _seed
 
 
@@ -49,6 +49,54 @@ def test_real_schema_selection_drives_generations_then_state_ranges_then_event_k
         assert connection.execute(query).fetchall() == connection.execute(original).fetchall()
         record_property("real_schema_original_plan", json.dumps(baseline))
         record_property("real_schema_state_first_plan", json.dumps(plan))
+
+
+def test_protection_reads_generation_heads_and_reuses_candidate_membership_indexes(tmp_path):
+    path = tmp_path / "authority.sqlite3"
+    _seed(path)
+    with sqlite3.connect(path) as connection:
+        select_candidates(connection)
+        statements = []
+        connection.set_trace_callback(statements.append)
+        protect_candidates(connection)
+        head_statement = next(sql for sql in statements if sql.startswith(
+            "DELETE FROM _retirement_candidates WHERE event_id IN ("))
+        plan = _plan(connection, head_statement)
+        assert any("SEARCH a USING PRIMARY KEY (aggregate_type=?)" in item for item in plan)
+        assert not any(item == "SCAN e" for item in plan)
+        for table, key, column in (
+            ("authority_payloads", "payload_id", "payload_id"),
+            ("authentication_contexts", "authentication_context_id", "authentication_context_id"),
+            ("authorization_requests", "request_digest", "authorization_request_digest"),
+            ("authorization_decisions", "authorization_decision_id", "authorization_decision_id"),
+        ):
+            query = f"SELECT 1 FROM {table} WHERE NOT ({key} IN (SELECT {column} FROM _retirement_candidates))"
+            assert any(f"_retirement_candidate_{column} FOR IN-OPERATOR" in item
+                       for item in _plan(connection, query))
+
+
+@pytest.mark.parametrize("table,key,candidates,candidate_key", [
+    ("projection_checkpoint_versions", "checkpoint_version", "_retirement_checkpoints", "checkpoint_version"),
+    ("projection_delivery_states", "ledger_seq", "_retirement_candidates", "source_seq"),
+    ("projection_delivery_attempts", "ledger_seq", "_retirement_candidates", "source_seq"),
+])
+def test_unmatched_composite_references_use_exact_indexed_membership(table, key, candidates, candidate_key):
+    costs = []
+    for size in (256, 512):
+        with sqlite3.connect(":memory:") as connection:
+            connection.execute(f"CREATE TABLE {table}(generation_id TEXT NOT NULL,{key} INTEGER NOT NULL,PRIMARY KEY(generation_id,{key})) WITHOUT ROWID")
+            connection.execute(f"CREATE TEMP TABLE {candidates}(generation_id TEXT,{candidate_key} INTEGER)")
+            connection.execute(f"CREATE UNIQUE INDEX candidate_key ON {candidates}(generation_id,{candidate_key})")
+            connection.executemany(f"INSERT INTO {table} VALUES(?,?)", [(generation, seq) for generation in ("retired", "current") for seq in range(size)])
+            connection.executemany(f"INSERT INTO {candidates} VALUES('retired',?)", [(seq,) for seq in range(size)])
+            old = f"NOT ((generation_id,{key}) IN (SELECT generation_id,{candidate_key} FROM {candidates}))"
+            prefix = f"SELECT generation_id,{key} FROM {table} WHERE "
+            before_rows, before = _select_steps(connection, prefix + old)
+            after_rows, after = _select_steps(connection, prefix + retained_condition(table))
+            assert before_rows == after_rows == [("current", seq) for seq in range(size)]
+            assert after * 8 < before
+            costs.append(after)
+    assert costs[1] < costs[0] * 2.5
 
 
 def _cohort(count, density):

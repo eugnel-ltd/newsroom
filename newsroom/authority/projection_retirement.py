@@ -10,6 +10,8 @@ from .projection_retirement_migrations import RETIRED_FIELDS, retired_record_dig
 
 # These are disposable diagnostics. Current local FK, causation and watermark
 # consumers still protect their required rows; historical opaque links expire.
+# Generation/sequence keys are NOT NULL. EXISTS keeps unmatched composite keys
+# on the exact index lookup instead of row-value NOT IN's fallback scan.
 _EXCLUSIONS = {
     "ledger_events": "event_id IN (SELECT event_id FROM _retirement_candidates)",
     "authority_commands": "command_id IN (SELECT command_id FROM _retirement_candidates)",
@@ -19,9 +21,9 @@ _EXCLUSIONS = {
     "authorization_requests": "request_digest IN (SELECT authorization_request_digest FROM _retirement_candidates)",
     "authorization_decisions": "authorization_decision_id IN (SELECT authorization_decision_id FROM _retirement_candidates)",
     "authentication_contexts": "authentication_context_id IN (SELECT authentication_context_id FROM _retirement_candidates)",
-    "projection_delivery_states": "(generation_id,ledger_seq) IN (SELECT generation_id,source_seq FROM _retirement_candidates)",
-    "projection_delivery_attempts": "(generation_id,ledger_seq) IN (SELECT generation_id,source_seq FROM _retirement_candidates)",
-    "projection_checkpoint_versions": "(generation_id,checkpoint_version) IN (SELECT generation_id,checkpoint_version FROM _retirement_checkpoints)",
+    "projection_delivery_states": "EXISTS (SELECT 1 FROM _retirement_candidates x WHERE x.generation_id=projection_delivery_states.generation_id AND x.source_seq=projection_delivery_states.ledger_seq)",
+    "projection_delivery_attempts": "EXISTS (SELECT 1 FROM _retirement_candidates x WHERE x.generation_id=projection_delivery_attempts.generation_id AND x.source_seq=projection_delivery_attempts.ledger_seq)",
+    "projection_checkpoint_versions": "EXISTS (SELECT 1 FROM _retirement_checkpoints x WHERE x.generation_id=projection_checkpoint_versions.generation_id AND x.checkpoint_version=projection_checkpoint_versions.checkpoint_version)",
 }
 
 
@@ -53,6 +55,9 @@ def select_candidates(conn: sqlite3.Connection) -> int:
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_event ON _retirement_candidates(event_id)")
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_command ON _retirement_candidates(command_id)")
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_source ON _retirement_candidates(generation_id,source_seq)")
+    for column in ("payload_id", "authentication_context_id",
+                   "authorization_request_digest", "authorization_decision_id"):
+        conn.execute(f"CREATE INDEX _retirement_candidate_{column} ON _retirement_candidates({column})")
     conn.execute("""CREATE TEMP TABLE _retirement_checkpoints AS
         SELECT c.generation_id,c.checkpoint_version,c.authority_event_id
         FROM projection_checkpoint_versions c JOIN projection_generations g USING(generation_id)
@@ -67,8 +72,9 @@ def protect_candidates(conn: sqlite3.Connection) -> int:
 
     initial = int(conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0])
     conn.execute("""DELETE FROM _retirement_candidates WHERE event_id IN (
-        SELECT e.event_id FROM ledger_events e JOIN authority_aggregates a
+        SELECT e.event_id FROM authority_aggregates a CROSS JOIN ledger_events e
         ON a.aggregate_type=e.aggregate_type AND a.aggregate_id=e.aggregate_id AND a.current_version=e.aggregate_version
+        WHERE a.aggregate_type='projection_generation'
         UNION SELECT event_id FROM ledger_events WHERE ledger_seq=(SELECT max(ledger_seq) FROM ledger_events)
         UNION SELECT event_id FROM ledger_events WHERE ledger_seq=(SELECT max(ledger_seq) FROM ledger_events WHERE aggregate_type NOT IN ('projection_family','projection_generation'))
         UNION SELECT e.event_id FROM ledger_events e JOIN projection_generation_validations v
