@@ -1,8 +1,8 @@
 """Offline reclamation of obsolete native read diagnostics.
 
 Default read-audit pruning preserves command history. The explicit retired
-projection mode expires only checked optional no-op diagnostic commands, not
-admissions, accounting, effects or source history. The existing writer lock is
+projection mode expires successful delivery diagnostics of retired generations,
+not admissions, accounting, effects or source history. The existing writer lock is
 held throughout, append-only triggers are restored transactionally, and no
 authority database copy is made.
 """

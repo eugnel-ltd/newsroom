@@ -302,20 +302,21 @@ class NativeGraphitiProcessor:
         # The existing defer callback retains the pipeline's wall-time quantum.
         while remaining:
             considered.clear()
-            _ingest(
-                self._connection, graphiti=self._runner,
-                units=tuple(remaining.values()),
-                max_graphiti=len(remaining), rights_check=self._rights,
-                rights_fence=self._fence, clock=self._clock,
-                model_usage=self._usage, cycle_id=cycle_id,
-                operator_drain_requested=self._operator_drain_requested,
-                defer_before_unit=defer,
-                preserve_unit_order=True,
-                fallback_permitted=True,
-                recovered_ambiguous_attempts=recovered_ambiguous_attempts,
-                authenticated_rejected_attempts=authenticated_rejected_attempts,
-                authenticated_reentry_attempts=authenticated_reentry_attempts,
-            )
+            with _native_phase("EXTRACTION", cycle_id=cycle_id, cohort_count=len(remaining)):
+                _ingest(
+                    self._connection, graphiti=self._runner,
+                    units=tuple(remaining.values()),
+                    max_graphiti=len(remaining), rights_check=self._rights,
+                    rights_fence=self._fence, clock=self._clock,
+                    model_usage=self._usage, cycle_id=cycle_id,
+                    operator_drain_requested=self._operator_drain_requested,
+                    defer_before_unit=defer,
+                    preserve_unit_order=True,
+                    fallback_permitted=True,
+                    recovered_ambiguous_attempts=recovered_ambiguous_attempts,
+                    authenticated_rejected_attempts=authenticated_rejected_attempts,
+                    authenticated_reentry_attempts=authenticated_reentry_attempts,
+                )
             for ingest_id in considered:
                 remaining.pop(ingest_id, None)
             if (
