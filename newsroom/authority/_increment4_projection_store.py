@@ -146,11 +146,7 @@ class _Increment4ProjectionAuthorityStore(
         for row in entity_rows:
             entity_id = CanonicalEntityId.parse(str(row["entity_id"]))
             try:
-                entity = self.entity(entity_id)
-                preferred = self.preferred_identity(entity_id)
-                version = self.entity_version(
-                    preferred.current_entity_version_id
-                )
+                entity, preferred, version = self._current_entity_projection_records(entity_id)
             except PermissionError:
                 # Rights-invalid current state must disappear from derivative
                 # authority rather than being copied from stale caller memory.

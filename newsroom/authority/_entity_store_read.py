@@ -1035,6 +1035,72 @@ class _EntityReadMixin:
                 self._require_mention_current(self._connection, mention)
             return results
 
+    @staticmethod
+    def _preferred_identity_from_row(row: sqlite3.Row) -> EntityPreferredIdentity:
+        return EntityPreferredIdentity(
+            entity_id=CanonicalEntityId.parse(str(row["entity_id"])),
+            current_entity_version_id=CanonicalEntityVersionId.parse(
+                str(row["current_entity_version_id"])
+            ),
+            preferred_entity_id=CanonicalEntityId.parse(
+                str(row["preferred_entity_id"])
+            ),
+            lifecycle=CanonicalEntityLifecycle(str(row["lifecycle"])),
+            decided_by_kind=(
+                None
+                if row["decided_by_kind"] is None
+                else EntityLineageDecisionKind(str(row["decided_by_kind"]))
+            ),
+            decided_by_id=(
+                None if row["decided_by_id"] is None else str(row["decided_by_id"])
+            ),
+            projected_through_ledger_seq=int(row["projected_through_ledger_seq"]),
+        )
+
+    def _validate_current_preferred_identity(
+        self, entity_id: CanonicalEntityId, result: EntityPreferredIdentity,
+    ) -> None:
+        """Exact CURRENT head/projection proof for public and combined reads."""
+        if self._current_state_only:
+            head = self._entity_head_row(self._connection, entity_id)
+            latest = self._connection.execute(
+                "SELECT * FROM entity_projection_events WHERE entity_id=? "
+                "ORDER BY source_ledger_seq DESC,projection_event_id DESC LIMIT 1", (str(entity_id),),
+            ).fetchone()
+            if latest is None:
+                raise AuthorityPersistenceError("current entity lacks latest projection authority")
+            event = self._projection_event_from_row(self._connection, latest)
+            self._validate_retained_event(str(event.source_event_id))
+            if (
+                str(result.current_entity_version_id) != head["current_entity_version_id"]
+                or result.lifecycle.value != head["lifecycle"]
+                or str(event.entity_version_id) != head["current_entity_version_id"]
+                or event.lifecycle.value != head["lifecycle"]
+                or str(event.preferred_entity_id) != str(result.preferred_entity_id)
+                or event.source_ledger_seq != result.projected_through_ledger_seq
+            ):
+                raise AuthorityPersistenceError("current entity preferred projection differs from latest authority")
+
+    def _current_entity_projection_records(self, entity_id: CanonicalEntityId):
+        """One current entity proof for this locked projection read only."""
+        with self._lock:
+            entity = self.entity(entity_id)
+            preferred = self._preferred_identity_from_row(self._required_entity_row(
+                self._connection, table="entity_preferred_identities", column="entity_id",
+                identifier=str(entity_id), identity="entity preferred identity",
+            ))
+            self._validate_current_preferred_identity(entity_id, preferred)
+            version = self._entity_version_from_row(self._connection, self._required_entity_row(
+                self._connection, table="canonical_entity_versions", column="entity_version_id",
+                identifier=str(preferred.current_entity_version_id), identity="canonical entity version",
+            ))
+            if version.entity_id != entity.entity_id:
+                # Preserve the public version getter's other-entity rights
+                # outcome for corrupt bindings; snapshot validation still rejects
+                # an otherwise-readable mismatched entity/version tuple.
+                self.entity(version.entity_id)
+            return entity, preferred, version
+
     def preferred_identity(self, entity_id: CanonicalEntityId) -> EntityPreferredIdentity:
         if not isinstance(entity_id, CanonicalEntityId):
             raise TypeError("canonical entity identity must be typed")
@@ -1046,45 +1112,9 @@ class _EntityReadMixin:
                 identifier=str(entity_id),
                 identity="entity preferred identity",
             )
-            result = EntityPreferredIdentity(
-                entity_id=CanonicalEntityId.parse(str(row["entity_id"])),
-                current_entity_version_id=CanonicalEntityVersionId.parse(
-                    str(row["current_entity_version_id"])
-                ),
-                preferred_entity_id=CanonicalEntityId.parse(
-                    str(row["preferred_entity_id"])
-                ),
-                lifecycle=CanonicalEntityLifecycle(str(row["lifecycle"])),
-                decided_by_kind=(
-                    None
-                    if row["decided_by_kind"] is None
-                    else EntityLineageDecisionKind(str(row["decided_by_kind"]))
-                ),
-                decided_by_id=(
-                    None if row["decided_by_id"] is None else str(row["decided_by_id"])
-                ),
-                projected_through_ledger_seq=int(row["projected_through_ledger_seq"]),
-            )
+            result = self._preferred_identity_from_row(row)
             self.entity(result.entity_id)
-            if self._current_state_only:
-                head = self._entity_head_row(self._connection, entity_id)
-                latest = self._connection.execute(
-                    "SELECT * FROM entity_projection_events WHERE entity_id=? "
-                    "ORDER BY source_ledger_seq DESC,projection_event_id DESC LIMIT 1", (str(entity_id),),
-                ).fetchone()
-                if latest is None:
-                    raise AuthorityPersistenceError("current entity lacks latest projection authority")
-                event = self._projection_event_from_row(self._connection, latest)
-                self._validate_retained_event(str(event.source_event_id))
-                if (
-                    str(result.current_entity_version_id) != head["current_entity_version_id"]
-                    or result.lifecycle.value != head["lifecycle"]
-                    or str(event.entity_version_id) != head["current_entity_version_id"]
-                    or event.lifecycle.value != head["lifecycle"]
-                    or str(event.preferred_entity_id) != str(result.preferred_entity_id)
-                    or event.source_ledger_seq != result.projected_through_ledger_seq
-                ):
-                    raise AuthorityPersistenceError("current entity preferred projection differs from latest authority")
+            self._validate_current_preferred_identity(entity_id, result)
             return result
 
     def merge_decision(
