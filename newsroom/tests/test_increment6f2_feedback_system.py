@@ -292,9 +292,9 @@ def test_accept_replay_snapshot_and_direct_tamper_fail_closed(tmp_path: Path) ->
     authority.close()
 
 
-@pytest.fixture(scope="module")
-def _generic_disposition_base(tmp_path_factory: pytest.TempPathFactory):
-    tmp_path = tmp_path_factory.mktemp("feedback-disposition")
+@pytest.fixture
+def _generic_disposition_base(tmp_path: Path):
+    # Each test may advance or corrupt this authority; never share its writes.
     location, args, feedback, obligation = _seed(tmp_path)
     authority = open_evaluation_feedback_authority_system(
         location.seed[1],
@@ -358,7 +358,7 @@ def test_stale_candidate_feedback_is_rejected(
     authority.close()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def _generic_disposition_state(_generic_disposition_base):
     location, args, feedback, obligation, accepted, _ = _generic_disposition_base
     authority = open_evaluation_feedback_authority_system(
