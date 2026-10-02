@@ -25,6 +25,9 @@ OLD_ASSESSMENT_CONTRACT = (
     "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v1+"
     "newsroom.qualification-relation.v3+newsroom.retained-assessment.v1"
 )
+CLOCK_UPGRADED_CONTRACT = OLD_ASSESSMENT_CONTRACT.replace(
+    "+newsroom.factual-localisation.v1+", "+newsroom.factual-localisation.v2+",
+)
 OLD_WRITE_POLICY = (
     "newsroom.write-admission.v9+newsroom.evid-012.v7+newsroom.evidence-approval.v8+"
     "newsroom.evidence-gates.v2+newsroom.governed-claim.v7+newsroom.governed-input.v10+"
@@ -37,8 +40,9 @@ def test_clock_consumer_upgrade_revalidates_cached_result_without_relabelling(
 ):
     facts = {"reason": "ASSESSOR_LOCALISATION_CONTRACT_HOLD",
              "assessment_contract_version": OLD_ASSESSMENT_CONTRACT}
-    assert assessment_revalidation_due(facts, ASSESSMENT_CONTRACT_VERSION)
-    assert same_assessment_producer(OLD_ASSESSMENT_CONTRACT, ASSESSMENT_CONTRACT_VERSION)
+    # Freeze the consumer-only change; today's wire may use a newer producer.
+    assert assessment_revalidation_due(facts, CLOCK_UPGRADED_CONTRACT)
+    assert same_assessment_producer(OLD_ASSESSMENT_CONTRACT, CLOCK_UPGRADED_CONTRACT)
     assert "+newsroom.factual-localisation.v2+" in ASSESSMENT_CONTRACT_VERSION
     _use_historical_v16(monkeypatch)
     candidate, base, source, acquired, raw = _qualification_assessor_inputs(retained_22589_assessment)
@@ -87,8 +91,8 @@ def test_clock_consumer_upgrade_revalidates_cached_result_without_relabelling(
         assert len(result.qualification_evidence) == 1
     assert retained_rows() == before
     assert json.loads(before[0][0][0])["prompt_contract_version"] == "newsroom.native-evidence-assessor.v16"
-    facts["assessment_contract_version"] = ASSESSMENT_CONTRACT_VERSION
-    assert not assessment_revalidation_due(facts, ASSESSMENT_CONTRACT_VERSION)
+    facts["assessment_contract_version"] = CLOCK_UPGRADED_CONTRACT
+    assert not assessment_revalidation_due(facts, CLOCK_UPGRADED_CONTRACT)
 
 def test_prior_factual_v1_write_admission_remains_readable():
     candidate, package = _candidate_package()
