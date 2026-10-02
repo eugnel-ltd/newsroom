@@ -3,7 +3,8 @@
 Load once at daemon start; append only changed state. Source bytes are retained
 once, never copied into each stage receipt. No additional database or schema.
 Unchanged retrieval binding/rights pairs refer to the previous same-revision
-progress record; ordered replay restores the original logical facts.
+progress record. Ordered replay verifies their original immutable root; selected
+reads restore complete detached facts without retaining every cold pair in RAM.
 The journal records work, not evidence/publication authority.
 """
 
@@ -11,6 +12,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
@@ -91,9 +94,11 @@ def _unit(value: dict, bodies: dict[str, str]) -> CorpusIngestUnit:
     return CorpusIngestUnit(**value)
 
 
-def _landed_units(value: dict) -> tuple[CorpusIngestUnit, ...]:
+def _landed_units(
+    value: dict, *, bodies: dict[str, str] | None = None,
+) -> tuple[CorpusIngestUnit, ...]:
     """Decode both retained encodings for journal and selected accounting reads."""
-    bodies: dict[str, str] = {}
+    bodies = {} if bodies is None else bodies
     raw_units = value.get("units", ())
     if len(raw_units) > 1:
         # Chunk authority/identity text repeats too. Reuse replay's immutable
@@ -111,8 +116,12 @@ class NativeRevisionJournal:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
         self.units: dict[str, tuple[CorpusIngestUnit, ...]] = {}
-        self.progress: dict[str, dict] = {}
+        # Share immutable equal body text only; every revision and authority
+        # container remains distinct. The pool is bounded by retained units.
+        self._bodies: dict[str, str] = {}
+        self._summaries: dict[str, dict] = {}
         self._records: dict[str, _ProgressRecord] = {}
+        self._pair_roots: dict[str, _ProgressRecord] = {}
         self.portfolio: tuple[dict, ...] = ()
         self._portfolio_record: tuple[int, str] | None = None
         self.observations: dict[str, tuple[str, str, str, str]] = {}
@@ -128,13 +137,13 @@ class NativeRevisionJournal:
             if canonical_json_bytes(value).decode() != raw:
                 raise ValueError("native progress ledger is not canonical")
             self._apply(kind, value, seq=seq, payload_digest=payload_digest)
-        _share_progress_strings(self.progress)
+        _share_progress_strings(self._summaries)
 
     def _apply(self, kind: str, value: dict, *, seq: int, payload_digest: str) -> None:
         if kind == LAND:
             # Chunk receipts repeat the full source body. Share exact-equal text
-            # in this revision only; retain and validate the original ledger bytes.
-            units = _landed_units(value)
+            # across revisions too; retain and validate every original ledger byte.
+            units = _landed_units(value, bodies=self._bodies)
             self._validate_units(units)
             revision_id = units[0].revision_id
             if value["revision_id"] != revision_id:
@@ -166,18 +175,29 @@ class NativeRevisionJournal:
                     or any(key in facts for key in _RETRIEVAL_FIELDS)
                 ):
                     raise ValueError("native retrieval facts reference differs")
-                prior_facts = self.progress[revision_id]["facts"]
-                facts.update({key: prior_facts[key] for key in _RETRIEVAL_FIELDS})
+                if revision_id not in self._pair_roots:
+                    raise ValueError("native retrieval facts reference lacks its root")
                 pair_digest = previous.pair_digest
             else:
                 pair_digest = _pair_digest(facts)
             logical = {key: item for key, item in value.items() if key != "retrieval_facts_ref"}
             logical["facts"] = facts
-            self._records[revision_id] = _ProgressRecord(
+            record = _ProgressRecord(
                 seq, payload_digest, ordinal, pair_digest,
                 _state_digest(value["stage"], facts, pair_digest),
             )
-            self.progress[revision_id] = logical
+            self._records[revision_id] = record
+            if pair_digest is None:
+                self._pair_roots.pop(revision_id, None)
+            elif "retrieval_facts_ref" not in value:
+                self._pair_roots[revision_id] = record
+            logical["facts"] = {
+                key: item for key, item in facts.items()
+                if pair_digest is None or key not in _RETRIEVAL_FIELDS
+            }
+            # An advance result and its input are ordinary mutable DTOs, not a
+            # view of retained state. Only the small inline tree remains here.
+            self._summaries[revision_id] = deepcopy(logical)
         elif kind == PORTFOLIO:
             self.portfolio = tuple(value["sources"])
             for source in self.portfolio:
@@ -257,32 +277,101 @@ class NativeRevisionJournal:
         record = self._records.get(revision_id)
         return None if record is None else record.ordinal
 
+    def summary(self, revision_id: str) -> dict:
+        """Return detached inline continuation metadata, never a full pair."""
+        logical = self._summaries.get(revision_id)
+        record = self._records.get(revision_id)
+        if logical is None:
+            if record is not None:
+                raise ValueError("native progress current summary is missing")
+            return {}
+        if record is None:
+            raise ValueError("native progress current record is missing")
+        if (
+            logical.get("revision_id") != revision_id
+            or type(logical.get("ordinal")) is not int
+            or logical["ordinal"] != record.ordinal
+            or _state_digest(logical["stage"], logical["facts"], record.pair_digest)
+            != record.state_digest
+        ):
+            raise ValueError("native progress current logical state differs")
+        return deepcopy(logical)
+
+    def iter_summaries(self) -> Iterator[tuple[str, dict]]:
+        """Yield detached metadata in retained order over a snapshot of keys."""
+        if self._summaries.keys() != self._records.keys():
+            raise ValueError("native progress current metadata inventory differs")
+        return ((revision_id, self.summary(revision_id))
+                for revision_id in tuple(self._summaries))
+
+    def _pair_facts(self, revision_id: str) -> dict:
+        record = self._records[revision_id]
+        root = self._pair_roots.get(revision_id)
+        if (
+            type(root) is not _ProgressRecord
+            or type(root.seq) is not int or type(root.ordinal) is not int
+            or root.seq < 1 or root.ordinal < 1
+            or root.seq > record.seq or root.ordinal > record.ordinal
+            or root.pair_digest != record.pair_digest
+        ):
+            raise ValueError("native retrieval pair root differs")
+        row = self._connection.execute(
+            "SELECT kind,payload_json,payload_digest FROM ledger WHERE seq=?",
+            (root.seq,),
+        ).fetchone()
+        if (
+            row is None or row[0] != STATE or row[2] != root.payload_digest
+            or digest_bytes(row[1].encode()) != root.payload_digest
+        ):
+            raise ValueError("native retrieval pair root payload differs")
+        value = json.loads(row[1])
+        if (
+            type(value) is not dict or canonical_json_bytes(value).decode() != row[1]
+            or value.get("revision_id") != revision_id
+            or type(value.get("ordinal")) is not int or value["ordinal"] != root.ordinal
+            or type(value.get("facts")) is not dict
+            or "retrieval_facts_ref" in value
+            or _pair_digest(value["facts"]) != record.pair_digest
+            or _state_digest(value["stage"], value["facts"], root.pair_digest)
+            != root.state_digest
+        ):
+            raise ValueError("native retrieval pair root body differs")
+        return {key: value["facts"][key] for key in _RETRIEVAL_FIELDS}
+
+    def current(self, revision_id: str) -> dict:
+        """Return complete detached facts through one selected verified root PK."""
+        logical = self.summary(revision_id)
+        if logical and self._records[revision_id].pair_digest is not None:
+            logical["facts"].update(self._pair_facts(revision_id))
+        return logical
+
     def advance(self, revision_id: str, *, stage: str, facts: dict) -> dict:
         if revision_id not in self.units or not stage:
             raise ValueError("native progress stage lacks a landed revision")
         if type(facts) is not dict:
             raise ValueError("native progress facts must be an object")
+        self.summary(revision_id)
         previous = self._records.get(revision_id)
         facts = json.loads(canonical_json_bytes(facts))
         pair_digest = _pair_digest(facts)
+        if previous and pair_digest is not None and pair_digest == previous.pair_digest:
+            # Check the referenced immutable bytes before creating any new
+            # reference or accepting a no-op, not after the append commits.
+            self._pair_facts(revision_id)
         logical = {"revision_id": revision_id, "ordinal": previous.ordinal if previous else 0,
                    "stage": stage, "facts": facts}
         if previous and _state_digest(stage, facts, pair_digest) == previous.state_digest:
-            # Public logical facts may have been mutated by a caller. Restore
-            # the detached, verified input instead of returning that mutation.
-            self.progress[revision_id] = logical
             return logical
         logical["ordinal"] += 1
         encoded = logical
         if (
             previous and pair_digest is not None and pair_digest == previous.pair_digest
-            and _pair_digest(self.progress[revision_id]["facts"]) == previous.pair_digest
         ):
             encoded = {**logical,
                        "facts": {key: item for key, item in facts.items() if key not in _RETRIEVAL_FIELDS},
                        "retrieval_facts_ref": previous.reference()}
         self._retain(STATE, encoded)
-        return self.progress[revision_id]
+        return logical
 
     def sources(self, dispositions: tuple) -> None:
         values = tuple({

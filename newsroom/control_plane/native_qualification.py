@@ -356,14 +356,14 @@ def _revision_inventory(
     except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
         raise NativeQualificationError("native revision progress differs") from exc
     retained_states = Counter(
-        journal.progress.get(revision_id, {}).get("stage", "QUEUED")
+        journal.summary(revision_id).get("stage", "QUEUED")
         for revision_id in journal.units
     )
     if dict(retained_states) != states or journal.portfolio != sources:
         raise NativeQualificationError("native pipeline report is not retained authority")
     if any(not _is_terminal_revision_state(state) for state in retained_states):
         raise NativeQualificationError("native revision is not terminal")
-    for value in journal.progress.values():
+    for _, value in journal.iter_summaries():
         stage = value.get("stage")
         reason = value.get("facts", {}).get("reason")
         if stage.endswith("_HOLD") and (

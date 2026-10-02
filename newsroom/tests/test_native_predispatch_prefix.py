@@ -75,7 +75,7 @@ def _prefix(tmp_path, monkeypatch, *, count=15, admission=False, allocated=False
         def advance(self, *, revision_id, candidate_version_id):
             if revision_id in versions:
                 ordinary.append(revision_id)
-                if journal.progress[revision_id]["stage"] == "ASSESSMENT_INTERRUPTED":
+                if journal.current(revision_id)["stage"] == "ASSESSMENT_INTERRUPTED":
                     return continuation.advance(revision_id=revision_id, candidate_version_id=candidate_version_id)
                 raise OSError("possible effect remains unknown")
             return original.advance(revision_id=revision_id, candidate_version_id=candidate_version_id)
@@ -114,7 +114,7 @@ def test_fifteen_interrupted_candidates_share_one_global_walk_and_exact_transiti
         return result
 
     monkeypatch.setattr(sqlite3, "connect", connect)
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     ledger = tuple(context.connection.execute("SELECT * FROM ledger ORDER BY seq"))
     try:
         report = context.pipeline.tick(cycle_id="finite-recovery")
@@ -128,7 +128,7 @@ def test_fifteen_interrupted_candidates_share_one_global_walk_and_exact_transiti
             assert sum(count for sql, count in counts.items() if sql.startswith("SELECT ") and f"FROM {table.upper()} ORDER BY" in sql) == 1
         for index, unit in enumerate(context.units):
             version = context.versions[unit.revision_id]
-            retained = context.journal.progress[unit.revision_id]
+            retained = context.journal.current(unit.revision_id)
             assert retained["ordinal"] == before[unit.revision_id]["ordinal"] + 1
             assert retained["facts"] == {
                 **before[unit.revision_id]["facts"],
@@ -149,20 +149,20 @@ def test_checked_allocated_denial_skips_duplicate_while_unknown_and_protected_re
     allocated, unknown, started, publishing = context.units
     context.candidates.pop(context.versions[unknown.revision_id].version_id)
     for unit, stage in ((started, "ASSESSMENT_STARTED"), (publishing, "PUBLICATION_STARTED")):
-        context.journal.advance(unit.revision_id, stage=stage, facts={**context.journal.progress[unit.revision_id]["facts"], "assessment_started_at": "2026-09-08T12:00:00Z"})
+        context.journal.advance(unit.revision_id, stage=stage, facts={**context.journal.current(unit.revision_id)["facts"], "assessment_started_at": "2026-09-08T12:00:00Z"})
     fresh = _native("fresh")
     context.dispositions[0] = (NS(source_id=fresh.source_id, status="READY", reason_code="RETAINED", units=(fresh,)),)
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         context.pipeline.tick(cycle_id="unknown-before-fresh")
         assert context.ordinary == [unit.revision_id for unit in (unknown, started, publishing)]
         assert len(context.batches) == 1 and len(context.batches[0]) == 1
         assert context.batches[0][0] == context.versions[allocated.revision_id]
-        assert context.journal.progress[allocated.revision_id] == before[allocated.revision_id]
-        assert context.journal.progress[unknown.revision_id] == before[unknown.revision_id]
-        assert context.journal.progress[publishing.revision_id] == before[publishing.revision_id]
-        assert context.journal.progress[started.revision_id] == before[started.revision_id]
-        assert context.journal.progress[fresh.revision_id]["stage"] == "ACKNOWLEDGED"
+        assert context.journal.current(allocated.revision_id) == before[allocated.revision_id]
+        assert context.journal.current(unknown.revision_id) == before[unknown.revision_id]
+        assert context.journal.current(publishing.revision_id) == before[publishing.revision_id]
+        assert context.journal.current(started.revision_id) == before[started.revision_id]
+        assert context.journal.current(fresh.revision_id)["stage"] == "ACKNOWLEDGED"
     finally:
         context.connection.close()
 
@@ -172,11 +172,11 @@ def test_unrelated_global_corruption_denies_all_prefix_transitions(tmp_path, mon
     _envelope(context.service, 0)
     with sqlite3.connect(context.service.path) as connection:
         connection.execute("UPDATE model_work_envelopes SET record_json='{}'")
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         report = context.pipeline.tick(cycle_id="global-integrity-denial")
         assert report.revision_states == {"ASSESSMENT_INTERRUPTED": 3}
-        assert context.journal.progress == before
+        assert {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()} == before
         assert not context.ordinary
         assert len(context.batches) == 1
     finally:
@@ -207,15 +207,15 @@ def test_prefix_bounds_preserve_unattempted_facts_and_reprove_next_tick(tmp_path
         return result
 
     monkeypatch.setattr(context.journal, "advance", retain)
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         if signal == "quantum":
             context.pipeline.tick(cycle_id="bounded-prefix")
         else:
             with pytest.raises(OperatorDrainRequested if signal == "drain" else VetoError):
                 context.pipeline.tick(cycle_id="bounded-prefix")
-        assert context.journal.progress[context.units[0].revision_id]["stage"] == "EVIDENCE_HOLD"
-        assert all(context.journal.progress[unit.revision_id] == before[unit.revision_id] for unit in context.units[1:])
+        assert context.journal.current(context.units[0].revision_id)["stage"] == "EVIDENCE_HOLD"
+        assert all(context.journal.current(unit.revision_id) == before[unit.revision_id] for unit in context.units[1:])
         assert not context.ordinary
         assert len(context.batches) == 1
         stopped[0] = False
@@ -225,7 +225,7 @@ def test_prefix_bounds_preserve_unattempted_facts_and_reprove_next_tick(tmp_path
             connection.execute("UPDATE model_work_envelopes SET canonical_digest='changed'")
         context.pipeline.tick(cycle_id="fresh-proof-after-mutation")
         assert len(context.batches) == 2
-        assert all(context.journal.progress[unit.revision_id] == before[unit.revision_id] for unit in context.units[1:])
+        assert all(context.journal.current(unit.revision_id) == before[unit.revision_id] for unit in context.units[1:])
         assert context.ordinary.count(context.units[1].revision_id) == 0
         assert context.ordinary.count(context.units[2].revision_id) == 0
     finally:
@@ -243,9 +243,9 @@ def test_predispatch_atomic_read_overrun_makes_progress_before_next_tick(
     # unconsumed proof prefix, never a fresh acquisition effect.
     for unit in context.units:
         context.journal.advance(unit.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
-            **context.journal.progress[unit.revision_id]["facts"], "acquisition_attempt_count": 3,
+            **context.journal.current(unit.revision_id)["facts"], "acquisition_attempt_count": 3,
         })
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     candidate_versions = context.continuation._runtime.authority.candidate_versions
     batch = context.usage.retained_pre_dispatch_failure_many
 
@@ -268,16 +268,16 @@ def test_predispatch_atomic_read_overrun_makes_progress_before_next_tick(
         assert first.revision_states == {"EVIDENCE_HOLD": 1, "ASSESSMENT_INTERRUPTED": 2}
         assert now[0] == 301
         assert len(context.batches) == 1
-        assert context.journal.progress[context.units[0].revision_id]["facts"]["acquisition_attempt_count"] == 3
-        assert all(context.journal.progress[unit.revision_id] == before[unit.revision_id] for unit in context.units[1:])
+        assert context.journal.current(context.units[0].revision_id)["facts"]["acquisition_attempt_count"] == 3
+        assert all(context.journal.current(unit.revision_id) == before[unit.revision_id] for unit in context.units[1:])
         assert not context.ordinary
         for tick in range(2):
-            settled_before = sum(progress["stage"] == "EVIDENCE_HOLD" for progress in context.journal.progress.values())
+            settled_before = sum(progress["stage"] == "EVIDENCE_HOLD" for progress in (value for _, value in context.journal.iter_summaries()))
             if settled_before == 3:
                 break
             context.pipeline.tick(cycle_id=f"atomic-read-overrun-{tick}")
-            assert sum(progress["stage"] == "EVIDENCE_HOLD" for progress in context.journal.progress.values()) > settled_before
-        assert all(progress["stage"] == "EVIDENCE_HOLD" for progress in context.journal.progress.values())
+            assert sum(progress["stage"] == "EVIDENCE_HOLD" for progress in (value for _, value in context.journal.iter_summaries())) > settled_before
+        assert all(progress["stage"] == "EVIDENCE_HOLD" for progress in (value for _, value in context.journal.iter_summaries()))
         assert len(context.batches) == 3
         assert not context.ordinary
     finally:
@@ -316,11 +316,11 @@ def test_predispatch_read_overrun_still_obeys_stop_and_drain_before_commit(
         context.continuation._runtime.authority.candidate_versions = slow_candidate
     else:
         monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", slow_proof)
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         with pytest.raises(VetoError if signal == "stop" else OperatorDrainRequested):
             context.pipeline.tick(cycle_id="stopped-atomic-read-overrun")
-        assert context.journal.progress == before
+        assert {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()} == before
         assert len(context.batches) == (0 if boundary == "candidate-read" else 1)
         assert not context.ordinary
     finally:
@@ -348,15 +348,15 @@ def test_predispatch_expired_proof_never_retires_unproved_targets(
         return result
 
     monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", slow_proof)
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         context.pipeline.tick(cycle_id="expired-unproved-target")
-        assert context.journal.progress[context.units[0].revision_id] == before[context.units[0].revision_id]
-        assert context.journal.progress[context.units[2].revision_id] == before[context.units[2].revision_id]
+        assert context.journal.current(context.units[0].revision_id) == before[context.units[0].revision_id]
+        assert context.journal.current(context.units[2].revision_id) == before[context.units[2].revision_id]
         if unproved == "global-corruption":
-            assert context.journal.progress == before
+            assert {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()} == before
         else:
-            assert context.journal.progress[context.units[1].revision_id]["stage"] == "EVIDENCE_HOLD"
+            assert context.journal.current(context.units[1].revision_id)["stage"] == "EVIDENCE_HOLD"
         assert len(context.batches) == 1
         assert not context.ordinary
     finally:
@@ -367,7 +367,7 @@ def test_predispatch_expired_proof_never_retires_unproved_targets(
 def test_recovery_candidate_partition_never_grants_forged_recovery(tmp_path, monkeypatch, partition):
     context = _prefix(tmp_path, monkeypatch, count=3)
     context.continuation._runtime.authority.candidate_versions = lambda _: partition
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         if type(partition) is tuple and len(partition) == 3:
             assert context.continuation.recover_pre_dispatch(
@@ -381,7 +381,7 @@ def test_recovery_candidate_partition_never_grants_forged_recovery(tmp_path, mon
                     tuple(context.versions), failure_many=lambda _: pytest.fail("no proved Candidate"),
                     before_revision=lambda: True,
                 )
-        assert context.journal.progress == before
+        assert {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()} == before
     finally:
         context.connection.close()
 
@@ -392,10 +392,10 @@ def test_none_recovery_partition_is_one_checked_turn_without_changes_and_reprove
     context = _prefix(tmp_path, monkeypatch, count=85, admission=True)
     original = context.usage.retained_pre_dispatch_failure_many
     monkeypatch.setattr(context.usage, "retained_pre_dispatch_failure_many", lambda candidates: (None,) * len(candidates))
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         context.pipeline.tick(cycle_id="checked-no-proof")
-        assert context.journal.progress == before
+        assert {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()} == before
         assert len(context.batches) == len(context.version_batches) == 1
         assert not context.ordinary
         # A later tick sees fresh model history; no denial survives this call.
@@ -403,7 +403,7 @@ def test_none_recovery_partition_is_one_checked_turn_without_changes_and_reprove
         context.pipeline.tick(cycle_id="fresh-proof-after-denial")
         assert len(context.batches) == len(context.version_batches) == 2
         assert not context.ordinary
-        assert all(value["facts"]["reason"] == "ASSESSOR_PRE_DISPATCH_HOLD" for value in context.journal.progress.values())
+        assert all(value["facts"]["reason"] == "ASSESSOR_PRE_DISPATCH_HOLD" for value in (value for _, value in context.journal.iter_summaries()))
     finally:
         context.connection.close()
 
@@ -413,16 +413,110 @@ def test_none_recovery_partition_keeps_contract_revalidation_ordinary(tmp_path, 
     unit = context.units[0]
     context.continuation._assessment_contract_version = "newsroom.native-evidence-assessor.v20"
     context.journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
-        **context.journal.progress[unit.revision_id]["facts"],
+        **context.journal.current(unit.revision_id)["facts"],
         "assessment_contract_version": "newsroom.native-evidence-assessor.v19",
         "editorial_hold_reason_codes": ["EVIDENCE_VALIDATION_HOLD"],
     })
-    before = dict(context.journal.progress)
+    before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         assert context.continuation.recover_pre_dispatch(
             (unit.revision_id,), failure_many=lambda candidates: (None,) * len(candidates),
             before_revision=lambda: True,
         ) == ()
-        assert context.journal.progress == before
+        assert {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()} == before
+    finally:
+        context.connection.close()
+
+
+@pytest.mark.parametrize("proved", (False, True))
+def test_recovery_expands_only_proved_writes_and_preserves_full_pairs(tmp_path, monkeypatch, proved):
+    from newsroom.tests.test_native_progress import _retrieval_facts
+
+    context = _prefix(tmp_path, monkeypatch, count=2)
+    current = context.journal.current
+    originals = {}
+    for unit in context.units:
+        value = current(unit.revision_id)
+        facts = {**_retrieval_facts(), **value["facts"], "unknown_inline": {"future": [True]}}
+        context.journal.advance(unit.revision_id, stage=value["stage"], facts=facts)
+        originals[unit.revision_id] = current(unit.revision_id)
+    reads = []
+
+    def selected(revision_id):
+        reads.append(revision_id)
+        return current(revision_id)
+
+    monkeypatch.setattr(context.journal, "current", selected)
+    try:
+        checked = context.continuation.recover_pre_dispatch(
+            tuple(originals), before_revision=lambda: True,
+            failure_many=(context.usage.retained_pre_dispatch_failure_many if proved
+                          else lambda versions: (None,) * len(versions)),
+        )
+        assert checked == tuple(originals)
+        assert reads == (list(originals) if proved else [])
+        for revision_id, original in originals.items():
+            retained = current(revision_id)
+            if proved:
+                assert retained["stage"] == "EVIDENCE_HOLD"
+                for key in ("retrieval_binding", "retrieval_rights_inventory", "unknown_inline"):
+                    assert retained["facts"][key] == original["facts"][key]
+            else:
+                assert retained == original
+    finally:
+        context.connection.close()
+
+
+def test_recovery_denies_pair_only_state_change_after_thin_snapshot(tmp_path, monkeypatch):
+    from newsroom.tests.test_native_progress import _retrieval_facts
+
+    context = _prefix(tmp_path, monkeypatch, count=1)
+    unit = context.units[0]
+    current = context.journal.current
+    original = current(unit.revision_id)
+    context.journal.advance(unit.revision_id, stage=original["stage"], facts={
+        **_retrieval_facts(), **original["facts"],
+    })
+    calls = []
+
+    def failure_many(versions):
+        failures = context.usage.retained_pre_dispatch_failure_many(versions)
+        fresh = current(unit.revision_id)
+        fresh["facts"]["retrieval_binding"]["request"]["nodes"].append("new retained node")
+        context.journal.advance(unit.revision_id, stage=fresh["stage"], facts=fresh["facts"])
+        return failures
+
+    monkeypatch.setattr(context.journal, "current", lambda revision: (calls.append(revision), current(revision))[1])
+    try:
+        checked = context.continuation.recover_pre_dispatch(
+            (unit.revision_id,), before_revision=lambda: True, failure_many=failure_many,
+        )
+        assert checked == ()
+        assert calls == []
+        assert current(unit.revision_id)["stage"] == "ASSESSMENT_INTERRUPTED"
+        assert current(unit.revision_id)["facts"]["retrieval_binding"]["request"]["nodes"][-1] == "new retained node"
+    finally:
+        context.connection.close()
+
+
+@pytest.mark.parametrize("field", ("candidate_id", "candidate_version_id"))
+def test_proved_recovery_write_denies_rebound_selected_candidate(tmp_path, monkeypatch, field):
+    from newsroom.control_plane.native_publication import NativePublicationError
+
+    context = _prefix(tmp_path, monkeypatch, count=1)
+    unit = context.units[0]
+    version = context.versions[unit.revision_id]
+    failure = context.usage.retained_pre_dispatch_failure_many((version,))[0]
+    retained = context.journal.current(unit.revision_id)
+    context.journal.advance(unit.revision_id, stage=retained["stage"], facts={
+        **retained["facts"], field: "rebound-candidate",
+    })
+    before = context.journal.current(unit.revision_id)
+    try:
+        with pytest.raises(NativePublicationError, match="Candidate differs"):
+            context.continuation._retain_pre_dispatch_hold(
+                unit.revision_id, version.version_id, version, failure,
+            )
+        assert context.journal.current(unit.revision_id) == before
     finally:
         context.connection.close()

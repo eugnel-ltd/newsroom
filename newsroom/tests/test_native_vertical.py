@@ -439,7 +439,7 @@ def test_native_vertical_reaches_private_ack_and_reopens_without_provider_repeat
         report = _tick_without_shared_history_rescans(
             pipeline, cycle_id="native-vertical-1", monkeypatch=monkeypatch,
         )
-        assert report.revision_states == {"ACKNOWLEDGED": 2}, pipeline._journal.progress
+        assert report.revision_states == {"ACKNOWLEDGED": 2}, {revision: pipeline._journal.current(revision) for revision, _ in pipeline._journal.iter_summaries()}
         assert pipeline._collision._journal == arguments["private_path"]
         assert pipeline._runtime.ingress.receipt_count == 2
 
@@ -448,7 +448,7 @@ def test_native_vertical_reaches_private_ack_and_reopens_without_provider_repeat
             pipeline._runtime.authority.candidates.load_version(
                 progress["facts"]["candidate_version_id"]
             )
-            for progress in pipeline._journal.progress.values()
+            for progress in (value for _, value in pipeline._journal.iter_summaries())
             if "candidate_version_id" in progress["facts"]
         }
         first_candidates = {
@@ -462,13 +462,13 @@ def test_native_vertical_reaches_private_ack_and_reopens_without_provider_repeat
         report = _tick_without_shared_history_rescans(
             successor, cycle_id="native-vertical-successor", monkeypatch=monkeypatch,
         )
-        assert report.revision_states == {"ACKNOWLEDGED": 4}, successor._journal.progress
+        assert report.revision_states == {"ACKNOWLEDGED": 4}, {revision: successor._journal.current(revision) for revision, _ in successor._journal.iter_summaries()}
         successor_versions = {
             progress["facts"]["candidate_version_id"]:
             successor._runtime.authority.candidates.load_version(
                 progress["facts"]["candidate_version_id"]
             )
-            for progress in successor._journal.progress.values()
+            for progress in (value for _, value in successor._journal.iter_summaries())
             if "candidate_version_id" in progress["facts"]
         }
         successor_candidates = {

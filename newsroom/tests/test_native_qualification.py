@@ -392,7 +392,7 @@ def test_retained_same_state_association_is_a_terminal_nonpublication(
         retained = record_qualification(connection, IDENTITY)
         assert validate_qualification(connection, IDENTITY) == retained
         assert {
-            value["stage"] for value in journal.progress.values()
+            value["stage"] for value in (value for _, value in journal.iter_summaries())
         } == {"SAME_STATE_ASSOCIATED"}
     finally:
         connection.close()
@@ -766,7 +766,7 @@ def test_qualification_accepts_shared_progress_and_rejects_broken_reference(tmp_
         (STATE,),
     ).fetchone()[0])
     assert "retrieval_facts_ref" in latest
-    assert NativeRevisionJournal(connection).progress[unit.revision_id]["facts"] == facts
+    assert NativeRevisionJournal(connection).current(unit.revision_id)["facts"] == facts
     retained = record_qualification(connection, IDENTITY)
     assert validate_qualification(connection, IDENTITY) == retained
     append_ledger(connection, STATE, {
@@ -914,5 +914,27 @@ def test_compact_reference_preserves_full_source_hold_validation(tmp_path, missi
         else:
             retained = record_qualification(connection, IDENTITY)
             assert validate_qualification(connection, IDENTITY) == retained
+    finally:
+        connection.close()
+
+
+
+def test_terminal_inventory_checks_all_inline_holds_without_cold_pair_reads(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_qualification import _revision_inventory
+    from newsroom.tests.test_native_progress import _retrieval_facts
+
+    connection = connect(str(tmp_path / "terminal-inline.sqlite3"))
+    journal = NativeRevisionJournal(connection)
+    unit = _native("terminal-inline")
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
+        **_retrieval_facts(), "reason": "NO_QUALIFYING_NEW_INFORMATION",
+        "unknown_inline": {"future": True},
+    })
+    monkeypatch.setattr(NativeRevisionJournal, "current", lambda *_: pytest.fail("qualification expanded a cold pair"))
+    try:
+        retained, states = _revision_inventory(connection, (), {"EVIDENCE_HOLD": 1})
+        assert states == {"EVIDENCE_HOLD": 1}
+        assert retained.summary(unit.revision_id)["facts"]["unknown_inline"] == {"future": True}
     finally:
         connection.close()

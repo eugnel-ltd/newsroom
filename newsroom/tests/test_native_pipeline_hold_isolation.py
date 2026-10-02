@@ -62,7 +62,7 @@ def _assert_fresh_progress(context):
         ("discovery", context.fresh.item_key),
         ("publish", context.fresh.revision_id),
     ]
-    assert NativeRevisionJournal(context.connection).progress[context.fresh.revision_id]["stage"] == "ACKNOWLEDGED"
+    assert NativeRevisionJournal(context.connection).current(context.fresh.revision_id)["stage"] == "ACKNOWLEDGED"
 
 
 def _assert_ledger_prefix(connection, before):
@@ -89,7 +89,7 @@ def test_admission_recovery_source_hold_does_not_starve_fresh_graphiti(continuat
     assert report.unclassified_revisions == 0
     _assert_fresh_progress(context)
     retained = NativeRevisionJournal(context.connection)
-    held = retained.progress[context.held.revision_id]
+    held = retained.current(context.held.revision_id)
     assert held["stage"] == "EVIDENCE_HOLD"
     assert held["facts"] == {
         **facts, "last_continuation_hold": {
@@ -102,7 +102,7 @@ def test_admission_recovery_source_hold_does_not_starve_fresh_graphiti(continuat
 
     settled = tuple(context.connection.execute("SELECT * FROM ledger ORDER BY seq"))
     context.pipeline.tick(cycle_id="unchanged-source-hold")
-    assert context.journal.progress[context.held.revision_id] == held
+    assert context.journal.current(context.held.revision_id) == held
     assert tuple(context.connection.execute("SELECT * FROM ledger ORDER BY seq")) == settled
     assert context.calls.count(("resume", context.held.revision_id)) == 2
     assert context.calls.count(("graphiti", context.fresh.item_key)) == 1
@@ -145,7 +145,7 @@ def test_retained_resume_failure_preserves_precise_history_and_advances_peer(
     expected_states = {stage: 1, "ACKNOWLEDGED": 1} if stage != "ACKNOWLEDGED" else {"ACKNOWLEDGED": 2}
     assert report.revision_states == expected_states
     _assert_fresh_progress(context)
-    held = NativeRevisionJournal(context.connection).progress[context.held.revision_id]
+    held = NativeRevisionJournal(context.connection).current(context.held.revision_id)
     if failure == "source-hold":
         assert held == {
             **original, "ordinal": original["ordinal"] + 1,
@@ -160,7 +160,7 @@ def test_retained_resume_failure_preserves_precise_history_and_advances_peer(
 
     settled = tuple(context.connection.execute("SELECT * FROM ledger ORDER BY seq"))
     context.pipeline.tick(cycle_id="unchanged-retained-resume-failure")
-    assert context.journal.progress[context.held.revision_id] == held
+    assert context.journal.current(context.held.revision_id) == held
     assert tuple(context.connection.execute("SELECT * FROM ledger ORDER BY seq")) == settled
     assert context.calls.count(("resume", context.held.revision_id)) == 2
     assert context.calls.count(("graphiti", context.fresh.item_key)) == 1
@@ -180,7 +180,7 @@ def test_candidate_source_hold_becomes_exact_publication_hold(continuation):
 
     assert report.revision_states == {"PUBLICATION_HOLD": 1, "ACKNOWLEDGED": 1}
     _assert_fresh_progress(context)
-    held = NativeRevisionJournal(context.connection).progress[context.held.revision_id]
+    held = NativeRevisionJournal(context.connection).current(context.held.revision_id)
     assert held["stage"] == "PUBLICATION_HOLD"
     assert held["facts"] == {
         **context.facts, "reason": "NATIVE_SOURCE_RAW_OBSERVATION_HOLD",
@@ -203,7 +203,7 @@ def test_unknown_dispatch_failure_keeps_existing_intent_marker(continuation, sta
         stage: 1, "ACKNOWLEDGED": 1,
     }
     _assert_fresh_progress(context)
-    assert NativeRevisionJournal(context.connection).progress[context.held.revision_id] == original
+    assert NativeRevisionJournal(context.connection).current(context.held.revision_id) == original
     _assert_ledger_prefix(context.connection, before)
 
 
@@ -223,8 +223,8 @@ def test_owner_stop_and_drain_escape_retained_resume_without_hold_conversion(
     with pytest.raises(signal):
         context.pipeline.tick(cycle_id="stopped-retained-resume")
 
-    assert NativeRevisionJournal(context.connection).progress[context.held.revision_id] == original
+    assert NativeRevisionJournal(context.connection).current(context.held.revision_id) == original
     assert not any(call[0] in {"graphiti", "discovery", "publish"} for call in context.calls)
     assert context.calls.count(("resume", context.held.revision_id)) == 1
     assert context.fresh.revision_id in context.journal.units
-    assert context.fresh.revision_id not in context.journal.progress
+    assert context.fresh.revision_id not in {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}

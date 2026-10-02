@@ -29,7 +29,7 @@ def test_copy_correction_retains_predecessor_and_replays_exact_intent(tmp_path, 
                  delivery_attempt_event_id="old-attempt", delivery_evidence_event_id="old-evidence")
     journal.advance(unit.revision_id, stage="ACKNOWLEDGED", facts=facts)
     original_rows = connection.execute("SELECT seq,payload_json FROM ledger").fetchall()
-    original_ordinal = journal.progress[unit.revision_id]["ordinal"]
+    original_ordinal = journal.current(unit.revision_id)["ordinal"]
     prior = NS(story_receipt=NS(aggregate_version=1), attempt_receipt=NS(aggregate_version=2))
     story = NS(candidate_version_id="candidate-version", package_admission_id=package_id,
                policy_decision_id=decision.decision_id)
@@ -51,7 +51,7 @@ def test_copy_correction_retains_predecessor_and_replays_exact_intent(tmp_path, 
         def advance(self, admitted, policy, **kwargs):
             assert admitted == package_id and policy == decision
             assert kwargs["correction_of"] is prior
-            assert journal.progress[unit.revision_id]["stage"] == "COPY_CORRECTION_PREPARED" or len(calls) >= 1
+            assert journal.current(unit.revision_id)["stage"] == "COPY_CORRECTION_PREPARED" or len(calls) >= 1
             calls.append(kwargs)
             if fault == "interrupted" and len(calls) == 1:
                 raise RuntimeError("interrupted after a versioned operation")
@@ -74,14 +74,14 @@ def test_copy_correction_retains_predecessor_and_replays_exact_intent(tmp_path, 
         if fault in {"predecessor", "changed-package"}:
             assert first.state == "ACKNOWLEDGED" and first.reason.startswith("COPY_CORRECTION_HOLD")
             assert calls == []
-            assert journal.progress[unit.revision_id]["facts"]["story_event_id"] == "old-story"
+            assert journal.current(unit.revision_id)["facts"]["story_event_id"] == "old-story"
         else:
             if fault == "interrupted":
                 assert first.state == "COPY_CORRECTION_PREPARED"
                 journal = NativeRevisionJournal(connection)
                 first = continuation().advance(revision_id=unit.revision_id, candidate_version_id="candidate-version")
             assert first.state == "ACKNOWLEDGED"
-            retained = journal.progress[unit.revision_id]["facts"]
+            retained = journal.current(unit.revision_id)["facts"]
             assert retained["copy_correction_of"]["progress_ordinal"] == original_ordinal
             assert retained["copy_correction_of"]["story_event_id"] == "old-story"
             assert retained["story_event_id"] == "new-story"

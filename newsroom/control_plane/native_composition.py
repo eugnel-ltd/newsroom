@@ -741,7 +741,7 @@ def open_native_pipeline(
                 )
 
             def advance(self, *, revision_id, candidate_version_id):
-                progress = journal.progress.get(revision_id, {})
+                progress = journal.summary(revision_id)
                 sources = ()
                 if progress.get("stage") != "ASSESSMENT_INTERRUPTED":
                     try:

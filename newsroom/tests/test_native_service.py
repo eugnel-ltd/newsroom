@@ -610,9 +610,9 @@ def test_unknown_assessment_continues_same_open_without_redispatch(tmp_path, mon
             # Fixture receipt of a later terminal disposition, not a retry or
             # permission to manufacture one in the service readiness predicate.
             journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
-                **journal.progress[unit.revision_id]["facts"], "reason": "SOURCE_LOCAL_EVIDENCE_HOLD",
+                **journal.current(unit.revision_id)["facts"], "reason": "SOURCE_LOCAL_EVIDENCE_HOLD",
             })
-        return NativePipelineReport((), {journal.progress[unit.revision_id]["stage"]: 1}, 0)
+        return NativePipelineReport((), {journal.current(unit.revision_id)["stage"]: 1}, 0)
 
     factory, opened = _pipeline(tmp_path, monkeypatch, tick)
     identity = digest_canonical({"runtime": "unknown-assessment-continuation"})
@@ -634,7 +634,7 @@ def test_unknown_assessment_continues_same_open_without_redispatch(tmp_path, mon
         assert result.pipeline.revision_states == {"EVIDENCE_HOLD": 1}
         assert order == ["pending", "continuing", "settled", "qualified", "unchanged"]
         assert opened == ["open", "close"]
-        assert journal.progress[unit.revision_id]["facts"]["acquisition_attempt_count"] == 1
+        assert journal.current(unit.revision_id)["facts"]["acquisition_attempt_count"] == 1
         assert runtime.authority.receives == 0 and runtime.publication.calls == 0
     finally:
         connection.close()
