@@ -100,7 +100,7 @@ def _use_historical_v16(monkeypatch):
 def _empty_reference_result(reason="No supported new information."):
     return {
         "package": {
-            "substantive_claim_indexes": [],
+            "select_new_information": False,
             "governed_claims": [],
             "qualification_evidence": [],
             "selection_rationale": reason,
@@ -163,6 +163,14 @@ def _v18_wire_from_v17(value):
         "governed_claims": claims,
         "qualification_evidence": qualifications,
     }}
+
+
+def _current_wire_from_v17(value):
+    wire = _v18_wire_from_v17(value)
+    wire["package"]["select_new_information"] = bool(
+        wire["package"].pop("substantive_claim_indexes")
+    )
+    return wire
 
 
 @pytest.mark.parametrize(("changes", "expected"), [
@@ -263,7 +271,7 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     invalid_geography["geography"] = ["Britain"]
     with pytest.raises(ValidationError):
         validator.validate({"package": invalid_geography})
-    assert VERSION == "newsroom.native-evidence-assessor.v20"
+    assert VERSION == "newsroom.native-evidence-assessor.v21"
     assert "ASSESSOR_CLAIM_BINDING_HOLD" in REASSESSABLE_HOLDS
     legacy = native_assessor_module._V17_SYSTEM
     assert "whitespace, newlines and country labels exactly" in legacy
@@ -283,7 +291,8 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     assert "rendered_assertion_zh_hant_hk_fragments" in SYSTEM
     assert "one contiguous source_range" in SYSTEM
     assert "ending _source_lookup_key" in SYSTEM
-    assert "no substantive_claim_indexes" in SYSTEM
+    assert "substantive_claim_indexes" not in SYSTEM
+    assert "select_new_information false" in SYSTEM
     connection.close()
 
 
@@ -1439,7 +1448,10 @@ def test_native_assessor_retains_precise_qualification_contract_hold(
 
 def _usage(tmp_path, monkeypatch):
     current = (
-        native_assessor_module.VERSION == native_assessor_module._REFERENCE_PRODUCER_VERSION
+        native_assessor_module.VERSION in {
+            native_assessor_module._V20_PRODUCER_VERSION,
+            native_assessor_module._REFERENCE_PRODUCER_VERSION,
+        }
     )
     if not current:
         # Historical fixtures retain their model, reasoning and output ceiling.
@@ -1508,7 +1520,7 @@ def test_native_assessor_input_bound_has_planning_headroom_not_an_output_limit(
     bound = native_assessment_input_bound(policy)
     assert bound['version'] == INPUT_BOUND_VERSION
     assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v3')
-    assert VERSION.endswith('.v20')
+    assert VERSION.endswith('.v21')
     assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
     assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
     assert bound['schema_digest'] == PROVIDER_SCHEMA_DIGEST
@@ -1523,7 +1535,7 @@ def test_native_assessor_input_bound_has_planning_headroom_not_an_output_limit(
         policy.max_prompt_bytes, policy.max_context_tokens - fixed,
         policy.max_total_tokens - fixed - bound['output_reserve_tokens'],
     )
-    assert bound['max_request_bytes'] == 61_650
+    assert bound['max_request_bytes'] == 61_726
     assert native_assessment_input_bound(replace(
         policy, max_prompt_bytes=56_464,
     ))['max_request_bytes'] == 56_464
@@ -2805,14 +2817,15 @@ def test_literal_csv_names_survive_full_assessment_and_governed_records(retained
             AutonomousNativeEvidenceAssessor._validated_execution(NativeAssessmentExecution(canonical_json_bytes(altered).decode(), {}),candidate,base,(source,),(acquired,))
 
 
-def test_v20_profile_preserves_v15_v16_v17_v18_v19_contracts():
+def test_v21_profile_preserves_v15_v16_v17_v18_v19_v20_contracts():
     from newsroom.control_plane.native_assessor import (
         _V15_SYSTEM, _V15_SCHEMA_DIGEST, _V15_SCHEMA_BYTES, _V16_SYSTEM,
         _V17_SYSTEM, _V17_PROVIDER_SCHEMA_DIGEST,
         _V18_SYSTEM, _V18_PROVIDER_SCHEMA,
         _V19_SYSTEM, _V19_PROVIDER_SCHEMA, _V19_PROVIDER_SCHEMA_DIGEST,
+        _V20_SYSTEM, _V20_PROVIDER_SCHEMA, _V20_PROVIDER_SCHEMA_DIGEST,
     )
-    assert VERSION == 'newsroom.native-evidence-assessor.v20'
+    assert VERSION == 'newsroom.native-evidence-assessor.v21'
     assert digest_bytes(_V15_SYSTEM.encode()) == 'sha256:5788c3e827199e12932d106ad494c80b71b2691e3f9c7e535a44c5d09811d4a6'
     assert len(_V15_SYSTEM.encode()) == 6797
     assert SCHEMA_DIGEST == _V15_SCHEMA_DIGEST
@@ -2827,11 +2840,15 @@ def test_v20_profile_preserves_v15_v16_v17_v18_v19_contracts():
     assert 'source_range' in SYSTEM
     assert 'rendered_assertion_zh_hant_hk_fragments' in SYSTEM
     assert _V17_PROVIDER_SCHEMA_DIGEST != PROVIDER_SCHEMA_DIGEST
-    assert SYSTEM == _V18_SYSTEM
-    assert PROVIDER_SCHEMA == _V18_PROVIDER_SCHEMA
-    assert SYSTEM == _V19_SYSTEM
-    assert PROVIDER_SCHEMA == _V19_PROVIDER_SCHEMA
-    assert PROVIDER_SCHEMA_DIGEST == _V19_PROVIDER_SCHEMA_DIGEST
+    assert _V20_SYSTEM == _V19_SYSTEM == _V18_SYSTEM
+    assert digest_bytes(_V20_SYSTEM.encode()) == 'sha256:9c9971f005ef0bc6450585d1e1afb440adf90576bb59f68594e464ae318c84f5'
+    assert len(_V20_SYSTEM.encode()) == 5024
+    assert _V20_PROVIDER_SCHEMA == _V19_PROVIDER_SCHEMA == _V18_PROVIDER_SCHEMA
+    assert _V20_PROVIDER_SCHEMA_DIGEST == _V19_PROVIDER_SCHEMA_DIGEST == 'sha256:ee75aaced2b407df8051fd508af1626bedefca8c9e900af65320bba7aff1c1a0'
+    assert SYSTEM != _V20_SYSTEM
+    assert PROVIDER_SCHEMA_DIGEST != _V20_PROVIDER_SCHEMA_DIGEST
+    assert 'substantive_claim_indexes' not in SYSTEM
+    assert PROVIDER_SCHEMA['properties']['package']['properties']['select_new_information'] == {'type':'boolean'}
     assert native_assessor_module.MODEL == 'grok-4.7'
     assert native_assessor_module.REASONING == 'high'
     assert native_assessor_module.COMMAND_FLAGS != CONT_PRIMARY_COMMAND_FLAGS
@@ -2839,3 +2856,47 @@ def test_v20_profile_preserves_v15_v16_v17_v18_v19_contracts():
     assert PROVIDER_SCHEMA['properties']['package']['properties'][
         'governed_claims'
     ]['items']['properties'].get('claim') is None
+
+
+def test_wire_only_v20_to_v21_transition_never_requests_historical_reassessment():
+    from newsroom.control_plane.native_assessor import assessment_revalidation_due
+    facts = {'assessment_contract_version':'newsroom.native-evidence-assessor.v20+consumer.v1',
+             'reason':'ASSESSOR_QUALIFICATION_CONTRACT_HOLD'}
+    assert assessment_revalidation_due(facts,'newsroom.native-evidence-assessor.v21+consumer.v1') is False
+    # A separate consumer-contract change keeps its existing revalidation semantics.
+    assert assessment_revalidation_due(facts,'newsroom.native-evidence-assessor.v21+consumer.v2') is True
+
+
+def test_frozen_v20_retained_result_replays_under_v21_without_redispatch(tmp_path, monkeypatch):
+    module = native_assessor_module
+    connection,_port,candidate = candidate_fixture(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    legacy_wire = _empty_reference_result()
+    legacy_wire['package'].pop('select_new_information')
+    legacy_wire['package']['substantive_claim_indexes'] = []
+    execution = NativeAssessmentExecution(canonical_json_bytes(legacy_wire).decode(), {
+        'usage_basis':'PROVIDER_REPORTED','input_tokens':1,'output_tokens':1,
+        'cached_read_tokens':0,'cached_write_tokens':0,'reasoning_tokens':0,
+        'context_tokens':1,'total_tokens':2,
+    })
+    with monkeypatch.context() as previous:
+        previous.setattr(module,'VERSION',module._V20_PRODUCER_VERSION)
+        previous.setattr(module,'SYSTEM',module._V20_SYSTEM)
+        previous.setattr(module,'PROVIDER_SCHEMA',module._V20_PROVIDER_SCHEMA)
+        previous.setattr(module,'PROVIDER_SCHEMA_DIGEST',module._V20_PROVIDER_SCHEMA_DIGEST)
+        service,usage = _usage(tmp_path,previous)
+        result = AutonomousNativeEvidenceAssessor(lambda _prompt:execution,
+            usage=usage,dispatch_fence=nullcontext)(candidate,base,(),())
+    _service,current_usage = _usage(tmp_path,monkeypatch)
+    def snapshot():
+        with sqlite3.connect(service.path) as retained:
+            return tuple(tuple(retained.execute(f'SELECT * FROM {table}').fetchall())
+                         for table in ('model_invocation_allocations','model_invocation_terminals','ledger'))
+    original = snapshot()
+    def dispatch(_prompt):
+        pytest.fail('historical result dispatched a v21 provider leaf')
+    assessor = AutonomousNativeEvidenceAssessor(dispatch,usage=current_usage,dispatch_fence=nullcontext)
+    for _ in range(2):
+        assert assessor.assess_with_boundary(candidate,base,(),(),before_dispatch=None,cached_only=True) == result
+    assert snapshot() == original
+    connection.close()

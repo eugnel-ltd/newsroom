@@ -25,7 +25,7 @@ from newsroom.control_plane.native_assessor_references import (
 from newsroom.control_plane.native_assessor_wire import materialise as materialise_v18
 from newsroom.control_plane.native_evidence import EvidenceAssessor, NativeEvidenceController, NativeEvidenceHold, rights_eligibility_digest
 from newsroom.tests.test_native_assessor import (
-    _qualification_assessor_inputs, _usage, _v18_wire_from_v17,
+    _qualification_assessor_inputs, _usage, _v18_wire_from_v17, _current_wire_from_v17,
     retained_22589_assessment,
 )
 
@@ -146,7 +146,7 @@ def _literal_reference_inputs(*, partitioned=False):
 
 def test_reference_result_materialises_then_passes_full_governed_path():
     candidate, base, source, acquired, view, wire, row, body = _literal_reference_inputs()
-    wire = _v18_wire_from_v17(wire)
+    wire = _current_wire_from_v17(wire)
     package_value, receipt = materialise_v18(
         canonical_json_bytes(wire),
         view,
@@ -215,7 +215,7 @@ _USAGE = {"usage_basis": "PROVIDER_REPORTED", "input_tokens": 1,
 
 def _run_reference_assessment(tmp_path, monkeypatch, *, malformed=False, raw_override=None, partitioned=True):
     candidate, base, source, acquired, view, wire, _row, _body = _literal_reference_inputs(partitioned=partitioned)
-    wire = _v18_wire_from_v17(wire)
+    wire = _current_wire_from_v17(wire)
     service, usage = _usage(tmp_path, monkeypatch)
     # Fixture creates the ledger after the usage schema; exercise normal startup
     # with a pre-existing ledger, as in the private runtime.

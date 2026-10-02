@@ -682,7 +682,7 @@ def test_hko_absent_current_item_rehydrates_exact_retained_cancellation(
                 build_source_view,
             )
             from newsroom.control_plane.native_assessor_wire import materialise
-            from newsroom.tests.test_native_assessor import _v18_wire_from_v17
+            from newsroom.tests.test_native_assessor import _current_wire_from_v17
 
             view = build_source_view((result.body.decode(),), ("HK-02",))
             by_text = {
@@ -763,7 +763,7 @@ def test_hko_absent_current_item_rehydrates_exact_retained_cancellation(
                 "categories": ["Weather and disasters"],
                 "explicit_exclusions": [],
             }}
-            wire = _v18_wire_from_v17(wire)
+            wire = _current_wire_from_v17(wire)
             materialised, receipt = materialise(
                 canonical_json_bytes(wire), view, "historical-weather-request",
                 provider_schema=PROVIDER_SCHEMA,
