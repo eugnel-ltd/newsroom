@@ -103,3 +103,28 @@ def test_diagnostic_storage_failure_does_not_change_service_outcome(tmp_path, mo
     result = _service(tmp_path, factory).run(once=True)
     assert result.outcome == 'COMPLETE'
     assert opened == ['open', 'close']
+
+
+@pytest.mark.parametrize('failed',[False,True])
+@pytest.mark.parametrize('generation',[None,'fixture'])
+def test_authority_projection_phase_is_completed_and_drop_safe(monkeypatch,caplog,failed,generation):
+    from newsroom.authority import _increment4_projection_store as module
+    clock=iter((1_000_000,124_000_000));cpu=iter((2_000_000,36_000_000))
+    monkeypatch.setattr(module,'perf_counter_ns',lambda:next(clock))
+    monkeypatch.setattr(module,'process_time_ns',lambda:next(cpu))
+    caplog.set_level(logging.INFO,logger='newsroom.authority.projection')
+    if failed:
+        with pytest.raises(RuntimeError,match='original failure'):
+            with module._projection_phase('CURRENT_STATE',generation_id=generation):
+                raise RuntimeError('original failure')
+    else:
+        with module._projection_phase('CURRENT_STATE',generation_id=generation):pass
+    text=caplog.text
+    assert 'elapsed_ms=123' in text and 'cpu_ms=34' in text
+    assert 'cpu_scope=PROCESS' in text and f'generation_id={generation}' in text
+    assert ('status=FAILED' if failed else 'status=COMPLETE') in text
+    monkeypatch.setattr(module._PHASE_LOG,'info',lambda *_a,**_kw:(_ for _ in ()).throw(OSError('dropped')))
+    monkeypatch.setattr(module,'perf_counter_ns',lambda:0);monkeypatch.setattr(module,'process_time_ns',lambda:0)
+    with pytest.raises(RuntimeError,match='original failure'):
+        with module._projection_phase('CURRENT_STATE',generation_id=generation):
+            raise RuntimeError('original failure')

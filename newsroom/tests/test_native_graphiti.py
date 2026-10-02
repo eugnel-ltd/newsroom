@@ -2074,3 +2074,27 @@ def test_owned_compensation_authenticates_immutable_original_input_and_existing_
         assert connection.total_changes == before
     finally:
         connection.close()
+
+
+def test_passive_admission_phases_do_not_change_completion_or_ledger(tmp_path,monkeypatch):
+    from newsroom.control_plane import native_graphiti as module
+    events=[]
+    monkeypatch.setattr(module,'emit_diagnostic',lambda event,data:events.append((event,data)))
+    processor,connection,calls=_open(tmp_path,monkeypatch,ingest=_complete)
+    try:
+        outcome,=processor.advance((_native(),),cycle_id='phase-fixture')
+        assert outcome.state=='GRAPHITI_COMPLETE'
+        assert {data['phase'] for event,data in events}=={'ADMISSION','QUEUE_AND_DECIDE','PREFLIGHT','FINALISE'}
+        assert all(event=='native_graphiti_phase' and data['cycle_id']=='phase-fixture'
+            and data['status']=='COMPLETE' and type(data['elapsed_ms']) is int
+            and type(data['cpu_ms']) is int and data['cpu_scope']=='PROCESS' for event,data in events)
+        assert not connection.execute("SELECT 1 FROM ledger WHERE kind='native_graphiti_phase'").fetchone()
+    finally:connection.close()
+
+
+def test_native_phase_drop_preserves_original_failure(monkeypatch):
+    from newsroom.control_plane import native_graphiti as module
+    monkeypatch.setattr(module,'emit_diagnostic',lambda *_a,**_kw:(_ for _ in ()).throw(OSError('dropped')))
+    with pytest.raises(RuntimeError,match='original phase failure'):
+        with module._native_phase('FINALISE',cycle_id='fixture',cohort_count=1):
+            raise RuntimeError('original phase failure')

@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import sqlite3
+import logging
+from time import perf_counter_ns, process_time_ns
 
 from newsroom.authority.persistence import AuthorityPersistenceError
 from newsroom.entities.types import (
@@ -27,6 +29,8 @@ from newsroom.projection.neo4j.models import StructuralBatch
 from newsroom.relations.editorial_models import (
     CanonicalEntityRelationEndpoint,
 )
+
+
 from newsroom.relations.editorial_types import (
     EditorialRelationAssertionId,
     EditorialRelationStaleDecision,
@@ -35,6 +39,36 @@ from newsroom.relations.editorial_types import (
 from ._editorial_relation_store import _EditorialRelationAuthorityStore
 from ._projection_store import _ProjectionAuthorityStore
 
+
+_PHASE_LOG = logging.getLogger("newsroom.authority.projection")
+
+
+@contextmanager
+def _projection_phase(phase: str, *, generation_id: str | None = None):
+    """Optional inclusive wall/process CPU timing; nested spans are not additive."""
+    started = None
+    try:
+        started = (perf_counter_ns(), process_time_ns())
+    except Exception:
+        pass
+    status, failure = "FAILED", "NONE"
+    try:
+        yield
+        status = "COMPLETE"
+    except BaseException as exc:
+        failure = type(exc).__name__
+        raise
+    finally:
+        if started is not None:
+            try:
+                _PHASE_LOG.info(
+                    "projection_phase phase=%s generation_id=%s status=%s elapsed_ms=%d cpu_ms=%d cpu_scope=PROCESS failure_class=%s",
+                    phase, generation_id[:128] if generation_id is not None else None, status,
+                    (perf_counter_ns() - started[0]) // 1_000_000,
+                    (process_time_ns() - started[1]) // 1_000_000, failure,
+                )
+            except Exception:
+                pass
 
 @dataclass(frozen=True, slots=True)
 class _Increment4CurrentBuildInputs:
@@ -279,7 +313,9 @@ class _Increment4ProjectionAuthorityStore(
             nested = conn.in_transaction
             conn.execute("SAVEPOINT increment4_current_build" if nested else "BEGIN")
             try:
-                yield (conn, *self._increment4_admitted_states())
+                with _projection_phase("CURRENT_STATE"):
+                    states = self._increment4_admitted_states()
+                yield (conn, *states)
             finally:
                 if nested:
                     conn.execute("ROLLBACK TO increment4_current_build")
@@ -294,18 +330,19 @@ class _Increment4ProjectionAuthorityStore(
         family: ProjectionFamilyDefinition,
     ) -> _Increment4CurrentBuildInputs:
         with self._increment4_projection_read() as (conn, entities, relations, watermark):
-            provenance, snapshot_digest = _stream_admitted_provenance(
-                entities=entities,
-                relations=relations,
-                events=(
-                    self._event_from_row(row)
-                    for row in conn.execute(
-                        "SELECT * FROM ledger_events WHERE ledger_seq<=? ORDER BY ledger_seq",
-                        (watermark,),
-                    )
-                ),
-                through_ledger_seq=watermark,
-            )
+            with _projection_phase("HEADER_COMMITMENT", generation_id=str(generation_id)):
+                provenance, snapshot_digest = _stream_admitted_provenance(
+                    entities=entities,
+                    relations=relations,
+                    events=(
+                        self._event_from_row(row)
+                        for row in conn.execute(
+                            "SELECT * FROM ledger_events WHERE ledger_seq<=? ORDER BY ledger_seq",
+                            (watermark,),
+                        )
+                    ),
+                    through_ledger_seq=watermark,
+                )
             assert snapshot_digest is not None
             batches = build_increment4_admitted_batches(
                 provenance, generation_id=generation_id, family=family,
