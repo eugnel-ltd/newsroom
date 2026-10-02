@@ -154,10 +154,17 @@ def _scan_business(
     logical_storage: bool = False,
     retired_chains: bool = False,
 ) -> dict[str, object]:
-    """Hash actual rows and collect references together, bounded by one row."""
+    """Hash rows and collect references, bounded by one row.
+
+    Physical hashes compare unchanged retained rows within one transaction, not
+    across rowid-changing rebuilds or storage versions. Logical comparisons keep
+    canonical primary-key ordering across migrations.
+    """
     digest = hashlib.sha256()
     rows = byte_count = 0
     pending: list[tuple[str]] = []
+    rowid_tables = {row[1] for row in source.execute("PRAGMA main.table_list")
+                    if row[2] == "table" and not row[4]} if not logical_storage else set()
     for table in _tables(source):
         # Migration identity is verified separately when comparing encodings;
         # ordinary retention keeps its unchanged raw-row hash contract.
@@ -167,10 +174,21 @@ def _scan_business(
             continue
         if exclude_projection_details and table == "projection_delivery_attempts":
             continue
+        try:
+            _LOG.info("AUDIT_RETENTION_TABLE table=%s logical=%s", table, logical_storage)
+        except Exception:
+            pass
         digest.update(table.encode() + b"\0")
-        columns = source.execute(f"PRAGMA main.table_info({_q(table)})").fetchall()
+        columns = source.execute(f"PRAGMA main.table_xinfo({_q(table)})").fetchall()
         primary = [c[1] for c in sorted(columns, key=lambda c: c[5]) if c[5]]
         order = ",".join(map(_q, primary)) if primary else "rowid"
+        if table in rowid_tables:
+            names = {column[1].casefold() for column in columns}
+            # A UUID secondary-index walk fetches large rows in random page
+            # order. Sequential rowids are stable throughout this transaction.
+            alias = next((name for name in ("rowid", "_rowid_", "oid") if name not in names), None)
+            if alias is not None:
+                order = _q(alias)
         condition = "1"
         if retired_chains:
             from .projection_retirement import retained_condition
