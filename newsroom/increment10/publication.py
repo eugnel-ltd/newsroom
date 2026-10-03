@@ -891,6 +891,13 @@ def _render(
         )
         common["renderer_version"] = "newsroom.context-preserving-surface.v1"
     if narrative:
+        # The retained, digest-bound review certifies the complete headline;
+        # writer links may correctly point only to its expanded body sentence.
+        if not any(item[1] == "HEADLINE" for item in article_links):
+            title_support = next(item for item in story.writer_review["sentence_support"]
+                                 if item["sentence_index"] == 0)
+            article_links += tuple((identity, "HEADLINE", headline, "MATERIAL")
+                                   for identity in title_support["claim_ids"])
         common["renderer_version"] = ("newsroom.source-grounded-brief.v1" if story.story_format == "BRIEF"
                                       else "newsroom.source-grounded-report.v1")
     feed_links = tuple(item for item in article_links if item[1] == "HEADLINE")

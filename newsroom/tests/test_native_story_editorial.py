@@ -33,7 +33,7 @@ def _fixture(tmp_path):
     return system, candidate_connection, candidate_port, evidence, registries, retained, reference
 
 
-def _writer(calls, *, supported=True):
+def _writer(calls, *, supported=True, headline_body_link=False):
     def write(package, **identities):
         assert identities["candidate_id"] == package.candidate_id
         headline, substantive = package.governed_claims
@@ -42,6 +42,8 @@ def _writer(calls, *, supported=True):
                 {"governed_claim_id": headline.claim_id, "rendered_assertion": "限期更改獲官方確認"},
                 {"governed_claim_id": headline.claim_id, "rendered_assertion": "官方確認限期已經更改"},
                 {"governed_claim_id": substantive.claim_id, "rendered_assertion": "相關限期安排亦已更新"}]}
+        if headline_body_link:
+            draft["evidence_links"][0]["rendered_assertion"] = "官方確認限期已經更改"
         def generate(request):
             calls.append("draft")
             return draft
