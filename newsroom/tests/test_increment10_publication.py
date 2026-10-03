@@ -412,7 +412,7 @@ def test_auto_publish_atomically_records_bundle_decision_and_two_operations(
     assert reopened_publication.read(
         receipt, story_receipt=story_receipt, candidate_port=port, proof=proof()
     ) == transaction
-    with pytest.raises(PublicationError, match="transaction admission differs"):
+    with pytest.raises(PublicationError, match="publication replay outcome differs"):
         reopened_publication.decide(
             replace(
                 request,
@@ -436,7 +436,7 @@ def test_auto_publish_atomically_records_bundle_decision_and_two_operations(
     connection.close()
 
 
-def test_hold_commits_only_decision_and_audit(tmp_path: Path) -> None:
+def test_hold_commits_only_decision_and_audit(tmp_path: Path, monkeypatch) -> None:
     context = _context(tmp_path)
     connection, port, ingress, system, registries, evidence, editorial, story_receipt, _ = context
     publication = _publication(system, evidence, editorial, registries)
@@ -468,6 +468,23 @@ def test_hold_commits_only_decision_and_audit(tmp_path: Path) -> None:
         item for item in system.events.after(0, limit=1000, proof=proof())
         if item.event_type == STORY_EVENT
     ) == before_story_events
+    def unexpected_effect(*args, **kwargs):
+        pytest.fail("changed-outcome replay must not admit a surface or execute a command")
+
+    monkeypatch.setattr(publication, "_admit_surface", unexpected_effect)
+    monkeypatch.setattr(type(system.commands), "execute", unexpected_effect)
+    monkeypatch.setattr(editorial, "_story_writer", unexpected_effect)
+    with pytest.raises(PublicationError, match="publication replay outcome differs"):
+        publication.decide(
+            PublicationRequest(
+                receipt.publication_id, 0, "publication-hold", "AUTO_PUBLISH",
+                ("AUTHORISATION_POLICY_MISSING",), "2026-09-08T12:03:00Z",
+            ),
+            story_receipt=story_receipt, candidate_port=port, proof=proof(),
+        )
+    assert publication.read(
+        receipt, story_receipt=story_receipt, candidate_port=port, proof=proof()
+    ) == transaction
     connection.rollback()
     system.close()
     ingress.close()

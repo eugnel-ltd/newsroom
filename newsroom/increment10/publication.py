@@ -30,7 +30,7 @@ from newsroom.authority.canonical import (
 from newsroom.authority.types import TrustScope
 from newsroom.increment6.candidates import StoryCandidateReadPort
 
-from .editorial import NativeEditorial, StoryVersion, StoryVersionReceipt
+from .editorial import DecisionReference, NativeEditorial, StoryVersion, StoryVersionReceipt
 from .evidence import GovernedEvidencePackages
 
 PUBLICATION_SCHEMA = "newsroom.increment10.publication-transaction.v1"
@@ -447,6 +447,7 @@ class OfflinePublication:
         transaction_admission_definition_digest: str,
         command_definition_digest: str,
         source_licence_policy: tuple[tuple[str, str, str], ...] = (),
+        retained_policy_pairs: tuple[tuple[str, str], ...] = (),
     ) -> None:
         if not all(
             type(value) is expected
@@ -488,6 +489,15 @@ class OfflinePublication:
         self._domain = authority_domain
         self._controller = controller_principal_id
         self._authorisation_policy = authorisation_policy_digest
+        if type(retained_policy_pairs) is not tuple or any(
+            type(pair) is not tuple or len(pair) != 2 for pair in retained_policy_pairs
+        ):
+            raise PublicationError("retained publication policies differ")
+        for pair in retained_policy_pairs:
+            _digests(*pair)
+        self._reader_policy_pairs = (
+            (editorial._policy_bundle_digest, authorisation_policy_digest), *retained_policy_pairs,
+        )
         self._target = target_id
         self._target_policy = target_policy_digest
         self._surface_policy = surface_hydration_policy_digest
@@ -506,7 +516,27 @@ class OfflinePublication:
     ) -> tuple[PublicationReceipt, PublicationTransaction]:
         if type(request) is not PublicationRequest:
             raise PublicationError("exact PublicationRequest is required")
-        story, sources = self._context(story_receipt, candidate_port, proof)
+        story, sources, policy_bundle = self._context(story_receipt, candidate_port, proof)
+        admission_request = ObjectAdmissionRequest(
+            TRANSACTION_ADMISSION_TYPE,
+            f"publication:{request.publication_id}:{request.expected_aggregate_version + 1}",
+        )
+        committed_admission = self._objects.committed_admission(admission_request, proof=proof)
+        retained = None
+        if committed_admission is not None:
+            material = self._objects.hydrate(
+                HydrationRequest(committed_admission.admission.admission_id, TRANSACTION_PURPOSE), proof=proof,
+            )
+            self._access(material.decision, self._transaction_policy, TRANSACTION_CLASS, TRANSACTION_USE)
+            retained = _transaction_from_value(_document(material.data))
+            if (policy_bundle, retained.decision.authorisation_policy_digest) not in self._reader_policy_pairs:
+                raise PublicationError("unknown retained article policy pair")
+            if retained.decision.outcome != request.outcome or (
+                retained.bundle is not None
+            ) != (request.outcome == "AUTO_PUBLISH"):
+                raise PublicationError("publication replay outcome differs")
+        elif policy_bundle != self._editorial._policy_bundle_digest:
+            raise PublicationError("current editorial policy required for publication")
         correction = "NATIVE_COPY_CORRECTION" in request.reason_codes
         if correction and (request.expected_aggregate_version < 1 or story.aggregate_version < 2):
             raise PublicationError("copy correction requires a prior Story and publication")
@@ -514,22 +544,23 @@ class OfflinePublication:
         admissions: tuple[ObjectAdmissionId, ...] = ()
         if request.outcome == "AUTO_PUBLISH":
             surfaces = _render(story, sources, self._source_licence_policy, correction=correction)
-            admissions = tuple(
-                self._admit_surface(surface, proof=proof) for surface in surfaces
-            )
+            if retained is None:
+                admissions = tuple(self._admit_surface(surface, proof=proof) for surface in surfaces)
+            else:
+                admissions = tuple(item[1] for item in retained.bundle.surface_payloads)
+                for surface, admission_id in zip(surfaces, admissions, strict=True):
+                    material = self._objects.hydrate(HydrationRequest(admission_id, SURFACE_PURPOSE), proof=proof)
+                    self._access(material.decision, self._surface_policy, SURFACE_CLASS, SURFACE_USE)
+                    if material.data != surface.canonical_bytes():
+                        raise PublicationError("surface payload replay differs")
         transaction = self._transaction(
-            request, story_receipt, story, surfaces, admissions
+            request, story_receipt, story, surfaces, admissions, retained=retained
         )
         raw = transaction.canonical_bytes()
-        admitted = self._objects.admit(
-            ObjectAdmissionRequest(
-                TRANSACTION_ADMISSION_TYPE,
-                f"publication:{request.publication_id}:"
-                f"{request.expected_aggregate_version + 1}",
-            ),
-            raw,
-            proof=proof,
-        ).admission
+        if committed_admission is not None:
+            admitted = committed_admission.admission
+        else:
+            admitted = self._objects.admit(admission_request, raw, proof=proof).admission
         if (
             admitted.definition_digest != self._transaction_definition
             or admitted.object_class != TRANSACTION_CLASS
@@ -594,7 +625,9 @@ class OfflinePublication:
             != receipt.operation_ids
         ):
             raise PublicationError("publication receipt records differ")
-        story, sources = self._context(story_receipt, candidate_port, proof)
+        story, sources, policy_bundle = self._context(story_receipt, candidate_port, proof)
+        if (policy_bundle, transaction.decision.authorisation_policy_digest) not in self._reader_policy_pairs:
+            raise PublicationError("unknown retained article policy pair")
         request = PublicationRequest(
             receipt.publication_id,
             receipt.aggregate_version - 1,
@@ -624,7 +657,7 @@ class OfflinePublication:
                 if material.data != surface.canonical_bytes():
                     raise PublicationError("surface payload replay differs")
         rebuilt = self._transaction(
-            request, story_receipt, story, surfaces, admissions
+            request, story_receipt, story, surfaces, admissions, retained=transaction
         )
         if rebuilt.canonical_bytes() != hydrated.data:
             raise PublicationError("publication transaction replay differs")
@@ -639,7 +672,11 @@ class OfflinePublication:
         )
         if retained.package.digest != story.retained_package_digest:
             raise PublicationError("Story Version Evidence Package differs")
-        return story, retained.source_inventory
+        policy = self._editorial._read_policy_decision(
+            DecisionReference(story.policy_decision_event_id, story.policy_decision_admission_id),
+            retained=retained, proof=proof,
+        )
+        return story, retained.source_inventory, policy.policy_bundle_digest
 
     def _admit_surface(
         self, surface: SurfacePayload, *, proof: AuthenticationProof
@@ -660,7 +697,12 @@ class OfflinePublication:
             raise PublicationError("surface payload admission differs")
         return admitted.admission_id
 
-    def _transaction(self, request, receipt, story, surfaces, admissions):
+    def _transaction(self, request, receipt, story, surfaces, admissions, *, retained=None):
+        authorisation = self._authorisation_policy
+        if retained is not None:
+            authorisation = retained.decision.authorisation_policy_digest
+            if authorisation not in {pair[1] for pair in self._reader_policy_pairs}:
+                raise PublicationError("unknown retained publication policy")
         validator_digest = digest_bytes(
             canonical_json_bytes(
                 [
@@ -716,7 +758,7 @@ class OfflinePublication:
             "story_event_id": receipt.event_id,
             "story_version_digest": story.digest,
             "bundle_id": None if bundle is None else bundle.bundle_id,
-            "authorisation_policy_digest": self._authorisation_policy,
+            "authorisation_policy_digest": authorisation,
             "target_policy_digest": self._target_policy,
             "controller_principal_id": self._controller,
             "decided_at": request.decided_at,
@@ -732,7 +774,7 @@ class OfflinePublication:
             "story_event_id": receipt.event_id,
             "story_version_digest": story.digest,
             "validator_digest": validator_digest,
-            "authorisation_policy_digest": self._authorisation_policy,
+            "authorisation_policy_digest": authorisation,
             "target_policy_digest": self._target_policy,
             "controller_principal_id": self._controller,
             "outcome": request.outcome,

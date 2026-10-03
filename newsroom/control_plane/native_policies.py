@@ -162,7 +162,7 @@ def native_policy_components(
             required_allowed_use=_OBJECTS[admission_type][1],
         ) for command, event, aggregate, admission_type, scope in _COMMANDS
     }
-    editorial_policy = digest_canonical({
+    editorial_policy_value = {
         "version": VERSION,
         "decision_schema": e.DECISION_SCHEMA, "story_schema": e.STORY_VERSION_SCHEMA,
         "evidence_policies": {
@@ -176,7 +176,8 @@ def native_policy_components(
         "decision_definition": commands[e.DECISION_COMMAND].digest,
         "story_definition": commands[e.STORY_COMMAND].digest,
         "publication_rights_from_proposal": False,
-    })
+    }
+    editorial_policy = digest_canonical(editorial_policy_value)
     # The policy is tied to the reviewed source terms. It is
     # publication metadata, never an editorial claim or permission exception.
     from .govuk_rights import ATTRIBUTION, LICENCE_URL, POLICY_DIGEST as GOVUK_RIGHTS_DIGEST
@@ -193,6 +194,17 @@ def native_policy_components(
         "target_policy": target_policy, "path": str(target_path.resolve()),
         "adapter": "private-serving-projection-v1",
     })
+    retained_policy_pairs = ()
+    if evidence_policy.NAMED_ENTITY_POLICY_VERSION == "newsroom.named-entity.v16":
+        prior = {**editorial_policy_value, "evidence_policies": {
+            **editorial_policy_value["evidence_policies"],
+            "NAMED_ENTITY_POLICY_VERSION": "newsroom.named-entity.v15",
+        }}
+        prior_editorial = digest_canonical(prior)
+        retained_policy_pairs = ((prior_editorial, digest_canonical({
+            "version": VERSION, "owner_scope": "issue-151-private-autonomous",
+            "editorial_policy": prior_editorial, "target_policy": target_policy,
+        })),)
     def hd(kind): return hydration_by_type[kind].contract_digest
     def ad(kind): return definitions[kind].digest
     publication = NativePublicationBindings(
@@ -221,6 +233,7 @@ def native_policy_components(
         serving_attempt_command_definition_digest=commands[s.ATTEMPT_COMMAND].digest,
         serving_evidence_command_definition_digest=commands[s.EVIDENCE_COMMAND].digest,
         source_licence_policy=source_licence_policy,
+        retained_policy_pairs=retained_policy_pairs,
     )
     scopes = frozenset({
         "authority.objects.read", "authority.events.read",
