@@ -903,3 +903,55 @@ def test_exact_composition_caller_lazily_loads_selected_sources_after_accounted_
         candidate_connection.close()
         pipeline_connection.close()
         connection.close()
+
+
+@pytest.mark.parametrize('case', ('older', 'older-after-regressed-story', 'current', 'newer', 'backdated-latest',
+    'unknown-bound', 'unknown-latest', 'same-time-conflict', 'other-warning', 'other-issuer', 'wrong-endpoint', 'missing-latest'))
+def test_hko_publisher_fence_uses_canonical_latest_not_latest_story(case):
+    from types import SimpleNamespace
+    from newsroom.authority import UtcTimestamp
+    from newsroom.authority.canonical import canonical_json_bytes
+    from newsroom.checks import deterministic_uuid4
+    from newsroom.control_plane import native_composition as module
+    from newsroom.control_plane.native_source_intake import VERSION as INTAKE_VERSION
+    from newsroom.graphiti_adapter.identity import content_digest
+    from newsroom.increment10.editorial import EditorialHold
+    from newsroom.increment9.proving import SOURCE_URLS
+    from newsroom.sources import SourceItemId, SourceTime
+    from newsroom.tests.authority_helpers import proof
+
+    definition_version = '00000000-0000-4000-8000-000000003102'
+    key = 'WRAIN' if case == 'other-warning' else 'WTS'
+    selected = '2026-10-03T00:35:00Z' if case == 'older' else '2026-10-03T01:00:00Z' if case == 'older-after-regressed-story' else '2026-10-03T01:50:00Z'
+    latest_time = '2026-10-03T02:10:00Z' if case == 'newer' else '2026-10-03T00:35:00Z' if case == 'backdated-latest' else '2026-10-03T01:50:00Z'
+    if case in ('newer', 'backdated-latest'): selected = latest_time
+    def raw(at, action):
+        return canonical_json_bytes({key: dict(code=key, name='雷暴警告', actionCode=action,
+            issueTime='2026-10-02T07:55:00Z', updateTime=at)}).decode()
+    selected_raw = raw(selected, 'EXTEND' if case in ('older','older-after-regressed-story','same-time-conflict') else 'CANCEL')
+    source_id = 'UK-10' if case == 'other-issuer' else 'HK-02'
+    package = SimpleNamespace(source_ids=(source_id,), passages=(selected_raw + '\n\nSource-bound facts.',))
+    current = SimpleNamespace(source_id=source_id, currency_family='CURRENT_VERSION',
+        version_reference='unparseable' if case == 'unknown-bound' else UtcTimestamp.parse(selected).to_text())
+    item_id = deterministic_uuid4(SourceItemId, namespace=f'{INTAKE_VERSION}:item', semantic_value=[definition_version,'HK-02',key])
+    latest = SimpleNamespace(request=SimpleNamespace(item_id=item_id, definition_version_id=definition_version,
+        source_updated_time=SourceTime.unknown() if case == 'unknown-latest' else SourceTime.exact(UtcTimestamp.parse(latest_time)),
+        permitted_state_digest=content_digest(headline='雷暴警告',body=raw(latest_time,'CANCEL'),canonical_url=SOURCE_URLS['HK-02']),
+        prior_revision_id='prior'))
+    previous = SimpleNamespace(request=SimpleNamespace(item_id=item_id,definition_version_id=definition_version,
+        source_updated_time=SourceTime.exact(UtcTimestamp.parse('2026-10-03T01:50:00Z' if case == 'backdated-latest' else '2026-10-03T00:35:00Z'))))
+    calls=[]
+    def latest_revision(selected_id, **kwargs):
+        calls.append(('latest',selected_id)); assert selected_id == item_id
+        return None if case == 'missing-latest' else latest
+    def revision(selected_id, **kwargs):
+        calls.append(('prior',selected_id));assert selected_id=='prior';return previous
+    sources=SimpleNamespace(latest_revision=latest_revision,revision=revision)
+    arguments=dict(sources=sources,definition_version_id=definition_version,locator='https://other.test/api' if case=='wrong-endpoint' else SOURCE_URLS['HK-02'],proof=proof())
+    if case in ('older','older-after-regressed-story','backdated-latest','unknown-bound','unknown-latest','same-time-conflict','wrong-endpoint','missing-latest'):
+        with pytest.raises(EditorialHold,match='NATIVE_STORY_SOURCE_(SUPERSEDED|ORDER_UNKNOWN)'):
+            module._require_hko_current_source(package,current,**arguments)
+    else:
+        module._require_hko_current_source(package,current,**arguments)
+    if case=='other-issuer': assert calls==[]
+    assert len(calls)<=2
