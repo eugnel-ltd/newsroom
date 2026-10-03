@@ -57,6 +57,54 @@ def test_complete_pdf_retains_every_page_text_and_exact_raw_inventory():
     assert sum(page['glyphs'] for page in document.page_inventory) == 82
 
 
+@pytest.mark.parametrize('appearance', [b'', b'/DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 3 0 R >> >>'])
+def test_explicit_empty_form_shell_preserves_all_page_text(appearance):
+    from newsroom.control_plane.govuk_pdf import _extract
+    raw = pdf_bytes('First page: 12 applicants may apply.', 'Second page: fees are £45.',
+                    catalog=b'/AcroForm << /Fields [] ' + appearance + b' >>')
+    extracted = _extract(raw)
+    assert len(extracted['pages']) == 2
+    assert '12 applicants may apply.' in extracted['pages'][0]['text']
+    assert 'fees are £45.' in extracted['pages'][1]['text']
+    assert sum(page['glyphs'] for page in extracted['pages']) == 62
+
+
+@pytest.mark.parametrize('form,reason', [
+    (b'/Fields [<< /FT /Tx /V (hidden field text) >>]', 'FORM_CONTENT'),
+    (b'/Fields [] /XFA (dynamic form)', 'ACTIVE_CONTENT'),
+    (b'/Fields [] /NeedAppearances true', 'FORM_CONTENT'),
+    (b'/Fields [] /NeedAppearances false', 'FORM_CONTENT'),
+    (b'/Fields [] /SigFlags 0', 'FORM_CONTENT'),
+    (b'/Fields (not an array)', 'FORM_CONTENT'),
+    (b'/DA (/Helv 0 Tf)', 'FORM_CONTENT'),
+    (b'/Fields [] /DA << >>', 'FORM_CONTENT'),
+    (b'/Fields [] /DR (not resources)', 'FORM_CONTENT'),
+    (b'/Fields [] /DR << /JS (active resource) >>', 'ACTIVE_CONTENT'),
+])
+def test_empty_form_exception_never_omits_hidden_or_active_content(form, reason):
+    from newsroom.control_plane.govuk_pdf import _extract, GovUkPdfHold
+    raw = pdf_bytes('Visible page text.', catalog=b'/AcroForm << ' + form + b' >>')
+    with pytest.raises(GovUkPdfHold, match='SOURCE_PDF_' + reason + '_HOLD'):
+        _extract(raw)
+
+
+@pytest.mark.parametrize('image_only,reason', [(False, 'UNSUPPORTED_TEXT_GRAPHIC'), (True, 'SCANNED_CONTENT')])
+def test_empty_form_does_not_waive_figure_or_scanned_coverage(image_only, reason):
+    import io
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import ArrayObject, DictionaryObject, NameObject
+    from newsroom.control_plane.govuk_pdf import _extract, GovUkPdfHold
+    raw = tagged_image_pdf(artifact=image_only, image_only=image_only)
+    writer = PdfWriter()
+    # Preserve the publisher's existing structure, rather than inventing tags.
+    reader = PdfReader(io.BytesIO(raw))
+    writer.clone_document_from_reader(reader)
+    writer.root_object[NameObject('/AcroForm')] = DictionaryObject({NameObject('/Fields'): ArrayObject()})
+    output = io.BytesIO(); writer.write(output)
+    with pytest.raises(GovUkPdfHold, match='SOURCE_PDF_' + reason + '_HOLD'):
+        _extract(output.getvalue())
+
+
 @pytest.mark.parametrize('change,reason', [
     ('missing-font-map', 'SOURCE_PDF_FONT_MAPPING_HOLD'),
     ('type3', 'SOURCE_PDF_FONT_MAPPING_HOLD'),

@@ -41,6 +41,7 @@ POLICY_DIGEST = digest_canonical({'version': VERSION, 'parser': 'pypdf',
     'cpu_seconds': CPU_SECONDS, 'wall_seconds': TIMEOUT_SECONDS, 'memory_bytes': MEMORY_BYTES,
     'worker_output_bytes': MAX_WORKER_OUTPUT, 'memory_enforcement': 'own-child-RSS-supervision',
     'graphics': 'tagged-publisher-Artifact-only-with-complete-structured-text',
+    'forms': 'explicit-empty-Fields-with-declarative-DA-DR-only',
     'active_content': 'rejected', 'unmapped_glyphs': 'rejected', 'ocr': False})
 
 
@@ -153,9 +154,18 @@ def _extract(raw):
             if value.get('/S') == '/Figure' or '/ActualText' in value:
                 _hold('UNSUPPORTED_TEXT_GRAPHIC')
             if '/AcroForm' in value and value['/AcroForm'].get_object():
-                if '/XFA' in value['/AcroForm'].get_object():
+                form = value['/AcroForm'].get_object()
+                if '/XFA' in form:
                     _hold('ACTIVE_CONTENT')
-                _hold('FORM_CONTENT')
+                # An explicit empty publisher shell has no interactive text.
+                # DA/DR resources still pass through the recursive inspection.
+                if (not isinstance(form, DictionaryObject)
+                        or set(form) - {'/Fields', '/DA', '/DR'}
+                        or '/Fields' not in form
+                        or not isinstance(form['/Fields'], ArrayObject) or form['/Fields']
+                        or '/DA' in form and not isinstance(form['/DA'], str)
+                        or '/DR' in form and not isinstance(form['/DR'], DictionaryObject)):
+                    _hold('FORM_CONTENT')
             if '/Annots' in value and any(annotation.get_object().get('/Subtype') != '/Link'
                     for annotation in value['/Annots']):
                 _hold('ANNOTATION_TEXT')
