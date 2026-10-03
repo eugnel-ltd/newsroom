@@ -9,6 +9,7 @@ import pytest
 from newsroom.authority.canonical import digest_canonical
 from newsroom.control_plane.native_evidence import NativeEvidenceController
 from newsroom.control_plane.native_publication import NativePublicationContinuation
+from newsroom.control_plane.native_publication import NativePublicationError
 from newsroom.control_plane.veto import OperatorDrainRequested, VetoError
 from newsroom.tests.test_native_assessor import _usage
 from newsroom.tests.test_native_graphiti import _native
@@ -96,6 +97,160 @@ def test_eighty_five_recovery_candidates_use_one_authority_snapshot(tmp_path, mo
         assert context.lookups == list(expected)
         assert report.revision_states == {"EVIDENCE_HOLD": 85}
         assert not context.ordinary
+    finally:
+        context.connection.close()
+
+
+def test_allocation_denials_do_not_reconstruct_candidates_or_change_holds(tmp_path, monkeypatch):
+    context = _prefix(tmp_path, monkeypatch, count=3, admission=True)
+    try:
+        before = tuple(context.journal.iter_summaries())
+        denied = []
+
+        def mask(version_ids, **_binding):
+            denied.append(version_ids)
+            return (True,) * len(version_ids)
+
+        checked = context.continuation.recover_pre_dispatch(
+            tuple(v.revision_id for v in context.units), failure_many=lambda _: pytest.fail("denied footprint is not proof"),
+            before_revision=lambda: True, denial_many=mask,
+        )
+        assert checked == tuple(v.revision_id for v in context.units)
+        assert not context.lookups and not context.version_batches
+        assert len(denied) == 1
+        assert tuple(context.journal.iter_summaries()) == before
+    finally:
+        context.connection.close()
+
+
+def test_mixed_allocation_denials_keep_survivors_fully_checked_and_input_order(tmp_path, monkeypatch):
+    context = _prefix(tmp_path, monkeypatch, count=3, admission=True)
+    try:
+        before = tuple(context.journal.iter_summaries())
+        proofs = []
+
+        def no_proof(candidates):
+            proofs.append(candidates)
+            return (None,) * len(candidates)
+
+        checked = context.continuation.recover_pre_dispatch(
+            tuple(v.revision_id for v in context.units), failure_many=no_proof,
+            before_revision=lambda: True, denial_many=lambda ids, **_: (True, False, True),
+        )
+        assert checked == tuple(v.revision_id for v in context.units)
+        assert context.lookups == [context.versions[context.units[1].revision_id].version_id]
+        assert len(proofs) == 1 and len(proofs[0]) == 1
+        assert tuple(context.journal.iter_summaries()) == before
+    finally:
+        context.connection.close()
+
+
+def test_allocated_denial_does_not_consume_ordinary_contract_revalidation(tmp_path, monkeypatch):
+    context = _prefix(tmp_path, monkeypatch, count=1, admission=True)
+    unit = context.units[0]
+    context.continuation._assessment_contract_version = "newsroom.native-evidence-assessor.v20"
+    context.journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
+        **context.journal.current(unit.revision_id)["facts"],
+        "assessment_contract_version": "newsroom.native-evidence-assessor.v19",
+        "editorial_hold_reason_codes": ["EVIDENCE_VALIDATION_HOLD"],
+    })
+    try:
+        before = tuple(context.journal.iter_summaries())
+        assert context.continuation.recover_pre_dispatch(
+            (unit.revision_id,), failure_many=lambda _: pytest.fail("not a recovery proof"),
+            before_revision=lambda: True, denial_many=lambda ids, **_: (True,),
+        ) == ()
+        assert not context.lookups
+        assert tuple(context.journal.iter_summaries()) == before
+    finally:
+        context.connection.close()
+
+
+def test_changed_snapshot_is_not_marked_checked_by_allocation_denial(tmp_path, monkeypatch):
+    context = _prefix(tmp_path, monkeypatch, count=1, admission=True)
+    unit = context.units[0]
+
+    def changed(ids, **_):
+        context.journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
+            **context.journal.current(unit.revision_id)["facts"], "reason": "CHANGED_STATE",
+        })
+        return (True,)
+
+    try:
+        assert context.continuation.recover_pre_dispatch(
+            (unit.revision_id,), failure_many=lambda _: pytest.fail("not a proof"),
+            before_revision=lambda: True, denial_many=changed,
+        ) == ()
+        assert context.journal.summary(unit.revision_id)["facts"]["reason"] == "CHANGED_STATE"
+    finally:
+        context.connection.close()
+
+
+def test_unavailable_denial_read_retains_original_authority_and_proof_reads(tmp_path, monkeypatch):
+    context = _prefix(tmp_path, monkeypatch, count=1, admission=True)
+
+    def unavailable(ids, **_):
+        raise OSError("read unavailable")
+
+    try:
+        assert context.continuation.recover_pre_dispatch(
+            (context.units[0].revision_id,), failure_many=lambda _: (None,),
+            before_revision=lambda: True, denial_many=unavailable,
+        ) == (context.units[0].revision_id,)
+        assert len(context.lookups) == 1
+    finally:
+        context.connection.close()
+
+
+@pytest.mark.parametrize("stop", (OperatorDrainRequested, VetoError))
+def test_allocation_denial_stop_is_propagated_before_authority_reads(tmp_path, monkeypatch, stop):
+    context = _prefix(tmp_path, monkeypatch, count=1, admission=True)
+
+    def interrupted(ids, **_):
+        raise stop("fixture stop")
+
+    try:
+        before = tuple(context.journal.iter_summaries())
+        with pytest.raises(stop):
+            context.continuation.recover_pre_dispatch(
+                (context.units[0].revision_id,), failure_many=lambda _: pytest.fail("no proof"),
+                before_revision=lambda: True, denial_many=interrupted,
+            )
+        assert not context.lookups
+        assert tuple(context.journal.iter_summaries()) == before
+    finally:
+        context.connection.close()
+
+
+@pytest.mark.parametrize("partition", ((True, False), [True], ("true",)))
+def test_malformed_denial_partition_never_grants_a_checked_turn(tmp_path, monkeypatch, partition):
+    context = _prefix(tmp_path, monkeypatch, count=1, admission=True)
+    try:
+        before = tuple(context.journal.iter_summaries())
+        with pytest.raises(NativePublicationError, match="denial partition"):
+            context.continuation.recover_pre_dispatch(
+                (context.units[0].revision_id,), failure_many=lambda _: pytest.fail("no proof"),
+                before_revision=lambda: True, denial_many=lambda ids, **_: partition,
+            )
+        assert not context.lookups
+        assert tuple(context.journal.iter_summaries()) == before
+    finally:
+        context.connection.close()
+
+
+def test_denial_read_consuming_quantum_stops_before_survivor_reconstruction(tmp_path, monkeypatch):
+    context = _prefix(tmp_path, monkeypatch, count=2, admission=True)
+    callbacks = iter((True, True, True, False))
+    try:
+        before = tuple(context.journal.iter_summaries())
+        assert context.continuation.recover_pre_dispatch(
+            tuple(v.revision_id for v in context.units),
+            failure_many=lambda _: pytest.fail("expired work must not enter proof"),
+            before_revision=lambda: next(callbacks),
+            denial_many=lambda ids, **_: (True, False),
+        ) == ()
+        assert not context.lookups and not context.version_batches
+        assert tuple(context.journal.iter_summaries()) == before
     finally:
         context.connection.close()
 
