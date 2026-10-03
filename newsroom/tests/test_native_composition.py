@@ -749,6 +749,150 @@ def test_rights_refresh_registers_and_binds_a_newly_permitted_source(
             pipeline._intake.bind_definitions({"HK-02": SourceDefinitionId.new()})
 
 
+@pytest.fixture
+def composed_rights_cohort(tmp_path, monkeypatch):
+    """Existing native opener and terms fixture, with real canonical CAS readers."""
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    from newsroom.tests.test_source_rights_bundle import _terms
+    bodies = _terms(monkeypatch)
+    now, stops, stop_requested = [NOW], [], [False]
+    def no_govuk(**_):
+        raise NativeEvidenceHold("GOVUK_LICENCE_REVIEW_HOLD", "UK-GOVUK")
+    def observed_terms(**arguments):
+        return native_source_rights.observe_portfolio_terms(**arguments, fetch=lambda url: bodies[url])
+    def stop():
+        stops.append("checked")
+        if stop_requested[0]:
+            raise RuntimeError("signed owner stop")
+    monkeypatch.setattr(native_composition, "retain_current_govuk_licence", no_govuk)
+    monkeypatch.setattr(native_composition, "observe_portfolio_terms", observed_terms)
+    monkeypatch.setattr("newsroom.authority._graphiti_increment4_system._open_structural_graph_adapter",
+        lambda _: MemoryNeo4jAdapter())
+    monkeypatch.setattr(native_composition, "open_native_retrieval_neo4j_resources", lambda **_: SimpleNamespace(
+        projector=_RetrievalProjection(), fulltext=_Reader(), close=lambda: None))
+    observations, assessments = [], []
+    read, require = native_composition.read_rights_observation, native_composition.require_rights_assessment
+    def checked_observation(**arguments):
+        observations.append(arguments["source_id"])
+        return read(**arguments)
+    def checked_assessment(**arguments):
+        assessments.append(arguments["assessment"].record_id)
+        return require(**arguments)
+    monkeypatch.setattr(native_composition, "read_rights_observation", checked_observation)
+    monkeypatch.setattr(native_composition, "require_rights_assessment", checked_assessment)
+    arguments = {**_arguments(tmp_path), "clock": lambda: now[0], "stop_check": stop, "stop_fence": nullcontext}
+    with native_composition.open_native_pipeline(**arguments) as pipeline:
+        pipeline._intake._fetch = lambda _: (200, b"{}")
+        ready = pipeline._intake._poll_one("HK-02")
+        assert ready.status == "READY" and ready.units
+        observations.clear()
+        assessments.clear()
+        yield SimpleNamespace(pipeline=pipeline, retrieval=pipeline._retrieval_for(ready.units),
+            unit=ready.units[0], now=now, stops=stops, observations=observations,
+            assessments=assessments, arguments=arguments, stop_requested=stop_requested)
+
+
+def test_composed_rights_cohort_reauthenticates_real_cas_once_per_key_and_each_operation(composed_rights_cohort):
+    fixture = composed_rights_cohort
+    expected = fixture.retrieval._rights(fixture.unit)
+    fixture.observations.clear()
+    fixture.assessments.clear()
+    for operation in range(2):
+        with fixture.retrieval._rights_cohort() as rights:
+            assert rights(fixture.unit) == expected
+            for index in range(30):
+                # Different passage/body identity, exactly the same rights key.
+                passage = replace(fixture.unit, body=f"Passage {index}")
+                before = len(fixture.stops)
+                assert rights(passage) == expected
+                assert len(fixture.stops) == before + 1
+        assert fixture.observations == ["HK-02"] * (2 * (operation + 1))
+        assert len(fixture.assessments) == 2 * (operation + 1)
+    assert fixture.pipeline._runtime.ingress.receipt_count == 0
+    before = len(fixture.stops)
+    with pytest.raises(NativeRetrievalHold, match="NATIVE_RIGHTS_COHORT_EXPIRED"):
+        rights(fixture.unit)
+    assert len(fixture.stops) == before
+    assert len(fixture.observations) == 4
+
+
+@pytest.mark.parametrize("changed", ("version", "locator", "definition", "source"))
+def test_composed_rights_cohort_never_merges_distinct_source_keys(composed_rights_cohort, changed):
+    fixture = composed_rights_cohort
+    unit = fixture.unit
+    if changed == "version":
+        unit = replace(unit, authority=replace(unit.authority, definition_version_id="00000000-0000-4000-8000-000000000999"))
+    elif changed == "definition":
+        unit = replace(unit, authority=replace(unit.authority, definition_id="00000000-0000-4000-8000-000000000999"))
+    elif changed == "locator":
+        unit = replace(unit, source_definition_url=SOURCE_URLS["UK-01"])
+    else:
+        unit = replace(unit, source_id="HK-01")
+    with pytest.raises((NativeRetrievalHold, LookupError)):
+        with fixture.retrieval._rights_cohort() as rights:
+            rights(fixture.unit)
+            rights(unit)
+    # A failed operation discards its permissions too.
+    with fixture.retrieval._rights_cohort() as rights:
+        assert rights(fixture.unit)
+    assert fixture.observations.count("HK-02") == 3
+
+
+@pytest.mark.parametrize("changed", ("current_version", "locator_column", "rights", "observation_revoked",
+    "assessment_revoked", "cas_corrupt", "expired_authentication", "stop"))
+def test_composed_rights_cohort_rechecks_end_mutations_before_return_or_port(composed_rights_cohort, monkeypatch, changed):
+    from datetime import timedelta
+    from newsroom.authority import AuthenticationError, ObjectAdmissionDenied, ObjectAdmissionId, ObjectIntegrityError, UtcTimestamp
+    from newsroom.authority.auth import StaticAuthenticator
+    from newsroom.authority.persistence import AuthorityPersistenceError
+    from newsroom.sources import SourceDefinitionVersionId
+    fixture = composed_rights_cohort
+    runtime = fixture.pipeline._runtime
+    snapshot = fixture.pipeline._intake._licence.snapshot_for("HK-02")
+    returned = []
+    with pytest.raises((NativeRetrievalHold, ObjectAdmissionDenied, ObjectIntegrityError,
+        AuthenticationError, AuthorityPersistenceError, RuntimeError)):
+        with fixture.retrieval._rights_cohort() as rights:
+            assert rights(fixture.unit)
+            if changed == "current_version":
+                version = runtime.authority.sources.version_details(
+                    SourceDefinitionVersionId.parse(fixture.unit.authority.definition_version_id), proof=runtime.proof)
+                runtime.authority.sources.record_definition_version(replace(version.request,
+                    version_id=SourceDefinitionVersionId.new(), version_number=2,
+                    expected_previous_version_id=version.request.version_id,
+                    idempotency_key="fixture-new-rights-source-version"), proof=runtime.proof)
+            elif changed == "locator_column":
+                with sqlite3.connect(fixture.arguments["authority_path"]) as retained:
+                    # Corrupt this local fixture only, following the existing
+                    # canonical-versus-normalised Source integrity tests.
+                    retained.execute("DROP TRIGGER immutable_source_version_update")
+                    retained.execute("UPDATE source_definition_versions SET locator=? WHERE version_id=?",
+                        (SOURCE_URLS["UK-01"], fixture.unit.authority.definition_version_id))
+            elif changed == "rights":
+                portfolio = fixture.pipeline._intake._licence
+                portfolio.evidence["HK-02"] = replace(portfolio.evidence["HK-02"], reason="SOURCE_TERMS_CHANGED")
+            elif changed in {"observation_revoked", "assessment_revoked"}:
+                target = snapshot.observation_admission_id if changed == "observation_revoked" else snapshot.assessment_admission_id
+                runtime.authority.objects.revoke(ObjectAdmissionId.parse(target), reason_code="REVOKED",
+                    idempotency_key="fixture-cohort-" + changed, proof=runtime.proof)
+            elif changed == "cas_corrupt":
+                digest = snapshot.observation_blob_digest.removeprefix("sha256:")
+                path = fixture.arguments["object_root"] / "objects" / digest[:2] / digest
+                path.chmod(0o600)
+                path.write_bytes(b"corrupt current rights observation")
+                path.chmod(0o400)
+            elif changed == "expired_authentication":
+                authenticate = StaticAuthenticator.authenticate
+                monkeypatch.setattr(StaticAuthenticator, "authenticate",
+                    lambda self, proof, *, now: authenticate(self, proof, now=UtcTimestamp(NOW)))
+                fixture.now[0] += timedelta(minutes=6)
+            else:
+                fixture.stop_requested[0] = True
+        returned.append("cohort returned before a retrieval port")
+    assert returned == []
+    assert fixture.pipeline._runtime.ingress.receipt_count == 0
+
+
 def test_native_composition_owner_stop_precedes_store_or_provider_effects(
     tmp_path,
 ) -> None:

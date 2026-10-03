@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import replace
 
 from newsroom.authority import AggregateId, AuthenticationProof, ObjectAdmissionId
@@ -74,10 +75,12 @@ class NativeRetrievalContinuation:
         journal: NativeRevisionJournal, connection: sqlite3.Connection,
         embedder, generation_id: str, port_for: Callable,
         rights_check: Callable[[CorpusIngestUnit], str | None],
+        rights_cohort: Callable | None = None,
     ) -> None:
         self._system, self._documents, self._journal = system, documents, journal
         self._connection, self._embedder = connection, embedder
         self._generation, self._port_for, self._rights = generation_id, port_for, rights_check
+        self._rights_cohort = rights_cohort
 
     def _facts(self, revision_id: str) -> dict:
         return dict(self._journal.current(revision_id).get("facts", {}))
@@ -169,6 +172,13 @@ class NativeRetrievalContinuation:
         return binding
 
     def _current_subjects(self):
+        # Generic callers retain per-unit semantics. The production native
+        # scope owns one single-writer rights snapshot, never a persistent cache.
+        scope = nullcontext(self._rights) if self._rights_cohort is None else self._rights_cohort()
+        with scope as rights:
+            return self._subjects_with_rights(rights)
+
+    def _subjects_with_rights(self, rights):
         subjects = []
         inventory = []
         # Historical documents are re-authorised independently. A held source
@@ -187,7 +197,7 @@ class NativeRetrievalContinuation:
                     continue
                 receipt = NativeDocumentReceipt.from_projection(record["receipt"])
                 try:
-                    current_rights_digest = self._rights(unit)
+                    current_rights_digest = rights(unit)
                 except NativeRetrievalHold as exc:
                     exclusion = {
                         "state": "EXCLUDED", "reason": exc.reason,
