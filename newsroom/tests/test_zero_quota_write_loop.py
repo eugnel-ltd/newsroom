@@ -1469,7 +1469,7 @@ def test_admission_policy_identity_binds_all_admission_subpolicies() -> None:
         "newsroom.cont-originality.v3+newsroom.zh-hant-hk-shape.v14"
     )
     assert WRITE_ADMISSION_POLICY_VERSION == (
-        "newsroom.write-admission.v9+"
+        "newsroom.write-admission.v10+"
         f"{EVID_012_POLICY_VERSION}+{EVIDENCE_APPROVAL_POLICY_VERSION}+"
         f"{EVIDENCE_GATE_POLICY_VERSION}+"
         f"{GOVERNED_CLAIM_POLICY_VERSION}+{GOVERNED_INPUT_SCHEMA_VERSION}+"
@@ -1570,7 +1570,6 @@ def test_changed_admission_semantics_replay_the_exact_previous_policy(
     assert current.decision == "HOLD"
     assert current.stable_reason_codes == (
         "INVALID_GOVERNED_CLAIM_EVIDENCE",
-        "INVALID_SUBSTANTIVE_CLAIM_INVENTORY",
         "UNQUALIFIED_HEADLINE_CLAIM",
     )
 
@@ -1675,7 +1674,7 @@ def test_changed_admission_semantics_replay_the_exact_previous_policy(
     assert connection.execute(
         "SELECT policy_version,decision FROM unpublished_write_admission_decisions "
         "ORDER BY policy_version"
-    ).fetchall() == [
+    ).fetchall() == sorted([
         (_OLDEST_WRITE_ADMISSION_POLICY_VERSION, "HOLD"),
         (_EARLIER_WRITE_ADMISSION_POLICY_VERSION, "HOLD"),
         (_PREVIOUS_WRITE_ADMISSION_POLICY_VERSION, "HOLD"),
@@ -1683,7 +1682,7 @@ def test_changed_admission_semantics_replay_the_exact_previous_policy(
         (_EARLIEST_CURRENT_SHAPE_WRITE_ADMISSION_POLICY_VERSION, "HOLD"),
         (_LATEST_LEGACY_WRITE_ADMISSION_POLICY_VERSION, "HOLD"),
         (WRITE_ADMISSION_POLICY_VERSION, "HOLD"),
-    ]
+    ])
 
     relabelled = legacy.as_record()
     relabelled["policy_version"] = WRITE_ADMISSION_POLICY_VERSION
@@ -5107,3 +5106,25 @@ def test_timeout_and_cancellation_retain_context_manifest_before_cleanup(
         assert len(leaves) == 1
         assert leaves[0]["context_manifest"] is not None
         assert leaves[0]["context_manifest"]["working_directory_inventory"] == []
+
+
+def test_previous_v9_reader_preserves_exact_record_without_accepting_unknown_policy():
+    from newsroom.control_plane.admission import _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION, _decision_id
+    assert _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION == (
+        "newsroom.write-admission.v9+newsroom.evid-012.v7+"
+        "newsroom.evidence-approval.v8+newsroom.evidence-gates.v2+"
+        "newsroom.governed-claim.v7+newsroom.governed-input.v10+"
+        "newsroom.named-entity.v16+newsroom.cont-originality.v3+"
+        "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
+        "newsroom.qualification-relation.v3")
+    candidate, package = _candidate_package()
+    decision = DeterministicWriteAdmission().decide(candidate, package, decided_at="2026-09-12T12:00:00Z")
+    record = decision.as_record()
+    record["policy_version"] = _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION
+    values = {key: getattr(decision, key) for key in record if key not in {"decision_id", "decided_at"}}
+    values["policy_version"] = record["policy_version"]
+    record["decision_id"] = _decision_id(**values)
+    assert WriteAdmissionDecision.from_record(record).as_record() == record
+    bad = {**record, "policy_version": record["policy_version"].replace("v9+", "v99+")}
+    with pytest.raises(ValueError, match="unsupported write-admission"):
+        WriteAdmissionDecision.from_record(bad)

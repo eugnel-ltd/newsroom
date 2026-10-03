@@ -10,13 +10,16 @@ import time
 from typing import ContextManager
 
 from newsroom.authority import UtcTimestamp
+from newsroom.sources import SourceRevisionId
 
+from .admission import write_admission_revalidation_due
 from .native_cycle import advance_native_cycle
 from .native_assessor import assessor_admission_recovery_due, assessment_revalidation_due, same_assessment_producer
 from .native_evidence import NativeEvidenceHold
 from .native_graphiti import _native_phase
 
 from .native_progress import NativeRevisionJournal
+from .native_source_disposition import archival_nil_return_candidate, archival_nil_return_disposition
 from .veto import OperatorDrainRequested, VetoError
 
 
@@ -321,6 +324,7 @@ class NativePipeline:
                         "GOVUK_LICENCE_REVIEW_HOLD", "NATIVE_SOURCE_RIGHTS_HOLD",
                         "PUBLICATION_RIGHTS_HOLD",
                     }
+                    and not write_admission_revalidation_due(previous.get("facts", {}))
                     and not assessment_revalidation_due(
                         previous.get("facts", {}), self._assessment_contract_version,
                     )
@@ -331,6 +335,29 @@ class NativePipeline:
                     continue
                 candidate_version_id = facts.get("candidate_version_id")
                 if candidate_version_id is None:
+                    receipts = facts["graphiti_receipts"]
+                    if (previous.get("stage") == "GRAPHITI_COMPLETE"
+                            and archival_nil_return_candidate(units[0])
+                            and len(receipts) == len(units)
+                            and {receipt.get("ingest_id") for receipt in receipts} == {unit.ingest_id for unit in units}
+                            and all(receipt.get("state") == "GRAPHITI_COMPLETE" and receipt.get("receipt_digest") for receipt in receipts)):
+                        try:
+                            original = self._runtime.authority.sources.revision(
+                                SourceRevisionId.parse(revision_id), proof=self._runtime.proof,
+                            ).request
+                        except (OperatorDrainRequested, VetoError):
+                            raise
+                        except Exception:
+                            original = None  # Unproved provenance takes the ordinary path.
+                        self._drain_between_work()
+                        self._check()
+                        disposition = archival_nil_return_disposition(units[0], original, now=self._clock())
+                        if disposition is not None:
+                            self._journal.advance(revision_id, stage="EVIDENCE_HOLD", facts={
+                                **facts, "reason": "NO_QUALIFYING_NEW_INFORMATION",
+                                "source_disposition": disposition,
+                            })
+                            continue
                     stage = "DISCOVERY"
                     now = self._clock()
                     delivered = self._discovery.deliver(

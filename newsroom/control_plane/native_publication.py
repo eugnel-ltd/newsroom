@@ -26,6 +26,9 @@ from newsroom.authority.canonical import (
     validate_sha256_digest,
 )
 from newsroom.authority.types import UtcTimestamp
+from newsroom.control_plane.admission import (
+    WRITE_ADMISSION_POLICY_VERSION, write_admission_revalidation_due,
+)
 from newsroom.control_plane.native_evidence import (
     NativeEvidenceController,
     NativeEvidenceHold,
@@ -971,6 +974,7 @@ class NativePublicationContinuation:
             and package_id is not None
             and progress.get("stage") == "EVIDENCE_HOLD"
             and facts.get("reason") not in _REFRESHABLE_EVIDENCE_HOLDS
+            and not write_admission_revalidation_due(facts)
         ):
             return NativePublicationContinuationResult(
                 "EVIDENCE_HOLD", str(facts.get("reason")), None
@@ -1171,6 +1175,12 @@ class NativePublicationContinuation:
             self._journal.advance(
                 revision_id, stage="PUBLICATION_STARTED", facts=facts
             )
+        # Resume the exact retained package/decision; this is not reassessment.
+        # Stamp the consumer even on another HOLD so unchanged failures do not loop.
+        if write_admission_revalidation_due(facts):
+            facts = current_facts()
+            facts["write_admission_policy_version"] = WRITE_ADMISSION_POLICY_VERSION
+            self._journal.advance(revision_id, stage="PUBLICATION_STARTED", facts=facts)
         try:
             published = self._runtime.publication.advance(
                 ObjectAdmissionId.parse(str(package_id)),
@@ -1201,6 +1211,7 @@ class NativePublicationContinuation:
                     else "EDITORIAL_ADMISSION_HOLD"
                 ),
                 editorial_hold_reason_codes=list(reason_codes),
+                write_admission_policy_version=WRITE_ADMISSION_POLICY_VERSION,
                 acquisition_retryable=False,
             )
             self._journal.advance(

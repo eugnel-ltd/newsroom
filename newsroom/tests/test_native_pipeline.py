@@ -70,6 +70,80 @@ def test_native_pipeline_continues_multiple_revisions_and_skips_acknowledged(tmp
         connection.close()
 
 
+def test_archival_nil_return_waits_for_graphiti_then_skips_optional_model_work(tmp_path, monkeypatch):
+    from newsroom.tests.test_native_source_disposition import _fixture, NOW
+    pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
+    unit, original = _fixture()
+    dispositions[0] = (NS(source_id=unit.source_id, status="READY", reason_code="RETAINED", units=(unit,)),)
+    source_reads = []
+    def revision(identity, **kwargs):
+        source_reads.append(str(identity))
+        return NS(request=original)
+    pipeline._runtime.authority = NS(sources=NS(revision=revision))
+    pipeline._clock = lambda: NOW
+    pipeline._retrieval_for = lambda _: pytest.fail("nil disclosure reached embedding/retrieval")
+    pipeline._publish.advance = lambda **_: pytest.fail("nil disclosure reached assessor/publication")
+    graphiti = pipeline._graphiti.advance
+    pipeline._graphiti.advance = lambda selected, **_: tuple(
+        NativeGraphitiOutcome(item.ingest_id, "GRAPHITI_HOLD", None, "RETAINED_GRAPH_HOLD") for item in selected)
+    try:
+        pipeline.tick(cycle_id="graph-held")
+        assert journal.current(unit.revision_id)["stage"] == "GRAPHITI_HOLD"
+        assert source_reads == []
+        pipeline._graphiti.advance = graphiti
+        report = pipeline.tick(cycle_id="graph-complete")
+        assert report.revision_states == {"EVIDENCE_HOLD": 1}
+        facts = journal.current(unit.revision_id)["facts"]
+        assert facts["reason"] == "NO_QUALIFYING_NEW_INFORMATION"
+        assert facts["source_disposition"]["zero_call"] is True
+        assert "assessment_contract_version" not in facts and "candidate_version_id" not in facts
+        assert facts["graphiti_receipts"][0]["ingest_id"] == unit.ingest_id
+        assert facts["graphiti_receipts"][0]["state"] == "GRAPHITI_COMPLETE"
+        assert source_reads == [unit.revision_id]
+        assert not any(call[0] in {"discovery", "publish"} for call in calls)
+        pipeline._journal = NativeRevisionJournal(connection)
+        assert pipeline._journal.units[unit.revision_id] == (unit,)
+        pipeline.tick(cycle_id="reopened")
+        assert source_reads == [unit.revision_id]
+        assert pipeline._journal.current(unit.revision_id)["facts"] == facts
+    finally:
+        connection.close()
+
+
+def test_archival_disposition_never_blocks_changed_source_revision(tmp_path, monkeypatch):
+    from newsroom.tests.test_native_source_disposition import _fixture, NOW
+    from newsroom.sources import SourceRevisionId, SourceTime
+    pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
+    unit, original = _fixture()
+    originals = {unit.revision_id: original}
+    pipeline._runtime.authority = NS(sources=NS(revision=lambda identity, **__: NS(request=originals[str(identity)])))
+    pipeline._clock = lambda: NOW
+    dispositions[0] = (NS(source_id=unit.source_id, status="READY", reason_code="RETAINED", units=(unit,)),)
+    retrieval_calls = []
+    pipeline._retrieval_for = lambda selected: retrieval_calls.append(selected) or object()
+    try:
+        pipeline.tick(cycle_id="archival-original")
+        assert journal.current(unit.revision_id)["stage"] == "EVIDENCE_HOLD" and retrieval_calls == []
+        old_revision = unit.revision_id
+        revision_id = SourceRevisionId.new()
+        # The same item's new native revision/date and populated field remain eligible.
+        unit = replace(unit, authority=replace(unit.authority, revision_id=str(revision_id)),
+            body=unit.body.replace('B="Nil Return "', 'B="2 August 2019"'),
+            updated_at=NOW.to_text(), effective_pull_first_observed_at=NOW.to_text())
+        originals[unit.revision_id] = replace(original, revision_id=revision_id,
+            prior_revision_id=original.revision_id, permitted_state_digest=unit.revision_digest,
+            source_updated_time=SourceTime.exact(NOW), source_native_revision_token=NOW.to_text(), observed_at=NOW)
+        dispositions[0] = (NS(source_id=unit.source_id, status="READY", reason_code="RETAINED", units=(unit,)),)
+        report = pipeline.tick(cycle_id="material-observation")
+        assert report.revision_states == {"ACKNOWLEDGED": 1, "EVIDENCE_HOLD": 1}
+        assert journal.current(old_revision)["facts"]["source_disposition"]["zero_call"] is True
+        assert retrieval_calls == [(unit,)]
+        assert ("discovery", unit.item_key) in calls and ("publish", unit.revision_id) in calls
+        assert "source_disposition" not in journal.current(unit.revision_id)["facts"]
+    finally:
+        connection.close()
+
+
 def test_ordinary_phase_timing_keeps_pipeline_decisions_and_ledger_when_dropped(tmp_path, monkeypatch):
     from newsroom.control_plane import native_graphiti
     events = []
@@ -1772,3 +1846,31 @@ def test_selected_candidate_write_carries_full_pair_and_unknown_facts(monkeypatc
     assert pipeline.tick(cycle_id="selected-full").revision_states == {"ACKNOWLEDGED": 1}
     assert len(journal.writes) == 2
     assert journal.current("selected")["facts"]["retrieval_binding"] == facts["retrieval_binding"]
+
+
+def test_retained_inventory_hold_gets_one_current_consumer_turn(tmp_path, monkeypatch):
+    from newsroom.control_plane.admission import WRITE_ADMISSION_POLICY_VERSION
+    pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
+    unit = units[0]
+    dispositions[0] = ()
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
+        "candidate_version_id": "candidate:" + unit.item_key, "graphiti_receipts": [{}],
+        "reason": "INVALID_SUBSTANTIVE_CLAIM_INVENTORY", "package_admission_id": "retained-package",
+        "editorial_decision": {"decision_id": "retained-decision"}})
+    attempted = []
+    def advance(**request):
+        attempted.append(request)
+        facts = journal.current(unit.revision_id)["facts"]
+        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={**facts,
+            "write_admission_policy_version": WRITE_ADMISSION_POLICY_VERSION})
+    pipeline._publish = NS(advance=advance)
+    try:
+        pipeline.tick(cycle_id="current-consumer")
+        assert len(attempted) == 1
+        pipeline._journal = NativeRevisionJournal(connection)
+        pipeline.tick(cycle_id="same-consumer-reopened")
+        assert len(attempted) == 1
+        assert journal.current(unit.revision_id)["facts"]["candidate_version_id"] == "candidate:" + unit.item_key
+    finally:
+        connection.close()
