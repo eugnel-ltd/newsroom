@@ -331,3 +331,31 @@ def test_encrypted_pdf_is_not_decrypted_or_counted_complete():
     raw = output.getvalue()
     with pytest.raises(GovUkPdfHold, match='SOURCE_PDF_ENCRYPTED_HOLD'):
         parse_govuk_pdf(PARENT, parent_bytes(raw), ASSET, raw, retrieved_at=NOW)
+
+
+@pytest.mark.parametrize('failed', (False, True))
+def test_worker_input_is_exact_bounded_anonymous_file_and_always_closed(monkeypatch, failed):
+    import newsroom.control_plane.govuk_pdf as module
+    raw = pdf_bytes('Complete first page.', 'Complete second page.', padding=1_100_000)
+    output = json.dumps(module._extract(raw)).encode()
+    captured = []
+    class Child:
+        returncode = 1 if failed else 0
+        def poll(self): return self.returncode
+        def communicate(self, **values):
+            assert 'input' not in values
+            return output, b''
+    def spawn(*_args, **values):
+        source = values['stdin']
+        assert not source.closed and source.tell() == 0
+        assert source.read() == raw and isinstance(source.name, int)
+        source.seek(0)
+        captured.append(source)
+        return Child()
+    monkeypatch.setattr(module.subprocess, 'Popen', spawn)
+    if failed:
+        with pytest.raises(module.GovUkPdfHold, match='SOURCE_PDF_WORKER_OUTPUT_HOLD'):
+            module.parse_govuk_pdf(PARENT, parent_bytes(raw), ASSET, raw, retrieved_at=NOW)
+    else:
+        assert len(module.parse_govuk_pdf(PARENT, parent_bytes(raw), ASSET, raw, retrieved_at=NOW).page_inventory) == 2
+    assert len(captured) == 1 and captured[0].closed

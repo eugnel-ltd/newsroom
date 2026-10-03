@@ -15,6 +15,7 @@ import posixpath
 import resource
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import unquote, urlsplit
 
@@ -308,46 +309,50 @@ def parse_govuk_pdf(parent_url, parent_raw, asset_url, raw, *, retrieved_at):
     if type(raw) is not bytes or len(raw) != declaration.file_size or not raw.startswith(b'%PDF-') or not raw.rstrip().endswith(b'%%EOF'):
         _hold('RAW_IDENTITY')
     try:
-        process = subprocess.Popen([sys.executable, '-I', '-c',
-            'from newsroom.control_plane.govuk_pdf import _worker; _worker()'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        deadline, started = time.monotonic() + TIMEOUT_SECONDS, False
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _hold('WORKER_BOUND')
-                try:
-                    stdout, stderr = process.communicate(input=None if started else raw, timeout=min(0.05, remaining))
-                    break
-                except subprocess.TimeoutExpired:
-                    started = True
-                    if process.poll() is not None:
-                        continue
-                    # Darwin rejects address-space/data rlimits. Observe only
-                    # our own child; a live child needs numeric memory evidence.
+        # Anonymous bounded input avoids Python 3.12's timed pipe-resumption
+        # trap without a writer thread, version branch or retained raw archive.
+        with tempfile.TemporaryFile() as source:
+            source.write(raw)
+            source.seek(0)
+            process = subprocess.Popen([sys.executable, '-I', '-c',
+                'from newsroom.control_plane.govuk_pdf import _worker; _worker()'],
+                stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            deadline = time.monotonic() + TIMEOUT_SECONDS
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        _hold('WORKER_BOUND')
                     try:
-                        memory = subprocess.run(['/bin/ps', '-o', 'rss=', '-p', str(process.pid)],
-                            capture_output=True, timeout=min(1, remaining), check=True).stdout.strip()
-                    except (subprocess.SubprocessError, OSError):
+                        stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
                         if process.poll() is not None:
                             continue
-                        raise
-                    if not memory.isdigit():
-                        # Our child may exit between poll() and ps. Completion
-                        # still passes through the exact output checks below.
-                        if process.poll() is not None:
-                            continue
-                        _hold('MEMORY_BOUND')
-                    if int(memory) * 1024 > MEMORY_BYTES:
-                        _hold('MEMORY_BOUND')
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.communicate()
-        if process.returncode or len(stdout) > MAX_WORKER_OUTPUT or stderr:
-            _hold('WORKER_OUTPUT')
-        value = json.loads(stdout)
+                        # Darwin rejects address-space/data rlimits. Observe only
+                        # our own child; a live child needs numeric memory evidence.
+                        try:
+                            memory = subprocess.run(['/bin/ps', '-o', 'rss=', '-p', str(process.pid)],
+                                capture_output=True, timeout=min(1, remaining), check=True).stdout.strip()
+                        except (subprocess.SubprocessError, OSError):
+                            if process.poll() is not None:
+                                continue
+                            raise
+                        if not memory.isdigit():
+                            # Our child may exit between poll() and ps. Completion
+                            # still passes through the exact output checks below.
+                            if process.poll() is not None:
+                                continue
+                            _hold('MEMORY_BOUND')
+                        if int(memory) * 1024 > MEMORY_BYTES:
+                            _hold('MEMORY_BOUND')
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+            if process.returncode or len(stdout) > MAX_WORKER_OUTPUT or stderr:
+                _hold('WORKER_OUTPUT')
+            value = json.loads(stdout)
     except GovUkPdfHold:
         raise
     except (subprocess.SubprocessError, ValueError, OSError):
