@@ -202,6 +202,63 @@ def test_unknown_or_excessive_own_child_rss_holds_and_reaps_child(monkeypatch, r
     assert child.killed
 
 
+@pytest.mark.parametrize('observation,result,exited,reason', [
+    ('error', 'complete', True, None),
+    ('timeout', 'complete', True, None),
+    ('empty', 'complete', True, None),
+    ('unknown', 'complete', True, None),
+    ('error', 'nonzero', True, 'SOURCE_PDF_WORKER_OUTPUT_HOLD'),
+    ('error', 'stderr', True, 'SOURCE_PDF_WORKER_OUTPUT_HOLD'),
+    ('error', 'malformed', True, 'SOURCE_PDF_WORKER_BOUND_HOLD'),
+    ('error', 'missing-page', True, 'SOURCE_PDF_PAGE_COVERAGE_HOLD'),
+    ('error', 'invalid-glyphs', True, 'SOURCE_PDF_WORKER_OUTPUT_HOLD'),
+    ('excessive', 'complete', True, 'SOURCE_PDF_MEMORY_BOUND_HOLD'),
+    ('error', 'complete', False, 'SOURCE_PDF_WORKER_BOUND_HOLD'),
+])
+def test_child_exit_during_rss_observation_still_requires_complete_valid_output(
+        monkeypatch, observation, result, exited, reason):
+    import subprocess
+    from types import SimpleNamespace
+    import newsroom.control_plane.govuk_pdf as module
+    raw = pdf_bytes('Complete first page.', 'Complete second page.')
+    value = module._extract(raw)
+    if result == 'missing-page': value['pages'].pop()
+    if result == 'invalid-glyphs': value['pages'][0]['glyphs'] = 'unknown'
+    output = b'{' if result == 'malformed' else json.dumps(value).encode()
+
+    class Child:
+        pid = 123
+        returncode = None
+        calls = 0
+        killed = False
+        def poll(self): return self.returncode
+        def communicate(self, **_values):
+            self.calls += 1
+            if self.calls == 1: raise subprocess.TimeoutExpired('pdf-worker', 0.05)
+            return output, b'warning' if result == 'stderr' else b''
+        def kill(self): self.killed = True; self.returncode = -9
+
+    child = Child()
+    def observe(*args, **_values):
+        if exited: child.returncode = 1 if result == 'nonzero' else 0
+        if observation == 'error': raise subprocess.CalledProcessError(1, args[0])
+        if observation == 'timeout': raise subprocess.TimeoutExpired(args[0], 1)
+        return SimpleNamespace(stdout={'empty': b'', 'unknown': b'UNKNOWN',
+            'excessive': str(module.MEMORY_BYTES // 1024 + 1).encode()}[observation])
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *_args, **_values: child)
+    monkeypatch.setattr(module.subprocess, 'run', observe)
+    if reason:
+        with pytest.raises(module.GovUkPdfHold, match=reason):
+            module.parse_govuk_pdf(PARENT, parent_bytes(raw), ASSET, raw, retrieved_at=NOW)
+    else:
+        document = module.parse_govuk_pdf(PARENT, parent_bytes(raw), ASSET, raw, retrieved_at=NOW)
+        assert len(document.page_inventory) == 2
+        assert 'Complete first page.' in document.body_text
+        assert 'Complete second page.' in document.body_text
+    assert child.calls >= 2
+    assert child.killed is not exited
+
+
 def test_worker_wall_deadline_holds_and_reaps_only_its_child(monkeypatch):
     import newsroom.control_plane.govuk_pdf as module
     class Child:

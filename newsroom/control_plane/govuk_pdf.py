@@ -325,10 +325,21 @@ def parse_govuk_pdf(parent_url, parent_raw, asset_url, raw, *, retrieved_at):
                     if process.poll() is not None:
                         continue
                     # Darwin rejects address-space/data rlimits. Observe only
-                    # our own child; missing memory evidence is never a PASS.
-                    memory = subprocess.run(['/bin/ps', '-o', 'rss=', '-p', str(process.pid)],
-                        capture_output=True, timeout=min(1, remaining), check=True).stdout.strip()
-                    if not memory.isdigit() or int(memory) * 1024 > MEMORY_BYTES:
+                    # our own child; a live child needs numeric memory evidence.
+                    try:
+                        memory = subprocess.run(['/bin/ps', '-o', 'rss=', '-p', str(process.pid)],
+                            capture_output=True, timeout=min(1, remaining), check=True).stdout.strip()
+                    except (subprocess.SubprocessError, OSError):
+                        if process.poll() is not None:
+                            continue
+                        raise
+                    if not memory.isdigit():
+                        # Our child may exit between poll() and ps. Completion
+                        # still passes through the exact output checks below.
+                        if process.poll() is not None:
+                            continue
+                        _hold('MEMORY_BOUND')
+                    if int(memory) * 1024 > MEMORY_BYTES:
                         _hold('MEMORY_BOUND')
         finally:
             if process.poll() is None:
