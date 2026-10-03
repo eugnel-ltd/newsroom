@@ -39,6 +39,8 @@ from newsroom.control_plane.native_assessor import (
     assessment_revalidation_due,
     same_assessment_producer,
     RetainedAssessorContractFailure,
+    RetainedAssessorResult,
+    VERSION as ASSESSOR_PRODUCER_VERSION,
     RetainedAssessorPreDispatchFailure,
 )
 from newsroom.control_plane.native_progress import NativeRevisionJournal
@@ -602,6 +604,9 @@ class NativePublicationContinuation:
         assessment_pre_dispatch_failure: (
             Callable[[object], RetainedAssessorPreDispatchFailure | None] | None
         ) = None,
+        assessment_old_provider_failure: (
+            Callable[[object], RetainedAssessorResult | None] | None
+        ) = None,
         assessment_contract_version: str | None = None,
         clock=UtcTimestamp.now,
     ) -> None:
@@ -621,6 +626,7 @@ class NativePublicationContinuation:
                 assessment_pre_dispatch_failure is not None
                 and not callable(assessment_pre_dispatch_failure)
             )
+            or (assessment_old_provider_failure is not None and not callable(assessment_old_provider_failure))
             or not isinstance(sources, Mapping)
             or not all(
                 type(key) is str
@@ -640,6 +646,7 @@ class NativePublicationContinuation:
         self._sources = dict(sources)
         self._assessment_contract_failure = assessment_contract_failure
         self._assessment_pre_dispatch_failure = assessment_pre_dispatch_failure
+        self._assessment_old_provider_failure = assessment_old_provider_failure
         self._assessment_contract_version = assessment_contract_version
         self._clock = clock
 
@@ -858,7 +865,22 @@ class NativePublicationContinuation:
         ):
             return self._advance_copy_correction(revision_id, candidate_version_id, facts, progress, current_facts)
 
-        if (
+        old_provider_failure = None
+        if (progress.get("stage") == "ASSESSMENT_INTERRUPTED"
+                and self._assessment_old_provider_failure is not None
+                and same_assessment_producer(self._assessment_contract_version, ASSESSOR_PRODUCER_VERSION)):
+            try:
+                retained = self._assessment_old_provider_failure(version)
+            except (OperatorDrainRequested, VetoError):
+                raise
+            except Exception:
+                retained = None
+            if (type(retained) is RetainedAssessorResult
+                    and retained.outcome == "ASSESSOR_PROVIDER_FAILED" and retained.execution is None
+                    and same_assessment_producer(facts.get("assessment_contract_version"), retained.contract_version)
+                    and not same_assessment_producer(self._assessment_contract_version, retained.contract_version)):
+                old_provider_failure = retained
+        if old_provider_failure is not None or (
             progress.get("stage") == "EVIDENCE_HOLD"
             and assessment_revalidation_due(facts, self._assessment_contract_version)
         ):
@@ -872,6 +894,16 @@ class NativePublicationContinuation:
                 "editorial_decision_id": facts.get("editorial_decision", {}).get("decision_id"),
                 "acquisition_attempt_count": facts.get("acquisition_attempt_count", 0),
             }
+            if old_provider_failure is not None:
+                old = old_provider_failure.proof
+                facts["assessment_superseded"].update(
+                    failure_class=facts.get("failure_class"),
+                    provider_failure={
+                        "outcome": old_provider_failure.outcome, "envelope_id": old.envelope_id,
+                        "invocation_id": old.invocation_id, "allocation_digest": old.allocation_digest,
+                        "terminal_digest": old.terminal_digest, "context_manifest_digest": old.context_manifest_digest,
+                    },
+                )
             for key in (
                 "package_admission_id", "editorial_decision", "acquisition_receipt_digests",
                 "expected_story_version", "expected_publication_version",

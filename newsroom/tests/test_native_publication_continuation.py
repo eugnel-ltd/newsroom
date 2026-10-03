@@ -1284,3 +1284,71 @@ def test_inventory_consumer_reuses_retained_package_once_without_assessor(tmp_pa
             assert publication.calls == 1
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('scenario', ['eligible', 'missing', 'same-producer', 'journal-mismatch',
+    'validation-result', 'reader-error', 'unknown-current', 'stop'])
+def test_accounted_old_provider_failure_reclassifies_interrupted_through_normal_current_producer(tmp_path, monkeypatch, scenario):
+    from datetime import UTC, datetime
+    from newsroom.control_plane.native_assessor import RetainedAssessorResult
+    from newsroom.control_plane.veto import VetoError
+    unit = _native()
+    connection = connect(str(tmp_path / 'private.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage='ASSESSMENT_INTERRUPTED', facts={
+        'candidate_id': 'candidate', 'candidate_version_id': 'candidate-version',
+        'graphiti_receipts': [{}], 'intake_receipt_id': 'already-acknowledged',
+        'assessment_contract_version': ('newsroom.native-evidence-assessor.v23+consumer.v1'
+            if scenario == 'same-producer' else 'newsroom.native-evidence-assessor.v21+consumer.v1'),
+        'failure_class': 'CliTimeoutError', 'reason': 'ACQUISITION_RESULT_NOT_RETAINED',
+        'acquisition_attempt_count': 1,
+    })
+    retained = RetainedAssessorResult(
+        RetainedAssessorContractFailure('old-envelope', 'old-invocation', _DIGEST, _DIGEST, _DIGEST),
+        'newsroom.native-evidence-assessor.v20' if scenario == 'journal-mismatch' else 'newsroom.native-evidence-assessor.v21',
+        _DIGEST, 'ASSESSOR_VALIDATION_FAILED' if scenario == 'validation-result' else 'ASSESSOR_PROVIDER_FAILED',
+        datetime(2026, 9, 8, tzinfo=UTC), None,
+    )
+    before = journal.current(unit.revision_id)
+    def recover(_candidate):
+        if scenario == 'reader-error': raise OSError('read failed')
+        if scenario == 'stop': raise VetoError('owner stop')
+        return None if scenario == 'missing' else retained
+    calls = []
+    def acquire(_self, **request):
+        calls.append(request['assessment_cached_only'])
+        assert request['intake_receipt_id'] == 'already-acknowledged'
+        request['before_assessment']()
+        raise NativeEvidenceHold('NO_QUALIFYING_NEW_INFORMATION', unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController, 'acquire_and_retain', acquire)
+    continuation = NativePublicationContinuation(
+        journal=journal, runtime=SimpleNamespace(authority=_Authority(), ingress=object(),
+            publication=_Publication(), proof=proof(), policies=SimpleNamespace(publication=object())),
+        evidence_controller=object.__new__(NativeEvidenceController), sources={unit.revision_id: (_source(unit),)},
+        assessment_old_provider_failure=recover,
+        assessment_contract_version=('newsroom.native-evidence-assessor.v24+consumer.v1'
+            if scenario == 'unknown-current' else 'newsroom.native-evidence-assessor.v23+consumer.v1'),
+        clock=lambda: UtcTimestamp.parse('2026-09-08T12:00:00Z'),
+    )
+    try:
+        if scenario != 'eligible':
+            if scenario == 'stop':
+                with pytest.raises(VetoError):
+                    continuation.advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
+            else:
+                result = continuation.advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
+                assert result.state == 'ASSESSMENT_INTERRUPTED'
+            assert calls == []
+            assert journal.current(unit.revision_id) == before
+            return
+        for _ in range(2):
+            result = continuation.advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
+            assert result.reason == 'NO_QUALIFYING_NEW_INFORMATION'
+        assert calls == [False]
+        facts = journal.current(unit.revision_id)['facts']
+        assert facts['assessment_superseded']['failure_class'] == 'CliTimeoutError'
+        assert facts['assessment_superseded']['provider_failure']['invocation_id'] == 'old-invocation'
+        assert facts['assessment_contract_version'] == 'newsroom.native-evidence-assessor.v23+consumer.v1'
+    finally:
+        connection.close()
