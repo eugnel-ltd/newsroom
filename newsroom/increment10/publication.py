@@ -537,7 +537,7 @@ class OfflinePublication:
                 raise PublicationError("publication replay outcome differs")
         elif policy_bundle != self._editorial._policy_bundle_digest:
             raise PublicationError("current editorial policy required for publication")
-        correction = "NATIVE_COPY_CORRECTION" in request.reason_codes
+        correction = bool({"NATIVE_COPY_CORRECTION", "NATIVE_FACTUAL_CORRECTION"} & set(request.reason_codes))
         if correction and (request.expected_aggregate_version < 1 or story.aggregate_version < 2):
             raise PublicationError("copy correction requires a prior Story and publication")
         surfaces: tuple[SurfacePayload, ...] = ()
@@ -641,7 +641,7 @@ class OfflinePublication:
         if transaction.bundle is not None:
             surfaces = _render(
                 story, sources, self._source_licence_policy,
-                correction="NATIVE_COPY_CORRECTION" in transaction.decision.reason_codes,
+                correction=bool({"NATIVE_COPY_CORRECTION", "NATIVE_FACTUAL_CORRECTION"} & set(transaction.decision.reason_codes)),
             )
             admissions = tuple(item[1] for item in transaction.bundle.surface_payloads)
             for surface, admission_id in zip(surfaces, admissions, strict=True):

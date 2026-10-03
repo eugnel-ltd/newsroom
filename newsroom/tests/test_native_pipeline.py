@@ -70,6 +70,21 @@ def test_native_pipeline_continues_multiple_revisions_and_skips_acknowledged(tmp
         connection.close()
 
 
+def test_current_output_restoration_runs_once_after_canonical_landing_before_provider_work(tmp_path,monkeypatch):
+    pipeline,journal,connection,units,calls,dispositions = _open(tmp_path,monkeypatch)
+    def restore():
+        assert set(journal.units)=={unit.revision_id for unit in units}
+        calls.append(('restore','current'))
+    pipeline._publish.restore_current_output = restore
+    try:
+        pipeline.tick(cycle_id='current-output-restoration')
+        assert calls.count(('restore','current'))==1
+        assert calls.index(('rights','current'))<calls.index(('restore','current'))
+        assert calls.index(('restore','current'))<next(index for index,item in enumerate(calls)if item[0]=='graphiti')
+    finally:
+        connection.close()
+
+
 def test_archival_nil_return_waits_for_graphiti_then_skips_optional_model_work(tmp_path, monkeypatch):
     from newsroom.tests.test_native_source_disposition import _fixture, NOW
     pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
