@@ -85,10 +85,11 @@ def test_current_output_restoration_runs_once_after_canonical_landing_before_pro
         connection.close()
 
 
-def test_archival_nil_return_waits_for_graphiti_then_skips_optional_model_work(tmp_path, monkeypatch):
-    from newsroom.tests.test_native_source_disposition import _fixture, NOW
+@pytest.mark.parametrize("ministerial", (False, True))
+def test_archival_nil_return_waits_for_graphiti_then_skips_optional_model_work(tmp_path, monkeypatch, ministerial):
+    from newsroom.tests.test_native_source_disposition import _fixture, _ministerial_hospitality_fixture, NOW
     pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
-    unit, original = _fixture()
+    unit, original = _ministerial_hospitality_fixture() if ministerial else _fixture()
     dispositions[0] = (NS(source_id=unit.source_id, status="READY", reason_code="RETAINED", units=(unit,)),)
     source_reads = []
     def revision(identity, **kwargs):
