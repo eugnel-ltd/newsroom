@@ -832,6 +832,9 @@ def open_native_pipeline(
             source_binding_recovery_due = staticmethod(lambda facts, decide=NativePublicationContinuation.source_binding_recovery_due:
                 decide(facts, ASSESSMENT_CONTRACT_VERSION))
 
+            def restore_current_output(self):
+                return runtime.publication.restore_current_publisher_output(journal,proof=proof)
+
             def sources_for(self, revision_id):
                 return native_evidence_sources(
                     units=journal.units[revision_id], sources=runtime.authority.sources,

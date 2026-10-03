@@ -617,6 +617,7 @@ class NativeEditorial:
         decision_reference: DecisionReference,
         candidate_port: StoryCandidateReadPort,
         proof: AuthenticationProof,
+        reviewed_copy_from: StoryVersionReceipt | None = None,
     ) -> tuple[StoryVersionReceipt, StoryVersion]:
         if type(request) is not StoryVersionRequest:
             raise EditorialError("immutable Story Version request is required")
@@ -674,8 +675,22 @@ class NativeEditorial:
         else:
             if decision.policy_bundle_digest != self._policy_bundle_digest:
                 raise EditorialHold(reason="CURRENT_EDITORIAL_POLICY_REQUIRED")
+            reviewed = None
+            if reviewed_copy_from is not None:
+                reviewed = self.read_story_version(reviewed_copy_from, candidate_port=candidate_port, proof=proof)
+                if (reviewed.story_id != request.story_id or reviewed.package_admission_id != package_admission_id
+                        or reviewed.retained_package_digest != retained.package.digest
+                        or reviewed.candidate_version_id != retained.candidate_version_id
+                        or reviewed.candidate_version_digest != retained.candidate_version_digest
+                        or reviewed.governing_manifest_digest != retained.governing_manifest_digest):
+                    raise EditorialError("reviewed correction copy belongs to another package")
             story = self._build_story(
-                request, retained, decision, decision_reference
+                request, retained, decision, decision_reference,
+                **({"writer_id": reviewed.copy.writer_id,
+                    "retained_copy": reviewed.copy if reviewed.writer_review is not None else None,
+                    "writer_review": reviewed.writer_review, "story_format": reviewed.story_format,
+                    "check_reused_source_currency": True}
+                   if reviewed is not None else {}),
             )
             if story.writer_review is not None:
                 refreshed = self._evidence.read(
@@ -788,6 +803,7 @@ class NativeEditorial:
         *, writer_id: str | None = None, retained_copy: WriterCopy | None = None,
         writer_review: dict | None = None, story_format: str | None = None,
         retained_admission: WriteAdmissionDecision | None = None,
+        check_reused_source_currency: bool = False,
     ) -> StoryVersion:
         package = retained.package
         if str(request.story_id) == package.candidate_id:
@@ -869,6 +885,8 @@ class NativeEditorial:
                 require_current_sources()
             else:
                 copy = retained_copy
+                if check_reused_source_currency:
+                    require_current_sources()
             validators = validate_retained_story(copy, evaluated, writer_review, story_format)
             if not validators or any(item.result != "PASS" for item in validators):
                 raise EditorialHold(reason="NATIVE_STORY_SOURCE_SUPPORT_HOLD")

@@ -109,6 +109,10 @@ class NativePipeline:
         for revision_id, units in grouped.items():
             self._journal.land(tuple(units))
         self._drain_between_work()
+        restore = getattr(self._publish, 'restore_current_output', None)
+        if callable(restore):
+            restore()
+            self._drain_between_work()
 
         with _native_phase("CLASSIFY", cycle_id=cycle_id, cohort_count=len(self._journal.units)):
             # Fixed disjoint cohorts attempt each revision at most once per tick.

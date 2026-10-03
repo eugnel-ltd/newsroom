@@ -853,9 +853,14 @@ def test_exact_composition_caller_lazily_loads_selected_sources_after_accounted_
             cached_only=request['assessment_cached_only'])
         raise NativeEvidenceHold('NO_QUALIFYING_NEW_INFORMATION', unit.source_id)
     monkeypatch.setattr(NativeEvidenceController, 'acquire_and_retain', acquire)
+    def restore_current_publisher_output(current_journal, *, proof):
+        assert current_journal is journal
+        assert all(progress.get('stage') != 'ACKNOWLEDGED' for _,progress in journal.iter_summaries())
     publication = _publication_caller_without_bootstrap(journal=journal,
         runtime=SimpleNamespace(authority=SimpleNamespace(candidate_version=lambda _: candidate,
-            sources=object(), objects=object()), ingress=object(), publication=object(), policies=object(), proof=object()),
+            sources=object(), objects=object()), ingress=object(),
+            publication=SimpleNamespace(restore_current_publisher_output=restore_current_publisher_output),
+            policies=object(), proof=object()),
         evidence=object.__new__(NativeEvidenceController), assessment_usage=usage,
         licence=object(), proof=object(), native_evidence_sources=sources,
         ASSESSMENT_CONTRACT_VERSION='newsroom.native-evidence-assessor.v23+consumer.v1',
