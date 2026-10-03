@@ -122,14 +122,14 @@ _PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS = frozenset(
     "newsroom.qualification-relation.v3"
 }
 QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v3"
+# Known historical identity; later consumer subpolicy changes must not relabel it.
 _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION = (
-    "newsroom.write-admission.v9+"
-    f"{EVID_012_POLICY_VERSION}+{EVIDENCE_APPROVAL_POLICY_VERSION}+"
-    f"{EVIDENCE_GATE_POLICY_VERSION}+"
-    f"{GOVERNED_CLAIM_POLICY_VERSION}+{GOVERNED_INPUT_SCHEMA_VERSION}+"
-    f"{NAMED_ENTITY_POLICY_VERSION}+{ORIGINALITY_POLICY_VERSION}+"
-    f"{ZH_HANT_HK_SHAPE_POLICY_VERSION}+{FACTUAL_LOCALISATION_POLICY_VERSION}+"
-    f"{QUALIFICATION_RELATION_POLICY_VERSION}"
+    "newsroom.write-admission.v9+newsroom.evid-012.v7+"
+    "newsroom.evidence-approval.v8+newsroom.evidence-gates.v2+"
+    "newsroom.governed-claim.v7+newsroom.governed-input.v10+"
+    "newsroom.named-entity.v16+newsroom.cont-originality.v3+"
+    "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
+    "newsroom.qualification-relation.v3"
 )
 WRITE_ADMISSION_POLICY_VERSION = (
     "newsroom.write-admission.v10+"

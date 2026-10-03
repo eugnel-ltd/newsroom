@@ -5110,6 +5110,13 @@ def test_timeout_and_cancellation_retain_context_manifest_before_cleanup(
 
 def test_previous_v9_reader_preserves_exact_record_without_accepting_unknown_policy():
     from newsroom.control_plane.admission import _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION, _decision_id
+    assert _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION == (
+        "newsroom.write-admission.v9+newsroom.evid-012.v7+"
+        "newsroom.evidence-approval.v8+newsroom.evidence-gates.v2+"
+        "newsroom.governed-claim.v7+newsroom.governed-input.v10+"
+        "newsroom.named-entity.v16+newsroom.cont-originality.v3+"
+        "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
+        "newsroom.qualification-relation.v3")
     candidate, package = _candidate_package()
     decision = DeterministicWriteAdmission().decide(candidate, package, decided_at="2026-09-12T12:00:00Z")
     record = decision.as_record()
