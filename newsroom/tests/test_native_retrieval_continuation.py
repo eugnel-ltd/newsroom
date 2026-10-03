@@ -520,7 +520,15 @@ def test_fulltext_query_is_checked_before_embedding(
     assert embedder.calls == []
 
 
-def test_multi_chunk_embeddings_and_context_are_reused_across_restart(tmp_path):
+@pytest.mark.parametrize("drop_diagnostics", (False, True))
+def test_multi_chunk_embeddings_and_context_are_reused_across_restart(tmp_path, monkeypatch, drop_diagnostics):
+    from newsroom.control_plane import native_graphiti
+    diagnostic_events = []
+    def diagnostic(event, value):
+        if drop_diagnostics:
+            raise OSError("diagnostic sink unavailable")
+        diagnostic_events.append((event, value))
+    monkeypatch.setattr(native_graphiti, "emit_diagnostic", diagnostic)
     base = replace(
         _native(), body="Retained native passage. " * (MAX_EPISODE_BYTES // 25 + 1)
     )
@@ -652,6 +660,15 @@ def test_multi_chunk_embeddings_and_context_are_reused_across_restart(tmp_path):
             final_continuation.retrieve(lead, proof=proof())
     finally:
         final_connection.close()
+    if not drop_diagnostics:
+        assert {value["phase"] for _, value in diagnostic_events} == {
+            "RETRIEVAL_REQUEST_RIGHTS", "RETRIEVAL_CURRENT_SUBJECTS", "RETRIEVAL_AUTHENTICATED_INVENTORY",
+            "RETRIEVAL_PORT_BUILD", "RETRIEVAL_PORT_EXECUTE", "RETRIEVAL_CONTEXT_READ",
+        }
+        assert all(value["cycle_id"] == base.revision_id and type(value["cohort_count"]) is int
+                   for _, value in diagnostic_events)
+        failures = [value for _, value in diagnostic_events if value["status"] == "FAILED"]
+        assert {value["failure_class"] for value in failures} == {"RuntimeError", "ValueError"}
 
 
 @pytest.mark.parametrize(("attempt_number", "retryable"), ((1, False), (3, True)))

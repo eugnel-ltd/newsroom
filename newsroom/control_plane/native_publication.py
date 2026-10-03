@@ -26,6 +26,9 @@ from newsroom.authority.canonical import (
     validate_sha256_digest,
 )
 from newsroom.authority.types import UtcTimestamp
+from newsroom.control_plane.admission import (
+    WRITE_ADMISSION_POLICY_VERSION, write_admission_revalidation_due,
+)
 from newsroom.control_plane.native_evidence import (
     NativeEvidenceController,
     NativeEvidenceHold,
@@ -651,6 +654,7 @@ class NativePublicationContinuation:
         self, revision_ids: tuple[str, ...], *,
         failure_many: Callable[[tuple[object, ...]], tuple],
         before_revision: Callable[[], bool],
+        denial_many: Callable[..., tuple[bool, ...]] | None = None,
     ) -> tuple[str, ...]:
         """Consume one finite proof-only snapshot before ordinary effects."""
         selected = []
@@ -672,6 +676,38 @@ class NativePublicationContinuation:
             selected.append((revision_id, progress, version_id))
         if not selected or not before_revision():
             return ()
+        checked = []
+        source_order = {revision: index for index, (revision, _, _) in enumerate(selected)}
+        if denial_many is not None:
+            try:
+                denials = denial_many(
+                    tuple(version_id for _, _, version_id in selected),
+                    expected_candidate_ids=tuple(progress.get("facts", {}).get("candidate_id") for _, progress, _ in selected),
+                )
+            except (OperatorDrainRequested, VetoError):
+                raise
+            except Exception:
+                # An unavailable denial shortcut leaves the original full read.
+                denials = (False,) * len(selected)
+            if type(denials) is not tuple or len(denials) != len(selected) or any(type(v) is not bool for v in denials):
+                raise NativePublicationError("native allocation-denial partition differs")
+            if not before_revision():
+                # A denial query is not an atomically started recovery effect.
+                # Expired work must not enter survivor reconstruction.
+                return ()
+            remaining = []
+            for (revision_id, progress, version_id), denied in zip(selected, denials, strict=True):
+                if not denied:
+                    remaining.append((revision_id, progress, version_id))
+                elif self._journal.summary(revision_id) == progress and not assessment_revalidation_due(
+                    progress.get("facts", {}), self._assessment_contract_version,
+                ):
+                    # Allocation existence can only deny pre-dispatch recovery.
+                    # Contract revalidation still belongs to ordinary advance.
+                    checked.append(revision_id)
+            selected = remaining
+            if not selected:
+                return tuple(sorted(checked, key=source_order.__getitem__))
         try:
             versions = self._runtime.authority.candidate_versions(
                 tuple(version_id for _, _, version_id in selected)
@@ -680,7 +716,7 @@ class NativePublicationContinuation:
             raise
         except Exception:
             # Global or upstream corruption grants no recovery proof.
-            return ()
+            return tuple(sorted(checked, key=source_order.__getitem__))
         if type(versions) is not tuple or len(versions) != len(selected):
             raise NativePublicationError("native Candidate version partition differs")
         retained = []
@@ -703,7 +739,7 @@ class NativePublicationContinuation:
             retained.append((revision_id, progress, version))
         selected = retained
         if not selected:
-            return ()
+            return tuple(sorted(checked, key=source_order.__getitem__))
         # An authoritative read started within the quantum may finish one
         # proved recovery atomically, even if reading the prefix overruns it.
         # The stop/drain check still applies before the proof and every write.
@@ -711,7 +747,7 @@ class NativePublicationContinuation:
         failures = failure_many(tuple(version for _, _, version in selected))
         if type(failures) is not tuple or len(failures) != len(selected):
             raise NativePublicationError("native pre-dispatch proof partition differs")
-        attempted, checked = [], []
+        attempted = []
         # The batch reader has closed its transaction before any journal write.
         # These proofs never enter ordinary advance or survive this call.
         for (revision_id, progress, version), failure in zip(selected, failures, strict=True):
@@ -745,7 +781,7 @@ class NativePublicationContinuation:
             if result is not None:
                 attempted.append(revision_id)
                 checked.append(revision_id)
-        return tuple(checked)
+        return tuple(sorted(checked, key=source_order.__getitem__))
 
     def _current_candidate_facts(self, revision_id, candidate_version_id, candidate_id) -> dict:
         facts = dict(self._journal.current(revision_id).get("facts", {}))
@@ -938,6 +974,7 @@ class NativePublicationContinuation:
             and package_id is not None
             and progress.get("stage") == "EVIDENCE_HOLD"
             and facts.get("reason") not in _REFRESHABLE_EVIDENCE_HOLDS
+            and not write_admission_revalidation_due(facts)
         ):
             return NativePublicationContinuationResult(
                 "EVIDENCE_HOLD", str(facts.get("reason")), None
@@ -1138,6 +1175,12 @@ class NativePublicationContinuation:
             self._journal.advance(
                 revision_id, stage="PUBLICATION_STARTED", facts=facts
             )
+        # Resume the exact retained package/decision; this is not reassessment.
+        # Stamp the consumer even on another HOLD so unchanged failures do not loop.
+        if write_admission_revalidation_due(facts):
+            facts = current_facts()
+            facts["write_admission_policy_version"] = WRITE_ADMISSION_POLICY_VERSION
+            self._journal.advance(revision_id, stage="PUBLICATION_STARTED", facts=facts)
         try:
             published = self._runtime.publication.advance(
                 ObjectAdmissionId.parse(str(package_id)),
@@ -1168,6 +1211,7 @@ class NativePublicationContinuation:
                     else "EDITORIAL_ADMISSION_HOLD"
                 ),
                 editorial_hold_reason_codes=list(reason_codes),
+                write_admission_policy_version=WRITE_ADMISSION_POLICY_VERSION,
                 acquisition_retryable=False,
             )
             self._journal.advance(

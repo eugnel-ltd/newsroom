@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Callable
+from newsroom.increment6.candidates import StoryCandidateVersion
 
 from newsroom.authority.canonical import (
     canonical_json_bytes,
@@ -1755,6 +1756,74 @@ class NativeAssessmentUsage:
         """Prove no assessor leaf was ever allocated for this exact Candidate."""
 
         return self.retained_pre_dispatch_failure_many((candidate,))[0]
+
+    def retained_pre_dispatch_allocation_denials(
+        self, version_ids: tuple[str, ...], *, authority_path: str,
+        expected_candidate_ids: tuple[str | None, ...] | None = None,
+    ) -> tuple[bool, ...]:
+        """Deny allocated footprints; absence never authorises recovery."""
+        if type(version_ids) is not tuple:
+            raise TypeError("native allocation denial requires a finite tuple")
+        unknown = (False,) * len(version_ids)
+        if expected_candidate_ids is not None and (
+            type(expected_candidate_ids) is not tuple or len(expected_candidate_ids) != len(version_ids)
+        ):
+            raise TypeError("native allocation denial identity partition differs")
+        requested = tuple(v for v in version_ids if type(v) is str and v)
+        if not requested:
+            return unknown
+        authority = usage = None
+        try:
+            authority = sqlite3.connect(f"file:{authority_path}?mode=ro", uri=True)
+            authority.execute("PRAGMA query_only=ON")
+            authority.execute("BEGIN")
+            identities = {}
+            for version_id, candidate_id, digest, raw in authority.execute(
+                "SELECT version_id,candidate_id,version_digest,version_bytes "
+                "FROM story_candidate_admission_receipts_v2 "
+                "WHERE version_id IN (SELECT value FROM json_each(?))", (json.dumps(requested),),
+            ):
+                version = StoryCandidateVersion.from_canonical_bytes(bytes(raw))
+                if (version.version_id, version.candidate_id, version.canonical_digest, version.canonical_bytes) != (
+                    version_id, candidate_id, digest, bytes(raw),
+                ):
+                    return unknown
+                identities[version_id] = candidate_id
+            usage = sqlite3.connect(f"file:{self._service.path}?mode=ro", uri=True)
+            usage.execute("PRAGMA query_only=ON")
+            usage.execute("BEGIN")
+            denied = set()
+            for envelope_id, cycle, workload, envelope_digest, envelope_raw, invocation_id, allocation_digest, allocation_raw in usage.execute(
+                "SELECT e.envelope_id,e.cycle_id,e.workload_class,e.canonical_digest,e.record_json,"
+                "a.invocation_id,a.canonical_digest,a.record_json FROM model_work_envelopes e "
+                "JOIN model_invocation_allocations a ON a.envelope_id=e.envelope_id "
+                "WHERE e.workload_class=? AND json_extract(e.record_json,'$.candidate_id') "
+                "IN (SELECT value FROM json_each(?))",
+                (WorkloadClass.NATIVE_EVIDENCE_ASSESSOR.value, json.dumps(tuple(identities.values()))),
+            ):
+                envelope = _envelope_from_record(json.loads(envelope_raw))
+                allocation = _allocation_from_record(json.loads(allocation_raw))
+                if (
+                    (envelope.envelope_id, envelope.cycle_id, envelope.workload_class.value, envelope.canonical_digest)
+                    != (envelope_id, cycle, workload, envelope_digest)
+                    or canonical_json_bytes(envelope.as_record()).decode() != envelope_raw
+                    or (allocation.invocation_id, allocation.canonical_digest, allocation.envelope_id, allocation.cycle_id)
+                    != (invocation_id, allocation_digest, envelope_id, cycle)
+                    or canonical_json_bytes(allocation.as_record()).decode() != allocation_raw
+                ):
+                    return unknown
+                denied.add(envelope.candidate_id)
+            return tuple(
+                type(v) is str and identities.get(v) in denied
+                and (expected_candidate_ids is None or expected_candidate_ids[index] in (None, identities[v]))
+                for index, v in enumerate(version_ids)
+            )
+        except (sqlite3.Error, TypeError, ValueError, KeyError, ModelUsageIntegrityError):
+            return unknown
+        finally:
+            for connection in (usage, authority):
+                if connection is not None:
+                    connection.close()
 
     def retained_pre_dispatch_failure_many(
         self, candidates: tuple[object, ...]
