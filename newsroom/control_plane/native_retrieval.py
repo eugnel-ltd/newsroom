@@ -86,12 +86,14 @@ class NativeRetrievalContinuation:
         self._journal.advance(revision_id, stage=stage, facts={**self._facts(revision_id), **updates})
 
     def retrieve(self, lead, *, proof: AuthenticationProof) -> RetrievalInputBinding:
+        from .native_graphiti import _native_phase
         revision_id = str(lead.request.revision_id)
         units = self._journal.units[revision_id]
         # The requested Lead itself is mandatory; only unrelated historical
         # subjects may be source-locally excluded below.
-        for unit in units:
-            self._rights(unit)
+        with _native_phase("RETRIEVAL_REQUEST_RIGHTS", cycle_id=revision_id, cohort_count=len(units)):
+            for unit in units:
+                self._rights(unit)
         headlines = {unit.headline for unit in units}
         if len(headlines) != 1:
             raise NativeRetrievalHold("NATIVE_FULLTEXT_QUERY_AMBIGUOUS")
@@ -106,12 +108,14 @@ class NativeRetrievalContinuation:
         retained = self._facts(revision_id).get("retrieval_binding")
         if retained is None:
             self._prepare(units, proof=proof)
-        subjects, rights_inventory = self._current_subjects()
+        with _native_phase("RETRIEVAL_CURRENT_SUBJECTS", cycle_id=revision_id, cohort_count=len(self._journal.units)):
+            subjects, rights_inventory = self._current_subjects()
         rights_inventory_digest = digest_canonical(rights_inventory)
         if retained is not None:
             binding = RetrievalInputBinding.from_value(retained)
             receipt = NativeRetrievalContextReceipt.from_bytes(binding.receipt_bytes)
-            context = self._documents.read_context(receipt, proof=proof)
+            with _native_phase("RETRIEVAL_CONTEXT_READ", cycle_id=revision_id, cohort_count=len(subjects)):
+                context = self._documents.read_context(receipt, proof=proof)
             if context.lead_id != str(lead.request.lead_id) or context.lead_digest != lead.canonical_digest:
                 raise ValueError("retained native context belongs to another Lead")
             if context.generation_id != self._generation:
@@ -123,16 +127,20 @@ class NativeRetrievalContinuation:
             ):
                 return binding
 
-        document_inventory = self._authenticated_inventory(
-            subjects, proof=proof,
-        )
-        port = self._port_for(
-            subjects, document_inventory, rights_inventory_digest
-        )
-        binding = port.retrieve(lead, proof=proof)
+        with _native_phase("RETRIEVAL_AUTHENTICATED_INVENTORY", cycle_id=revision_id, cohort_count=len(subjects)):
+            document_inventory = self._authenticated_inventory(
+                subjects, proof=proof,
+            )
+        with _native_phase("RETRIEVAL_PORT_BUILD", cycle_id=revision_id, cohort_count=len(subjects)):
+            port = self._port_for(
+                subjects, document_inventory, rights_inventory_digest
+            )
+        with _native_phase("RETRIEVAL_PORT_EXECUTE", cycle_id=revision_id, cohort_count=len(subjects)):
+            binding = port.retrieve(lead, proof=proof)
         request = NativeRetrievalContextRequest.from_bytes(binding.request_bytes)
         receipt = NativeRetrievalContextReceipt.from_bytes(binding.receipt_bytes)
-        context = self._documents.read_context(receipt, proof=proof)
+        with _native_phase("RETRIEVAL_CONTEXT_READ", cycle_id=revision_id, cohort_count=len(subjects)):
+            context = self._documents.read_context(receipt, proof=proof)
         permitted_events = {
             item.document_receipt.event_id for item in subjects
         }

@@ -785,6 +785,9 @@ def open_native_pipeline(
                 return self.continuation({}).recover_pre_dispatch(
                     revision_ids,
                     failure_many=assessment_usage.retained_pre_dispatch_failure_many,
+                    denial_many=lambda ids, **binding: assessment_usage.retained_pre_dispatch_allocation_denials(
+                        ids, authority_path=runtime.authority.authority_store_path, **binding,
+                    ),
                     before_revision=before_revision,
                 )
 

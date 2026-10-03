@@ -402,6 +402,24 @@ class NativePipeline:
             except VetoError:
                 raise
             except Exception as exc:
+                # Diagnostic-only failure location; no exception text, source
+                # bytes or provider output enters the bounded optional sink.
+                try:
+                    from .diagnostic_logging import emit_diagnostic
+                    point = exc.__traceback__
+                    while point is not None and point.tb_next is not None:
+                        point = point.tb_next
+                    emit_diagnostic("native_continuation_failure", {
+                        "revision_id": revision_id, "stage": stage,
+                        "failure_class": type(exc).__name__,
+                        "file": point.tb_frame.f_code.co_filename.rsplit("/", 1)[-1] if point else None,
+                        "function": point.tb_frame.f_code.co_name if point else None,
+                        "line": point.tb_lineno if point else None,
+                    })
+                except Exception:
+                    pass
+                finally:
+                    point = None
                 # Do not overwrite a more precise durable provider-dispatch or
                 # publication intent marker with a generic outer-loop failure.
                 retained = self._journal.summary(revision_id)

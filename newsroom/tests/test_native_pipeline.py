@@ -1874,3 +1874,38 @@ def test_retained_inventory_hold_gets_one_current_consumer_turn(tmp_path, monkey
         assert journal.current(unit.revision_id)["facts"]["candidate_version_id"] == "candidate:" + unit.item_key
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("sink_fails", (False, True))
+def test_unknown_continuation_failure_reports_only_site_without_changing_intent(tmp_path, monkeypatch, sink_fails):
+    pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
+    unit = units[0]
+    dispositions[0] = ()
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="PUBLICATION_STARTED", facts={
+        "candidate_version_id": "candidate:" + unit.item_key, "graphiti_receipts": [{}],
+        "publication_started_at": "2026-10-03T07:00:00Z"})
+    before = journal.current(unit.revision_id)
+    def failed(**_request):
+        raise RuntimeError("PRIVATE_SOURCE_PROVIDER_TEXT_MUST_NOT_BE_LOGGED")
+    pipeline._publish = NS(advance=failed)
+    events = []
+    def diagnostic(name, value):
+        if sink_fails:
+            raise OSError("optional sink failed")
+        if name == "native_continuation_failure": events.append(value)
+    monkeypatch.setattr("newsroom.control_plane.diagnostic_logging.emit_diagnostic", diagnostic)
+    try:
+        report = pipeline.tick(cycle_id="unknown-publication-failure")
+        assert report.revision_states == {"PUBLICATION_STARTED": 1}
+        assert journal.current(unit.revision_id) == before
+        if not sink_fails:
+            assert len(events) == 1
+            assert events[0]["failure_class"] == "RuntimeError"
+            assert events[0]["function"] == "failed" and events[0]["file"] == "test_native_pipeline.py"
+            assert events[0]["line"] > 0
+            assert "PRIVATE_SOURCE_PROVIDER_TEXT" not in repr(events)
+        else:
+            assert events == []
+    finally:
+        connection.close()
