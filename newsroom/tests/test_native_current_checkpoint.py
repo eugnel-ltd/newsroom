@@ -175,7 +175,7 @@ def test_discovery_current_head_survives_superseded_history_drop_and_next_ordina
         updated_disposition=system.discovery.record_lead_disposition(next_disposition,proof=runtime.proof)
         with pytest.raises(DiscoveryVersionConflict,match="exact current head"):
             system.discovery.decide_gate(replace(next_gate,decision_id=GateDecisionId.new(),
-                previous_decision_id=gate.request.previous_decision_id,idempotency_key='old-head-resurrection'),proof=runtime.proof)
+                previous_decision_id=gate.request.previous_decision_id or gate.request.decision_id,idempotency_key='old-head-resurrection'),proof=runtime.proof)
     with open_native_runtime(**args) as runtime:
         assert runtime.authority.discovery.current_gate(request.signal.signal_id,proof=runtime.proof)==appended
         assert runtime.authority.discovery.current_disposition(request.lead.lead_id,proof=runtime.proof)==updated_disposition
