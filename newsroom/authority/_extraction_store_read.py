@@ -8,6 +8,7 @@ from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, dig
 from newsroom.authority.persistence import AuthorityPersistenceError
 from newsroom.authority.types import EventId, UtcTimestamp
 from newsroom.extraction.models import (
+    ExtractionInputBinding,
     ExtractionOutputView,
     ExtractionRawOutput,
     ExtractionRunMetadata,
@@ -640,7 +641,11 @@ class _ExtractionReadMixin:
     def _revalidate_result_current(
         self, conn: sqlite3.Connection, result: ExtractionRunVersion
     ) -> None:
-        binding = result.request.input_binding
+        self._revalidate_input_binding_current(conn, result.request.input_binding)
+
+    def _revalidate_input_binding_current(
+        self, conn: sqlite3.Connection, binding: ExtractionInputBinding,
+    ) -> None:
         self._require_source_binding_current(conn, binding)
         now = self._clock()
         for passage in binding.passages:

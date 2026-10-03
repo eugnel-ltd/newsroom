@@ -308,11 +308,20 @@ class _Increment4ProjectionAuthorityStore(
             conn = self._connection
             nested = conn.in_transaction
             conn.execute("SAVEPOINT increment4_current_build" if nested else "BEGIN")
+            absent = object()
+            previous = getattr(self, "_increment4_run_closure", absent)
+            closure = {"connection": conn, "changes": conn.total_changes, "bindings": {}}
+            self._increment4_run_closure = closure
             try:
                 with _projection_phase("CURRENT_STATE"):
                     states = self._increment4_admitted_states()
                 yield (conn, *states)
             finally:
+                closure["bindings"].clear()
+                if previous is absent:
+                    del self._increment4_run_closure
+                else:
+                    self._increment4_run_closure = previous
                 if nested:
                     conn.execute("ROLLBACK TO increment4_current_build")
                     conn.execute("RELEASE increment4_current_build")
