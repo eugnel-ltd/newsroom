@@ -27,7 +27,7 @@ def test_v42_migrates_exact_v41_with_native_foreign_keys_and_no_expiry(tmp_path)
         pass
     assert _snapshot(path) == before
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 42
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == migrations.SCHEMA_VERSION
         assert conn.execute("SELECT count(*) FROM ledger_events WHERE retired_header_digest IS NOT NULL").fetchone()[0] == 0
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert migrations.schema_fingerprint(conn) == migrations.EXPECTED_SCHEMA_FINGERPRINT

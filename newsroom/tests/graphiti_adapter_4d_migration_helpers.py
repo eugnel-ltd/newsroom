@@ -1417,15 +1417,36 @@ def _drop_v41_command_bound_storage(connection: sqlite3.Connection) -> None:
     connection.execute("RELEASE SAVEPOINT checked_command_storage_downgrade")
 
 
+def _drop_v43_retirement_lookup(connection: sqlite3.Connection) -> None:
+    """Remove only index-only v43 in exact historical test fixtures."""
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 43:
+        return
+    from newsroom.authority.migrations import EXPECTED_SCHEMA_FINGERPRINT, schema_fingerprint
+    from newsroom.authority.projection_retirement_lookup_migrations import RETIREMENT_LOOKUP_PREDECESSOR_FINGERPRINT
+    if schema_fingerprint(connection) != EXPECTED_SCHEMA_FINGERPRINT:
+        raise sqlite3.DatabaseError("historical fixture requires exact v43 authority")
+    for name, in connection.execute("SELECT name FROM sqlite_schema WHERE type='index' AND name LIKE 'idx_retirement_%'").fetchall():
+        connection.execute(f'DROP INDEX "{name}"')
+    guard = connection.execute("SELECT sql FROM sqlite_schema WHERE name='immutable_authority_migrations_delete'").fetchone()[0]
+    connection.execute("DROP TRIGGER immutable_authority_migrations_delete")
+    connection.execute("DELETE FROM authority_migrations WHERE version=43")
+    connection.execute(guard)
+    connection.execute("PRAGMA user_version=42")
+    if schema_fingerprint(connection) != RETIREMENT_LOOKUP_PREDECESSOR_FINGERPRINT:
+        raise sqlite3.DatabaseError("v43 fixture downgrade lost exact v42 schema")
+
+
 def _drop_v42_projection_retirement(connection: sqlite3.Connection) -> None:
     """Remove schema-only v42 from full-history migration fixtures, never live data."""
+    _drop_v43_retirement_lookup(connection)
     if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 42:
         return
     from newsroom.authority.migrations import MIGRATION_STATEMENTS, EXPECTED_MIGRATION_HISTORY, EXPECTED_SCHEMA_FINGERPRINT, schema_fingerprint
     from newsroom.authority.projection_retirement_migrations import PROJECTION_RETIREMENT_PREDECESSOR_FINGERPRINT
 
-    if (schema_fingerprint(connection) != EXPECTED_SCHEMA_FINGERPRINT
-            or tuple(tuple(row) for row in connection.execute("SELECT version,name,checksum FROM authority_migrations ORDER BY version")) != EXPECTED_MIGRATION_HISTORY
+    from newsroom.authority.projection_retirement_lookup_migrations import RETIREMENT_LOOKUP_PREDECESSOR_FINGERPRINT
+    if (schema_fingerprint(connection) != RETIREMENT_LOOKUP_PREDECESSOR_FINGERPRINT
+            or tuple(tuple(row) for row in connection.execute("SELECT version,name,checksum FROM authority_migrations ORDER BY version")) != tuple(row for row in EXPECTED_MIGRATION_HISTORY if row[0] <= 42)
             or connection.execute("SELECT 1 FROM ledger_events WHERE retired_header_digest IS NOT NULL LIMIT 1").fetchone() is not None):
         raise sqlite3.DatabaseError("historical fixture requires exact unexpired v42 authority")
     connection.execute("SAVEPOINT checked_projection_retirement_downgrade")
