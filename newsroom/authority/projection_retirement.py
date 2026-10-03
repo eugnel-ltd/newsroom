@@ -33,9 +33,10 @@ def retained_condition(table: str) -> str:
     return "NOT (" + exclusion + ")" if exclusion else "1"
 
 
-def select_candidates(conn: sqlite3.Connection) -> int:
+def select_candidates(conn: sqlite3.Connection, *, generation_id: str | None = None) -> int:
     # Visit each generation's state range once, then its exact event-ID key.
     # An event-first plan repeats the whole state range for every ledger event.
+    scope = "" if generation_id is None else " AND g.generation_id=?"
     conn.execute("""CREATE TEMP TABLE _retirement_candidates AS
         SELECT e.event_id,e.command_id,e.payload_id,e.authentication_context_id,
                e.authorization_request_digest,e.authorization_decision_id,
@@ -50,7 +51,7 @@ def select_candidates(conn: sqlite3.Connection) -> int:
           AND e.aggregate_id=g.generation_id
           AND NOT EXISTS(SELECT 1 FROM projection_delivery_attempts a
               WHERE a.generation_id=s.generation_id AND a.ledger_seq=s.ledger_seq AND a.attempt_number<>1)
-    """)
+    """ + scope, () if generation_id is None else (generation_id,))
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_event ON _retirement_candidates(event_id)")
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_command ON _retirement_candidates(command_id)")
     conn.execute("CREATE UNIQUE INDEX _retirement_candidate_source ON _retirement_candidates(generation_id,source_seq)")
@@ -62,8 +63,10 @@ def select_candidates(conn: sqlite3.Connection) -> int:
     # Previously qualified ignored-only expiry retains its existing semantics.
     conn.execute("""CREATE TEMP TABLE _retirement_checkpoints AS
         SELECT c.generation_id,c.checkpoint_version,c.authority_event_id
-        FROM projection_checkpoint_versions c JOIN projection_generations g USING(generation_id)
-        WHERE g.state='RETIRED' AND EXISTS(SELECT 1 FROM _retirement_candidates x WHERE x.generation_id=g.generation_id)
+        FROM (SELECT DISTINCT generation_id FROM _retirement_candidates) x
+        CROSS JOIN projection_generations g ON g.generation_id=x.generation_id
+        CROSS JOIN projection_checkpoint_versions c ON c.generation_id=x.generation_id
+        WHERE g.state='RETIRED'
           AND NOT (c.checkpoint_version=(SELECT max(last.checkpoint_version)
                    FROM projection_checkpoint_versions last WHERE last.generation_id=c.generation_id)
               AND (g.diagnostic_history_expired=1 OR EXISTS(SELECT 1 FROM projection_delivery_states s
@@ -77,16 +80,18 @@ def protect_candidates(conn: sqlite3.Connection) -> int:
     from .audit_retention import _children, _q
 
     initial = int(conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0])
-    conn.execute("""DELETE FROM _retirement_candidates WHERE event_id IN (
-        SELECT e.event_id FROM authority_aggregates a CROSS JOIN ledger_events e
-        ON a.aggregate_type=e.aggregate_type AND a.aggregate_id=e.aggregate_id AND a.current_version=e.aggregate_version
-        WHERE a.aggregate_type='projection_generation'
-        UNION SELECT event_id FROM ledger_events WHERE ledger_seq=(SELECT max(ledger_seq) FROM ledger_events)
-        UNION SELECT event_id FROM ledger_events WHERE ledger_seq=(SELECT max(ledger_seq) FROM ledger_events WHERE aggregate_type NOT IN ('projection_family','projection_generation'))
-        UNION SELECT e.event_id FROM ledger_events e JOIN projection_generation_validations v
-        ON e.ledger_seq=json_extract(CAST(v.canonical_bytes AS TEXT),'$.source_watermark_ledger_seq')
-        UNION SELECT e.event_id FROM ledger_events e JOIN hybrid_retrieval_attempts r ON e.ledger_seq=r.authority_watermark
-    )""")
+    conn.execute("""DELETE FROM _retirement_candidates AS candidate WHERE EXISTS (
+        SELECT 1 FROM ledger_events e WHERE e.event_id=candidate.event_id AND (
+            EXISTS(SELECT 1 FROM authority_aggregates a
+                WHERE a.aggregate_type=e.aggregate_type AND a.aggregate_id=e.aggregate_id
+                  AND a.current_version=e.aggregate_version)
+            OR e.ledger_seq=(SELECT max(ledger_seq) FROM ledger_events)
+            OR e.ledger_seq=(SELECT max(ledger_seq) FROM ledger_events
+                WHERE aggregate_type NOT IN ('projection_family','projection_generation'))
+            OR EXISTS(SELECT 1 FROM projection_generation_validations v
+                WHERE json_extract(CAST(v.canonical_bytes AS TEXT),'$.source_watermark_ledger_seq')=e.ledger_seq)
+            OR EXISTS(SELECT 1 FROM hybrid_retrieval_attempts r WHERE r.authority_watermark=e.ledger_seq)
+        ))""")
     while True:
         before = int(conn.execute("SELECT count(*) FROM _retirement_candidates").fetchone()[0])
         for parent, key, candidate_key in (
@@ -102,16 +107,19 @@ def protect_candidates(conn: sqlite3.Connection) -> int:
                     outcome = "current_outcome" if table.endswith("states") else "outcome"
                     route = f" AND NOT (required=0 AND {outcome}='IGNORED_OPTIONAL')"
                 conn.execute(
-                    f"DELETE FROM _retirement_candidates WHERE {_q(candidate_key)} IN "
-                    f"(SELECT {_q(column)} FROM {_q(table)} WHERE {retained_condition(table)}{route})"
+                    f"DELETE FROM _retirement_candidates AS candidate WHERE EXISTS "
+                    f"(SELECT 1 FROM {_q(table)} WHERE {_q(column)}=candidate.{_q(candidate_key)} "
+                    f"AND {retained_condition(table)}{route})"
                 )
         # A retained causal child pins full EVENT/COMMAND provenance. This is
         # not generation-scoped; removing one candidate can pin its predecessor.
-        conn.execute("""DELETE FROM _retirement_candidates WHERE event_id IN (
-            SELECT causation_identifier FROM ledger_events WHERE causation_kind='EVENT'
-            AND event_id NOT IN (SELECT event_id FROM _retirement_candidates)) OR command_id IN (
-            SELECT causation_identifier FROM ledger_events WHERE causation_kind='COMMAND'
-            AND event_id NOT IN (SELECT event_id FROM _retirement_candidates))""")
+        conn.execute("""DELETE FROM _retirement_candidates AS candidate WHERE
+            EXISTS(SELECT 1 FROM ledger_events child WHERE child.causation_kind='EVENT'
+                AND child.causation_identifier=candidate.event_id
+                AND child.event_id NOT IN (SELECT event_id FROM _retirement_candidates))
+            OR EXISTS(SELECT 1 FROM ledger_events child WHERE child.causation_kind='COMMAND'
+                AND child.causation_identifier=candidate.command_id
+                AND child.event_id NOT IN (SELECT event_id FROM _retirement_candidates))""")
         # Do not expire checkpoint history for a generation whose candidates
         # are all protected. Actual checkpoint consumers stay exact/full.
         conn.execute("DELETE FROM _retirement_checkpoints WHERE generation_id NOT IN (SELECT generation_id FROM _retirement_candidates)")
@@ -121,7 +129,7 @@ def protect_candidates(conn: sqlite3.Connection) -> int:
 
 
 def expire_candidates(conn: sqlite3.Connection) -> dict[str, int]:
-    from .audit_retention import _index_children, _q, _unreferenced
+    from .audit_retention import _children, _q, _unreferenced
     from ._event_store_read import _EventStoreReadMixin
 
     # This operation is called only inside the writer-owned transaction and
@@ -143,7 +151,7 @@ def expire_candidates(conn: sqlite3.Connection) -> dict[str, int]:
         # history is deliberately discarded rather than reconstructed or audited.
         for event in conn.execute("""SELECT e.*,c.idempotency_namespace AS expired_namespace,
                 c.idempotency_key AS expired_key
-            FROM ledger_events e CROSS JOIN _retirement_candidates x ON x.event_id=e.event_id
+            FROM _retirement_candidates x CROSS JOIN ledger_events e ON e.event_id=x.event_id
             CROSS JOIN authority_commands c ON c.command_id=e.command_id
             ORDER BY e.ledger_seq"""):
             header = _EventStoreReadMixin._event_from_row(event)
@@ -160,29 +168,44 @@ def expire_candidates(conn: sqlite3.Connection) -> dict[str, int]:
     # generations. Keep every actual protected checkpoint consumer.
     conn.execute("UPDATE projection_generations SET diagnostic_history_expired=1 WHERE generation_id IN (SELECT generation_id FROM _retirement_candidates)")
     deleted = {}
-    indexes = []
-    # Reservations leave live_command_id NULL, but native parent DELETE still
-    # needs an indexed generated-child probe for each expired command.
-    _index_children(conn, "authority_commands", indexes, key="command_id")
     for table in (
         "projection_delivery_attempts", "projection_delivery_states", "projection_checkpoint_versions",
         "authority_audit_events", "authority_aggregate_versions", "authority_commands", "authority_payloads",
         "authorization_decisions", "authorization_requests", "authentication_contexts",
     ):
-        condition = "NOT (" + retained_condition(table) + ")"
+        if table in {"projection_delivery_states", "projection_delivery_attempts"}:
+            condition = "(generation_id,ledger_seq) IN (SELECT generation_id,source_seq FROM _retirement_candidates)"
+        elif table == "projection_checkpoint_versions":
+            condition = "(generation_id,checkpoint_version) IN (SELECT generation_id,checkpoint_version FROM _retirement_checkpoints)"
+        else:
+            # Positive IN drives parent keys directly. Double NOT around IN
+            # makes SQLite scan unrelated parent history before filtering.
+            condition = _EXCLUSIONS[table]
         if table in {"authority_payloads", "authorization_decisions", "authorization_requests", "authentication_contexts"}:
             key = "payload_id" if table == "authority_payloads" else {
                 "authorization_decisions": "authorization_decision_id", "authorization_requests": "request_digest", "authentication_contexts": "authentication_context_id",
             }[table]
-            children = _index_children(conn, table, indexes, key=key)
+            children = _children(conn, table, key=key)
             if table == "authority_payloads":
                 condition += "".join(f" AND NOT EXISTS(SELECT 1 FROM {_q(child)} WHERE {_q(column)}=authority_payloads.payload_id)" for child, column in children)
             else:
                 condition += " AND " + _unreferenced(table, children, opaque_tokens=False)
         conn.execute(f"DELETE FROM {_q(table)} WHERE {condition}")
         deleted[table] = int(conn.execute("SELECT changes()").fetchone()[0])
-    for name in indexes:
-        conn.execute(f"DROP INDEX {_q(name)}")
     for _, sql in guards:
         conn.execute(sql)
     return deleted
+
+
+def retire_predecessor_diagnostics(conn: sqlite3.Connection, generation_id: str) -> dict[str, int]:
+    """Expire one eligible retired predecessor inside its native promotion transaction."""
+    if not conn.in_transaction:
+        raise sqlite3.DatabaseError("predecessor retirement requires the promotion transaction")
+    try:
+        if not select_candidates(conn, generation_id=generation_id):
+            return {}
+        protect_candidates(conn)
+        return expire_candidates(conn) if conn.execute("SELECT 1 FROM _retirement_candidates LIMIT 1").fetchone() else {}
+    finally:
+        conn.execute("DROP TABLE IF EXISTS temp._retirement_checkpoints")
+        conn.execute("DROP TABLE IF EXISTS temp._retirement_candidates")

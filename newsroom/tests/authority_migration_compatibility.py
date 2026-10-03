@@ -254,6 +254,11 @@ PINNED_MIGRATION_HISTORY: tuple[HistoryRow, ...] = (
         "retired_projection_diagnostic_reservations_v42",
         "sha256:6d8074762801dbb74e966ea4a441ad035a7eebea178372523dab69e5e91fd2e5",
     ),
+    (
+        43,
+        "native_projection_retirement_lookup_indexes_v43",
+        "sha256:f9aecc8859aec5b6a19acbacb8b1eea7e1a179c99a8d01b638976f4080b52832",
+    ),
 )
 
 
@@ -355,7 +360,7 @@ def _checked_registry() -> tuple[MigrationLike, ...]:
             "EXPECTED_MIGRATION_HISTORY differs from independent literal release pins"
         )
     versions = tuple(record[0] for record in record_history)
-    if versions != (*range(1, 33), 34, 35, 36, 37, 38, 39, 40, 41, 42):
+    if versions != (*range(1, 33), 34, 35, 36, 37, 38, 39, 40, 41, 42, 43):
         raise MigrationCompatibilityError(
             "authority migration registry differs from the central release sequence"
         )
@@ -494,6 +499,14 @@ def build_exact_prefix(
                 )
             elif record.version == authority_migrations.PROJECTION_RETIREMENT_SCHEMA_VERSION:
                 authority_migrations.migrate_projection_retirement(
+                    connection,
+                    expected_history=tuple(
+                        _record_tuple(previous) for previous in MIGRATION_REGISTRY
+                        if previous.version < record.version
+                    ),
+                )
+            elif record.version == authority_migrations.RETIREMENT_LOOKUP_SCHEMA_VERSION:
+                authority_migrations.migrate_retirement_lookup(
                     connection,
                     expected_history=tuple(
                         _record_tuple(previous) for previous in MIGRATION_REGISTRY

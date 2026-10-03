@@ -364,8 +364,15 @@ from .projection_retirement_migrations import (
     migrate_projection_retirement,
 )
 
+from .projection_retirement_lookup_migrations import (
+    RETIREMENT_LOOKUP_SCHEMA_VERSION, RETIREMENT_LOOKUP_MIGRATION,
+    RETIREMENT_LOOKUP_MIGRATION_NAME, RETIREMENT_LOOKUP_MIGRATION_CHECKSUM,
+    RETIREMENT_LOOKUP_MIGRATION_STATEMENTS,
+    migrate_retirement_lookup,
+)
+
 BASE_SCHEMA_VERSION = 1
-SCHEMA_VERSION = PROJECTION_RETIREMENT_SCHEMA_VERSION
+SCHEMA_VERSION = RETIREMENT_LOOKUP_SCHEMA_VERSION
 ISOLATED_SCHEMA_VERSION_RESERVATIONS = frozenset({33})
 MIGRATION_NAME = "authority_event_foundation_v1"
 
@@ -1763,6 +1770,15 @@ def apply_pending_migrations(conn: sqlite3.Connection, *, applied_at: str) -> No
                  PROJECTION_RETIREMENT_MIGRATION_CHECKSUM, applied_at),
             )
             current = PROJECTION_RETIREMENT_SCHEMA_VERSION
+        if current == PROJECTION_RETIREMENT_SCHEMA_VERSION:
+            migrate_retirement_lookup(conn, expected_history=tuple(
+                (r.version, r.name, r.checksum) for r in MIGRATIONS
+                if r.version <= PROJECTION_RETIREMENT_SCHEMA_VERSION
+            ))
+            conn.execute("INSERT INTO authority_migrations(version,name,checksum,applied_at) VALUES(?,?,?,?)",
+                (RETIREMENT_LOOKUP_SCHEMA_VERSION, RETIREMENT_LOOKUP_MIGRATION_NAME,
+                 RETIREMENT_LOOKUP_MIGRATION_CHECKSUM, applied_at))
+            current = RETIREMENT_LOOKUP_SCHEMA_VERSION
         # fmt: on
         conn.execute(f"PRAGMA user_version={current}")
         conn.execute("COMMIT")
@@ -1814,6 +1830,7 @@ MIGRATIONS: tuple[MigrationRecord | object, ...] = (
     RELATIONSHIP_OPEN_INDEX_MIGRATION,
     COMMAND_BOUND_STORAGE_MIGRATION,
     PROJECTION_RETIREMENT_MIGRATION,
+    RETIREMENT_LOOKUP_MIGRATION,
 )
 
 
@@ -2018,5 +2035,6 @@ EXPECTED_MIGRATION_HISTORY: tuple[tuple[int, str, str], ...] = (
     ),
     (PROJECTION_RETIREMENT_SCHEMA_VERSION, PROJECTION_RETIREMENT_MIGRATION_NAME,
      PROJECTION_RETIREMENT_MIGRATION_CHECKSUM),
+    (RETIREMENT_LOOKUP_SCHEMA_VERSION, RETIREMENT_LOOKUP_MIGRATION_NAME, RETIREMENT_LOOKUP_MIGRATION_CHECKSUM),
 )
 # fmt: on
