@@ -326,6 +326,117 @@ class NativePublicationController:
     def close(self) -> None:
         self._delivery.close()
 
+    def restore_current_publisher_output(self, journal: NativeRevisionJournal, *, proof: AuthenticationProof) -> None:
+        """Append one factual correction from already acknowledged current copy.
+
+        Original ACK references remain immutable facts. A tiny retained intent
+        makes interrupted correction resume its exact slot without a model call.
+        """
+        if self._source_currentness_fence is None:
+            return
+        references = ('story_event_id','publication_event_id','delivery_attempt_event_id','delivery_evidence_event_id')
+        groups = {}
+        for revision, progress in journal.iter_summaries():
+            facts = progress.get('facts', {})
+            units = journal.units.get(revision, ())
+            if (units and units[0].source_id == 'HK-02' and progress.get('stage') == 'ACKNOWLEDGED'
+                    and facts.get('candidate_id') and all(facts.get(key) for key in references)):
+                groups.setdefault(facts['candidate_id'], []).append((revision,facts))
+        for members in groups.values():
+            try:
+                self._restore_publisher_group(journal,members,references,proof)
+            except (OperatorDrainRequested,VetoError):
+                raise
+            except Exception as exc:
+                # One unproved or conflicting original chain cannot block peers.
+                # No source/exception text or successful correction is invented.
+                for revision, _ in members:
+                    facts = dict(journal.current(revision)['facts'])
+                    facts['factual_correction_hold'] = type(exc).__name__
+                    journal.advance(revision,stage='ACKNOWLEDGED',facts=facts)
+                continue
+
+    def _restore_publisher_group(self,journal,members,references,proof):
+        if len(members) < 2:
+            return
+        selected = []
+        for revision, facts in members:
+            result, story = self.read_acknowledged({key:facts[key]for key in references}, proof=proof)
+            if story.copy.writer_id != 'newsroom.native-story-writer.v1':
+                continue
+            package = self._evidence.read(story.package_admission_id, candidate_port=self._candidate_port, proof=proof)
+            policy = self._editorial._read_policy_decision(
+                DecisionReference(story.policy_decision_event_id,story.policy_decision_admission_id),
+                retained=package,proof=proof)
+            selected.append((revision,facts,result,story,package,policy))
+            correction = facts.get('factual_correction_result')
+            if correction is not None:
+                derived, derived_story = self.read_acknowledged(correction,proof=proof)
+                if (derived_story.story_id != story.story_id
+                        or derived.attempt_receipt.publication_id != result.attempt_receipt.publication_id
+                        or derived.story_receipt.aggregate_version <= result.story_receipt.aggregate_version):
+                    raise NativePublicationError('derived factual correction belongs to another acknowledged chain')
+                derived_package = self._evidence.read(derived_story.package_admission_id,
+                    candidate_port=self._candidate_port,proof=proof)
+                derived_policy = self._editorial._read_policy_decision(
+                    DecisionReference(derived_story.policy_decision_event_id,derived_story.policy_decision_admission_id),
+                    retained=derived_package,proof=proof)
+                selected.append((revision,{**facts,**correction},derived,derived_story,derived_package,derived_policy))
+        if len(selected) < 2:
+            return
+        latest = max(selected, key=lambda item:item[2].story_receipt.aggregate_version)
+        prior_facts = latest[1]
+        intent = prior_facts.get('factual_correction_intent') if 'factual_correction_result' not in prior_facts else None
+        if intent is None:
+            try:
+                self._source_currentness_fence(latest[4].package,latest[5].currentness)
+            except EditorialHold as exc:
+                if str(exc) != 'NATIVE_STORY_SOURCE_SUPERSEDED':
+                    return
+            else:
+                return
+            current = {}
+            for item in selected:
+                if item is latest:
+                    continue
+                try:self._source_currentness_fence(item[4].package,item[5].currentness)
+                except EditorialHold:continue
+                identity = str(item[3].package_admission_id)
+                previous = current.get(identity)
+                if previous is None or item[2].story_receipt.aggregate_version > previous[2].story_receipt.aggregate_version:
+                    current[identity] = item
+            if len(current) != 1:
+                return
+            chosen = next(iter(current.values()))
+            intent = {'superseded':{key:prior_facts[key]for key in references},
+                'reviewed':{key:chosen[1][key]for key in references},
+                'package_admission_id':str(chosen[3].package_admission_id),
+                'editorial_decision':json.loads(chosen[5].canonical_bytes()),
+                'expected_story_version':latest[2].story_receipt.aggregate_version,
+                'expected_publication_version':latest[2].attempt_receipt.aggregate_version}
+            facts = dict(journal.current(latest[0])['facts'])
+            facts['factual_correction_intent'] = intent
+            journal.advance(latest[0],stage='ACKNOWLEDGED',facts=facts)
+        old, _ = self.read_acknowledged(intent['superseded'],proof=proof)
+        reviewed, _ = self.read_acknowledged(intent['reviewed'],proof=proof)
+        try:
+            corrected = self.advance(ObjectAdmissionId.parse(intent['package_admission_id']),
+                EditorialPolicyDecision.from_bytes(canonical_json_bytes(intent['editorial_decision'])),
+                expected_story_version=intent['expected_story_version'],
+                expected_publication_version=intent['expected_publication_version'],expected_delivery_evidence_version=0,
+                proof=proof,factual_correction_of=old,reviewed_copy_from=reviewed)
+        except EditorialHold as exc:
+            facts = dict(journal.current(latest[0])['facts'])
+            facts['factual_correction_hold'] = str(exc)
+            journal.advance(latest[0],stage='ACKNOWLEDGED',facts=facts)
+            return
+        facts = dict(journal.current(latest[0])['facts'])
+        facts.pop('factual_correction_hold',None)
+        facts['factual_correction_result'] = dict(zip(references,(
+            corrected.story_receipt.event_id,corrected.publication_receipt.event_id,
+            corrected.attempt_receipt.event_id,corrected.evidence_receipt.event_id)))
+        journal.advance(latest[0],stage='ACKNOWLEDGED',facts=facts)
+
     def advance(
         self,
         package_admission_id: ObjectAdmissionId,
@@ -336,6 +447,8 @@ class NativePublicationController:
         expected_delivery_evidence_version: int,
         proof: AuthenticationProof,
         correction_of: NativePublicationResult | None = None,
+        factual_correction_of: NativePublicationResult | None = None,
+        reviewed_copy_from: NativePublicationResult | None = None,
         reconciled_predecessor: dict | None = None,
     ) -> NativePublicationResult:
         if (
@@ -357,6 +470,39 @@ class NativePublicationController:
             candidate_port=self._candidate_port,
             proof=proof,
         )
+        if factual_correction_of is not None or reviewed_copy_from is not None:
+            if (type(factual_correction_of) is not NativePublicationResult
+                    or type(reviewed_copy_from) is not NativePublicationResult
+                    or correction_of is not None or reconciled_predecessor is not None
+                    or self._source_currentness_fence is None):
+                raise NativePublicationError("factual correction requires exact source and ACK authorities")
+            def acknowledged(result):
+                return self.read_acknowledged({
+                    "story_event_id": result.story_receipt.event_id,
+                    "publication_event_id": result.publication_receipt.event_id,
+                    "delivery_attempt_event_id": result.attempt_receipt.event_id,
+                    "delivery_evidence_event_id": result.evidence_receipt.event_id,
+                }, proof=proof)
+            old, old_story = acknowledged(factual_correction_of)
+            reviewed, reviewed_story = acknowledged(reviewed_copy_from)
+            current_decision = self._editorial.current_copy_decision(editorial_decision)
+            reviewed_policy = self._editorial._read_policy_decision(
+                DecisionReference(reviewed_story.policy_decision_event_id,reviewed_story.policy_decision_admission_id),
+                retained=retained,proof=proof)
+            expected_decision = self._editorial.current_copy_decision(reviewed_policy)
+            if (old != factual_correction_of or reviewed != reviewed_copy_from
+                    or old_story.story_id != _aggregate("story", retained.package.candidate_id)
+                    or reviewed_story.story_id != old_story.story_id
+                    or reviewed_story.package_admission_id != package_admission_id
+                    or old_story.package_admission_id == package_admission_id
+                    or old.story_receipt.aggregate_version != expected_story_version
+                    or old.attempt_receipt.aggregate_version != expected_publication_version
+                    or expected_delivery_evidence_version != 0):
+                raise NativePublicationError("factual correction predecessor binding differs")
+            if (current_decision.package_digest != retained.package.digest
+                    or current_decision.canonical_bytes() != expected_decision.canonical_bytes()):
+                raise NativePublicationError("factual correction current package differs")
+            editorial_decision = current_decision
         if reconciled_predecessor is not None:
             prior, prior_story = self.read_acknowledged(reconciled_predecessor, proof=proof)
             prior_package = self._evidence.read(
@@ -430,6 +576,7 @@ class NativePublicationController:
             decision_reference=decision_reference,
             candidate_port=self._candidate_port,
             proof=proof,
+            reviewed_copy_from=(None if reviewed_copy_from is None else reviewed_copy_from.story_receipt),
         )
         if correction_of is not None and _story.copy.writer_id != self.writer_contract_version:
             raise NativePublicationError("copy correction writer differs")
@@ -439,8 +586,9 @@ class NativePublicationController:
                 expected_publication_version,
                 f"native-publication:{identity}:{expected_publication_version + 1}",
                 "AUTO_PUBLISH",
-                (("NATIVE_COPY_CORRECTION", "NATIVE_STORY_WRITE_READY")
-                 if correction_of is not None else ("NATIVE_STORY_WRITE_READY",)),
+                (("NATIVE_FACTUAL_CORRECTION", "NATIVE_STORY_WRITE_READY") if factual_correction_of is not None else
+                 ("NATIVE_COPY_CORRECTION", "NATIVE_STORY_WRITE_READY") if correction_of is not None else
+                 ("NATIVE_STORY_WRITE_READY",)),
                 editorial_decision.evaluated_at,
             ),
             story_receipt=story_receipt,

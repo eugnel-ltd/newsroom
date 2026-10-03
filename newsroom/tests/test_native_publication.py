@@ -98,6 +98,220 @@ def test_fresh_story_checks_publisher_state_before_any_draft_or_decision(tmp_pat
         candidates.close()
 
 
+@pytest.mark.parametrize(('native_copy','failure'),
+    [(native, failure) for native in (False,True) for failure in (None,'source','wrong-copy','wrong-version','bad-ack')]
+    + [(True,'automatic'),(True,'derived-ack'),(True,'decision'),(True,'after-apply'),(True,'before-apply'),(True,'after-story'),(True,'later-sibling')])
+def test_factual_correction_binds_current_and_superseded_ack_without_second_writer(tmp_path, monkeypatch, native_copy, failure):
+    from dataclasses import replace
+    from newsroom.tests.test_increment10_private_serving import _context, _close
+    from newsroom.authority.canonical import digest_bytes
+    from newsroom.increment10.evidence import _base_package
+    from newsroom.increment10.editorial import EditorialError
+
+    context = _context(tmp_path)
+    candidates, port, ingress, system, registries, hydration, definitions, commands, evidence = context[:9]
+    original_story = context[9].read_story_version(context[-2], candidate_port=port, proof=proof())
+    current = evidence.read(original_story.package_admission_id, candidate_port=port, proof=proof())
+    # Build a genuinely different, valid source-bound sibling; do not patch an
+    # already admitted claim, payload, model result or ACK.
+    passage, stale_package, stale_records = _ready_package(port.require_retained_version(current.candidate_version_id))
+    passage = passage.replace('The deadline changed.', 'The deadline was extended.')
+    head = replace(stale_package.governed_claims[0], claim='The deadline was extended.',
+        supporting_excerpt='The deadline was extended.', rendered_assertion_zh_hant_hk='官方確認限期已經延長。')
+    qualification = replace(stale_package.qualification_evidence[0], test_evidence=tuple(
+        (key, head.claim if key in {'material_relation_span','reader_action'} else value)
+        for key,value in stale_package.qualification_evidence[0].test_evidence))
+    stale_package = replace(stale_package, passages=(passage,), observation_digests=(digest_bytes(passage.encode()),),
+        governed_claims=(head,stale_package.governed_claims[1]), qualification_evidence=(qualification,),
+        substantive_new_information=(head.claim,stale_package.governed_claims[1].claim))
+    records = []
+    for original in stale_records:
+        record = {**original, 'base_package_digest':_base_package(stale_package).digest}
+        if record.get('governed_claim_id') == head.claim_id:
+            if 'claim_digest' in record: record['claim_digest'] = digest_bytes(head.claim.encode())
+            if 'rendered_assertion_digest' in record: record['rendered_assertion_digest'] = digest_bytes(head.rendered_assertion_zh_hant_hk.encode())
+            if 'evidence_span_digest' in record: record['evidence_span_digest'] = digest_bytes(head.supporting_excerpt.encode())
+            if 'test_evidence' in record: record['test_evidence'] = [list(item)for item in qualification.test_evidence]
+        if record['record_type']=='SOURCE_RECORD': record['originating_artefact_digest'] = digest_bytes(passage.encode())
+        records.append(record)
+    stale_source = system.objects.admit(ObjectAdmissionRequest('evidence.source','correction-stale-source'),passage.encode(),proof=proof()).admission
+    stale_ids = tuple(system.objects.admit(ObjectAdmissionRequest('evidence.record',f'correction-stale-record:{index}'),
+        canonical_json_bytes(record),proof=proof()).admission.admission_id for index,record in enumerate(records))
+    older = evidence.retain(stale_package,
+        receipt_id=current.receipt_id, candidate_port=port,
+        source_admission_ids=(stale_source.admission_id,),
+        record_admission_ids=stale_ids, proof=proof())
+    bindings = _bindings(tmp_path, registries, hydration, definitions, commands)
+    calls = []
+    current_source = [True]
+    writer_calls = []
+    def story_writer(package, **_identities):
+        from newsroom.control_plane.native_story_writer import write_native_story
+        def draft(request):
+            writer_calls.append('draft')
+            claims = request['evidence']['approved_governed_claims']
+            return dict(title=next(c['rendered_assertion'] for c in claims if c['claim_role']=='HEADLINE'),
+                body='\n\n'.join(c['rendered_assertion'] for c in claims), format='BRIEF',
+                evidence_links=[dict(governed_claim_id=c['governed_claim_id'],rendered_assertion=c['rendered_assertion'])for c in claims])
+        def review(request):
+            writer_calls.append('review')
+            claims = request['evidence']['approved_governed_claims']
+            return dict(source_package_digest=request['source_package_digest'],draft_digest=request['draft_digest'],
+                verdict='PASS',covered_claim_ids=[c['governed_claim_id']for c in claims],
+                sentence_support=[dict(sentence_index=i,verdict='SUPPORTED',claim_ids=[link['governed_claim_id']
+                    for link in request['draft']['evidence_links']if link['rendered_assertion']in sentence])
+                    for i,sentence in enumerate(request['sentences'])],
+                factual_checks={key:'PASS'for key in ('numbers','entities','modality','quotations')})
+        return write_native_story(package, generate=draft, review=review)
+    def fence(package, currentness):
+        calls.append(package.digest)
+        if not current_source[0]: raise EditorialHold(reason='NATIVE_STORY_SOURCE_SUPERSEDED')
+    controller = NativePublicationController(objects=system.objects, commands=system.commands, events=system.events,
+        candidate_port=port, evidence_packages=evidence, bindings=bindings,
+        clock=lambda: UtcTimestamp.parse('2026-07-16T12:00:00Z'),
+        story_writer=story_writer if native_copy else None,
+        source_currentness_fence=fence)
+    source_id = current.source_admission_ids[0]
+    request = dict(expected_story_version=0, expected_publication_version=0,
+                   expected_delivery_evidence_version=0, proof=proof())
+    try:
+        current_ack = controller.advance(current.package_admission_id, _decision(current, source_id), **request)
+        stale_ack = controller.advance(older.package_admission_id, _decision(older, stale_source.admission_id),
+            **{**request, 'expected_story_version':1, 'expected_publication_version':2})
+        prior_writer_calls = list(writer_calls)
+        with sqlite3.connect(bindings.target_path)as target:
+            original_rows = target.execute('SELECT *FROM private_serving_payloads ORDER BY operation_key').fetchall()
+        correction = dict(**{**request, 'expected_story_version':2, 'expected_publication_version':4},
+            factual_correction_of=stale_ack, reviewed_copy_from=current_ack)
+        if failure == 'later-sibling':
+            sibling = evidence.retain(replace(older.package,selection_rationale=older.package.selection_rationale+' A later sibling.'),
+                receipt_id=current.receipt_id,candidate_port=port,source_admission_ids=(stale_source.admission_id,),
+                record_admission_ids=stale_ids,proof=proof())
+            controller.advance(sibling.package_admission_id,_decision(sibling,stale_source.admission_id),
+                **{**request,'expected_story_version':2,'expected_publication_version':4})
+            count = len(writer_calls)
+            with pytest.raises((NativePublicationError,EditorialError)):
+                controller.advance(current.package_admission_id,_decision(current,source_id),**correction)
+            assert len(writer_calls)==count
+            with sqlite3.connect(bindings.target_path)as target:
+                assert target.execute('SELECT count(*)FROM private_serving_payloads').fetchone()[0]==6
+            return
+        if failure in {'automatic','derived-ack'}:
+            from types import SimpleNamespace
+            references = ('story_event_id','publication_event_id','delivery_attempt_event_id','delivery_evidence_event_id')
+            snapshots = {}
+            for revision, package, result in (('current',current,current_ack),('stale',older,stale_ack)):
+                facts = dict(candidate_id=current.package.candidate_id, **dict(zip(references,(
+                    result.story_receipt.event_id,result.publication_receipt.event_id,
+                    result.attempt_receipt.event_id,result.evidence_receipt.event_id))))
+                snapshots[revision] = dict(stage='ACKNOWLEDGED',facts=facts)
+            class Journal:
+                units = {revision:(SimpleNamespace(source_id='HK-02'),)for revision in snapshots}
+                def iter_summaries(self): return iter(snapshots.items())
+                def current(self,revision): return snapshots[revision]
+                def advance(self,revision,*,stage,facts): snapshots[revision] = dict(stage=stage,facts=facts)
+            # The production source fence alone diagnoses supersession; the
+            # complete ACK, package and policy proof paths remain real here.
+            controller._source_currentness_fence = lambda package,_: (_ for _ in ()).throw(
+                EditorialHold(reason='NATIVE_STORY_SOURCE_SUPERSEDED')) if package.digest==older.package.digest else None
+            journal = Journal()
+            if failure=='derived-ack':
+                snapshots['stale']['facts']['factual_correction_result'] = dict(zip(references,(
+                    current_ack.story_receipt.event_id,current_ack.publication_receipt.event_id,
+                    current_ack.attempt_receipt.event_id,current_ack.evidence_receipt.event_id)))
+                controller.restore_current_publisher_output(journal,proof=proof())
+                assert snapshots['stale']['facts']['factual_correction_hold']=='NativePublicationError'
+                assert writer_calls==prior_writer_calls
+                with sqlite3.connect(bindings.target_path)as target:
+                    assert target.execute('SELECT count(*)FROM private_serving_payloads').fetchone()[0]==4
+                return
+            controller.restore_current_publisher_output(journal,proof=proof())
+            assert snapshots['stale']['facts']['story_event_id']==stale_ack.story_receipt.event_id
+            assert 'factual_correction_result'in snapshots['stale']['facts']
+            assert writer_calls == prior_writer_calls
+            original_refs = dict(snapshots['stale']['facts']['factual_correction_result'])
+            controller.restore_current_publisher_output(journal,proof=proof())
+            assert snapshots['stale']['facts']['factual_correction_result'] == original_refs
+            assert writer_calls == prior_writer_calls
+            with sqlite3.connect(bindings.target_path)as target:
+                assert target.execute('SELECT count(*)FROM private_serving_payloads').fetchone()[0]==6
+            return
+        if failure in {'after-apply','before-apply','after-story'}:
+            target = controller._publication if failure=='after-story' else controller._delivery
+            name = 'decide' if failure=='after-story' else 'apply'
+            original = getattr(target,name)
+            def interrupted(*args,**kwargs):
+                if failure=='after-apply': original(*args,**kwargs)
+                raise RuntimeError('correction interrupted')
+            with monkeypatch.context() as fault:
+                fault.setattr(target,name,interrupted)
+                with pytest.raises(RuntimeError,match='correction interrupted'):
+                    controller.advance(current.package_admission_id,_decision(current,source_id),**correction)
+            assert writer_calls == prior_writer_calls
+            current_source[0] = False
+            controller.close()
+            controller = NativePublicationController(objects=system.objects,commands=system.commands,events=system.events,
+                candidate_port=port,evidence_packages=evidence,bindings=bindings,
+                clock=lambda:UtcTimestamp.parse('2026-07-16T12:00:00Z'),
+                story_writer=story_writer if native_copy else None,source_currentness_fence=fence)
+            if failure!='after-apply':
+                with pytest.raises(EditorialHold,match='NATIVE_STORY_SOURCE_SUPERSEDED'):
+                    controller.advance(current.package_admission_id,_decision(current,source_id),**correction)
+                with sqlite3.connect(bindings.target_path)as target:
+                    assert target.execute('SELECT count(*)FROM private_serving_payloads').fetchone()[0]==4
+                return
+        elif failure is not None:
+            current_source[0] = failure != 'source'
+            if failure == 'wrong-copy': correction['reviewed_copy_from'] = stale_ack
+            if failure == 'wrong-version': correction['expected_story_version'] = 1
+            if failure == 'bad-ack':
+                correction['factual_correction_of'] = replace(stale_ack, evidence_receipt=current_ack.evidence_receipt)
+            decision = _decision(current,source_id)
+            if failure == 'decision':
+                changed = replace(decision.currentness[0],source_definition_revision_digest='sha256:'+'0'*64)
+                decision = type(decision).create(**{name:(tuple([changed]) if name=='currentness' else getattr(decision,name))
+                    for name in decision.__dataclass_fields__ if name!='decision_id'})
+            with pytest.raises((NativePublicationError, EditorialError)):
+                controller.advance(current.package_admission_id, decision, **correction)
+            assert writer_calls == prior_writer_calls
+            with sqlite3.connect(bindings.target_path) as target:
+                assert target.execute('SELECT count(*) FROM private_serving_payloads').fetchone()[0] == 4
+            return
+        corrected = controller.advance(current.package_admission_id, _decision(current, source_id),
+            **{**request, 'expected_story_version':2, 'expected_publication_version':4},
+            factual_correction_of=stale_ack, reviewed_copy_from=current_ack)
+        assert corrected.story_receipt.aggregate_version == 3
+        assert writer_calls == prior_writer_calls
+        def refs(result):
+            return dict(story_event_id=result.story_receipt.event_id,publication_event_id=result.publication_receipt.event_id,
+                delivery_attempt_event_id=result.attempt_receipt.event_id,delivery_evidence_event_id=result.evidence_receipt.event_id)
+        current_story = controller.read_acknowledged(refs(current_ack),proof=proof())[1]
+        corrected_story = controller.read_acknowledged(refs(corrected),proof=proof())[1]
+        stale_story = controller.read_acknowledged(refs(stale_ack),proof=proof())[1]
+        assert corrected_story.copy == current_story.copy
+        assert corrected_story.copy.body != stale_story.copy.body
+        with sqlite3.connect(bindings.target_path)as target:
+            assert all(target.execute('SELECT *FROM private_serving_payloads WHERE operation_key=?',(row[0],)).fetchone()==row
+                       for row in original_rows)
+        current_source[0] = False  # Original corrected rows settle/replay after a later source change.
+        assert controller.advance(current.package_admission_id, _decision(current, source_id),
+            **{**request, 'expected_story_version':2, 'expected_publication_version':4},
+            factual_correction_of=stale_ack, reviewed_copy_from=current_ack) == corrected
+        reader = open_private_serving_read_port(bindings.target_path, target_id=bindings.target_id,
+            target_context_digest=bindings.target_context_digest, proof=corrected.read_proof)
+        try:
+            assert [json.loads(row.payload_bytes)['correction_status'] for row in reader.acknowledged_rows().rows] == ['CORRECTED','CORRECTED']
+        finally:
+            reader.close()
+        assert controller.read_acknowledged(dict(story_event_id=stale_ack.story_receipt.event_id,
+            publication_event_id=stale_ack.publication_receipt.event_id,
+            delivery_attempt_event_id=stale_ack.attempt_receipt.event_id,
+            delivery_evidence_event_id=stale_ack.evidence_receipt.event_id), proof=proof())[0] == stale_ack
+    finally:
+        controller.close()
+        context[0].rollback(); context[3].close(); context[2].close(); context[0].close()
+
+
 @pytest.mark.parametrize("failure_boundary", (None, "before_apply", "after_apply", "after_record"))
 @pytest.mark.parametrize("copy_correction", (False, True, "narrative", "reviewed_headline"))
 def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monkeypatch, copy_correction, failure_boundary) -> None:
