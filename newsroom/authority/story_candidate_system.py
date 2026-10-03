@@ -419,22 +419,38 @@ class _CandidateStore(_EventAuthorityStore):
         UtcTimestamp.parse(str(row["recorded_at"]))
         return admission, candidate, version, collision, comparator, disposition_ids, row
 
-    def _all_receipts(self):
+    def _all_receipts(self, *, candidate_ids=None):
+        where = "" if candidate_ids is None else " WHERE candidate_id IN (SELECT value FROM json_each(?))"
+        parameters = () if candidate_ids is None else (json.dumps(sorted(candidate_ids)),)
         return {
             str(row["admission_digest"]): self._verify_row(str(row["admission_digest"]))
             for row in self._connection.execute(
-                "SELECT admission_digest FROM story_candidate_admission_receipts_v2 "
-                "ORDER BY recorded_at,admission_digest"
+                "SELECT admission_digest FROM story_candidate_admission_receipts_v2"
+                + where + " ORDER BY recorded_at,admission_digest", parameters,
             )
         }
 
-    def _verify_local(self):
-        # The opener validates the whole shared store. Runtime reads retain
-        # this complete domain history and each event's exact authority closure.
-        verified = self._all_receipts()
+    def _verify_local(self, *, candidate_ids=None):
+        # Opening and explicit inventory retain the whole domain. Runtime reads
+        # retain every version and exact event closure of selected and related histories.
+        if candidate_ids is not None and not candidate_ids:
+            return {}
+        verified = self._all_receipts(candidate_ids=candidate_ids)
+        if candidate_ids is not None:
+            selected = set(candidate_ids)
+            while related := {
+                item[0].distinct_scope_proof.comparator_candidate_id
+                for item in verified.values() if item[0].distinct_scope_proof is not None
+            } - selected:
+                selected.update(related)
+                verified.update(self._all_receipts(candidate_ids=related))
+            candidate_ids = frozenset(selected)
+        where = "" if candidate_ids is None else " WHERE candidate_id IN (SELECT value FROM json_each(?))"
+        parameters = () if candidate_ids is None else (json.dumps(sorted(candidate_ids)),)
         event_count = self._connection.execute(
-            "SELECT COUNT(*) FROM ledger_events WHERE aggregate_type=?",
-            (candidate_command_definition().aggregate_type,),
+            "SELECT COUNT(*) FROM ledger_events WHERE aggregate_type=?"
+            + ("" if candidate_ids is None else " AND aggregate_id IN (SELECT value FROM json_each(?))"),
+            (candidate_command_definition().aggregate_type, *parameters),
         ).fetchone()[0]
         if event_count != len(verified):
             raise CandidateContractError("Candidate event coverage differs")
@@ -453,9 +469,10 @@ class _CandidateStore(_EventAuthorityStore):
         heads = {row["candidate_id"]: row for row in self._connection.execute(
             "SELECT h.*,g.current_version generic_current FROM story_candidate_heads h "
             "LEFT JOIN authority_aggregates g ON g.aggregate_type='story_candidate_admission' AND g.aggregate_id=h.candidate_id"
+            + where.replace("candidate_id", "h.candidate_id"), parameters,
         )}
         bindings = {row["candidate_id"]: row for row in self._connection.execute(
-            "SELECT * FROM story_candidate_collision_bindings"
+            "SELECT * FROM story_candidate_collision_bindings" + where, parameters,
         )}
         groups = {}
         for item in verified.values():
@@ -486,9 +503,15 @@ class _CandidateStore(_EventAuthorityStore):
             "story_candidate_admission_receipts_v2",
             "story_candidate_collision_bindings", "story_candidate_heads",
         ):
-            if self._connection.execute(
-                f'PRAGMA foreign_key_check("{table}")'
-            ).fetchone() is not None:
+            if candidate_ids is None:
+                violation = self._connection.execute(f'PRAGMA foreign_key_check("{table}")').fetchone()
+            else:
+                violation = self._connection.execute(
+                    f'SELECT 1 FROM pragma_foreign_key_check(?) bad JOIN "{table}" child ON child.rowid=bad.rowid '
+                    'WHERE child.candidate_id IN (SELECT value FROM json_each(?)) LIMIT 1',
+                    (table, *parameters),
+                ).fetchone()
+            if violation is not None:
                 raise CandidateContractError("Candidate foreign keys differ")
         return verified
 
@@ -1240,7 +1263,16 @@ class _StoryCandidateReadAuthority:
 
     def __verified_receipts(self, *, version_id=None, candidate_id=None, version_ids=None):
         _require_candidate_read_connection(self.__connection, active=True)
-        verified = self.__verifier._verify_local()
+        candidate_ids = None
+        if candidate_id is not None:
+            candidate_ids = frozenset({candidate_id})
+        elif version_id is not None or version_ids is not None:
+            requested = version_ids if version_ids is not None else (version_id,)
+            candidate_ids = frozenset(row[0] for row in self.__connection.execute(
+                "SELECT DISTINCT candidate_id FROM story_candidate_admission_receipts_v2 "
+                "WHERE version_id IN (SELECT value FROM json_each(?))", (json.dumps(sorted(requested)),),
+            ))
+        verified = self.__verifier._verify_local(candidate_ids=candidate_ids)
         matches = tuple(
             item
             for item in verified.values()
