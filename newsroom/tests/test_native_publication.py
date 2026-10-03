@@ -68,7 +68,7 @@ def _bindings(tmp_path: Path, registries, hydration, definitions, commands):
 
 
 @pytest.mark.parametrize("failure_boundary", (None, "before_apply", "after_apply", "after_record"))
-@pytest.mark.parametrize("copy_correction", (False, True, "narrative"))
+@pytest.mark.parametrize("copy_correction", (False, True, "narrative", "reviewed_headline"))
 def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monkeypatch, copy_correction, failure_boundary) -> None:
     candidate_connection, candidate_port, version = _candidate(tmp_path)
     ingress = open_evidence_intake_ingress(tmp_path / "intake.sqlite3")
@@ -190,9 +190,9 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
 
     if copy_correction:
         monkeypatch.setattr(controller._editorial, "_build_story", original_builder)
-        if copy_correction == "narrative":
+        if copy_correction in {"narrative", "reviewed_headline"}:
             from newsroom.tests.test_native_story_editorial import _writer
-            controller._editorial._story_writer = _writer([])
+            controller._editorial._story_writer = _writer([], headline_body_link=copy_correction == "reviewed_headline")
             controller.writer_contract_version = "newsroom.native-story-writer.v1"
         facts = {
             "story_event_id": first.story_receipt.event_id,
