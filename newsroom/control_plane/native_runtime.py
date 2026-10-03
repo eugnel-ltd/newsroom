@@ -46,7 +46,8 @@ from newsroom.sources.policy import (
 )
 from newsroom.sources.types import SourceRegistryReadPolicy
 
-from .native_policies import MAX_OBJECT_BYTES, VERSION, NativePolicies, native_policy_components
+from .native_policies import (MAX_OBJECT_BYTES, MAX_PDF_OBJECT_BYTES,
+    NATIVE_PDF_OBSERVATION_CLASS, VERSION, NativePolicies, native_policy_components)
 from .native_publication import NativePublicationController
 from .graphiti_operational_readiness import (
     _operational_entity_write_scopes, _operational_graphiti_write_scopes,
@@ -215,11 +216,12 @@ def open_native_runtime(
         relation_read_policy=relation_read, graphiti_read_policy=graphiti_read,
         projection_read_policy=projection_read,
         object_limits=ObjectLimits(
-            global_max_bytes=MAX_OBJECT_BYTES,
-            class_max_bytes={definition.object_class: MAX_OBJECT_BYTES
+            global_max_bytes=MAX_PDF_OBJECT_BYTES,
+            class_max_bytes={definition.object_class:
+                             MAX_PDF_OBJECT_BYTES if definition.object_class == NATIVE_PDF_OBSERVATION_CLASS else MAX_OBJECT_BYTES
                              for definition in policies.admission_registry.definitions()},
-            max_read_bytes=MAX_OBJECT_BYTES, max_staging_bytes=MAX_OBJECT_BYTES,
-            max_range_bytes=MAX_OBJECT_BYTES, min_free_bytes=100 * 1024 * 1024,
+            max_read_bytes=MAX_PDF_OBJECT_BYTES, max_staging_bytes=MAX_PDF_OBJECT_BYTES,
+            max_range_bytes=MAX_PDF_OBJECT_BYTES, min_free_bytes=100 * 1024 * 1024,
         ),
         neo4j_config=neo4j_config, retrieval_authority=retrieval_authority,
         collision_enforcer=collision_enforcer,

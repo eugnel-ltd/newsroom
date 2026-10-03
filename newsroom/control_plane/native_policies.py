@@ -28,6 +28,7 @@ from newsroom.increment10 import editorial as e, publication as p, private_servi
 from .graphiti_operational_readiness import operational_policy_components
 from .native_publication import NativePublicationBindings
 from . import evidence as evidence_policy
+from .govuk_pdf import MAX_RAW_BYTES as MAX_PDF_OBJECT_BYTES
 from newsroom.increment5 import native_retrieval as r
 
 VERSION = "hermes-private-native-v1"
@@ -36,9 +37,17 @@ NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE = "source.native-observation"
 NATIVE_SOURCE_OBSERVATION_CLASS = "source.native-observation"
 NATIVE_SOURCE_OBSERVATION_USE = "native-source-parsing"
 NATIVE_SOURCE_OBSERVATION_PURPOSE = "native-source-intake-read"
+NATIVE_PDF_OBSERVATION_ADMISSION_TYPE = "source.native-pdf-observation"
+NATIVE_PDF_OBSERVATION_CLASS = "source.native-pdf-observation"
+NATIVE_PDF_OBSERVATION_PURPOSE = "native-source-pdf-intake-read"
 
 # class, allowed use, hydration purpose, security, retention, write scope
 _OBJECTS = {
+    NATIVE_PDF_OBSERVATION_ADMISSION_TYPE: (
+        NATIVE_PDF_OBSERVATION_CLASS, NATIVE_SOURCE_OBSERVATION_USE,
+        NATIVE_PDF_OBSERVATION_PURPOSE, "authority.protected",
+        "source.observation.retained", "authority.source.observe",
+    ),
     NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE: (
         NATIVE_SOURCE_OBSERVATION_CLASS, NATIVE_SOURCE_OBSERVATION_USE,
         NATIVE_SOURCE_OBSERVATION_PURPOSE, "authority.protected",
@@ -130,7 +139,8 @@ def native_policy_components(
             allowed_authority_domains=frozenset({authority_domain}),
             allowed_object_classes=frozenset({values[0]}), allowed_uses=frozenset({values[1]}),
             allowed_security_scopes=frozenset({values[3]}),
-            allowed_retention_scopes=frozenset({values[4]}), max_bytes=MAX_OBJECT_BYTES,
+            allowed_retention_scopes=frozenset({values[4]}),
+            max_bytes=MAX_PDF_OBJECT_BYTES if values[0] == NATIVE_PDF_OBSERVATION_CLASS else MAX_OBJECT_BYTES,
         ) for admission_type, values in _OBJECTS.items()
     }
     hydration = HydrationPolicyRegistry((*base["hydration_policies"].contracts(), *hydration_by_type.values()))
