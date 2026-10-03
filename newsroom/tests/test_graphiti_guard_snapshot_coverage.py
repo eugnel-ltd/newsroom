@@ -227,6 +227,12 @@ def test_guard_rejects_invalid_snapshot_coverage_count(count: object) -> None:
 
 
 class _JournalResult:
+    def __aiter__(self):
+        async def iterate():
+            for row in self.records:
+                yield row
+        return iterate()
+
     def __init__(self, records):
         self.records = records
 
@@ -379,6 +385,16 @@ class _JournalDriver:
 
             async def begin_transaction(self):
                 return Transaction()
+
+            async def execute_write(self, callback):
+                transaction = Transaction()
+                try:
+                    value = await callback(transaction)
+                    await transaction.commit()
+                    return value
+                except BaseException:
+                    await transaction.rollback()
+                    raise
 
         return Session()
 
@@ -560,6 +576,11 @@ class _PageGuard(Neo4jMutationGuard):
         self.label_writes = []
         self.inventory_reads = []
 
+    async def _capture_inventory(self, match, *, element):
+        self.inventory_reads.append(match)
+        rows = [] if element == "r" else self.rows
+        return [(row["source_identity"], row["source_identity"]) for row in rows]
+
     async def _identity_inventory(self, query, *, snapshot_label):
         self.inventory_reads.append(query)
         rows = self.rows if snapshot_label == "NewsroomSnapshotNode" else []
@@ -580,6 +601,9 @@ class _PageGuard(Neo4jMutationGuard):
         if "identities" in params:
             self.reads.append(params)
             selected = {(row["source_identity"], row["target_identity"]) for row in params["identities"]}
+            if "MATCH (n) WHERE elementId(n) = row.source_identity" in query and "properties(n) AS source_properties" in query:
+                return [{**row, "target_identity": row["source_identity"]} for row in self.rows
+                        if (row["source_identity"], row["source_identity"]) in selected]
             return [row for row in self.rows if (row["source_identity"], row["target_identity"]) in selected]
         assert "ORDER BY source_identity" in query and "LIMIT $limit" in query
         assert "elementId(" in query and "uuid >" not in query
@@ -653,7 +677,9 @@ def test_snapshot_pages_commit_stable_original_element_identities():
     guard = _PageGuard(rows)
     asyncio.run(guard._snapshot())
     assert [len(page) for page in guard.writes] == [64, 1]
-    assert guard.reads[1]["cursor_source"] == "original-0063"
+    assert len(guard.inventory_reads) == 2
+    assert all("cursor_source" not in read for read in guard.reads)
+    assert guard.reads[1]["identities"] == [{"source_identity": "original-0064", "target_identity": "original-0064"}]
 
 
 def test_committed_rollback_page_crash_retains_durable_owner_until_exact_recovery():
@@ -741,7 +767,7 @@ class _InventoryDriver:
         class Transaction:
             async def run(self, query, **_parameters):
                 driver.queries.append(query)
-                return Result([{"snapshot_count": driver.count}] if "count(s)" in query else driver.rows)
+                return Result([{"snapshot_count": driver.count}] if "AS snapshot_count" in query else driver.rows)
         class Session:
             async def __aenter__(self):
                 return self
@@ -1090,3 +1116,102 @@ def test_passive_guard_begin_timer_records_exact_clock_and_preserves_exception(m
         'elapsed_ms': 7, 'cpu_ms': 3, 'cpu_scope': 'PROCESS',
         'nested_spans_not_additive': True,
     }]
+
+
+def test_capture_inventory_streams_all_actual_identities_not_uuid_aliases():
+    rows=[{'source_identity':f'original-{i:04}'}for i in range(2006)]
+    driver=_InventoryDriver(list(reversed(rows)),2006)
+    guard=Neo4jMutationGuard(driver,group_id='group-id',episode_uuid='episode-a',attempt_number=1,input_digest='sha256:'+'0'*64)
+    actual=asyncio.run(guard._capture_inventory('MATCH (n) WHERE n.group_id=$group_id',element='n'))
+    assert actual==[(row['source_identity'],row['source_identity'])for row in rows]
+    assert len(driver.queries)==2 and all('properties('not in query for query in driver.queries)
+
+
+@pytest.mark.parametrize('defect',('missing','duplicate','identity','count','bytes','stop'))
+def test_capture_inventory_denies_partial_oversized_or_interrupted_sets(defect,monkeypatch):
+    import newsroom.graphiti_adapter.neo4j_guard as module
+    rows=[{'source_identity':'original-a'}]
+    if defect=='duplicate':rows*=2
+    if defect=='identity':rows=[{'source_identity':None}]
+    if defect=='bytes':monkeypatch.setattr(module,'_INVENTORY_BYTES',300)
+    driver=_InventoryDriver(rows,True if defect=='count' else 2 if defect=='missing' else len(rows))
+    guard=Neo4jMutationGuard(driver,group_id='group-id',episode_uuid='episode-a',attempt_number=1,input_digest='sha256:'+'0'*64)
+    if defect=='stop':
+        def stopped():raise asyncio.CancelledError()
+        guard._owned_recovery_stop_check=stopped
+    with pytest.raises(asyncio.CancelledError if defect=='stop'else GuardError):
+        asyncio.run(guard._capture_inventory('MATCH (n) WHERE n.group_id=$group_id',element='n'))
+
+
+class _CaptureDriver(_SnapshotCleanupDriver):
+    """Interpret the unchanged capture predicates; count global versus point reads."""
+    def __init__(self,size=2006,fail_copy=False):
+        super().__init__();self.full_reads=0;self.point_reads=0;self.copied=[];self.fail_copy=fail_copy
+        self.nodes={f'node-{i:04}':({'Entity' if i%2 else 'CustomSDKLabel'},dict(uuid='alias' if i<2 else f'uuid-{i}',group_id='group-id',embedding=[1.0]*16))for i in range(size)}
+        self.nodes['outside']=({'Entity'},dict(uuid='outside',group_id='outside'))
+        self.nodes['old-snapshot']=({'NewsroomSnapshotNode'},dict(uuid='old',group_id='group-id'))
+        self.relationships={f'rel-{i:04}':(f'node-{i:04}','outside',dict(uuid=f'edge-{i}',weight=1.0))for i in range(size)}
+        self.relationships['outside-edge']=('outside','outside',dict(uuid='outside-edge'))
+    def selected(self,element):
+        if element=='n':
+            return [(identity,props,labels)for identity,(labels,props)in self.nodes.items()
+                if props.get('group_id')=='group-id'and not labels&{'NewsroomSnapshotNode','NewsroomSnapshotRelationship','NewsroomIngestMarker'}]
+        return [(identity,props,())for identity,(a,b,props)in self.relationships.items()
+            if (self.nodes[a][1].get('group_id')=='group-id'or self.nodes[b][1].get('group_id')=='group-id')
+            and 'NewsroomSnapshotNode'not in self.nodes[a][0]and 'NewsroomSnapshotNode'not in self.nodes[b][0]and props.get('uuid')is not None]
+    def apply(self,query,params):
+        if 'unsafe_nodes'in query:return [{'unsafe_nodes':0}]
+        if 'unsafe_relationships'in query:return [{'unsafe_relationships':0}]
+        if 'CREATE (s:NewsroomSnapshot'in query:
+            if self.fail_copy:raise GuardError('Graphiti bounded property write lost an actual target')
+            label='NewsroomSnapshotNode'if 'CREATE (s:NewsroomSnapshotNode)'in query else'NewsroomSnapshotRelationship'
+            for row in params['page']:
+                self.copied.append((label,row['source_identity']))
+                self.snapshots[f"{label}:{row['source_identity']}"]=({label},params['snapshot_id'])
+            return [{'written':len(params['page'])}]
+        if 'group_id = $group_id'in query and ('AS source_identity'in query or 'RETURN count(*) AS snapshot_count'in query):
+            self.full_reads+=1;element='r'if 'MATCH (a)-[r]->(b)'in query else'n'
+            if element=='r':assert '(a.group_id = $group_id OR b.group_id = $group_id)'in query
+            else:assert 'NOT n:NewsroomSnapshotRelationship'in query and ':Entity'not in query
+            selected=self.selected(element)
+            return [{'snapshot_count':len(selected)}]if 'AS snapshot_count'in query else[{'source_identity':identity}for identity,_props,_labels in selected]
+        if 'identities'in params:
+            self.point_reads+=1;element='r'if 'properties(r)'in query else'n'
+            values={identity:(props,labels)for identity,props,labels in self.selected(element)}
+            return [dict(source_identity=row['source_identity'],target_identity=row['source_identity'],source_properties=values[row['source_identity']][0],expected=list(values[row['source_identity']][1]))
+                for row in params['identities']if row['source_identity']in values]
+        return super().apply(query,params)
+
+
+class _CaptureGuard(_ActualCleanupJournalGuard):
+    _snapshot=Neo4jMutationGuard._snapshot
+
+
+def test_full_capture_uses_four_global_reads_and_keeps_cross_scope_and_alias_targets():
+    async def exercise():
+        driver=_CaptureDriver();driver.snapshots['protected']=({'NewsroomSnapshotNode'},'other:1')
+        guard=_CaptureGuard(driver,group_id='group-id',episode_uuid='episode-a',attempt_number=1,input_digest='sha256:'+'0'*64)
+        await guard.begin()
+        assert driver.full_reads==4 and driver.point_reads==64
+        assert len(driver.copied)==4012 and len(set(driver.copied))==4012
+        assert ('NewsroomSnapshotNode','node-0000')in driver.copied and ('NewsroomSnapshotNode','node-0001')in driver.copied
+        assert ('NewsroomSnapshotRelationship','rel-0000')in driver.copied
+        assert not any(identity in {'outside','old-snapshot','outside-edge'}for _label,identity in driver.copied)
+        with pytest.raises(GuardError):await _journal_guard(driver,'episode-b').begin()
+        await guard.complete({'provider_attempt_number':1})
+        assert driver.snapshots=={'protected':({'NewsroomSnapshotNode'},'other:1')}
+        previous=(driver.full_reads,driver.point_reads,len(driver.copied))
+        assert (await guard.begin()).state.value=='COMPLETE'
+        assert previous==(driver.full_reads,driver.point_reads,len(driver.copied))
+    asyncio.run(exercise())
+
+
+def test_failed_capture_never_dispatches_or_releases_its_generation_owner():
+    async def exercise():
+        driver=_CaptureDriver(size=1,fail_copy=True)
+        guard=_CaptureGuard(driver,group_id='group-id',episode_uuid='episode-a',attempt_number=1,input_digest='sha256:'+'0'*64)
+        with pytest.raises(GuardError):await guard.begin()
+        assert driver.markers['episode-a']['state']=='SNAPSHOTTING'
+        assert driver.owner['owner_marker_uuid']=='episode-a'
+        with pytest.raises(GuardError):await _journal_guard(driver,'episode-b').begin()
+    asyncio.run(exercise())

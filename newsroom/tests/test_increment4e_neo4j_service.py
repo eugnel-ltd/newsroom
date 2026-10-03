@@ -167,6 +167,59 @@ def test_actual_guard_restores_multiple_pages_and_duplicate_targets() -> None:
     asyncio.run(exercise())
 
 
+def test_actual_guard_capture_inventory_preserves_cross_group_targets_with_point_seeks() -> None:
+    """Bounded disposable service proof; no provider and no live workspace."""
+    from newsroom.graphiti_adapter.neo4j_guard import Neo4jMutationGuard
+
+    async def exercise():
+        config = _service_config()
+        suffix = str(uuid.uuid4())
+        group, outside, episode = f'capture-{suffix}', f'outside-{suffix}', f'capture-episode-{suffix}'
+        driver = _DatabaseBoundAsyncDriver(
+            AsyncGraphDatabase.driver(config.uri, auth=(config.username, config.password)), database=config.database)
+        captured_plans = {}
+        point_reads = []
+        class PlannedGuard(Neo4jMutationGuard):
+            async def _query(self, cypher, **params):
+                if 'identities' in params and ('properties(n) AS source_properties' in cypher or 'properties(r) AS source_properties' in cypher):
+                    kind = 'node' if 'properties(n)' in cypher else 'relationship'
+                    point_reads.append(kind)
+                    if kind not in captured_plans:
+                        _, summary, _ = await driver.execute_query('EXPLAIN ' + cypher, params=params, routing_='w')
+                        def operators(plan):
+                            return [plan['operatorType'], *(value for child in plan.get('children', []) for value in operators(child))]
+                        actual = operators(summary.plan)
+                        assert not any(value.startswith('AllNodesScan') or value.startswith('AllRelationshipsScan') for value in actual), actual
+                        assert any('ByElementIdSeek' in value for value in actual), actual
+                        captured_plans[kind] = actual
+                return await super()._query(cypher, **params)
+        async def query(cypher, **params):
+            return await driver.execute_query(cypher, params=params, routing_='w')
+        try:
+            await Neo4jMutationGuard.bootstrap_schema(driver)
+            await query("CREATE (:Entity {uuid:$outside,group_id:$outside,fixture:$fixture})",outside=outside,fixture=suffix)
+            await query("UNWIND range(0,2005) AS i CREATE (n:CustomSDKLabel {uuid:$prefix+toString(i),group_id:$group,fixture:$fixture,vector:[0.125,0.25,0.5]}) "
+                        "WITH n,i MATCH (b:Entity {uuid:$outside}) CREATE (n)-[:CAPTURE_EDGE {uuid:$prefix+'edge-'+toString(i),counter:i}]->(b)",
+                        prefix=suffix,group=group,outside=outside,fixture=suffix)
+            # UUID aliases and unfamiliar SDK labels must not narrow capture.
+            await query("MATCH (n:CustomSDKLabel {uuid:$id}) SET n.uuid=$alias",id=suffix+'1',alias=suffix+'0')
+            guard=PlannedGuard(driver,group_id=group,episode_uuid=episode,attempt_number=1,input_digest='sha256:'+'1'*64)
+            await guard.begin()
+            nodes,_,_=await query("MATCH (s:NewsroomSnapshotNode {_newsroom_snapshot_id:$snapshot}) RETURN count(s) AS total",snapshot=episode+':1')
+            edges,_,_=await query("MATCH (s:NewsroomSnapshotRelationship {_newsroom_snapshot_id:$snapshot}) RETURN count(s) AS total",snapshot=episode+':1')
+            assert nodes[0]['total']==edges[0]['total']==2006
+            assert point_reads.count('node')==point_reads.count('relationship')==32
+            assert set(captured_plans)=={'node','relationship'}
+            await guard.complete({'provider_attempt_number':1})
+            rows,_,_=await query("MATCH (s) WHERE s._newsroom_snapshot_id=$snapshot RETURN count(s) AS total",snapshot=episode+':1')
+            assert rows[0]['total']==0
+        finally:
+            await query("MATCH (n) WHERE n.fixture=$fixture OR n.group_id=$group OR n.episode_uuid=$episode "
+                        "OR n._newsroom_snapshot_id=$snapshot DETACH DELETE n",fixture=suffix,group=group,episode=episode,snapshot=episode+':1')
+            await driver.close()
+    asyncio.run(exercise())
+
+
 def test_actual_guard_expiry_keeps_generation_owned_until_recovery() -> None:
     from newsroom.graphiti_adapter.neo4j_guard import GuardError, GuardState, Neo4jMutationGuard
 

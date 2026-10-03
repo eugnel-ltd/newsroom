@@ -676,36 +676,49 @@ class Neo4jMutationGuard:
             _record_value(unsafe_relationships[0], "unsafe_relationships") or 0
         ):
             raise GuardError("Graphiti generation relationship has no stable UUID or uses reserved guard properties")
-        await self._write_pages(
+        nodes = await self._capture_inventory(
             f"""
             MATCH (n) WHERE n.group_id = $group_id
               AND NOT n:{_SNAPSHOT_NODE} AND NOT n:{_SNAPSHOT_RELATIONSHIP} AND NOT n:{_MARKER}
-              AND elementId(n) > $cursor_source
-            WITH n, elementId(n) AS source_identity
-            ORDER BY source_identity LIMIT $limit
-            RETURN source_identity, '' AS target_identity,
+            """, element="n",
+        )
+        async for records in self._inventory_pages(nodes,
+            """
+            UNWIND $identities AS row
+            MATCH (n) WHERE elementId(n) = row.source_identity
+            RETURN elementId(n) AS source_identity, elementId(n) AS target_identity,
                    properties(n) AS source_properties, labels(n) AS expected
+            ORDER BY source_identity, target_identity
             """,
-            f"""
+        ):
+            await self._write_page(
+                f"""
             UNWIND $page AS row
             MATCH (n) WHERE elementId(n) = row.source_identity
             CREATE (s:{_SNAPSHOT_NODE}) SET s = properties(n)
             SET s._newsroom_snapshot_id = $snapshot_id,
                 s._newsroom_source_uuid = n.uuid, s._newsroom_source_labels = labels(n)
             RETURN count(s) AS written
-            """,
-        )
-        await self._write_pages(
+                """, records,
+            )
+        nodes.clear()
+        relationships = await self._capture_inventory(
             f"""
             MATCH (a)-[r]->(b)
             WHERE (a.group_id = $group_id OR b.group_id = $group_id)
               AND NOT a:{_SNAPSHOT_NODE} AND NOT b:{_SNAPSHOT_NODE} AND r.uuid IS NOT NULL
-              AND elementId(r) > $cursor_source
-            WITH r, elementId(r) AS source_identity
-            ORDER BY source_identity LIMIT $limit
-            RETURN source_identity, '' AS target_identity, properties(r) AS source_properties
+            """, element="r",
+        )
+        async for records in self._inventory_pages(relationships,
+            """
+            UNWIND $identities AS row
+            MATCH (a)-[r]->(b) WHERE elementId(r) = row.source_identity
+            RETURN elementId(r) AS source_identity, elementId(r) AS target_identity, properties(r) AS source_properties
+            ORDER BY source_identity, target_identity
             """,
-            f"""
+        ):
+            await self._write_page(
+                f"""
             UNWIND $page AS row
             MATCH (a)-[r]->(b) WHERE elementId(r) = row.source_identity
             CREATE (s:{_SNAPSHOT_RELATIONSHIP}) SET s = properties(r)
@@ -713,8 +726,40 @@ class Neo4jMutationGuard:
                 s._newsroom_source_uuid = a.uuid, s._newsroom_target_uuid = b.uuid,
                 s._newsroom_relationship_type = type(r)
             RETURN count(s) AS written
-            """,
-        )
+                """, records,
+            )
+
+    async def _capture_inventory(self, match: str, *, element: str) -> list[tuple[str, str]]:
+        """Select the unchanged protected set once, without transferring properties."""
+        identity = f"elementId({element})"
+        async def consume(transaction):
+            if self._owned_recovery_stop_check is not None:
+                self._owned_recovery_stop_check()
+            result = await transaction.run(match + " RETURN count(*) AS snapshot_count", group_id=self._group_id)
+            count = _record_value(await result.single(strict=True), "snapshot_count")
+            if type(count) is not int or count < 0:
+                raise GuardError("Graphiti snapshot coverage count is invalid")
+            records = await transaction.run(match + f" RETURN {identity} AS source_identity", group_id=self._group_id)
+            identities, seen, size = [], set(), 256
+            async for record in records:
+                if self._owned_recovery_stop_check is not None and len(identities) % _PAGE_TARGET_LIMIT == 0:
+                    self._owned_recovery_stop_check()
+                source = _record_value(record, "source_identity")
+                if type(source) is not str or not source:
+                    raise GuardError("Graphiti inventory identity is absent")
+                if source in seen:
+                    raise GuardError("Graphiti inventory has a duplicate actual pair")
+                size += 512 + 3 * len(source.encode())
+                if size > _INVENTORY_BYTES:
+                    raise GuardError("Graphiti identity inventory exceeds its byte bound")
+                identities.append((source, source))
+                seen.add(source)
+            if len(identities) != count:
+                raise GuardError("Graphiti identity inventory omits a pre-existing target")
+            identities.sort()
+            return identities
+        async with self._driver.session() as session:
+            return await session.execute_write(consume)
 
     async def record_pending_telemetry(
         self,
