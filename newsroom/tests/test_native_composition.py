@@ -850,8 +850,9 @@ def test_composed_rights_cohort_rechecks_end_mutations_before_return_or_port(com
     runtime = fixture.pipeline._runtime
     snapshot = fixture.pipeline._intake._licence.snapshot_for("HK-02")
     returned = []
+    mutation_completed = False
     with pytest.raises((NativeRetrievalHold, ObjectAdmissionDenied, ObjectIntegrityError,
-        AuthenticationError, AuthorityPersistenceError, RuntimeError)):
+        AuthenticationError, AuthorityPersistenceError, RuntimeError)) as denied:
         with fixture.retrieval._rights_cohort() as rights:
             assert rights(fixture.unit)
             if changed == "current_version":
@@ -860,6 +861,7 @@ def test_composed_rights_cohort_rechecks_end_mutations_before_return_or_port(com
                 runtime.authority.sources.record_definition_version(replace(version.request,
                     version_id=SourceDefinitionVersionId.new(), version_number=2,
                     expected_previous_version_id=version.request.version_id,
+                    extraction_scope=tuple(sorted((*version.request.extraction_scope, "cohort-fixture-new-scope"))),
                     idempotency_key="fixture-new-rights-source-version"), proof=runtime.proof)
             elif changed == "locator_column":
                 with sqlite3.connect(fixture.arguments["authority_path"]) as retained:
@@ -888,7 +890,9 @@ def test_composed_rights_cohort_rechecks_end_mutations_before_return_or_port(com
                 fixture.now[0] += timedelta(minutes=6)
             else:
                 fixture.stop_requested[0] = True
+            mutation_completed = True
         returned.append("cohort returned before a retrieval port")
+    assert mutation_completed, f"mutation setup failed: {type(denied.value).__name__}: {denied.value}"
     assert returned == []
     assert fixture.pipeline._runtime.ingress.receipt_count == 0
 
