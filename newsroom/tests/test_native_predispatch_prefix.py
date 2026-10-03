@@ -675,3 +675,74 @@ def test_proved_recovery_write_denies_rebound_selected_candidate(tmp_path, monke
         assert context.journal.current(unit.revision_id) == before
     finally:
         context.connection.close()
+
+
+def test_old_cli_timeout_bypasses_denial_prefix_and_reaches_one_qualified_current_assessment(tmp_path, monkeypatch):
+    import json
+    from contextlib import nullcontext
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor, NativeAssessmentExecution
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    from newsroom.tests.test_native_assessor import _old_provider_failure, _empty_reference_result
+    from newsroom.tests.test_native_publication_continuation import _source
+    pipeline, journal, connection, _units, calls, dispositions = _open(tmp_path, monkeypatch)
+    candidate_connection, candidate, base, service, usage, old_allocation, old_terminal = _old_provider_failure(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    unit = _native('rich-cli-timeout')
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage='ASSESSMENT_INTERRUPTED', facts={
+        'candidate_id': candidate.candidate_id, 'candidate_version_id': candidate.version_id,
+        'graphiti_receipts': [{}], 'intake_receipt_id': 'retained-intake',
+        'assessment_contract_version': 'newsroom.native-evidence-assessor.v21+consumer.v1',
+        'failure_class': 'CliTimeoutError', 'reason': 'ACQUISITION_RESULT_NOT_RETAINED',
+        'acquisition_attempt_count': 1,
+    })
+    provider_calls, acquire_calls = [], []
+    def provider(_request):
+        provider_calls.append('v23')
+        return NativeAssessmentExecution(json.dumps(_empty_reference_result()), {
+            'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 1, 'output_tokens': 1,
+            'cached_read_tokens': 0, 'cached_write_tokens': 0, 'reasoning_tokens': 0,
+            'context_tokens': 1, 'total_tokens': 2,
+        })
+    assessor = AutonomousNativeEvidenceAssessor(provider, usage=usage, dispatch_fence=nullcontext)
+    def acquire(_self, **request):
+        acquire_calls.append(request['assessment_cached_only'])
+        assert request['intake_receipt_id'] == 'retained-intake'
+        assessor.assess_with_boundary(candidate, base, (), (), before_dispatch=request['before_assessment'],
+            cached_only=request['assessment_cached_only'])
+        raise NativeEvidenceHold('NO_QUALIFYING_NEW_INFORMATION', unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController, 'acquire_and_retain', acquire)
+    def version(identity):
+        assert identity == candidate.version_id
+        return candidate
+    continuation = NativePublicationContinuation(
+        journal=journal, runtime=NS(authority=NS(candidate_version=version), ingress=object(),
+            publication=object(), policies=object(), proof=object()),
+        evidence_controller=object.__new__(NativeEvidenceController), sources={unit.revision_id: (_source(unit),)},
+        assessment_old_provider_failure=usage.retained_old_provider_failure,
+        assessment_contract_failure=usage.retained_output_contract_failure,
+        assessment_contract_version='newsroom.native-evidence-assessor.v23+consumer.v1', clock=pipeline._clock,
+    )
+    class Publication:
+        def recover_pre_dispatch(self, revisions, *, before_revision):
+            return continuation.recover_pre_dispatch(revisions, before_revision=before_revision,
+                failure_many=lambda _: pytest.fail('CliTimeoutError must not enter the zero-allocation proof prefix'),
+                denial_many=lambda *_args, **_kwargs: pytest.fail('CliTimeoutError must not be marked checked by allocation denial'))
+        def advance(self, **request): return continuation.advance(**request)
+    pipeline._publish = Publication()
+    try:
+        first = pipeline.tick(cycle_id='old-timeout-qualified-current')
+        assert first.revision_states == {'EVIDENCE_HOLD': 1}
+        pipeline.tick(cycle_id='same-current-no-retry')
+        assert acquire_calls == [False]
+        assert provider_calls == ['v23']
+        assert calls == [('rights', 'current'), ('rights', 'current')]
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT COUNT(*) FROM model_invocation_allocations').fetchone() == (2,)
+            assert retained.execute('SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?',
+                (json.loads(old_terminal)['invocation_id'],)).fetchone() == (old_terminal,)
+            assert retained.execute('SELECT record_json FROM model_invocation_allocations WHERE invocation_id=?',
+                (json.loads(old_allocation)['invocation_id'],)).fetchone() == (old_allocation,)
+    finally:
+        candidate_connection.close()
+        connection.close()
