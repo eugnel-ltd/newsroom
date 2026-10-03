@@ -54,9 +54,11 @@ from .govuk_spreadsheet import (
     is_spreadsheet_url,
     parse_govuk_spreadsheet,
 )
+from .govuk_pdf import declared_pdf, is_pdf_url, parse_govuk_pdf, MAX_RAW_BYTES as MAX_PDF_RAW_BYTES
 from .native_policies import (
     NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE,
     NATIVE_SOURCE_OBSERVATION_PURPOSE,
+    NATIVE_PDF_OBSERVATION_ADMISSION_TYPE, NATIVE_PDF_OBSERVATION_PURPOSE,
 )
 from .native_evidence import (
     DependencyAssessment, NativeEvidenceHold, NativeEvidenceSource,
@@ -91,11 +93,13 @@ def _fetch_exact(url: str) -> tuple[int, bytes]:
         url not in SOURCE_URLS.values()
         and not url.startswith("https://www.gov.uk/api/content/")
         and not is_spreadsheet_url(url)
+        and not is_pdf_url(url)
     ):
         raise ValueError("native source endpoint is not approved")
     request = urllib.request.Request(
         url, method="GET", headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
     )
+    body_limit = MAX_PDF_RAW_BYTES if is_pdf_url(url) else MAX_BODY_BYTES
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=ssl.create_default_context()),
@@ -105,14 +109,14 @@ def _fetch_exact(url: str) -> tuple[int, bytes]:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
             status = int(getattr(response, "status", 200))
             response_url = response.geturl()
-            body = response.read(MAX_BODY_BYTES + 1)
+            body = response.read(body_limit + 1)
     except urllib.error.HTTPError as exc:
-        body = exc.read(MAX_BODY_BYTES + 1) if exc.fp else b""
+        body = exc.read(body_limit + 1) if exc.fp else b""
         status = int(exc.code)
         response_url = exc.geturl()
     except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
         raise ValueError("native source transport failed") from exc
-    if len(body) > MAX_BODY_BYTES:
+    if len(body) > body_limit:
         raise ValueError("native source response exceeds body bound")
     if response_url != url:
         raise ValueError("native source response identity differs")
@@ -153,6 +157,15 @@ def spreadsheet_asset_url(unit: CorpusIngestUnit) -> str | None:
         if separator == "|" and is_spreadsheet_url(asset_url)
         else None
     )
+
+
+def pdf_asset_url(unit: CorpusIngestUnit) -> str | None:
+    root_digest, separator, asset_url = unit.item_key.partition("|")
+    try:
+        validate_sha256_digest(root_digest)
+    except (TypeError, ValueError):
+        return None
+    return asset_url if separator == "|" and is_pdf_url(asset_url) else None
 
 
 class NativeSourceIntake:
@@ -347,25 +360,26 @@ class NativeSourceIntake:
                         child.canonical_url,
                         getattr(child_exc, "reason_code", "SOURCE_ITEM_RETAIN_FAILED"),
                     ))
-            spreadsheet_declarations = []
+            asset_declarations = []
             unsupported_attachments = []
             for asset_url, asset_title in exc.unsupported_attachments:
                 if (asset_url, asset_title) in exc.archival_references:
                     unsupported_attachments.append((asset_url, asset_title))
                     continue
                 try:
-                    spreadsheet_declarations.append(declared_spreadsheet(
+                    declare = declared_pdf if is_pdf_url(asset_url) else declared_spreadsheet
+                    asset_declarations.append(declare(
                         item.canonical_url, raw, asset_url, retrieved_at=observed,
                     ))
                 except (TypeError, ValueError, KeyError, UnicodeError):
                     unsupported_attachments.append((asset_url, asset_title))
-            for declaration, fetched in self._fetch_spreadsheet_assets(
-                source_id, spreadsheet_declarations,
+            for declaration, fetched in self._fetch_declared_assets(
+                source_id, asset_declarations,
             ):
                 try:
                     asset_url, asset_raw, asset_observed = fetched.result()
                     asset_admission, asset_access = self._admit_observation(
-                        source_id, asset_raw,
+                        source_id, asset_raw, pdf=is_pdf_url(asset_url),
                     )
                     asset_digest = digest_bytes(asset_raw)
                     observations.append((
@@ -373,7 +387,8 @@ class NativeSourceIntake:
                         str(asset_admission.admission_id),
                         str(asset_access.access_decision_id),
                     ))
-                    document = parse_govuk_spreadsheet(
+                    parse = parse_govuk_pdf if is_pdf_url(asset_url) else parse_govuk_spreadsheet
+                    document = parse(
                         item.canonical_url, raw, asset_url, asset_raw,
                         retrieved_at=asset_observed,
                     )
@@ -394,7 +409,7 @@ class NativeSourceIntake:
                         declaration.asset_url,
                         getattr(
                             asset_exc, "reason_code",
-                            "SOURCE_SPREADSHEET_RETAIN_FAILED",
+                            "SOURCE_PDF_RETAIN_FAILED" if is_pdf_url(declaration.asset_url) else "SOURCE_SPREADSHEET_RETAIN_FAILED",
                         ),
                     ))
             if unsupported_attachments:
@@ -525,7 +540,7 @@ class NativeSourceIntake:
         with self._fence(source_id, url):
             return self._fetch_item_response(item)
 
-    def _fetch_spreadsheet_assets(self, source_id, declarations):
+    def _fetch_declared_assets(self, source_id, declarations):
         declarations = tuple(declarations)
         if not declarations:
             return
@@ -542,7 +557,7 @@ class NativeSourceIntake:
                             (
                                 declaration,
                                 pool.submit(
-                                    self._fetch_spreadsheet_response,
+                                    self._fetch_asset_response,
                                     declaration.asset_url,
                                 ),
                             )
@@ -554,14 +569,15 @@ class NativeSourceIntake:
                         raise
                 yield from pending
 
-    def _fetch_spreadsheet_response(self, asset_url):
-        if not is_spreadsheet_url(asset_url):
+    def _fetch_asset_response(self, asset_url):
+        pdf = is_pdf_url(asset_url)
+        if not pdf and not is_spreadsheet_url(asset_url):
             raise NativeSourceIntakeHold("SOURCE_SPREADSHEET_URL_HOLD")
         status, raw = self._fetch(asset_url)
-        if len(raw) > MAX_BODY_BYTES:
-            raise NativeSourceIntakeHold("SOURCE_SPREADSHEET_BODY_TOO_LARGE")
+        if len(raw) > (MAX_PDF_RAW_BYTES if pdf else MAX_BODY_BYTES):
+            raise NativeSourceIntakeHold("SOURCE_PDF_RAW_BOUND_HOLD" if pdf else "SOURCE_SPREADSHEET_BODY_TOO_LARGE")
         if status != 200 or not raw:
-            raise NativeSourceIntakeHold("SOURCE_SPREADSHEET_FETCH_INCOMPLETE")
+            raise NativeSourceIntakeHold("SOURCE_PDF_FETCH_INCOMPLETE_HOLD" if pdf else "SOURCE_SPREADSHEET_FETCH_INCOMPLETE")
         return asset_url, raw, self._clock().astimezone(UTC)
 
     def _fetch_item_response(self, item):
@@ -602,12 +618,12 @@ class NativeSourceIntake:
             updated_at=_utc(document.updated),
         )
 
-    def _admit_observation(self, source_id: str, raw: bytes):
+    def _admit_observation(self, source_id: str, raw: bytes, *, pdf=False):
         admission = self._objects.admit(ObjectAdmissionRequest(
-            NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE,
+            NATIVE_PDF_OBSERVATION_ADMISSION_TYPE if pdf else NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE,
             f"native-source-observation:{source_id}:{digest_bytes(raw)}"
         ), raw, proof=self._proof).admission
-        access = self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, raw)
+        access = self._hydrate(admission, NATIVE_PDF_OBSERVATION_PURPOSE if pdf else NATIVE_SOURCE_OBSERVATION_PURPOSE, raw)
         return admission, access
 
     @staticmethod
@@ -830,7 +846,7 @@ def native_evidence_sources(
             raise hold("NATIVE_SOURCE_CHUNK_BINDING_HOLD")
         try:
             validate_sha256_digest(unit.observation_digest)
-            asset_url = spreadsheet_asset_url(unit)
+            asset_url = spreadsheet_asset_url(unit) or pdf_asset_url(unit)
             expected_api_url = (
                 SOURCE_URLS[unit.source_id]
                 if weather
@@ -924,7 +940,8 @@ def native_evidence_sources(
                     if parent_inventory is None:
                         raise ValueError("spreadsheet parent inventory is absent")
                     parent_url, parent_raw = parent_inventory
-                    document = parse_govuk_spreadsheet(
+                    parse = parse_govuk_pdf if is_pdf_url(asset_url) else parse_govuk_spreadsheet
+                    document = parse(
                         parent_url, parent_raw, asset_url, raw,
                         retrieved_at=retrieved,
                     )
@@ -1017,13 +1034,13 @@ def _require_parent_inventory_binding(
                 )
                 parent_found = any(item.canonical_url == parent_url for item in feed_items)
                 if not parent_found and (
-                    spreadsheet_asset_url(unit) is not None
+                    spreadsheet_asset_url(unit) is not None or pdf_asset_url(unit) is not None
                     or _declared_publication_leaves(raw, parent_url)
                 ):
                     parent_found = _declared_file_parent_in_feed_child(
                         unit=unit, parent_url=parent_url, feed_items=feed_items,
                         observations=observations, objects=objects, proof=proof,
-                        collection_only=spreadsheet_asset_url(unit) is None,
+                        collection_only=spreadsheet_asset_url(unit) is None and pdf_asset_url(unit) is None,
                     )
                 if parent_found:
                     break
@@ -1041,11 +1058,12 @@ def _require_parent_inventory_binding(
         child_paths = {path for path, _title in exc.child_items}
     else:
         raise ValueError("parent inventory is absent")
-    asset_url = spreadsheet_asset_url(unit)
+    asset_url = spreadsheet_asset_url(unit) or pdf_asset_url(unit)
     if asset_url is not None:
         if section_path != asset_url or parent_url != unit.canonical_url:
             raise ValueError("spreadsheet child identity differs")
-        declared_spreadsheet(
+        declare = declared_pdf if is_pdf_url(asset_url) else declared_spreadsheet
+        declare(
             parent_url, raw, asset_url,
             retrieved_at=datetime.fromisoformat(
                 unit.observed_at.replace("Z", "+00:00")
@@ -1117,19 +1135,20 @@ def _declared_file_parent_in_feed_child(
 
 
 def _require_observation_access(*, observation, objects, proof):
+    purpose = NATIVE_PDF_OBSERVATION_PURPOSE if is_pdf_url(observation[0]) else NATIVE_SOURCE_OBSERVATION_PURPOSE
     admission_id = ObjectAdmissionId.parse(observation[2])
     retained = objects.access_decision(
         ObjectAccessDecisionId.parse(observation[3]),
         admission_id=admission_id,
-        purpose=NATIVE_SOURCE_OBSERVATION_PURPOSE,
+        purpose=purpose,
         proof=proof,
     )
     current = objects.latest_access_decision(
-        admission_id, purpose=NATIVE_SOURCE_OBSERVATION_PURPOSE, proof=proof,
+        admission_id, purpose=purpose, proof=proof,
     )
     if (
         retained.admission_id != admission_id
-        or retained.purpose != NATIVE_SOURCE_OBSERVATION_PURPOSE
+        or retained.purpose != purpose
         or retained.offset != 0
         or retained.allowed_bytes != current.allowed_bytes
         or current.admission_id != admission_id
@@ -1158,7 +1177,7 @@ def verified_native_observation(
         observation=observation, objects=objects, proof=proof,
     )
     raw = objects.rehydrate(HydrationRequest(
-        admission_id, NATIVE_SOURCE_OBSERVATION_PURPOSE,
+        admission_id, NATIVE_PDF_OBSERVATION_PURPOSE if is_pdf_url(expected_url) else NATIVE_SOURCE_OBSERVATION_PURPOSE,
         0, access.allowed_bytes,
     ), proof=proof).data
     if digest_bytes(raw) != observation[1]:

@@ -14,7 +14,7 @@ def test_private_policy_bindings_are_derived_and_have_no_source_or_public_grant(
     assert policies.publication == same.publication
     assert not target.exists()
     assert len(policies.registry.definitions()) == 7
-    assert len(policies.admission_registry.definitions()) == 15
+    assert len(policies.admission_registry.definitions()) == 16
     context = policies.registry.resolve("retrieval.native_context.admit")
     assert context.aggregate_type == "native_retrieval_context"
     assert context.required_scope == "authority.retrieval.context"
@@ -45,3 +45,17 @@ def test_native_factory_keeps_exact_v15_reader_pair_not_an_unknown_policy(tmp_pa
     assert old_authorisation == 'sha256:4d7b98fab375ea20763a907e49a4bbe037f56b5020697e2391ffd3661bdcdd79'
     assert old_editorial != policies.publication.editorial_policy_bundle_digest
     assert old_authorisation != policies.publication.publication_authorisation_policy_digest
+
+
+def test_pdf_raw_hydration_limit_is_separate_from_every_existing_object_class(tmp_path):
+    from newsroom.control_plane.native_policies import (MAX_OBJECT_BYTES, MAX_PDF_OBJECT_BYTES,
+        NATIVE_PDF_OBSERVATION_CLASS, NATIVE_PDF_OBSERVATION_PURPOSE)
+    policies = native_policy_components(principal_id='newsroom.hermes', authority_domain='newsroom.authority',
+        target_path=tmp_path / 'serving.sqlite3', target_id='hermes-private-serving')
+    contracts = policies.hydration_policies.contracts()
+    pdf, = [contract for contract in contracts if contract.purpose == NATIVE_PDF_OBSERVATION_PURPOSE]
+    assert pdf.max_bytes == MAX_PDF_OBJECT_BYTES == 8 * 1_048_576
+    assert pdf.allowed_object_classes == frozenset({NATIVE_PDF_OBSERVATION_CLASS})
+    assert all(contract.max_bytes <= MAX_OBJECT_BYTES for contract in contracts
+               if contract.purpose != NATIVE_PDF_OBSERVATION_PURPOSE)
+    assert pdf.required_scope == 'authority.objects.read'
