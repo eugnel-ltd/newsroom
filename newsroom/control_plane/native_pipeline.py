@@ -14,6 +14,7 @@ from newsroom.authority import UtcTimestamp
 from .native_cycle import advance_native_cycle
 from .native_assessor import assessor_admission_recovery_due, assessment_revalidation_due, same_assessment_producer
 from .native_evidence import NativeEvidenceHold
+from .native_graphiti import _native_phase
 
 from .native_progress import NativeRevisionJournal
 from .veto import OperatorDrainRequested, VetoError
@@ -106,54 +107,57 @@ class NativePipeline:
             self._journal.land(tuple(units))
         self._drain_between_work()
 
-        # Fixed disjoint cohorts attempt each revision at most once per tick.
-        # Retained downstream work must not wait behind fresh model requests.
-        ordinary, reassessments, pending_revisions = [], [], []
-        for revision_id, units in self._journal.units.items():
-            previous = self._journal.summary(revision_id)
-            facts = previous.get("facts", {})
-            if not facts.get("graphiti_receipts"):
-                cohort = pending_revisions
-            elif previous.get("stage") == "EVIDENCE_HOLD" and assessment_revalidation_due(
-                facts, self._assessment_contract_version,
-            ):
-                # Exact cached consumer repairs need no model turn and should
-                # not wait behind fresh extraction/provider backlog.
-                cohort = ordinary if same_assessment_producer(
-                    facts.get("assessment_contract_version"), self._assessment_contract_version,
-                ) else reassessments
-            else:
-                cohort = ordinary
-            cohort.append((revision_id, units))
-        # Use the same current/archive turn for already-admitted downstream
-        # work; recent source updates must not wait behind old recovery backlog.
-        if not self._spill_archive_turn:
-            ordinary.sort(key=_source_update_time, reverse=True)
-        # Interrupted/unknown effects still settle before ordinary work. The
-        # stable sort preserves source recency, or LAND order on archive turns.
-        # Each turn has the existing quantum; an atomic revision may overrun it.
-        ordinary.sort(key=lambda item: self._journal.summary(item[0]).get("stage")
-                      not in {"ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
-        ordinary_deadline = self._monotonic_clock() + self._reassessment_quantum
-        ordinary_before = {revision: self._journal.progress_ordinal(revision) for revision, _ in ordinary}
-        recover = getattr(self._publish, "recover_pre_dispatch", None)
-        if callable(recover):
-            def before_recovery() -> bool:
-                self._drain_between_work()
-                self._check()
-                return self._monotonic_clock() < ordinary_deadline
+        with _native_phase("CLASSIFY", cycle_id=cycle_id, cohort_count=len(self._journal.units)):
+            # Fixed disjoint cohorts attempt each revision at most once per tick.
+            # Retained downstream work must not wait behind fresh model requests.
+            ordinary, reassessments, pending_revisions = [], [], []
+            for revision_id, units in self._journal.units.items():
+                previous = self._journal.summary(revision_id)
+                facts = previous.get("facts", {})
+                if not facts.get("graphiti_receipts"):
+                    cohort = pending_revisions
+                elif previous.get("stage") == "EVIDENCE_HOLD" and assessment_revalidation_due(
+                    facts, self._assessment_contract_version,
+                ):
+                    # Exact cached consumer repairs need no model turn and should
+                    # not wait behind fresh extraction/provider backlog.
+                    cohort = ordinary if same_assessment_producer(
+                        facts.get("assessment_contract_version"), self._assessment_contract_version,
+                    ) else reassessments
+                else:
+                    cohort = ordinary
+                cohort.append((revision_id, units))
+            # Use the same current/archive turn for already-admitted downstream
+            # work; recent source updates must not wait behind old recovery backlog.
+            if not self._spill_archive_turn:
+                ordinary.sort(key=_source_update_time, reverse=True)
+            # Interrupted/unknown effects still settle before ordinary work. The
+            # stable sort preserves source recency, or LAND order on archive turns.
+            # Each turn has the existing quantum; an atomic revision may overrun it.
+            ordinary.sort(key=lambda item: self._journal.summary(item[0]).get("stage")
+                          not in {"ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
+            ordinary_deadline = self._monotonic_clock() + self._reassessment_quantum
+            ordinary_before = {revision: self._journal.progress_ordinal(revision) for revision, _ in ordinary}
+        with _native_phase("ORDINARY_RECOVERY", cycle_id=cycle_id, cohort_count=len(ordinary)):
+            recover = getattr(self._publish, "recover_pre_dispatch", None)
+            if callable(recover):
+                def before_recovery() -> bool:
+                    self._drain_between_work()
+                    self._check()
+                    return self._monotonic_clock() < ordinary_deadline
 
-            attempted = set(recover(
-                tuple(revision_id for revision_id, _ in ordinary),
-                before_revision=before_recovery,
-            ))
-            # Reclassification is this revision's only turn in the tick, not
-            # permission for a fresh source/model retry using the batch proof.
-            ordinary = [item for item in ordinary if item[0] not in attempted]
-        deadline_deferred_ready = self._advance_revisions(
-            tuple(ordinary),
-            work_deadline=ordinary_deadline,
-        )
+                attempted = set(recover(
+                    tuple(revision_id for revision_id, _ in ordinary),
+                    before_revision=before_recovery,
+                ))
+                # Reclassification is this revision's only turn in the tick, not
+                # permission for a fresh source/model retry using the batch proof.
+                ordinary = [item for item in ordinary if item[0] not in attempted]
+        with _native_phase("ORDINARY_ADVANCE", cycle_id=cycle_id, cohort_count=len(ordinary)):
+            deadline_deferred_ready = self._advance_revisions(
+                tuple(ordinary),
+                work_deadline=ordinary_deadline,
+            )
         ordinary_turn_taken = any(
             self._journal.progress_ordinal(revision) != previous
             for revision, previous in ordinary_before.items()
