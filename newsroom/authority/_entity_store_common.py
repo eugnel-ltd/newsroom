@@ -280,6 +280,13 @@ class _EntityStoreSupport:
         conn: sqlite3.Connection,
         proposal_id: ProposalEnvelopeId,
     ) -> ProposalEnvelope:
+        closure = getattr(self, "_increment4_run_closure", None)
+        if closure is not None and closure["connection"] is conn and conn.in_transaction:
+            if closure["changes"] != conn.total_changes:
+                closure["bindings"].clear()
+                closure["changes"] = conn.total_changes
+        else:
+            closure = None
         row = conn.execute(
             "SELECT p.*,s.producer_contract_digest AS set_contract_digest,"
             "s.retained_at AS set_retained_at "
@@ -306,8 +313,20 @@ class _EntityStoreSupport:
         ).fetchone()
         if version_row is None:
             raise AuthorityPersistenceError("source proposal run version is missing")
-        result = self._run_version_from_row(conn, version_row, replayed=False)
-        self._revalidate_result_current(conn, result)
+        run_id = str(proposal.run_version_id)
+        binding = None if closure is None else closure["bindings"].get(run_id)
+        if binding is None:
+            # Validate the whole immutable output/proposal set, including unused
+            # members, but retain only its small current-rights input binding.
+            result = self._run_version_from_row(conn, version_row, replayed=False)
+            binding = result.request.input_binding
+        self._revalidate_input_binding_current(conn, binding)
+        if closure is not None:
+            if closure["changes"] == conn.total_changes:
+                closure["bindings"][run_id] = binding
+            else:
+                closure["bindings"].clear()
+                closure["changes"] = conn.total_changes
         return proposal
 
     def _mention_row(self, conn: sqlite3.Connection, mention_id: EntityMentionId) -> sqlite3.Row:
