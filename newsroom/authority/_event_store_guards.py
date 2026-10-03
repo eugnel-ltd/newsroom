@@ -309,6 +309,10 @@ class _ExactAuthorityGuards:
             if event_row is None:
                 raise AuthorityPersistenceError("retained event is missing")
             if event_row["retired_header_digest"] is not None:
+                if self._current_state_only and self._native_checkpoint_schema and event_row['native_checkpoint_id'] is not None:
+                    from .native_current_checkpoint import checkpoint_member
+                    checkpoint_member(self,event_id)
+                    return
                 self._validate_event_types(event_row)  # type: ignore[attr-defined]
                 return
             self._validate_event_types(event_row)  # type: ignore[attr-defined]

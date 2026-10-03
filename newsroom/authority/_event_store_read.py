@@ -171,6 +171,12 @@ class _EventStoreReadMixin:
             tuple(values),
         ).fetchone()
         if row is None:
+            if self._native_checkpoint_schema and self._connection.execute(
+                f'SELECT 1 FROM native_expired_command_keys WHERE {column}=? '
+                f'AND security_scope IN ({security_marks}) AND trust_scope IN ({trust_marks}) AND {sequence_clause}',
+                tuple(values),
+            ).fetchone() is not None:
+                raise DiagnosticHistoryExpired('event diagnostic provenance expired')
             raise KeyError(identifier)
         return row
 
