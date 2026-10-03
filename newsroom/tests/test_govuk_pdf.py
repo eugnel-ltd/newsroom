@@ -57,6 +57,37 @@ def test_complete_pdf_retains_every_page_text_and_exact_raw_inventory():
     assert sum(page['glyphs'] for page in document.page_inventory) == 82
 
 
+@pytest.mark.parametrize('tamper', ['body', 'page-digest', 'outcome', 'binding'])
+def test_pdf_parse_receipt_is_exact_canonical_metadata_not_raw_archive(tamper):
+    from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
+    from newsroom.control_plane.govuk_pdf import (GovUkPdfDocument, pdf_parse_binding,
+        pdf_parse_receipt, read_pdf_parse_receipt)
+    raw = pdf_bytes('Complete first page.')
+    binding = pdf_parse_binding(PARENT, parent_bytes(raw, 1), ASSET, raw,
+        retrieved_at=NOW, source_version='fixture-version')
+    text = 'Complete first page.'
+    declared = binding['declaration']
+    document = GovUkPdfDocument('pdf', declared['title'], 'Attachment: ' + ASSET + '\nPage 1\n' + text,
+        datetime.fromisoformat(declared['publication']), datetime.fromisoformat(declared['updated']),
+        tuple(declared['organisations']), (), digest_bytes(raw),
+        ({'page': 1, 'glyphs': len(text), 'text_digest': digest_bytes(text.encode()), 'decorative_images': 0},),
+        binding['parser_version'])
+    encoded = pdf_parse_receipt(binding, document)
+    assert len(encoded) < 1_048_576 and b'%PDF-' not in encoded
+    assert read_pdf_parse_receipt(encoded, binding) == document
+    value = json.loads(encoded)
+    if tamper == 'body':
+        value['document']['body_text'] += ' fabricated'
+    elif tamper == 'page-digest':
+        value['document']['page_inventory'][0]['text_digest'] = 'sha256:' + 'f' * 64
+    elif tamper == 'outcome':
+        value['outcome'] = 'UNKNOWN'
+    else:
+        value['binding']['parser_policy'] = 'sha256:' + 'e' * 64
+    with pytest.raises(ValueError, match='receipt binding'):
+        read_pdf_parse_receipt(canonical_json_bytes(value), binding)
+
+
 @pytest.mark.parametrize('appearance', [b'', b'/DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 3 0 R >> >>'])
 def test_explicit_empty_form_shell_preserves_all_page_text(appearance):
     from newsroom.control_plane.govuk_pdf import _extract

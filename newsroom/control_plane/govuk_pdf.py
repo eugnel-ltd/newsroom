@@ -6,7 +6,7 @@ active content, font guessing, hidden truncation or source fetch occurs here.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 import io
 import json
@@ -19,7 +19,7 @@ import tempfile
 import time
 from urllib.parse import unquote, urlsplit
 
-from newsroom.authority.canonical import digest_bytes, digest_canonical
+from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical, validate_sha256_digest
 from .govuk_evidence import (GovUkContentDocument, GovUkContentHold, MAX_BODY_BYTES,
     _api_url, _exclusion_signals, _html_text, _instant, _organisation_names,
     _safe_attachment_location, _unique_object, parse_govuk_content_document)
@@ -70,6 +70,93 @@ class GovUkPdfDocument(GovUkContentDocument):
     raw_digest: str
     page_inventory: tuple[dict, ...]
     parser_version: str
+
+
+PARSE_RECEIPT_VERSION = 'hermes-govuk-pdf-parse-receipt-v1'
+_STABLE_HOLDS = frozenset('SOURCE_PDF_' + code + '_HOLD' for code in (
+    'ACTIVE_CONTENT', 'ENCRYPTED', 'ANNOTATION_TEXT', 'FORM_CONTENT',
+    'UNSUPPORTED_TEXT_GRAPHIC', 'FONT_MAPPING', 'CONTENT_STRUCTURE',
+    'UNSUPPORTED_CONTENT', 'STRUCTURED_TEXT_COVERAGE', 'SCANNED_CONTENT',
+    'TEXT_COVERAGE', 'PAGE_BOUND', 'STREAM_BOUND', 'OPERATOR_BOUND',
+    'STRUCTURE_BOUND', 'TEXT_BOUND', 'PAGE_COVERAGE', 'RIGHTS_EXCLUSION'))
+
+
+def pdf_parse_binding(parent_url, parent_raw, asset_url, raw, *, retrieved_at, source_version):
+    """Fresh declared bytes first; parser receipts never grant source permission."""
+    from importlib.metadata import version
+    declaration = declared_pdf(parent_url, parent_raw, asset_url, retrieved_at=retrieved_at)
+    if (type(raw) is not bytes or len(raw) != declaration.file_size
+            or not raw.startswith(b'%PDF-') or not raw.rstrip().endswith(b'%%EOF')):
+        _hold('RAW_IDENTITY')
+    declared = asdict(declaration)
+    for field in ('publication', 'updated'):
+        declared[field] = declared[field].isoformat()
+    declared = json.loads(canonical_json_bytes(declared))
+    return {'version': PARSE_RECEIPT_VERSION, 'source_version': source_version,
+        'parent_url': parent_url, 'parent_digest': digest_bytes(parent_raw),
+        'asset_url': asset_url, 'raw_digest': digest_bytes(raw),
+        'declaration': declared, 'declaration_digest': digest_canonical(declared), 'parser_policy': POLICY_DIGEST,
+        'canonicaliser': VERSION, 'parser_version': version('pypdf')}
+
+
+def pdf_parse_receipt(binding, outcome):
+    """Bounded complete text or a deterministic typed HOLD, never worker failures."""
+    if isinstance(outcome, str):
+        if outcome not in _STABLE_HOLDS:
+            return None
+        document = None
+    else:
+        if type(outcome) is not GovUkPdfDocument:
+            raise ValueError('PDF parse receipt requires exact document')
+        document = asdict(outcome)
+        for field in ('publication', 'updated'):
+            document[field] = document[field].isoformat()
+        outcome = 'COMPLETE'
+    value = {'binding': binding, 'outcome': outcome, 'document': document}
+    encoded = canonical_json_bytes({**value, 'receipt_digest': digest_canonical(value)})
+    # Reuse is optional for the largest already-qualified text; no new HOLD or
+    # truncation is introduced merely to fit optimisation metadata.
+    return encoded if len(encoded) <= MAX_TEXT_BYTES else None
+
+
+def read_pdf_parse_receipt(raw, binding):
+    if type(raw) is not bytes or not 0 < len(raw) <= MAX_TEXT_BYTES:
+        raise ValueError('PDF parse receipt size differs')
+    value = json.loads(raw, object_pairs_hook=_unique_object)
+    if (not isinstance(value, dict) or set(value) != {'binding', 'outcome', 'document', 'receipt_digest'}
+            or canonical_json_bytes(value) != raw or value['binding'] != binding
+            or digest_canonical({key: value[key] for key in ('binding', 'outcome', 'document')}) != value['receipt_digest']):
+        raise ValueError('PDF parse receipt binding differs')
+    if value['outcome'] in _STABLE_HOLDS and value['document'] is None:
+        return value['outcome']
+    document = value['document']
+    if value['outcome'] != 'COMPLETE' or not isinstance(document, dict):
+        raise ValueError('PDF parse receipt outcome differs')
+    document['publication'] = datetime.fromisoformat(document['publication'])
+    document['updated'] = datetime.fromisoformat(document['updated'])
+    for field in ('organisations', 'exclusion_signals', 'page_inventory'):
+        document[field] = tuple(document[field])
+    result = GovUkPdfDocument(**document)
+    declared = binding['declaration']
+    if (result.document_type != 'pdf' or result.raw_digest != binding['raw_digest']
+            or result.parser_version != binding['parser_version'] or result.exclusion_signals
+            or result.title != declared['title'] or list(result.organisations) != list(declared['organisations'])
+            or result.publication.isoformat() != declared['publication']
+            or result.updated.isoformat() != declared['updated']
+            or not isinstance(result.title, str) or not isinstance(result.body_text, str)
+            or not result.body_text.startswith('Attachment: ' + binding['asset_url'] + '\n')
+            or len((result.title + '\n\n' + result.body_text).encode()) > MAX_TEXT_BYTES
+            or not 0 < len(result.page_inventory) <= MAX_PAGES
+            or declared['page_count'] is not None and len(result.page_inventory) != declared['page_count']
+            or any(not isinstance(page, dict) or set(page) != {'page', 'glyphs', 'text_digest', 'decorative_images'}
+                   or page.get('page') != number
+                   or type(page.get('glyphs')) is not int or page['glyphs'] < 0
+                   or type(page.get('decorative_images')) is not int or page['decorative_images'] < 0
+                   for number, page in enumerate(result.page_inventory, 1))):
+        raise ValueError('PDF parse receipt document differs')
+    for page in result.page_inventory:
+        validate_sha256_digest(page['text_digest'])
+    return result
 
 
 def is_pdf_url(url):
