@@ -1773,7 +1773,7 @@ def test_guard_retry_resets_snapshot_after_retained_attempt_cleanup(
     created = asyncio.run(guard.begin())
     assert created.attempt_number == 2
     assert created_snapshots == ["episode-id:2"]
-    assert deleted_snapshots == ["episode-id:1"]
+    assert deleted_snapshots == ["episode-id:1"] * 2
 
 
 def test_concurrent_guard_begin_has_one_atomic_marker_claim() -> None:
@@ -2035,9 +2035,11 @@ def test_guard_schema_bootstrap_is_explicit_and_separate_from_begin() -> None:
 
     asyncio.run(Neo4jMutationGuard.bootstrap_schema(Driver()))
 
-    assert len(queries) == 1
+    assert len(queries) == 3
     assert "CREATE CONSTRAINT newsroom_ingest_marker_episode" in queries[0][0]
-    assert queries[0][1] == {}
+    assert "CREATE INDEX newsroom_snapshot_node_identity" in queries[1][0]
+    assert "CREATE INDEX newsroom_snapshot_relationship_identity" in queries[2][0]
+    assert all(params == {} for _, params in queries)
 
 
 def test_real_runtime_bootstraps_guard_schema_once_before_attempts(
@@ -2056,7 +2058,7 @@ def test_real_runtime_bootstraps_guard_schema_once_before_attempts(
             routing_: str,
         ) -> tuple[list[dict[str, object]], None, None]:
             nonlocal calls
-            assert "CREATE CONSTRAINT" in query
+            assert "CREATE CONSTRAINT" in query or "CREATE INDEX" in query
             assert params == {}
             assert routing_ == "w"
             calls += 1
@@ -2071,7 +2073,7 @@ def test_real_runtime_bootstraps_guard_schema_once_before_attempts(
 
     asyncio.run(bootstrap_twice())
 
-    assert calls == 1
+    assert calls == 3
 
 
 def test_guard_rejects_telemetry_after_claim_takeover() -> None:
@@ -2407,7 +2409,7 @@ def test_complete_guard_recovery_cleans_crash_window_snapshot() -> None:
     )
     retained = asyncio.run(guard.begin())
     assert retained.state.value == "COMPLETE"
-    assert deleted_snapshots == ["episode-id:1"]
+    assert deleted_snapshots == ["episode-id:1"] * 2
 
 
 def test_complete_guard_recovery_requires_byte_exact_canonical_snapshot() -> None:
