@@ -1595,6 +1595,26 @@ class NativePublicationContinuation:
             # correction's original predecessor; interrupted intents replay.
             predecessor, prepared = None, False
         try:
+            if (progress.get("stage") == "COPY_CORRECTION_PREPARED"
+                    and facts.get("copy_correction_result") == "CORRECTED"
+                    and "copy_correction_origin" not in facts
+                    and self.copy_correction_due(facts, target_writer)):
+                # Older code could relabel a completed correction as PREPARED
+                # while retaining its consumed predecessor slot. Only an exact
+                # current ACK proving that slot completed permits a new upgrade.
+                current, _ = self._runtime.publication.read_acknowledged(
+                    {key: facts[key] for key in (
+                        "story_event_id", "publication_event_id",
+                        "delivery_attempt_event_id", "delivery_evidence_event_id",
+                    )}, proof=self._runtime.proof,
+                )
+                expected = facts.get("expected_story_version")
+                if (type(expected) is int and expected >= 0
+                        and current.story_receipt.aggregate_version == expected + 1
+                        and self._runtime.publication.retained_writer_id(
+                            facts["story_event_id"], proof=self._runtime.proof,
+                        ) == facts.get("copy_correction_checked_version")):
+                    predecessor, prepared, next_upgrade = None, False, True
             if predecessor is None:
                 writer_id = self._runtime.publication.retained_writer_id(
                     facts["story_event_id"], proof=self._runtime.proof,
@@ -1649,7 +1669,7 @@ class NativePublicationContinuation:
             facts = current_facts()
             facts["copy_correction_hold_reason"] = f"COPY_CORRECTION_HOLD:{type(exc).__name__}"
             facts["copy_correction_failure_detail"] = str(exc)[:240]
-            stage = "COPY_CORRECTION_PREPARED" if prepared else "ACKNOWLEDGED"
+            stage = "COPY_CORRECTION_PREPARED" if prepared or progress.get("stage") == "COPY_CORRECTION_PREPARED" else "ACKNOWLEDGED"
             self._journal.advance(revision_id, stage=stage, facts=facts)
             return NativePublicationContinuationResult(stage, facts["copy_correction_hold_reason"], None)
         facts = current_facts()
