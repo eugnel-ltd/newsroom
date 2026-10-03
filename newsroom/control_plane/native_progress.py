@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 
@@ -110,12 +110,112 @@ def _landed_units(
     return tuple(_unit(item, bodies) for item in raw_units)
 
 
+@dataclass(frozen=True, slots=True)
+class NativeSourceHeader:
+    source_id: str
+    item_key: str
+    headline: str
+    canonical_url: str
+    definition_version_id: str | None
+    published_at: str | None
+    updated_at: str | None
+    observed_ats: tuple[str, ...]
+    unit_index: tuple[tuple[str, str], ...]
+
+
+def _source_header(units: tuple[CorpusIngestUnit, ...]) -> NativeSourceHeader:
+    first = units[0]
+    return NativeSourceHeader(
+        first.source_id, first.item_key, first.headline, first.canonical_url,
+        None if first.authority is None else first.authority.definition_version_id,
+        first.published_at, first.updated_at, tuple(unit.observed_at for unit in units),
+        tuple((unit.ingest_id, digest_bytes(canonical_json_bytes(asdict(unit.effective_revision))))
+              for unit in units),
+    )
+
+
+class _CurrentUnits(Mapping[str, tuple[CorpusIngestUnit, ...]]):
+    """Selected exact source reads; immutable row pins, never a body cache."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self._pins: dict[str, tuple[int, str, str, int]] = {}
+        self._headers: dict[str, NativeSourceHeader] = {}
+
+    def __iter__(self):
+        return iter(self._pins)
+
+    def __len__(self):
+        return len(self._pins)
+
+    def __contains__(self, revision_id):
+        return revision_id in self._pins
+
+    def __getitem__(self, revision_id: str) -> tuple[CorpusIngestUnit, ...]:
+        from .native_progress_state import checked_json
+        pin = self._pins[revision_id]
+        owns_read = not self._connection.in_transaction
+        if owns_read:
+            self._connection.execute('BEGIN')
+        try:
+            expected = self._headers[revision_id].unit_index
+            if self._connection.execute(
+                    'SELECT count(*) FROM native_current_units WHERE revision_id=?',
+                    (revision_id,),
+            ).fetchone()[0] != len(expected):
+                raise ValueError('native CURRENT selected source index differs')
+            row = self._connection.execute(
+                'SELECT CASE WHEN land_seq=? AND land_digest=? AND content_digest=? '
+                'AND length(CAST(content_json AS BLOB))=? THEN content_json END '
+                'FROM native_current_sources WHERE revision_id=?', (*pin, revision_id),
+            ).fetchone()
+            if row is None or row[0] is None:
+                raise ValueError('native CURRENT selected source binding differs')
+            indexed = self._connection.execute(
+                'SELECT refs.key,u.revision_id,u.effective_revision_digest FROM json_each(?) refs '
+                'LEFT JOIN native_current_units u ON u.ingest_id=refs.value '
+                'ORDER BY CAST(refs.key AS INTEGER)',
+                (json.dumps([ingest for ingest, _ in expected]),),
+            ).fetchall()
+            if tuple(tuple(item) for item in indexed) != tuple(
+                    (ordinal, revision_id, digest) for ordinal, (_, digest) in enumerate(expected)):
+                raise ValueError('native CURRENT selected source index differs')
+            # Recheck the exact bytes validated before pin retention. Returned
+            # units and mutable authority records belong to this selection only.
+            return _landed_units(checked_json(row[0], pin[2], label='source'))
+        finally:
+            if owns_read:
+                self._connection.rollback()
+
+    def retain(self, revision_id: str, *, seq: int, digest: str,
+               content_digest: str, content_size: int,
+               units: tuple[CorpusIngestUnit, ...]) -> None:
+        pin = (seq, digest, content_digest, content_size)
+        if revision_id in self._pins and self._pins[revision_id] != pin:
+            raise ValueError('native CURRENT retained source binding differs')
+        self._pins[revision_id] = pin
+        self._headers[revision_id] = _source_header(units)
+
+
+def source_header(units: Mapping, revision_id: str) -> NativeSourceHeader:
+    """Return validated metadata without selecting a CURRENT body."""
+    return units._headers[revision_id] if isinstance(units, _CurrentUnits) else _source_header(units[revision_id])
+
+
+def iter_source_headers(units: Mapping) -> Iterator[NativeSourceHeader]:
+    if isinstance(units, _CurrentUnits):
+        yield from units._headers.values()
+    else:
+        for retained in units.values():
+            yield _source_header(retained)
+
+
 class NativeRevisionJournal:
     def __init__(self, connection: sqlite3.Connection, *, _legacy: bool = False) -> None:
         self._connection = connection
-        self.units: dict[str, tuple[CorpusIngestUnit, ...]] = {}
-        # Share immutable equal body text only; every revision and authority
-        # container remains distinct. The pool is bounded by retained units.
+        self.units: Mapping[str, tuple[CorpusIngestUnit, ...]] = {} if _legacy else _CurrentUnits(connection)
+        # Legacy replay shares immutable equal body text only. CURRENT retains
+        # exact row pins/headers and selects detached original units on demand.
         self._bodies: dict[str, str] = {}
         self._summaries: dict[str, dict] = {}
         self._records: dict[str, _ProgressRecord] = {}
@@ -154,11 +254,13 @@ class NativeRevisionJournal:
             'SELECT revision_id,land_seq,land_digest,content_json,content_digest FROM native_current_sources ORDER BY land_seq'
         ):
             value = checked_json(raw, content_digest, label='source')
-            self._apply(LAND, value, seq=seq, payload_digest=digest)
+            self._apply(LAND, value, seq=seq, payload_digest=digest,
+                        content_digest=content_digest, content_size=len(raw.encode()))
             if value['revision_id'] != revision:
                 raise ValueError('native CURRENT source identity differs')
-        expected_units = {unit.ingest_id: (unit.revision_id, digest_bytes(canonical_json_bytes(asdict(unit.effective_revision))))
-                          for units in self.units.values() for unit in units}
+        expected_units = {ingest: (revision, digest)
+                          for revision, header in self.units._headers.items()
+                          for ingest, digest in header.unit_index}
         indexed_units = {ingest: (revision, digest) for ingest, revision, digest in self._connection.execute(
             'SELECT ingest_id,revision_id,effective_revision_digest FROM native_current_units')}
         if indexed_units != expected_units:
@@ -188,19 +290,27 @@ class NativeRevisionJournal:
                 raise ValueError('native CURRENT observation binding differs')
             self.observations[observation] = tuple(value)
 
-    def _apply(self, kind: str, value: dict, *, seq: int, payload_digest: str) -> None:
+    def _apply(self, kind: str, value: dict, *, seq: int, payload_digest: str,
+               content_digest: str | None = None, content_size: int | None = None) -> None:
         if kind == LAND:
             # Chunk receipts repeat the full source body. Share exact-equal text
             # across revisions too; retain and validate every original ledger byte.
-            units = _landed_units(value, bodies=self._bodies)
+            units = _landed_units(value, bodies=None if self._current_state else self._bodies)
             self._validate_units(units)
             revision_id = units[0].revision_id
             if value["revision_id"] != revision_id:
                 raise ValueError("native progress revision identity differs")
-            prior = self.units.get(revision_id)
-            if prior is not None and prior != units:
-                raise ValueError("native progress retained units changed")
-            self.units[revision_id] = units
+            if self._current_state:
+                if content_digest is None or content_size is None:
+                    raw = canonical_json_bytes(value)
+                    content_digest, content_size = digest_bytes(raw), len(raw)
+                self.units.retain(revision_id, seq=seq, digest=payload_digest,
+                    content_digest=content_digest, content_size=content_size, units=units)
+            else:
+                prior = self.units.get(revision_id)
+                if prior is not None and prior != units:
+                    raise ValueError("native progress retained units changed")
+                self.units[revision_id] = units
         elif kind == STATE:
             revision_id = value["revision_id"]
             if revision_id not in self.units:

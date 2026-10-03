@@ -65,7 +65,7 @@ from .native_policies import (
 from .native_evidence import (
     DependencyAssessment, NativeEvidenceHold, NativeEvidenceSource,
 )
-from .native_progress import NativeRevisionJournal
+from .native_progress import NativeRevisionJournal, iter_source_headers
 
 from .veto import OperatorDrainRequested, VetoError
 
@@ -693,10 +693,10 @@ class NativeSourceIntake:
             return item.item_key
         # First journal LAND wins, then the first successful retention this poll.
         # Keep that exact namespace and its original ancestry proof.
-        for units in chain(self._retained_units.values(), self._pending_units.values()):
-            unit = units[0]
-            if (unit.source_id == source_id and unit.authority is not None
-                    and unit.authority.definition_version_id == str(version_id)
+        for unit in chain(iter_source_headers(self._retained_units),
+                          iter_source_headers(self._pending_units)):
+            if (unit.source_id == source_id
+                    and unit.definition_version_id == str(version_id)
                     and unit.canonical_url == item.canonical_url
                     and self._govuk_item_path(unit) == path):
                 return unit.item_key

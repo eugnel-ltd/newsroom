@@ -1400,23 +1400,26 @@ def test_manual_item_key_reuses_only_exact_retained_namespace(mismatch):
 
     path = "/government/publications/factsheets"
     old_key, current_key = "sha256:" + "1" * 64 + "|" + path, "sha256:" + "2" * 64 + "|" + path
-    old = SimpleNamespace(source_id="UK-01", item_key=old_key, canonical_url="https://www.gov.uk" + path,
-                          authority=SimpleNamespace(definition_version_id="version-1"))
+    from newsroom.tests.test_native_graphiti import _native
+    original = _native("namespace")
+    old = replace(original, source_id="UK-01", item_key=old_key,
+                  canonical_url="https://www.gov.uk" + path,
+                  authority=replace(original.authority, definition_version_id="version-1"))
     if mismatch == "source":
-        old.source_id = "UK-03"
+        old = replace(old, source_id="UK-03")
     elif mismatch == "version":
-        old.authority.definition_version_id = "version-2"
+        old = replace(old, authority=replace(old.authority, definition_version_id="version-2"))
     elif mismatch == "path":
-        old.item_key = old_key + "-other"
+        old = replace(old, item_key=old_key + "-other")
     elif mismatch == "url":
-        old.canonical_url += "-other"
+        old = replace(old, canonical_url=old.canonical_url + "-other")
     elif mismatch == "invalid-root":
-        old.item_key = "sha256:invalid|" + path
+        old = replace(old, item_key="sha256:invalid|" + path)
     elif mismatch == "file":
         current_key = "sha256:" + "2" * 64 + "|https://assets.publishing.service.gov.uk/file.xlsx"
     elif mismatch == "tagged":
         current_key = "govuk-child-v1|" + path
-    later = SimpleNamespace(**{**vars(old), "item_key": "sha256:" + "3" * 64 + "|" + path})
+    later = replace(old, item_key="sha256:" + "3" * 64 + "|" + path)
     intake = NativeSourceIntake(sources=None, objects=None, proof=None, definition_ids={}, licence=None,
                                dispatch_fence=lambda *_: nullcontext(),
                                retained_units={"first-land": (old,), "later-land": (later,)} if mismatch is None else {"first-land": (old,)})
@@ -1692,3 +1695,32 @@ def test_pdf_parent_keeps_failed_sibling_obligation_visible(tmp_path, monkeypatc
         assert len(result.units) == 1
         assert (other_url, 'SOURCE_PDF_FONT_MAPPING_HOLD') in result.item_holds
         assert {row[0] for row in result.observations} >= {ASSET, other_url}
+
+
+def test_current_namespace_lookup_uses_validated_headers_in_original_land_order(tmp_path):
+    from newsroom.control_plane.native_progress import NativeRevisionJournal
+    from newsroom.control_plane.store import connect
+    from newsroom.control_plane.items import SourceItem
+    from newsroom.tests.test_native_graphiti import _native
+
+    path = '/government/publications/current-facts'
+    current_key = 'sha256:' + '2' * 64 + '|' + path
+    connection = connect(str(tmp_path / 'namespace-headers.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    old_keys = tuple('sha256:' + str(index) * 64 + '|' + path for index in (1, 3))
+    for index, key in enumerate(old_keys):
+        original = _native(f'namespace-{index}')
+        unit = replace(original, item_key=key, canonical_url='https://www.gov.uk' + path,
+            authority=replace(original.authority, definition_version_id='version-1'))
+        journal.land((unit,))
+    reopened = NativeRevisionJournal(connection)
+    intake = NativeSourceIntake(sources=None, objects=None, proof=None, definition_ids={}, licence=None,
+        dispatch_fence=lambda *_: nullcontext(), retained_units=reopened.units)
+    item = SourceItem('UK-01', current_key, 'Factsheets', 'Retained body', 'https://www.gov.uk' + path)
+    statements = []
+    connection.set_trace_callback(statements.append)
+    try:
+        assert intake._manual_item_key('UK-01', 'version-1', item) == old_keys[0]
+        assert statements == []
+    finally:
+        connection.close()

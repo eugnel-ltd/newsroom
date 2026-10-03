@@ -1,14 +1,14 @@
 """Provider-free regressions for exact GOV.UK child revision aliases."""
 
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from newsroom.authority.canonical import digest_bytes
+from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
 from newsroom.control_plane.graphiti_operational_readiness import (
     OPERATOR_AUTHORITY_DOMAIN, OPERATOR_PRINCIPAL_ID,
 )
@@ -170,7 +170,7 @@ def test_historical_namespace_survives_later_parent_and_feed_aliases(
             )
             assert str(revision.request.prior_revision_id) == old.authority.revision_id
         else:
-            assert new is case.journal.units[old.revision_id][0]
+            assert canonical_json_bytes(asdict(new)) == canonical_json_bytes(asdict(case.journal.units[old.revision_id][0]))
             assert new == old
         assert _evidence(case, result)
         assert case.connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall() == original_ledger
@@ -374,7 +374,7 @@ def test_first_historical_land_is_future_identity_without_rewriting_three_old_al
         case.bodies[SOURCE_URLS["UK-01"]] = _feed(CHILD, *PARENTS)
         result = case.intake.poll()[0]
         assert result.status == "READY" and len(result.units) == 1
-        assert result.units[0] is case.journal.units[original_units[0].revision_id][0]
+        assert canonical_json_bytes(asdict(result.units[0])) == canonical_json_bytes(asdict(case.journal.units[original_units[0].revision_id][0]))
         assert _evidence(case, result)
         assert len(case.journal.units) == 3
         assert case.connection.execute("SELECT * FROM ledger ORDER BY seq").fetchall() == ledger

@@ -789,3 +789,17 @@ def test_stale_story_slot_requires_exact_acknowledged_sibling(tmp_path, monkeypa
             assert controller.advance(third.package_admission_id, decision_for(third), **final_request) == final
     finally:
         controller.close(); candidates.rollback(); candidates.close(); system.close()
+
+
+def test_current_output_restoration_never_selects_unacknowledged_source_bodies():
+    from types import SimpleNamespace
+    class ColdSources(dict):
+        def get(self, *_):
+            pytest.fail('restoration selected an unrelated cold source')
+    controller = object.__new__(NativePublicationController)
+    controller._source_currentness_fence = lambda *_: None
+    journal = SimpleNamespace(units=ColdSources(), iter_summaries=lambda: iter((
+        ('held', {'stage': 'EVIDENCE_HOLD', 'facts': {}}),
+        ('pending', {'stage': 'PUBLICATION_STARTED', 'facts': {}}),
+    )))
+    controller.restore_current_publisher_output(journal, proof=None)
