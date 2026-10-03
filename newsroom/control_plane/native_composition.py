@@ -95,6 +95,58 @@ TRANSPORT_POLICY = digest_canonical({
 })
 
 
+def _require_hko_current_source(package, current, *, sources, definition_version_id, locator, proof):
+    """Fence one timestamped HKO warning against existing canonical source state."""
+    if current.source_id != "HK-02" or current.currency_family not in {"CURRENT_VERSION", "COMPLETED_HISTORICAL_EVENT"}:
+        return
+    from newsroom.checks import deterministic_uuid4
+    from newsroom.graphiti_adapter.identity import content_digest
+    from newsroom.increment10.editorial import EditorialHold
+    from newsroom.increment9.proving import SOURCE_URLS
+    from newsroom.sources import SourceItemId
+    from newsroom.sources.types import TimePrecision
+    from .native_source_intake import VERSION as INTAKE_VERSION
+    from .native_weather_evidence import _hko_warning
+
+    def unknown():
+        raise EditorialHold(reason="NATIVE_STORY_SOURCE_ORDER_UNKNOWN")
+
+    if locator != SOURCE_URLS["HK-02"]:
+        unknown()
+    try:
+        raw = package.passages[package.source_ids.index(current.source_id)].partition("\n\n")[0]
+        warning, _label = _hko_warning(raw.encode())
+        key = next(iter(json.loads(raw)))
+        selected_time = UtcTimestamp.parse(current.version_reference).value
+        if UtcTimestamp.parse(warning["updateTime"]).value != selected_time:
+            unknown()
+    except (ValueError, TypeError, KeyError, IndexError, UnicodeError):
+        unknown()
+    item_id = deterministic_uuid4(SourceItemId, namespace=f"{INTAKE_VERSION}:item",
+        semantic_value=[str(definition_version_id), current.source_id, key])
+    latest = sources.latest_revision(item_id, proof=proof)
+
+    def timestamp(revision):
+        if (revision is None or revision.request.item_id != item_id
+                or str(revision.request.definition_version_id) != str(definition_version_id)
+                or revision.request.source_updated_time.precision is not TimePrecision.EXACT):
+            unknown()
+        return UtcTimestamp.parse(revision.request.source_updated_time.value).value
+
+    latest_time = timestamp(latest)
+    if latest.request.prior_revision_id is not None:
+        previous_time = timestamp(sources.revision(latest.request.prior_revision_id, proof=proof))
+        # Ledger order is not a timestamp high-water. Refuse a backdated current
+        # revision rather than asserting that its name establishes currentness.
+        if latest_time < previous_time:
+            unknown()
+    if selected_time < latest_time:
+        raise EditorialHold(reason="NATIVE_STORY_SOURCE_SUPERSEDED")
+    if (selected_time != latest_time or latest.request.permitted_state_digest != content_digest(
+            headline=warning["name"], body=raw, canonical_url=locator)):
+        unknown()
+
+
 def _lexical_path(path: str | Path) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
@@ -383,6 +435,25 @@ def open_native_pipeline(
         resources.callback(proving.close)
         journal = NativeRevisionJournal(private)
         usage = ModelUsageService(str(private_path))
+        def require_current_story_sources(package, currentness):
+            from newsroom.increment10.editorial import EditorialHold
+            stop_check()
+            if tuple(item.source_id for item in currentness) != package.source_ids:
+                raise EditorialHold(reason="NATIVE_STORY_SOURCE_BINDING_HOLD")
+            for item in currentness:
+                definition = runtime.authority.sources.current_summary(
+                    SourceDefinitionId.parse(item.source_definition_id), proof=proof)
+                version = runtime.authority.sources.version_details(definition.version_id, proof=proof)
+                if (version.canonical_digest != item.source_definition_revision_digest
+                        or source_rights(item.source_id, version.request.locator) is None):
+                    raise EditorialHold(reason="NATIVE_STORY_CURRENT_SOURCE_RIGHTS_HOLD")
+                _require_hko_current_source(package, item, sources=runtime.authority.sources,
+                    definition_version_id=definition.version_id, locator=version.request.locator, proof=proof)
+
+        def source_currentness_fence(package, currentness):
+            with stop_fence():
+                require_current_story_sources(package, currentness)
+
         def story_writer(package, **identities):
             from newsroom.increment10.editorial import EditorialHold
             from .model_usage import ModelUsageAdmissionError
@@ -391,16 +462,7 @@ def open_native_pipeline(
             from .writer import WriterDispatchError, CliProcessError, CliTimeoutError
             currentness = identities.pop("source_currentness")
             def require_story_sources():
-                stop_check()
-                if tuple(item.source_id for item in currentness) != package.source_ids:
-                    raise EditorialHold(reason="NATIVE_STORY_SOURCE_BINDING_HOLD")
-                for item in currentness:
-                    definition = runtime.authority.sources.current_summary(
-                        SourceDefinitionId.parse(item.source_definition_id), proof=proof)
-                    version = runtime.authority.sources.version_details(definition.version_id, proof=proof)
-                    if (version.canonical_digest != item.source_definition_revision_digest
-                            or source_rights(item.source_id, version.request.locator) is None):
-                        raise EditorialHold(reason="NATIVE_STORY_CURRENT_SOURCE_RIGHTS_HOLD")
+                require_current_story_sources(package, currentness)
             @contextmanager
             def writer_fence():
                 with stop_fence():
@@ -456,6 +518,7 @@ def open_native_pipeline(
             credential=credential, principal_id=principal, authority_domain=domain,
             neo4j_config=neo4j_config, native_dependency_factory=dependencies, clock=now,
             story_writer=story_writer,
+            source_currentness_fence=source_currentness_fence,
         ))
         documents = components["documents"]
         from newsroom.increment9.proving import SOURCE_URLS

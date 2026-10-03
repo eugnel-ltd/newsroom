@@ -279,3 +279,77 @@ def test_terminal_binding_failure_in_capture_preserves_original_cli_timeout(tmp_
             assert retained.execute("SELECT count(*) FROM ledger WHERE kind='NATIVE_ASSESSOR_TRANSPORT_DIAGNOSTIC'").fetchone()[0] == 0
     finally:
         connection.close()
+
+
+def test_timeout_emits_bounded_framing_observation_without_output_or_authority(monkeypatch, caplog):
+    import logging
+    output = '\n'.join(json.dumps(value) for value in (
+        {'type': 'thought', 'data': 'private 中文'},
+        {'params': {'update': {'sessionUpdate': 'agent_thought_chunk', 'content': {'text': 'more'}}}},
+        {'type': 'text', 'data': _SECRET},
+        {'update': {'sessionUpdate': 'agent_message_chunk', 'content': {'text': '字'}}},
+        {'type': 'usage', 'usage': {'total_tokens': 900}},
+        {'type': 'end', 'stopReason': 'end_turn'},
+        {'type': _SECRET, 'data': _SECRET},
+    )).encode()
+    def timeout(command, **_arguments):
+        raise subprocess.TimeoutExpired(command, 300, output=output, stderr=b'')
+    monkeypatch.setattr(writer.subprocess, 'run', timeout)
+    with caplog.at_level(logging.INFO, logger='newsroom.diagnostic'):
+        with pytest.raises(writer.CliTimeoutError) as caught:
+            writer._run(('grok',), timeout=300)
+    records = [record for record in caplog.records if getattr(record, 'diagnostic_event', None) == 'CLI_TIMEOUT_STREAM_OBSERVATION']
+    assert len(records) == 1
+    data = records[0].diagnostic_data
+    assert data['thought'] == [2, len('private 中文more'.encode())]
+    assert data['text'] == [2, len((_SECRET + '字').encode())]
+    assert data['usage'] == data['end'] == 1
+    assert data['end_seen'] is True and data['stop'] == 'end_turn'
+    assert data['other'] == 1 and data['invalid'] == 0 and data['truncated'] is False
+    assert len(json.dumps(data, separators=(',', ':')).encode()) <= 256
+    assert _SECRET not in json.dumps(data) and 'private 中文' not in json.dumps(data)
+    assert validated_timeout_diagnostics([caught.value.evidence]) == [caught.value.evidence]
+    assert 'end_seen' not in caught.value.evidence
+    assert caught.value.diagnostic_reference is None
+
+
+@pytest.mark.parametrize('output,invalid,truncated,end_seen,stop', (
+    (b'{"type":"text","data":"ok"}\n{"type":"thought","data":"\xff"}\n{"type":"end"', 2, False, False, 'UNOBSERVED'),
+    (b'{"type":"thought","data":"\\ud800"}\n', 1, False, False, 'UNOBSERVED'),
+    (b'{"type":"end","stopReason":"private-token"}\n', 0, False, True, 'UNOBSERVED'),
+    ((b'{"type":"text","data":"x"}\n' * 6000) + _FINAL.encode(), 0, True, False, 'UNOBSERVED'),
+    (b'{"type":"thought","data":"' + b'x' * 100_000 + b'"}\n', 0, True, False, 'UNOBSERVED'),
+    (b'{"type":"turn_completed","stopReason":"cancelled"}\n', 0, False, True, 'cancelled'),
+))
+def test_timeout_framing_partial_invalid_and_scan_limits_never_imply_complete_output(
+        monkeypatch, output, invalid, truncated, end_seen, stop):
+    observed = []
+    monkeypatch.setattr(writer, 'emit_diagnostic', lambda event, data: observed.append((event, data)))
+    def timeout(command, **_arguments):
+        raise subprocess.TimeoutExpired(command, 300, output=output, stderr=b'')
+    monkeypatch.setattr(writer.subprocess, 'run', timeout)
+    with pytest.raises(writer.CliTimeoutError) as caught:
+        writer._run(('grok',), timeout=300)
+    assert len(observed) == 1
+    data = observed[0][1]
+    assert data['invalid'] == invalid and data['truncated'] is truncated
+    assert data['end_seen'] is end_seen and data['stop'] == stop
+    assert len(json.dumps(data, separators=(',', ':')).encode()) <= 256
+    assert _SECRET not in json.dumps(data) and 'private-token' not in json.dumps(data)
+    assert caught.value.evidence['provider_cause'] == caught.value.evidence['termination'] == 'UNOBSERVED'
+    assert caught.value.diagnostic_reference is None
+
+
+@pytest.mark.parametrize('fault', ['sink', 'parser'])
+def test_optional_framing_observation_failure_preserves_original_timeout(monkeypatch, fault):
+    def fail(*_args, **_kwargs): raise RuntimeError(_SECRET)
+    monkeypatch.setattr(writer, 'emit_diagnostic' if fault == 'sink' else '_grok_writer_update', fail)
+    def timeout(command, **arguments):
+        assert arguments['timeout'] == 300
+        raise subprocess.TimeoutExpired(command, 300, output=_FINAL.encode(), stderr=b'')
+    monkeypatch.setattr(writer.subprocess, 'run', timeout)
+    with pytest.raises(writer.CliTimeoutError, match='grok writer timed out') as caught:
+        writer._run(('grok',), timeout=300)
+    assert _SECRET not in str(caught.value)
+    assert caught.value.evidence['cause'] == 'CONFIGURED_TIMEOUT_EXPIRED'
+    assert validated_timeout_diagnostics([caught.value.evidence]) == [caught.value.evidence]

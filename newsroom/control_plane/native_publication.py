@@ -206,6 +206,7 @@ class NativePublicationController:
         bindings: NativePublicationBindings,
         clock: Callable[[], UtcTimestamp] = UtcTimestamp.now,
         story_writer=None,
+        source_currentness_fence: Callable | None = None,
     ) -> None:
         if not callable(clock) or not all(
             type(value) is expected
@@ -221,6 +222,9 @@ class NativePublicationController:
             raise NativePublicationError(
                 "exact native publication authorities required"
             )
+        if source_currentness_fence is not None and not callable(source_currentness_fence):
+            raise NativePublicationError("native source currentness fence must be callable")
+        self._source_currentness_fence = source_currentness_fence
         self._objects = objects
         self._events = events
         self._commands = commands
@@ -407,6 +411,14 @@ class NativePublicationController:
         identity = retained.package.candidate_id
         story_id = _aggregate("story", identity)
         publication_id = _aggregate("publication", identity)
+        if self._source_currentness_fence is not None:
+            own_story = self._objects.committed_admission(ObjectAdmissionRequest(
+                STORY_ADMISSION_TYPE, f"story-version:{story_id}:{expected_story_version + 1}",
+            ), proof=proof)
+            if own_story is None:
+                # Do not spend on a fresh draft for a superseded publisher state.
+                # An admitted Story alone does not waive the fresh effect fence below.
+                self._source_currentness_fence(retained.package, editorial_decision.currentness)
         decision_reference = self._record_decision(editorial_decision, proof=proof)
         story_receipt, _story = self._editorial.admit_story_version(
             StoryVersionRequest(
@@ -450,6 +462,8 @@ class NativePublicationController:
             # the effect boundary; apply preserves any already committed time.
             applied_at=self._clock().to_text(),
             proof=proof,
+            before_new_effect=(None if self._source_currentness_fence is None else
+                lambda: self._source_currentness_fence(retained.package, editorial_decision.currentness)),
         )
         evidence = self._delivery.observe(
             attempt_receipt,

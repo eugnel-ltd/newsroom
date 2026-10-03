@@ -67,6 +67,37 @@ def _bindings(tmp_path: Path, registries, hydration, definitions, commands):
     )
 
 
+def test_fresh_story_checks_publisher_state_before_any_draft_or_decision(tmp_path):
+    from types import SimpleNamespace
+    from newsroom.authority import ObjectAdmissionId
+
+    candidates, port, version = _candidate(tmp_path)
+    try:
+        _, package, _ = _ready_package(version)
+        retained = SimpleNamespace(package=package, candidate_version_id=version.version_id,
+            candidate_version_digest=version.canonical_digest,
+            governing_manifest_digest=version.governing_manifest.canonical_digest,
+            package_admission_id=ObjectAdmissionId.new())
+        decision = _decision(retained, ObjectAdmissionId.new())
+        controller = object.__new__(NativePublicationController)
+        controller._candidate_port = port
+        controller._evidence = SimpleNamespace(read=lambda *_args, **_kw: retained)
+        controller._objects = SimpleNamespace(committed_admission=lambda *_args, **_kw: None)
+
+        def superseded(actual_package, currentness):
+            assert actual_package == package and currentness == decision.currentness
+            raise EditorialHold(reason='NATIVE_STORY_SOURCE_SUPERSEDED')
+
+        controller._source_currentness_fence = superseded
+        controller._record_decision = lambda *_args, **_kw: pytest.fail('source check follows decision/model work')
+        with pytest.raises(EditorialHold, match='NATIVE_STORY_SOURCE_SUPERSEDED'):
+            controller.advance(ObjectAdmissionId.new(), decision, expected_story_version=0,
+                               expected_publication_version=0, expected_delivery_evidence_version=0,
+                               proof=proof())
+    finally:
+        candidates.close()
+
+
 @pytest.mark.parametrize("failure_boundary", (None, "before_apply", "after_apply", "after_record"))
 @pytest.mark.parametrize("copy_correction", (False, True, "narrative", "reviewed_headline"))
 def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monkeypatch, copy_correction, failure_boundary) -> None:
@@ -114,6 +145,14 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         proof=proof(),
     )
     bindings = _bindings(tmp_path, registries, hydration, definitions, commands)
+    source_current = [True]
+    source_checks = []
+
+    def current_source_fence(package, currentness):
+        source_checks.append(package.digest)
+        if not source_current[0]:
+            raise EditorialHold(reason='NATIVE_STORY_SOURCE_SUPERSEDED')
+
     controller = NativePublicationController(
         objects=system.objects,
         commands=system.commands,
@@ -121,6 +160,7 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         candidate_port=candidate_port,
         evidence_packages=evidence_packages,
         bindings=bindings, clock=effect_clock,
+        source_currentness_fence=current_source_fence,
     )
     original_builder = controller._editorial._build_story
     if copy_correction:
@@ -162,10 +202,16 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
             controller.advance(retained.package_admission_id, decision, **request)
         monkeypatch.setattr(controller._delivery, method, original)
         instant[0] = UtcTimestamp.parse("2026-07-16T13:00:00Z").value
+        if failure_boundary in {'after_apply', 'after_record'}:
+            source_current[0] = False  # Existing effects must settle, not republish.
     first = controller.advance(retained.package_admission_id, decision, **request)
     assert controller.retained_writer_id(first.story_receipt.event_id, proof=proof()) == first.writer_id
+    source_current[0] = False
+    before_replay_checks = len(source_checks)
     replay = controller.advance(retained.package_admission_id, decision, **request)
     assert replay == first
+    assert len(source_checks) == before_replay_checks
+    source_current[0] = True
 
     reader = open_private_serving_read_port(
         bindings.target_path,
@@ -242,6 +288,7 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
             target.execute("UPDATE private_serving_payloads SET payload_bytes=? WHERE operation_key=?", (original_bytes, key))
 
     controller.close()
+    source_current[0] = False
     reopened = NativePublicationController(
         objects=system.objects,
         commands=system.commands,
@@ -249,6 +296,7 @@ def test_native_publication_replays_to_exact_ack_only_rows(tmp_path: Path, monke
         candidate_port=candidate_port,
         evidence_packages=evidence_packages,
         bindings=bindings, clock=effect_clock,
+        source_currentness_fence=current_source_fence,
     )
     assert reopened.advance(retained.package_admission_id, decision, **request) == first
     reopened.close()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -630,7 +631,10 @@ class PrivateServingDelivery:
         candidate_port: StoryCandidateReadPort,
         applied_at: str,
         proof: AuthenticationProof,
+        before_new_effect: Callable[[], None] | None = None,
     ) -> tuple[ProjectionRow, ...]:
+        if before_new_effect is not None and not callable(before_new_effect):
+            raise TypeError("private serving source fence must be callable")
         UtcTimestamp.parse(applied_at)
         batch = self._read_attempt(
             receipt,
@@ -644,11 +648,15 @@ class PrivateServingDelivery:
             for item in batch.attempts
         )
         retained_rows: list[ProjectionRow] = []
+        checked_new_effect = False
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             for row in rows:
                 existing = self._query(row.operation_key)
                 if existing is None:
+                    if not checked_new_effect and before_new_effect is not None:
+                        before_new_effect()
+                        checked_new_effect = True
                     self._connection.execute(
                         "INSERT INTO private_serving_payloads VALUES(?,?,?,?,?,?,?,?)",
                         (

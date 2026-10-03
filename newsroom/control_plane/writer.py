@@ -22,6 +22,7 @@ from newsroom.authority.canonical import (
     digest_canonical,
 )
 from newsroom.control_plane.child_environment import unprivileged_child_environment
+from newsroom.control_plane.diagnostic_logging import emit_diagnostic
 from newsroom.control_plane.editorial import StoryCandidateRecord
 from newsroom.control_plane.evidence import EvidencePackage, GovernedClaimEvidence
 from newsroom.control_plane.governed_context import GovernedContextStatus
@@ -1658,6 +1659,7 @@ def _run(
         ) from exc
     except subprocess.TimeoutExpired as exc:
         stdout, stderr = _timeout_output_bytes(exc.output), _timeout_output_bytes(exc.stderr)
+        _observe_cli_timeout_stream(stdout)
         progress = ("UNOBSERVED" if stdout is None or stderr is None
                     else "OUTPUT_OBSERVED" if stdout or stderr else "NO_OUTPUT_OBSERVED")
         evidence = timeout_diagnostic(
@@ -1699,6 +1701,56 @@ def _grok_writer_update(value: object) -> dict[str, object] | None:
         return params["update"]
     update = value.get("update")
     return update if isinstance(update, dict) else value
+
+
+def _observe_cli_timeout_stream(raw: bytes | None) -> None:
+    """Bounded framing observation only; completion and usage remain unknown."""
+    if raw is None:
+        return
+    try:
+        data = {"thought": [0, 0], "text": [0, 0], "usage": 0, "end": 0,
+                "end_seen": False, "stop": "UNOBSERVED", "other": 0,
+                "invalid": 0, "truncated": len(raw) > 131_072}
+        lines = raw[:131_072].split(b"\n")
+        data["truncated"] |= len(lines) > 1024
+        for line in lines[:1024]:
+            if not line.strip():
+                continue
+            if len(line) > 32_768:
+                data["truncated"] = True
+                continue
+            try:
+                update = _grok_writer_update(json.loads(line.decode("utf-8")))
+                if update is None:
+                    data["invalid"] += 1
+                    continue
+                kind = update.get("sessionUpdate") or update.get("type")
+                if kind in {"thought", "agent_thought_chunk", "text", "agent_message_chunk", "assistant_message_chunk"}:
+                    content = update.get("content")
+                    text = (update.get("data") if kind in {"thought", "text"}
+                            else content.get("text") if isinstance(content, dict) else content)
+                    size = len(text.encode("utf-8")) if isinstance(text, str) else 0
+                    key = "thought" if kind in {"thought", "agent_thought_chunk"} else "text"
+                    data[key][0] += 1
+                    data[key][1] += size
+                elif kind == "usage":
+                    data["usage"] += 1
+                elif kind in {"end", "turn_completed", "turnEnded"}:
+                    data["end"] += 1
+                    data["end_seen"] = True
+                    stop = update.get("stopReason") or update.get("stop_reason")
+                    if stop in {"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"}:
+                        data["stop"] = stop
+                    elif stop == "EndTurn":
+                        data["stop"] = "end_turn"
+                else:
+                    data["other"] += 1
+            except (UnicodeError, ValueError, RecursionError, TypeError):
+                data["invalid"] += 1
+        if len(json.dumps(data, separators=(",", ":")).encode()) <= 256:
+            emit_diagnostic("CLI_TIMEOUT_STREAM_OBSERVATION", data)
+    except Exception:
+        pass  # Optional observations never replace the original timeout.
 
 
 def _retain_grok_usage(current: dict[str, object], value: object) -> dict[str, object]:

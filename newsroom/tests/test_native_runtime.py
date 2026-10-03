@@ -67,6 +67,14 @@ def test_native_runtime_real_policy_composition_and_reopen(tmp_path, monkeypatch
     # No target row, provider invocation or fake retrieval success was created.
 
 
+def test_native_runtime_forwards_current_source_fence_without_invoking_it_on_open(tmp_path, monkeypatch):
+    calls = []
+    fence = lambda *args: calls.append(args)
+    with open_native_runtime(**_args(tmp_path, monkeypatch), source_currentness_fence=fence) as runtime:
+        assert runtime.publication._source_currentness_fence is fence
+        assert calls == []
+
+
 def test_existing_private_target_survives_licence_markup_normalisation(tmp_path, monkeypatch):
     from newsroom.control_plane import govuk_rights
     from newsroom.increment10.private_serving import PrivateServingError

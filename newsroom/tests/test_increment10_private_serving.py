@@ -335,6 +335,50 @@ def _close(context, delivery) -> None:
     context[0].close()
 
 
+def test_current_source_fence_precedes_new_rows_but_not_exact_effect_replay(tmp_path):
+    context = _context(tmp_path)
+    delivery = _delivery(tmp_path, context)
+    request = dict(story_receipt=context[-2], candidate_port=context[1], proof=proof())
+    calls = []
+
+    def superseded():
+        calls.append('source')
+        raise ValueError('source superseded')
+
+    try:
+        attempt, batch = delivery.begin(context[-1], **request)
+        with pytest.raises(ValueError, match='source superseded'):
+            delivery.apply(attempt, publication_receipt=context[-1],
+                           applied_at='2026-07-16T11:00:00Z',
+                           before_new_effect=superseded, **request)
+        assert calls == ['source']
+        assert all(delivery.query(item.operation_key) is None for item in batch.attempts)
+        assert not delivery._connection.in_transaction
+        rows = delivery.apply(attempt, publication_receipt=context[-1],
+                              applied_at='2026-07-16T11:00:00Z',
+                              before_new_effect=lambda: calls.append('current'), **request)
+        assert calls == ['source', 'current']
+        # The original applied rows can settle after a later publisher update.
+        assert delivery.apply(attempt, publication_receipt=context[-1],
+                              applied_at='2026-07-16T11:10:00Z',
+                              before_new_effect=superseded, **request) == rows
+        assert calls == ['source', 'current']
+        # A genuinely missing surface is a new effect, not an ACK replay.
+        article, card = rows
+        delivery._connection.execute('DELETE FROM private_serving_payloads WHERE operation_key=?',
+                                     (card.operation_key,))
+        delivery._connection.commit()
+        with pytest.raises(ValueError, match='source superseded'):
+            delivery.apply(attempt, publication_receipt=context[-1],
+                           applied_at='2026-07-16T11:20:00Z',
+                           before_new_effect=superseded, **request)
+        assert delivery.query(article.operation_key) == article
+        assert delivery.query(card.operation_key) is None
+        assert not delivery._connection.in_transaction
+    finally:
+        _close(context, delivery)
+
+
 def test_committed_publication_projects_and_acknowledges_exact_private_rows(
     tmp_path: Path,
 ) -> None:
