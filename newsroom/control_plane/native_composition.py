@@ -763,6 +763,7 @@ def open_native_pipeline(
                     assessment_pre_dispatch_failure=(
                         assessment_usage.retained_pre_dispatch_failure
                     ),
+                    assessment_old_provider_failure=assessment_usage.retained_old_provider_failure,
                     assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,
                     clock=now,
                 )

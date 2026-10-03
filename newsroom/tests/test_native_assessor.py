@@ -2929,3 +2929,135 @@ def test_status_prompt_change_does_not_schedule_historical_reassessment(previous
     assert assessment_revalidation_due(facts, VERSION + '+consumer.v2')
     facts['reason'] = 'NO_QUALIFYING_NEW_INFORMATION'
     assert not assessment_revalidation_due(facts, VERSION + '+consumer.v1')
+
+
+def _old_provider_failure(tmp_path, monkeypatch, *, contract='newsroom.native-evidence-assessor.v21'):
+    from dataclasses import asdict
+    from newsroom.control_plane.writer import CliTimeoutError
+    connection, _port, candidate = candidate_fixture(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    current_system = native_assessor_module.SYSTEM
+    monkeypatch.setattr(native_assessor_module, 'VERSION', contract)
+    monkeypatch.setattr(native_assessor_module, 'SYSTEM', native_assessor_module._V21_SYSTEM)
+    service, old = _usage(tmp_path, monkeypatch)
+    policy = InvocationEfficiencyPolicy.create(**{
+        **asdict(old._policy), 'hard_estimate_ceiling_tokens': 300_000,
+    })
+    old = NativeAssessmentUsage(service, policy, clock=old._clock)
+    def timeout(_request): raise CliTimeoutError('fixture writer timed out')
+    with pytest.raises(CliTimeoutError):
+        AutonomousNativeEvidenceAssessor(timeout, usage=old, dispatch_fence=nullcontext)(candidate, base, (), ())
+    with sqlite3.connect(service.path) as retained:
+        allocation = retained.execute('SELECT record_json FROM model_invocation_allocations').fetchone()[0]
+        terminal = retained.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0]
+    monkeypatch.setattr(native_assessor_module, 'VERSION', native_assessor_module._REFERENCE_PRODUCER_VERSION)
+    monkeypatch.setattr(native_assessor_module, 'SYSTEM', current_system)
+    _, current = _usage(tmp_path, monkeypatch)
+    return connection, candidate, base, service, current, allocation, terminal
+
+
+def test_known_old_provider_failure_allows_one_current_producer_and_preserves_unknown_accounting(tmp_path, monkeypatch):
+    connection, candidate, base, service, current, old_allocation, old_terminal = _old_provider_failure(tmp_path, monkeypatch)
+    calls = []
+    execution = NativeAssessmentExecution(json.dumps(_empty_reference_result()), {
+        'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 1, 'output_tokens': 1,
+        'cached_read_tokens': 0, 'cached_write_tokens': 0, 'reasoning_tokens': 0,
+        'context_tokens': 1, 'total_tokens': 2,
+    })
+    def dispatch(_request): calls.append('current'); return execution
+    assessor = AutonomousNativeEvidenceAssessor(dispatch, usage=current, dispatch_fence=nullcontext)
+    try:
+        first = assessor(candidate, base, (), ())
+        reopened = NativeAssessmentUsage(ModelUsageService(service.path), current._policy, clock=current._clock)
+        assert AutonomousNativeEvidenceAssessor(dispatch, usage=reopened, dispatch_fence=nullcontext)(candidate, base, (), ()) == first
+        assert calls == ['current']
+        assert current.retained_output_contract_failure(candidate) is None
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT COUNT(*) FROM model_invocation_allocations').fetchone() == (2,)
+            assert retained.execute('SELECT record_json FROM model_invocation_allocations WHERE invocation_id=?',
+                (json.loads(old_allocation)['invocation_id'],)).fetchone() == (old_allocation,)
+            assert retained.execute('SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?',
+                (json.loads(old_terminal)['invocation_id'],)).fetchone() == (old_terminal,)
+        assert json.loads(old_terminal)['components']['total_tokens'] == 300_000
+        assert json.loads(old_terminal)['usage_status'] == 'ESTIMATED'
+        assert json.loads(old_terminal)['pre_dispatch_zero_proved'] is False
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('defect', [
+    'active', 'current-producer', 'unknown-producer', 'unqualified-current',
+    'allocation-index', 'terminal-index', 'candidate-binding', 'source-binding',
+    'upper-charge', 'retained-output', 'telemetry', 'cached-only', 'changed-source',
+])
+def test_old_provider_failure_continuation_denies_incomplete_or_changed_authority(tmp_path, monkeypatch, defect):
+    from dataclasses import asdict
+    contract = {'current-producer': native_assessor_module._REFERENCE_PRODUCER_VERSION,
+                'unknown-producer': 'newsroom.native-evidence-assessor.v999'}.get(defect,
+                    'newsroom.native-evidence-assessor.v21')
+    connection, candidate, base, service, current, old_allocation, old_terminal = _old_provider_failure(
+        tmp_path, monkeypatch, contract=contract)
+    invocation_id = json.loads(old_allocation)['invocation_id']
+    with sqlite3.connect(service.path) as retained:
+        if defect == 'active': retained.execute('DELETE FROM model_invocation_terminals')
+        elif defect == 'allocation-index': retained.execute("UPDATE model_invocation_allocations SET request_digest='sha256:'||?", ('f' * 64,))
+        elif defect == 'terminal-index': retained.execute("UPDATE model_invocation_terminals SET failure_class='wrong'")
+        elif defect == 'candidate-binding':
+            raw = json.loads(retained.execute('SELECT record_json FROM model_work_envelopes').fetchone()[0])
+            raw['candidate_id'] = 'unknown-candidate'
+            retained.execute('UPDATE model_work_envelopes SET record_json=?', (canonical_json_bytes(raw).decode(),))
+        elif defect == 'source-binding':
+            raw = json.loads(retained.execute('SELECT record_json FROM model_invocation_context_manifests').fetchone()[0])
+            raw['source_reference_binding']['partition_version'] = 'source-view.v999'
+            retained.execute('UPDATE model_invocation_context_manifests SET record_json=?', (canonical_json_bytes(raw).decode(),))
+        elif defect == 'upper-charge':
+            from newsroom.control_plane.model_usage import _terminal_from_record, InvocationTerminal
+            terminal = _terminal_from_record(json.loads(old_terminal))
+            values = {name: getattr(terminal, name) for name in terminal.__dataclass_fields__}
+            terminal = InvocationTerminal.create(**{**values, 'components': replace(terminal.components, total_tokens=299_999)})
+            retained.execute('UPDATE model_invocation_terminals SET terminal_digest=?,record_json=?',
+                (terminal.terminal_digest, canonical_json_bytes(terminal.as_record()).decode()))
+        elif defect == 'retained-output':
+            from newsroom.control_plane.store import append_ledger
+            append_ledger(retained, 'NATIVE_ASSESSMENT_RESULT', {'invocation_id': invocation_id})
+        elif defect == 'telemetry':
+            retained.execute('INSERT INTO model_provider_telemetry VALUES(?,?,?,?)',
+                ('sha256:' + 'b' * 64, invocation_id, 'sha256:' + 'c' * 64, '{}'))
+    if defect == 'unqualified-current':
+        current._policy = InvocationEfficiencyPolicy.create(**{**asdict(current._policy), 'qualified': False})
+    if defect == 'changed-source': base = replace(base, passages=(base.passages[0] + ' changed',))
+    calls = []
+    assessor = AutonomousNativeEvidenceAssessor(lambda _request: calls.append('provider'), usage=current, dispatch_fence=nullcontext)
+    try:
+        with pytest.raises(NativeEvidenceHold):
+            assessor.assess_with_boundary(candidate, base, (), (), before_dispatch=None, cached_only=defect == 'cached-only')
+        assert calls == []
+        assert current.retained_output_contract_failure(candidate) is None
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT COUNT(*) FROM model_invocation_allocations').fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('boundary', ['stop', 'currentness'])
+def test_old_provider_failure_continuation_keeps_current_source_and_stop_boundaries(tmp_path, monkeypatch, boundary):
+    from newsroom.control_plane.veto import VetoError
+    connection, candidate, base, service, current, _allocation, _terminal = _old_provider_failure(tmp_path, monkeypatch)
+    calls = []
+    assessor = AutonomousNativeEvidenceAssessor(lambda _request: calls.append('provider'), usage=current, dispatch_fence=nullcontext)
+    def stop(): raise VetoError('owner stop')
+    sources, acquired = (), ()
+    if boundary == 'currentness':
+        sources = (SimpleNamespace(unit=SimpleNamespace(source_id=base.source_ids[0])),)
+        acquired = (SimpleNamespace(currentness_basis='STALE_VERSION'),)
+    try:
+        with pytest.raises(VetoError if boundary == 'stop' else NativeEvidenceHold):
+            assessor.assess_with_boundary(candidate, base, sources, acquired,
+                before_dispatch=stop if boundary == 'stop' else None, cached_only=False)
+        assert calls == []
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT COUNT(*) FROM model_invocation_allocations').fetchone() == (2 if boundary == 'stop' else 1,)
+            assert retained.execute('SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?',
+                (json.loads(_terminal)['invocation_id'],)).fetchone() == (_terminal,)
+    finally:
+        connection.close()
