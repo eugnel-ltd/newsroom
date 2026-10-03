@@ -124,6 +124,127 @@ def test_symbol_alias_falls_back_to_broad_consumer_routing(tmp_path: Path) -> No
     ]
 
 
+def test_private_helper_keeps_direct_tests_and_local_callers_only(tmp_path: Path) -> None:
+    subprocess.run(("git", "init", "-q"), cwd=tmp_path, check=True)
+    source = "def _render():\n    return 1\n\ndef render():\n    return _render()\n\ndef other():\n    return 0\n"
+    _write(tmp_path, "newsroom/feature.py", source)
+    _write(tmp_path, "newsroom/tests/test_private.py", "from newsroom.feature import _render\n")
+    _write(tmp_path, "newsroom/tests/test_public.py", "from newsroom.feature import render\n")
+    _write(tmp_path, "newsroom/tests/test_other_neo4j_service.py", "from newsroom.feature import other\n")
+    base = _commit(tmp_path, "base")
+    _write(tmp_path, "newsroom/feature.py", source.replace("return 1", "return 2"))
+    head = _commit(tmp_path, "head")
+
+    route = selector.select_focus(("newsroom/feature.py",), repo_root=tmp_path, base_sha=base, head_sha=head)
+
+    assert route["selected_tests"] == ["newsroom/tests/test_private.py", "newsroom/tests/test_public.py"]
+    assert route["selected_service_tests"] == []
+    assert route["full_health_required"] is False
+
+
+@pytest.mark.parametrize("import_statement, selected_call, other_call", (
+    ("from .feature import render as selected", "selected()", "0"),
+    ("import newsroom.feature as selected", "selected.render()", "selected.other()"),
+    ("from newsroom import feature as selected", "selected.render()", "selected.other()"),
+    ("import newsroom.feature", "newsroom.feature.render()", "newsroom.feature.other()"),
+))
+def test_symbol_closure_filters_each_importer_hop_and_keeps_reexport_aliases(
+    tmp_path: Path, import_statement: str, selected_call: str, other_call: str,
+) -> None:
+    subprocess.run(("git", "init", "-q"), cwd=tmp_path, check=True)
+    _write(tmp_path, "newsroom/__init__.py")
+    source = "def render():\n    return 1\n\ndef other():\n    return 0\n"
+    _write(tmp_path, "newsroom/feature.py", source)
+    _write(tmp_path, "newsroom/middle.py", f"{import_statement}\n\ndef affected():\n    return {selected_call}\n\ndef other():\n    return {other_call}\n")
+    _write(tmp_path, "newsroom/downstream.py", "from .middle import affected as alias\n\ndef consume():\n    return alias()\n\ndef other():\n    return 0\n")
+    _write(tmp_path, "newsroom/api/__init__.py", "from ..middle import affected as Export\n")
+    _write(tmp_path, "newsroom/tests/test_direct.py", "from newsroom.feature import render\n")
+    _write(tmp_path, "newsroom/tests/test_middle.py", "from newsroom.middle import affected\n")
+    _write(tmp_path, "newsroom/tests/test_downstream.py", "from newsroom.downstream import consume\n")
+    _write(tmp_path, "newsroom/tests/test_api.py", "from newsroom.api import Export\n")
+    _write(tmp_path, "newsroom/tests/test_other_neo4j_service.py", "from newsroom.downstream import other\n")
+    base = _commit(tmp_path, "base")
+    _write(tmp_path, "newsroom/feature.py", source.replace("return 1", "return 2"))
+    head = _commit(tmp_path, "head")
+
+    route = selector.select_focus(("newsroom/feature.py",), repo_root=tmp_path, base_sha=base, head_sha=head)
+
+    assert route["selected_tests"] == ["newsroom/tests/test_api.py", "newsroom/tests/test_direct.py",
+                                        "newsroom/tests/test_downstream.py", "newsroom/tests/test_middle.py"]
+    assert route["selected_service_tests"] == []
+    assert route["gates"] == ["F0", "F1", "F2"]
+
+
+@pytest.mark.parametrize("middle", (
+    "from .feature import *\n",
+    "from .feature import render as local\nAlias = local\n",
+    "from importlib import import_module\nloaded = import_module('newsroom.feature')\n",
+    "from . import feature\n\ndef reflect():\n    return getattr(feature, 'render')\n",
+))
+def test_uncertain_importer_surface_keeps_broad_descendant_fallback(tmp_path: Path, middle: str) -> None:
+    subprocess.run(("git", "init", "-q"), cwd=tmp_path, check=True)
+    _write(tmp_path, "newsroom/__init__.py")
+    source = "def render():\n    return 1\n"
+    _write(tmp_path, "newsroom/feature.py", source)
+    _write(tmp_path, "newsroom/middle.py", middle + "\ndef other():\n    return 0\n")
+    _write(tmp_path, "newsroom/tests/test_other_neo4j_service.py", "from newsroom.middle import other\n")
+    base = _commit(tmp_path, "base")
+    _write(tmp_path, "newsroom/feature.py", source.replace("return 1", "return 2"))
+    head = _commit(tmp_path, "head")
+    route = selector.select_focus(("newsroom/feature.py",), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route["selected_service_tests"] == ["newsroom/tests/test_other_neo4j_service.py"]
+    assert "F3" in route["gates"]
+
+
+@pytest.mark.parametrize("source", (
+    "value = 0\n\ndef _update():\n    global value\n    value = 1\n\ndef read():\n    return value\n",
+    "state = {'value': 0}\n\ndef _update():\n    state['value'] = 1\n\ndef read():\n    return state['value']\n",
+))
+def test_private_global_write_is_not_a_closed_local_surface(tmp_path: Path, source: str) -> None:
+    subprocess.run(("git", "init", "-q"), cwd=tmp_path, check=True)
+    _write(tmp_path, "newsroom/feature.py", source)
+    _write(tmp_path, "newsroom/tests/test_reader.py", "from newsroom.feature import read\n")
+    base = _commit(tmp_path, "base")
+    _write(tmp_path, "newsroom/feature.py", source.replace("= 1", "= 2"))
+    head = _commit(tmp_path, "head")
+    route = selector.select_focus(("newsroom/feature.py",), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route["selected_tests"] == ["newsroom/tests/test_reader.py"]
+
+
+@pytest.mark.parametrize("lookup", (
+    "getattr(sys.modules[__name__], '_render')()",
+    "sys.modules[__name__].__dict__['_render']()",
+    "vars(sys.modules[__name__])['_render']()",
+))
+def test_self_module_reflection_keeps_conservative_consumer_route(tmp_path: Path, lookup: str) -> None:
+    subprocess.run(("git", "init", "-q"), cwd=tmp_path, check=True)
+    source = f"import sys\n\ndef _render():\n    return 1\n\ndef public():\n    return {lookup}\n"
+    _write(tmp_path, "newsroom/feature.py", source)
+    _write(tmp_path, "newsroom/tests/test_public.py", "from newsroom.feature import public\n")
+    base = _commit(tmp_path, "base")
+    _write(tmp_path, "newsroom/feature.py", source.replace("return 1", "return 2"))
+    head = _commit(tmp_path, "head")
+    route = selector.select_focus(("newsroom/feature.py",), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route["selected_tests"] == ["newsroom/tests/test_public.py"]
+
+
+def test_cyclic_reexport_closure_retains_consumer_without_unrelated_service(tmp_path: Path) -> None:
+    subprocess.run(("git", "init", "-q"), cwd=tmp_path, check=True)
+    _write(tmp_path, "newsroom/__init__.py")
+    source = "def render():\n    return 1\n"
+    _write(tmp_path, "newsroom/feature.py", source)
+    _write(tmp_path, "newsroom/left.py", "from .feature import render\n\ndef use():\n    return render()\n\nfrom .right import alias\n")
+    _write(tmp_path, "newsroom/right.py", "from .left import use as alias\n\ndef other():\n    return 0\n")
+    _write(tmp_path, "newsroom/tests/test_consumer.py", "from newsroom.right import alias\n")
+    _write(tmp_path, "newsroom/tests/test_other_neo4j_service.py", "from newsroom.right import other\n")
+    base = _commit(tmp_path, "base")
+    _write(tmp_path, "newsroom/feature.py", source.replace("return 1", "return 2"))
+    head = _commit(tmp_path, "head")
+    route = selector.select_focus(("newsroom/feature.py",), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route["selected_tests"] == ["newsroom/tests/test_consumer.py"]
+    assert route["selected_service_tests"] == []
+
+
 def test_short_constant_reexport_selects_exact_consumer_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
