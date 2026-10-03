@@ -676,6 +676,7 @@ class NativePublicationContinuation:
         assessment_old_provider_failure: (
             Callable[[object], RetainedAssessorResult | None] | None
         ) = None,
+        evidence_sources_for: Callable[[str], tuple[NativeEvidenceSource, ...]] | None = None,
         assessment_contract_version: str | None = None,
         clock=UtcTimestamp.now,
     ) -> None:
@@ -696,6 +697,7 @@ class NativePublicationContinuation:
                 and not callable(assessment_pre_dispatch_failure)
             )
             or (assessment_old_provider_failure is not None and not callable(assessment_old_provider_failure))
+            or (evidence_sources_for is not None and not callable(evidence_sources_for))
             or not isinstance(sources, Mapping)
             or not all(
                 type(key) is str
@@ -716,6 +718,7 @@ class NativePublicationContinuation:
         self._assessment_contract_failure = assessment_contract_failure
         self._assessment_pre_dispatch_failure = assessment_pre_dispatch_failure
         self._assessment_old_provider_failure = assessment_old_provider_failure
+        self._evidence_sources_for = evidence_sources_for
         self._assessment_contract_version = assessment_contract_version
         self._clock = clock
 
@@ -724,6 +727,27 @@ class NativePublicationContinuation:
         return (
             facts.get("writer_id") != writer_contract_version
             and facts.get("copy_correction_checked_version") != writer_contract_version
+        )
+
+    @staticmethod
+    def source_binding_recovery_due(facts: dict, contract_version: str | None) -> bool:
+        """Schedule an exact pre-assessment source-binding repair, never authorise it."""
+        prior = facts.get("assessment_superseded")
+        old = prior.get("provider_failure") if type(prior) is dict else None
+        attempts = facts.get("acquisition_attempt_count")
+        return (
+            facts.get("reason") == "ACQUISITION_RESULT_NOT_RETAINED"
+            and facts.get("failure_class") == "KeyError"
+            and facts.get("assessment_started_at") is None
+            and facts.get("assessment_contract_version") == contract_version
+            and same_assessment_producer(contract_version, ASSESSOR_PRODUCER_VERSION)
+            and type(attempts) is int and 0 < attempts < _MAX_ACQUISITION_ATTEMPTS
+            and type(old) is dict and old.get("outcome") == "ASSESSOR_PROVIDER_FAILED"
+            and set(old) == {"outcome", "envelope_id", "invocation_id", "allocation_digest",
+                            "terminal_digest", "context_manifest_digest"}
+            and all(type(value) is str and value for value in old.values())
+            and type(prior.get("contract_version")) is str
+            and not same_assessment_producer(prior["contract_version"], contract_version)
         )
 
     def recover_pre_dispatch(
@@ -908,9 +932,11 @@ class NativePublicationContinuation:
             progress.get("stage") == "EVIDENCE_HOLD"
             and assessor_admission_recovery_due(facts)
         )
+        source_binding_recovery = self.source_binding_recovery_due(facts, self._assessment_contract_version)
         if (
             progress.get("stage") not in {"ASSESSMENT_INTERRUPTED", "ACKNOWLEDGED", "COPY_CORRECTION_PREPARED"}
             and not admission_recovery
+            and not (source_binding_recovery and self._evidence_sources_for is not None)
             and revision_id not in self._sources
         ):
             raise NativePublicationError("native continuation revision differs")
@@ -935,7 +961,7 @@ class NativePublicationContinuation:
             return self._advance_copy_correction(revision_id, candidate_version_id, facts, progress, current_facts)
 
         old_provider_failure = None
-        if (progress.get("stage") == "ASSESSMENT_INTERRUPTED"
+        if ((progress.get("stage") == "ASSESSMENT_INTERRUPTED" or source_binding_recovery)
                 and self._assessment_old_provider_failure is not None
                 and same_assessment_producer(self._assessment_contract_version, ASSESSOR_PRODUCER_VERSION)):
             try:
@@ -946,9 +972,18 @@ class NativePublicationContinuation:
                 retained = None
             if (type(retained) is RetainedAssessorResult
                     and retained.outcome == "ASSESSOR_PROVIDER_FAILED" and retained.execution is None
-                    and same_assessment_producer(facts.get("assessment_contract_version"), retained.contract_version)
+                    and same_assessment_producer(
+                        facts.get("assessment_superseded", {}).get("contract_version")
+                        if source_binding_recovery else facts.get("assessment_contract_version"), retained.contract_version,
+                    )
                     and not same_assessment_producer(self._assessment_contract_version, retained.contract_version)):
-                old_provider_failure = retained
+                old = retained.proof
+                if not source_binding_recovery or facts["assessment_superseded"]["provider_failure"] == {
+                    "outcome": retained.outcome, "envelope_id": old.envelope_id, "invocation_id": old.invocation_id,
+                    "allocation_digest": old.allocation_digest, "terminal_digest": old.terminal_digest,
+                    "context_manifest_digest": old.context_manifest_digest,
+                }:
+                    old_provider_failure = retained
         if old_provider_failure is not None or (
             progress.get("stage") == "EVIDENCE_HOLD"
             and assessment_revalidation_due(facts, self._assessment_contract_version)
@@ -956,14 +991,14 @@ class NativePublicationContinuation:
             facts = current_facts()
             # Retain the superseded references before clearing continuation-only
             # fields. Intake identity and all original ledger/accounting remain.
-            facts["assessment_superseded"] = {
+            facts["assessment_superseded"] = facts["assessment_superseded"] if source_binding_recovery else {
                 "contract_version": facts.get("assessment_contract_version"),
                 "reason": facts.get("reason"),
                 "package_admission_id": facts.get("package_admission_id"),
                 "editorial_decision_id": facts.get("editorial_decision", {}).get("decision_id"),
                 "acquisition_attempt_count": facts.get("acquisition_attempt_count", 0),
             }
-            if old_provider_failure is not None:
+            if old_provider_failure is not None and not source_binding_recovery:
                 old = old_provider_failure.proof
                 facts["assessment_superseded"].update(
                     failure_class=facts.get("failure_class"),
@@ -985,7 +1020,7 @@ class NativePublicationContinuation:
                 facts.pop(key, None)
             facts.update(
                 assessment_contract_version=self._assessment_contract_version,
-                acquisition_attempt_count=0,
+                acquisition_attempt_count=facts.get("acquisition_attempt_count", 0) if source_binding_recovery else 0,
             )
             progress = self._journal.advance(
                 revision_id, stage="ASSESSMENT_CONTRACT_REVALIDATION", facts=facts
@@ -1163,6 +1198,12 @@ class NativePublicationContinuation:
                 consumer_only_revalidation = same_assessment_producer(
                     prior_contract, self._assessment_contract_version,
                 )
+                if revision_id not in self._sources and self._evidence_sources_for is not None:
+                    selected_sources = self._evidence_sources_for(revision_id)
+                    if (type(selected_sources) is not tuple or not selected_sources
+                            or not all(type(item) is NativeEvidenceSource for item in selected_sources)):
+                        raise NativePublicationError("native selected evidence sources differ")
+                    self._sources[revision_id] = selected_sources
                 evidence = self._evidence.acquire_and_retain(
                     candidate_version_id=candidate_version_id,
                     intake_receipt_id=str(facts["intake_receipt_id"]),

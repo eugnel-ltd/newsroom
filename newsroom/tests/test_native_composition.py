@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
@@ -763,3 +764,142 @@ def test_native_composition_owner_stop_precedes_store_or_provider_effects(
             raise AssertionError("stopped composition entered")
     assert not arguments["authority_path"].exists()
     assert not arguments["private_path"].exists()
+
+
+def _publication_caller_without_bootstrap(**bindings):
+    """Execute the actual nested caller only; no runtime/source/provider bootstrap."""
+    import ast
+    tree = ast.parse(Path(native_composition.__file__).read_text())
+    nodes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == 'Publication']
+    assert len(nodes) == 1
+    scope = {**vars(native_composition), **bindings}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), native_composition.__file__, 'exec'), scope)
+    return scope['Publication']()
+
+
+@pytest.mark.parametrize('initial,defect', [
+    ('old-interrupted', None), ('current-source-keyerror', None),
+    ('old-interrupted', 'unresolved'), ('current-source-keyerror', 'current-allocation'),
+    ('current-source-keyerror', 'unallocated-current-envelope'),
+    ('current-source-keyerror', 'wrong-old-proof'), ('current-source-keyerror', 'raw-keyerror'),
+    ('current-source-keyerror', 'unrelated-hold'), ('current-source-keyerror', 'exhausted'),
+    ('current-source-keyerror', 'changed-source'), ('current-source-keyerror', 'stop'),
+])
+def test_exact_composition_caller_lazily_loads_selected_sources_after_accounted_failure_proof(tmp_path, monkeypatch, initial, defect):
+    from newsroom.control_plane.native_evidence import NativeEvidenceController, NativeEvidenceHold
+    from newsroom.control_plane.native_progress import NativeRevisionJournal
+    from newsroom.control_plane.store import connect
+    from newsroom.tests.test_native_assessor import _old_provider_failure, _empty_reference_result
+    from newsroom.tests.test_native_publication_continuation import _source
+    candidate_connection, candidate, base, service, usage, old_allocation, old_terminal = _old_provider_failure(tmp_path, monkeypatch)
+    connection = connect(str(tmp_path / 'private.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    unit = _native('rich-6114-source-keyerror')
+    journal.land((unit,))
+    facts = {
+        'candidate_id': candidate.candidate_id, 'candidate_version_id': candidate.version_id,
+        'graphiti_receipts': [{}], 'intake_receipt_id': 'retained-intake',
+        'assessment_contract_version': 'newsroom.native-evidence-assessor.v21+consumer.v1',
+        'failure_class': 'CliTimeoutError', 'reason': 'ACQUISITION_RESULT_NOT_RETAINED',
+        'acquisition_attempt_count': 1,
+    }
+    stage = 'ASSESSMENT_INTERRUPTED'
+    if initial == 'current-source-keyerror':
+        old = usage.retained_old_provider_failure(candidate)
+        facts['assessment_superseded'] = {'contract_version': facts['assessment_contract_version'],
+            'reason': facts['reason'], 'failure_class': facts['failure_class'],
+            'provider_failure': {'outcome': old.outcome, **asdict(old.proof)}}
+        facts.update(assessment_contract_version='newsroom.native-evidence-assessor.v23+consumer.v1',
+                     failure_class='KeyError', assessment_started_at=None)
+        stage = 'EVIDENCE_HOLD'
+    if defect == 'wrong-old-proof': facts['assessment_superseded']['provider_failure']['terminal_digest'] = 'sha256:' + 'f' * 64
+    if defect == 'raw-keyerror': facts.pop('assessment_superseded')
+    if defect == 'unrelated-hold': facts['reason'] = 'SOURCE_POLICY_FACTS_HOLD'
+    if defect == 'exhausted': facts['acquisition_attempt_count'] = 3
+    if defect == 'changed-source': base = replace(base, passages=(base.passages[0] + ' changed',))
+    if defect in {'current-allocation', 'unallocated-current-envelope'}:
+        current = usage.begin(candidate, base, 'already admitted current',
+            source_view=native_assessor.build_lossless_source_view(base.passages, base.source_ids))
+        if defect == 'unallocated-current-envelope':
+            with sqlite3.connect(service.path) as retained:
+                retained.execute('DELETE FROM model_invocation_allocations WHERE invocation_id=?', (current.invocation_id,))
+    if defect == 'unresolved':
+        with sqlite3.connect(service.path) as retained: retained.execute('DELETE FROM model_invocation_terminals')
+    journal.advance(unit.revision_id, stage=stage, facts=facts)
+    before = journal.current(unit.revision_id)
+    loaded, acquired, providers = [], [], []
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor, NativeAssessmentExecution
+    def provider(_request):
+        providers.append('current-v23')
+        return NativeAssessmentExecution(json.dumps(_empty_reference_result()), {
+            'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 1, 'output_tokens': 1,
+            'cached_read_tokens': 0, 'cached_write_tokens': 0, 'reasoning_tokens': 0,
+            'context_tokens': 1, 'total_tokens': 2,
+        })
+    assessor = AutonomousNativeEvidenceAssessor(provider, usage=usage, dispatch_fence=nullcontext)
+    def sources(**request):
+        assert request['units'] == (unit,)
+        # Source construction must follow an authenticated accounted-old failure.
+        assert journal.current(unit.revision_id)['stage'] in {'ASSESSMENT_CONTRACT_REVALIDATION', 'ACQUISITION_STARTED'}
+        loaded.append(unit.revision_id)
+        if defect == 'stop':
+            from newsroom.control_plane.veto import VetoError
+            raise VetoError('owner stop')
+        return (_source(unit),)
+    def acquire(_self, **request):
+        acquired.append(request['assessment_cached_only'])
+        assert request['sources'][0].unit.revision_id == unit.revision_id
+        assessor.assess_with_boundary(candidate, base, (), (), before_dispatch=request['before_assessment'],
+            cached_only=request['assessment_cached_only'])
+        raise NativeEvidenceHold('NO_QUALIFYING_NEW_INFORMATION', unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController, 'acquire_and_retain', acquire)
+    publication = _publication_caller_without_bootstrap(journal=journal,
+        runtime=SimpleNamespace(authority=SimpleNamespace(candidate_version=lambda _: candidate,
+            sources=object(), objects=object()), ingress=object(), publication=object(), policies=object(), proof=object()),
+        evidence=object.__new__(NativeEvidenceController), assessment_usage=usage,
+        licence=object(), proof=object(), native_evidence_sources=sources,
+        ASSESSMENT_CONTRACT_VERSION='newsroom.native-evidence-assessor.v23+consumer.v1',
+        now=lambda: native_composition.UtcTimestamp.parse('2026-09-08T12:00:00Z'))
+    from newsroom.tests.test_native_pipeline import _open
+    pipeline, _journal, pipeline_connection, _units, pipeline_calls, dispositions = _open(tmp_path, monkeypatch)
+    pipeline._journal = journal
+    pipeline._publish = publication
+    dispositions[0] = ()
+    try:
+        if defect == 'stop':
+            from newsroom.control_plane.veto import VetoError
+            with pytest.raises(VetoError): pipeline.tick(cycle_id='source-binding-stop')
+            assert loaded == [unit.revision_id] and not acquired and not providers
+            return
+        report = pipeline.tick(cycle_id='source-binding-recovery')
+        if defect not in {None, 'changed-source'}:
+            assert not loaded and not acquired and not providers
+            assert journal.current(unit.revision_id) == before
+            return
+        if defect == 'changed-source':
+            assert loaded == [unit.revision_id] and acquired == [False] and not providers
+            assert journal.current(unit.revision_id)['facts']['reason'] == 'ASSESSOR_REVALIDATION_INPUT_CHANGED_HOLD'
+            return
+        assert report.revision_states == {'EVIDENCE_HOLD': 1}
+        pipeline.tick(cycle_id='source-binding-recovery-once')
+        assert journal.current(unit.revision_id)['facts']['reason'] == 'NO_QUALIFYING_NEW_INFORMATION'
+        assert loaded == [unit.revision_id] and acquired == [False] and providers == ['current-v23']
+        settled = journal.current(unit.revision_id)['facts']
+        assert settled['acquisition_attempt_count'] == (2 if initial == 'current-source-keyerror' else 1)
+        assert settled['assessment_superseded']['contract_version'] == 'newsroom.native-evidence-assessor.v21+consumer.v1'
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT count(*) FROM model_invocation_allocations').fetchone() == (2,)
+            assert retained.execute('SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?',
+                (json.loads(old_terminal)['invocation_id'],)).fetchone() == (old_terminal,)
+            assert retained.execute('SELECT record_json FROM model_invocation_allocations WHERE invocation_id=?',
+                (json.loads(old_allocation)['invocation_id'],)).fetchone() == (old_allocation,)
+    finally:
+        with sqlite3.connect(service.path) as retained:
+            if defect != 'unresolved':
+                assert retained.execute('SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?',
+                    (json.loads(old_terminal)['invocation_id'],)).fetchone() == (old_terminal,)
+            assert retained.execute('SELECT record_json FROM model_invocation_allocations WHERE invocation_id=?',
+                (json.loads(old_allocation)['invocation_id'],)).fetchone() == (old_allocation,)
+        candidate_connection.close()
+        pipeline_connection.close()
+        connection.close()
