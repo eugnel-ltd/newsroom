@@ -569,3 +569,34 @@ def test_rehydrate_rejects_rebound_request_for_another_admission(tmp_path):
             conn.execute(trigger)
         with pytest.raises(AuthorityPersistenceError, match='request semantics'):
             system.objects.rehydrate(request, proof=proof())
+
+
+def test_current_rehydrate_reuses_exact_event_only_within_its_transaction(tmp_path, monkeypatch):
+    with open_object_system(tmp_path / 'current-rehydrate.sqlite3') as system:
+        admission = admit(system, data=b'retained source bytes').admission
+        store = system.objects._GovernedObjects__rehydrate.__self__._store
+        store._current_state_only = True
+        request = HydrationRequest(admission.admission_id, 'project.discovery')
+        first = system.objects.rehydrate(request, proof=proof())
+        event_checks, current_checks = [], []
+        exact = store._validate_retained_event_exact
+        current = store._current_admission_row
+        def check_event(event_id):
+            event_checks.append(event_id)
+            return exact(event_id)
+        def check_current(*args, **kwargs):
+            current_checks.append(kwargs['now'])
+            return current(*args, **kwargs)
+        monkeypatch.setattr(store, '_validate_retained_event_exact', check_event)
+        monkeypatch.setattr(store, '_current_admission_row', check_current)
+        for turn in (1, 2):
+            assert system.objects.rehydrate(request, proof=proof()) == first
+            assert len(event_checks) == turn
+            assert len(current_checks) == 3 * turn
+            assert store._exact_event_scope is None
+        with pytest.raises(AuthenticationError):
+            system.objects.rehydrate(request, proof=proof(credential='wrong'))
+        system.objects.revoke(admission.admission_id, reason_code='REVOKED', idempotency_key='revoke-scoped', proof=proof())
+        with pytest.raises(ObjectAdmissionDenied, match='ACTIVE'):
+            system.objects.rehydrate(request, proof=proof())
+        assert store._exact_event_scope is None

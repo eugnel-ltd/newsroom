@@ -49,7 +49,7 @@ class _ObjectHydrationStoreMixin:
             else self._transaction()
         )
         with self._lock:
-            with transaction as conn:
+            with transaction as conn, self._exact_event_read_scope(conn):
                 decided_at = self._clock()
                 self._object_issuer.verify_hydration(
                     grant, now=decided_at

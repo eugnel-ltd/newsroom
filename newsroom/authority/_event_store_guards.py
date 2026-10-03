@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 
 from ._capability import _AuthorizedCommandGrant
 from .canonical import canonical_json_bytes, digest_bytes, digest_canonical
@@ -251,7 +252,53 @@ class _ExactAuthorityGuards:
             )
         return provenance
 
+    @contextmanager
+    def _exact_event_read_scope(self, conn: sqlite3.Connection):
+        """Reuse exact immutable closure only inside this owned transaction."""
+        with self._lock:
+            if conn is not self._connection or not conn.in_transaction:
+                raise AuthorityPersistenceError("exact event scope requires its current transaction")
+            previous = getattr(self, "_exact_event_scope", None)
+            scope = {"connection": conn, "stamp": None, "proofs": {}}
+            anchor = f"exact_event_read_{id(scope):x}"
+            conn.execute(f"SAVEPOINT {anchor}")
+            self._exact_event_scope = scope
+            failed = False
+            try:
+                yield
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                scope["proofs"].clear()
+                self._exact_event_scope = previous
+                try:
+                    conn.execute(f"RELEASE {anchor}")
+                except sqlite3.DatabaseError as exc:
+                    if not failed:
+                        raise AuthorityPersistenceError("exact event scope transaction changed") from exc
+
     def _validate_retained_event(self, event_id: str) -> None:
+        with self._lock:
+            conn = self._connection
+            scope = getattr(self, "_exact_event_scope", None)
+            if scope is not None and scope["connection"] is conn and conn.in_transaction:
+                stamp = (conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0],
+                         conn.execute("PRAGMA schema_version").fetchone()[0])
+                if scope["stamp"] != stamp:
+                    scope["proofs"].clear()
+                    scope["stamp"] = stamp
+                if event_id in scope["proofs"]:
+                    return
+            else:
+                if scope is not None:
+                    scope["proofs"].clear()
+                scope = None
+            closure = self._validate_retained_event_exact(event_id)
+            if scope is not None and closure is not None:
+                scope["proofs"][event_id] = closure
+
+    def _validate_retained_event_exact(self, event_id: str) -> tuple | None:
         """Validate the complete generic authority closure for one event."""
 
         with self._lock:  # type: ignore[attr-defined]
@@ -686,3 +733,13 @@ class _ExactAuthorityGuards:
                     raise AuthorityPersistenceError(
                         "retained event causation target is missing"
                     )
+            # Retain the complete verified closure, not a count or ledger watermark.
+            return (
+                tuple(event_row), tuple(command), tuple(version), tuple(audit),
+                tuple(payload), tuple(aggregate), tuple(head), tuple(counts),
+                provenance.authentication.canonical_bytes,
+                provenance.authorization_request.canonical_bytes,
+                provenance.authorization_decision.canonical_bytes,
+                provenance.command_definition.canonical_bytes,
+                provenance.payload_schema_contract.canonical_bytes,
+            )

@@ -153,3 +153,104 @@ def test_exact_event_closure_does_not_scan_unrelated_history(
         store._validate_retained_event(target.event_id)
         with pytest.raises(AuthorityPersistenceError, match="payload digest"):
             store._validate_immutable_records(store._connection)
+
+
+def test_transaction_event_scope_proves_complete_selected_closure_once(tmp_path, monkeypatch):
+    service = make_service()
+    with _store(tmp_path / 'scoped.sqlite3', service) as store:
+        selected = _commit(store, service, 'scoped-selected')
+        checks = []
+        original = store._validate_payload_record
+        def count(conn, row):
+            checks.append(row['payload_id'])
+            return original(conn, row)
+        monkeypatch.setattr(store, '_validate_payload_record', count)
+        with store._transaction() as conn:
+            with store._exact_event_read_scope(conn):
+                store._validate_retained_event(selected.event_id)
+                store._validate_retained_event(selected.event_id)
+                assert len(checks) == 1
+        store._validate_retained_event(selected.event_id)
+        assert len(checks) == 2
+
+
+@pytest.mark.parametrize('tamper', (_tamper_authentication, _tamper_request, _tamper_decision,
+    _tamper_payload, _tamper_result, _tamper_audit, _tamper_cardinality, _tamper_envelope, _tamper_head))
+def test_transaction_event_scope_rejects_same_count_selected_tamper(tmp_path, tamper):
+    service = make_service()
+    with _store(tmp_path / 'tamper-scope.sqlite3', service) as store:
+        selected = _commit(store, service, 'selected')
+        if tamper is _tamper_head:
+            store._connection.execute('PRAGMA foreign_keys=OFF')
+        with store._transaction() as conn:
+            with store._exact_event_read_scope(conn):
+                store._validate_retained_event(selected.event_id)
+                tamper(store, selected.command_id)
+                with pytest.raises(AuthorityPersistenceError):
+                    store._validate_retained_event(selected.event_id)
+
+
+def test_transaction_event_scope_rejects_missing_or_replaced_transaction(tmp_path):
+    service = make_service()
+    with _store(tmp_path / 'transaction-scope.sqlite3', service) as store:
+        selected = _commit(store, service, 'selected')
+        with pytest.raises(AuthorityPersistenceError, match='transaction'):
+            with store._exact_event_read_scope(store._connection):
+                pass
+        conn = store._connection
+        conn.execute('BEGIN')
+        with pytest.raises(AuthorityPersistenceError, match='transaction'):
+            with store._exact_event_read_scope(conn):
+                store._validate_retained_event(selected.event_id)
+                conn.execute('ROLLBACK')
+                conn.execute('BEGIN')
+                store._validate_retained_event(selected.event_id)
+        if conn.in_transaction:
+            conn.execute('ROLLBACK')
+
+
+def test_transaction_event_scope_is_connection_bound_and_rollback_invalidates(tmp_path, monkeypatch):
+    import sqlite3
+    service = make_service()
+    path = tmp_path / 'rollback-scope.sqlite3'
+    with _store(path, service) as store:
+        selected = _commit(store, service, 'selected')
+        checks = []
+        original = store._validate_payload_record
+        def count(conn, row):
+            checks.append(row['payload_id'])
+            return original(conn, row)
+        monkeypatch.setattr(store, '_validate_payload_record', count)
+        with sqlite3.connect(path) as other:
+            other.execute('BEGIN')
+            with pytest.raises(AuthorityPersistenceError, match='transaction'):
+                with store._exact_event_read_scope(other):
+                    pass
+        with store._transaction() as conn:
+            with store._exact_event_read_scope(conn):
+                store._validate_retained_event(selected.event_id)
+                conn.execute('SAVEPOINT fixture_mutation')
+                _tamper_payload(store, selected.command_id)
+                conn.execute('ROLLBACK TO fixture_mutation')
+                conn.execute('RELEASE fixture_mutation')
+                store._validate_retained_event(selected.event_id)
+                assert len(checks) == 2
+        _tamper_payload(store, selected.command_id)
+        with store._transaction() as conn:
+            with store._exact_event_read_scope(conn):
+                with pytest.raises(AuthorityPersistenceError, match='payload digest'):
+                    store._validate_retained_event(selected.event_id)
+
+
+def test_transaction_event_scope_does_not_sweep_unrelated_history(tmp_path):
+    service = make_service()
+    with _store(tmp_path / 'selected-scope.sqlite3', service) as store:
+        selected = _commit(store, service, 'selected')
+        unrelated = _commit(store, service, 'unrelated')
+        with store._transaction() as conn:
+            with store._exact_event_read_scope(conn):
+                store._validate_retained_event(selected.event_id)
+                _tamper_payload(store, unrelated.command_id)
+                store._validate_retained_event(selected.event_id)
+                with pytest.raises(AuthorityPersistenceError, match='payload digest'):
+                    store._validate_retained_event(unrelated.event_id)
