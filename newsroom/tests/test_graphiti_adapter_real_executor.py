@@ -1703,6 +1703,9 @@ def test_guard_retry_resets_snapshot_after_retained_attempt_cleanup(
         ) -> tuple[list[dict[str, object]], None, None]:
             nonlocal marker
             assert routing_ == "w"
+            if "RETURN count(*) AS snapshot_count" in query:
+                assert params == {"group_id": GRAPHITI_WORKSPACE_GROUP}
+                return ([{"snapshot_count": 0}], None, None)
             if "CREATE CONSTRAINT" in query:
                 return ([], None, None)
             if "MERGE (m:NewsroomIngestMarker" in query:
@@ -1799,6 +1802,9 @@ def test_concurrent_guard_begin_has_one_atomic_marker_claim() -> None:
         ) -> tuple[list[dict[str, object]], None, None]:
             nonlocal claims, constraints, marker
             assert routing_ == "w"
+            if "RETURN count(*) AS snapshot_count" in query:
+                assert params == {"group_id": GRAPHITI_WORKSPACE_GROUP}
+                return ([{"snapshot_count": 0}], None, None)
             if "CREATE CONSTRAINT" in query:
                 constraints += 1
                 assert "REQUIRE m.episode_uuid IS UNIQUE" in query
@@ -2204,6 +2210,9 @@ def test_concurrent_expired_marker_takeover_is_fenced() -> None:
         ) -> tuple[list[dict[str, object]], None, None]:
             nonlocal claims, marker
             assert routing_ == "w"
+            if "RETURN count(*) AS snapshot_count" in query:
+                assert params == {"group_id": GRAPHITI_WORKSPACE_GROUP}
+                return ([{"snapshot_count": 0}], None, None)
             if "CREATE CONSTRAINT" in query:
                 return ([], None, None)
             if "MERGE (m:NewsroomIngestMarker" in query:
