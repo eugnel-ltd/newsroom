@@ -36,6 +36,8 @@ from .govuk_spreadsheet_evidence import (
     GovUkSpreadsheetEvidenceAcquisition,
     POLICY_DIGEST as GOVUK_SPREADSHEET_TRANSPORT_POLICY,
 )
+from .govuk_pdf_evidence import GovUkPdfEvidenceAcquisition, POLICY_DIGEST as GOVUK_PDF_TRANSPORT_POLICY
+
 from .govuk_rights import (
     LICENCE_URL, REUSE_URL, GovUkLicenceEvidence, retain_current_govuk_licence,
     _govuk_semantic_evidence,
@@ -65,7 +67,7 @@ from .native_runtime import open_native_runtime
 from .native_source_intake import (
     NativeSourceIntake,
     native_evidence_sources,
-    spreadsheet_asset_url,
+    spreadsheet_asset_url, pdf_asset_url,
 )
 from .native_source_rights import (
     NativePortfolioRights, observe_portfolio_terms, read_rights_observation,
@@ -88,6 +90,7 @@ TRANSPORT_POLICY = digest_canonical({
     "version": "hermes-native-independent-evidence-v2",
     "govuk": GOVUK_TRANSPORT_POLICY,
     "govuk_spreadsheet": GOVUK_SPREADSHEET_TRANSPORT_POLICY,
+    "govuk_pdf": GOVUK_PDF_TRANSPORT_POLICY,
     "weather": WEATHER_TRANSPORT_POLICY,
 })
 
@@ -725,6 +728,13 @@ def open_native_pipeline(
             clock=clock,
         )
 
+        pdf_acquisition = GovUkPdfEvidenceAcquisition(
+            sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=proof, licence=licence, transport_policy_digest=TRANSPORT_POLICY,
+            dispatch_fence=lambda request: source_fence(request.source_id, request.canonical_url),
+            retained_units=journal.units, observations=journal.observations, clock=clock,
+        )
+
         def acquire(request):
             retained = journal.units.get(request.source_revision_id, ())
             spreadsheet = bool(retained) and all(
@@ -732,11 +742,15 @@ def open_native_pipeline(
                 and unit.canonical_url == request.canonical_url
                 for unit in retained
             )
+            pdf = bool(retained) and all(pdf_asset_url(unit) is not None
+                and unit.canonical_url == request.canonical_url for unit in retained)
             transport = (
                 weather_acquisition
                 if request.source_id in {"HK-02", "UK-10"}
                 else spreadsheet_acquisition
                 if spreadsheet
+                else pdf_acquisition
+                if pdf
                 else govuk_acquisition
             )
             return transport(request)

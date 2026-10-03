@@ -49,6 +49,15 @@ POLICY_DIGEST = digest_canonical(
 class GovUkSpreadsheetEvidenceAcquisition:
     """Reacquire an exact parent declaration and its spreadsheet asset."""
 
+    asset_url_for = staticmethod(spreadsheet_asset_url)
+    declare = staticmethod(declared_spreadsheet)
+    parse = staticmethod(parse_govuk_spreadsheet)
+    asset_byte_limit = MAX_BODY_BYTES
+    parser_policy_digest = PARSER_POLICY_DIGEST
+    version = VERSION
+    reason_prefix = "GOVUK_SPREADSHEET"
+    require_raw_identity = False
+
     def __init__(
         self,
         *,
@@ -90,7 +99,7 @@ class GovUkSpreadsheetEvidenceAcquisition:
             raise TypeError("exact independent acquisition request required")
 
         def hold(reason: str) -> NativeEvidenceHold:
-            return NativeEvidenceHold(reason, request.source_id)
+            return NativeEvidenceHold(reason.replace("GOVUK_SPREADSHEET", self.reason_prefix), request.source_id)
 
         if request.transport_policy_digest != self._transport_policy_digest:
             raise hold("TRANSPORT_POLICY_MISMATCH")
@@ -112,7 +121,7 @@ class GovUkSpreadsheetEvidenceAcquisition:
             unit = source.unit
             authority = unit.authority
             root_digest = unit.item_key.partition("|")[0]
-            asset_url = spreadsheet_asset_url(unit)
+            asset_url = self.asset_url_for(unit)
             parent_observation = self._observations[root_digest]
             if (
                 asset_url is None
@@ -143,12 +152,14 @@ class GovUkSpreadsheetEvidenceAcquisition:
                     or len(parent_raw) > MAX_BODY_BYTES
                 ):
                     raise hold("GOVUK_SPREADSHEET_ACQUISITION_INCOMPLETE")
-                declared_spreadsheet(
+                self.declare(
                     _canonical_url_from_api(parent_url),
                     parent_raw,
                     asset_url,
                     retrieved_at=self._clock(),
                 )
+                if self.require_raw_identity and digest_bytes(parent_raw) != root_digest:
+                    raise hold("GOVUK_SPREADSHEET_PARENT_CHANGED_HOLD")
                 asset_status, asset_raw = self._fetch(asset_url)
         except VetoError:
             raise
@@ -163,12 +174,14 @@ class GovUkSpreadsheetEvidenceAcquisition:
             retrieved.tzinfo is None
             or asset_status != 200
             or not asset_raw
-            or len(asset_raw) > MAX_BODY_BYTES
+            or len(asset_raw) > self.asset_byte_limit
         ):
             raise hold("GOVUK_SPREADSHEET_ACQUISITION_INCOMPLETE")
         retrieved = retrieved.astimezone(UTC)
+        if self.require_raw_identity and digest_bytes(asset_raw) != unit.observation_digest:
+            raise hold("GOVUK_SPREADSHEET_RAW_CHANGED_HOLD")
         try:
-            document = parse_govuk_spreadsheet(
+            document = self.parse(
                 _canonical_url_from_api(parent_url),
                 parent_raw,
                 asset_url,
@@ -188,8 +201,8 @@ class GovUkSpreadsheetEvidenceAcquisition:
         body_digest = digest_bytes(body)
         transport_digest = digest_canonical(
             {
-                "version": VERSION,
-                "parser_policy": PARSER_POLICY_DIGEST,
+                "version": self.version,
+                "parser_policy": self.parser_policy_digest,
                 "request_digest": request.digest,
                 "parent_url": parent_url,
                 "parent_response_digest": digest_bytes(parent_raw),

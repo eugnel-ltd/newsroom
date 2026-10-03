@@ -16,6 +16,7 @@ dependencies = [
     "neo4j==6.2.0",
     "opencc-python-reimplemented==0.1.7",
     "orjson>=3.10,<4",
+    "pypdf==6.19.0",
 ]
 
 [project.urls]
