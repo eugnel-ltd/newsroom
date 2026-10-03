@@ -11,20 +11,26 @@ from .corpus import CorpusIngestUnit, CorpusAuthorityBinding
 from .govuk_spreadsheet import POLICY_DIGEST as PARSER_POLICY_DIGEST
 from .native_source_intake import VERSION as SOURCE_VERSION
 
-VERSION = "newsroom.archival-nil-return.v1"
+VERSION = "newsroom.archival-nil-return.v2"
 _NOTICE = "Published CSV cells: Row and column identify each literal text cell. Whitespace, empty fields, quoted newlines and formula-like text are preserved; nothing is executed. No header or numeric types are inferred."
 _HEADERS = {
-    "meetings": (("Special adviser", "Date", "Name", "Media organisation represented", "Purpose of meeting"),
+    "special advisers meetings": (("Special adviser", "Date", "Name", "Media organisation represented", "Purpose of meeting"),
                  ("Special Adviser", "Date", "Name of organisation or individual", "Purpose of meeting")),
-    "hospitality": (("Special adviser", "Date", "Person or organisation that hospitality was received from",
+    "special advisers hospitality": (("Special adviser", "Date", "Person or organisation that hospitality was received from",
+                     "Type of hospitality received", "Accompanied by spouse, family member(s) or friend?"),),
+    "hospitality": (("Minister", "Date", "Person or organisation that offered hospitality",
                      "Type of hospitality received", "Accompanied by spouse, family member(s) or friend?"),),
 }
+_NIL_VALUES = {"special advisers meetings": ("Nil Return",),
+               "special advisers hospitality": ("Nil Return",),
+               "hospitality": ("Nil Return", "nil return")}
 _PERIODS = {"January to March": (3, 31), "April to June": (6, 30),
             "July to September": (9, 30), "October to December": (12, 31)}
-_TITLE = re.compile(r"Home Office's ministerial special advisers (meetings|hospitality), (January to March|April to June|July to September|October to December) ([0-9]{4})")
+_TITLE = re.compile(r"Home Office's ministerial (special advisers meetings|special advisers hospitality|hospitality), (January to March|April to June|July to September|October to December) ([0-9]{4})")
 POLICY_DIGEST = digest_canonical({"version": VERSION, "parser": PARSER_POLICY_DIGEST,
     "headers": _HEADERS, "periods": _PERIODS, "dates": "report-period-end<publication-date;publication-year<original-observation-year;publication=update",
-    "source": SOURCE_VERSION, "observation_cells": "literal-Nil-Return-plus-whitespace"})
+    "source": SOURCE_VERSION, "title": _TITLE.pattern,
+    "observation_cells": _NIL_VALUES, "whitespace": "strip-only"})
 
 
 def archival_nil_return_candidate(unit):
@@ -90,7 +96,7 @@ def archival_nil_return_disposition(unit, original, *, now):
         records = [row for row in rows[1:] if any(value.strip() for value in row)]
         if not records or any(len(row) != len(rows[0])
                 or re.fullmatch(r"[A-Z][A-Za-z'’-]*(?: [A-Z][A-Za-z'’-]*){1,4}", row[0].strip()) is None
-                or any(value.strip() != "Nil Return" for value in row[1:]) for row in records):
+                or any(value.strip() not in _NIL_VALUES[role] for value in row[1:]) for row in records):
             return None
     except (ValueError, TypeError, IndexError):
         return None
