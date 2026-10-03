@@ -832,3 +832,138 @@ def test_reexport_import_walks_are_constant_per_test_file(tmp_path, monkeypatch,
     assert selected == set() and unresolved is False
     # One existing import inventory pass, then at most two reexport passes.
     assert len(walks) == (3 if package_count else 1)
+
+
+def test_added_private_declaration_keeps_unchanged_land_importers_out_of_route(tmp_path):
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    source = ('LAND = "land"\n'
+              'def _landed_units():\n    return ()\n'
+              'class Journal:\n    def read(self):\n        return 1\n')
+    _write(tmp_path, 'newsroom/progress.py', source)
+    _write(tmp_path, 'newsroom/accounting.py',
+           'from .progress import LAND, _landed_units\n\ndef unrelated():\n    return LAND, _landed_units()\n')
+    _write(tmp_path, 'newsroom/consumer.py',
+           'from .progress import Journal\n\ndef selected():\n    return Journal().read()\n')
+    _write(tmp_path, 'newsroom/tests/test_direct.py', 'from newsroom.progress import Journal\n')
+    _write(tmp_path, 'newsroom/tests/test_caller.py', 'from newsroom.consumer import selected\n')
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py', 'from newsroom.accounting import unrelated\n')
+    base = _commit(tmp_path, 'base')
+    _write(tmp_path, 'newsroom/progress.py', source.replace('return 1', 'return _selected()')
+           + '\ndef _selected():\n    return 2\n')
+    _write(tmp_path, 'newsroom/tests/test_private.py', 'from newsroom.progress import _selected\n')
+    head = _commit(tmp_path, 'added private body reader')
+    route = selector.select_focus(('newsroom/progress.py',), repo_root=tmp_path,
+                                  base_sha=base, head_sha=head)
+    assert route['selected_tests'] == ['newsroom/tests/test_caller.py', 'newsroom/tests/test_direct.py',
+                                       'newsroom/tests/test_private.py']
+    assert route['selected_service_tests'] == []
+
+
+@pytest.mark.parametrize('change', ('literal', 'import'))
+def test_declaration_change_retains_bound_callers_not_unrelated_consumers(tmp_path, change):
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    _write(tmp_path, 'newsroom/headers.py', 'def headers():\n    return ()\n\ndef landed():\n    return ()\n')
+    source = ('from .headers import landed\nSCHEMA = ("CREATE TABLE current",)\n'
+              'def ensure_schema():\n    return SCHEMA\n'
+              'class Intake:\n    def namespace(self):\n        return landed()\n'
+              'def verified_native_observation():\n    return 1\n')
+    _write(tmp_path, 'newsroom/state.py', source)
+    _write(tmp_path, 'newsroom/store.py', 'from .state import ensure_schema\n\ndef connect():\n    return ensure_schema()\n')
+    _write(tmp_path, 'newsroom/weather.py', 'from .state import verified_native_observation\n\ndef unchanged():\n    return verified_native_observation()\n')
+    _write(tmp_path, 'newsroom/tests/test_state.py', 'from newsroom.state import ensure_schema\n')
+    _write(tmp_path, 'newsroom/tests/test_intake.py', 'from newsroom.state import Intake\n')
+    _write(tmp_path, 'newsroom/tests/test_store.py', 'from newsroom.store import connect\n')
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py', 'from newsroom.weather import unchanged\n')
+    base = _commit(tmp_path, 'base')
+    changed = (source.replace('"CREATE TABLE current",', '"CREATE TABLE current", "CREATE INDEX revision",')
+               if change == 'literal' else source.replace('import landed', 'import landed, headers')
+               .replace('return landed()', 'return headers()'))
+    _write(tmp_path, 'newsroom/state.py', changed)
+    head = _commit(tmp_path, 'closed declaration')
+    route = selector.select_focus(('newsroom/state.py',), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_tests'] == (['newsroom/tests/test_state.py', 'newsroom/tests/test_store.py']
+                                       if change == 'literal' else ['newsroom/tests/test_intake.py'])
+    assert route['selected_service_tests'] == []
+
+
+@pytest.mark.parametrize('binding,decorator', (
+    ('from dataclasses import dataclass', 'dataclass'),
+    ('from dataclasses import dataclass as dc', 'dc(frozen=True, slots=True)'),
+    ('import dataclasses as dc', 'dc.dataclass(frozen=True)'),
+))
+def test_added_static_stdlib_dataclass_is_a_changed_binding_not_whole_module(tmp_path, binding, decorator):
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    source = binding + '\nLAND = "land"\n\ndef unchanged():\n    return LAND\n'
+    _write(tmp_path, 'newsroom/progress.py', source)
+    _write(tmp_path, 'newsroom/accounting.py', 'from .progress import unchanged\n')
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py', 'from newsroom.accounting import unchanged\n')
+    base = _commit(tmp_path, 'base')
+    _write(tmp_path, 'newsroom/progress.py', source + '\n@' + decorator
+           + '\nclass Header:\n    name: str\n    identity: tuple[str, str]\n    latest: str | None = None\n')
+    _write(tmp_path, 'newsroom/tests/test_header.py', 'from newsroom.progress import Header\n')
+    head = _commit(tmp_path, 'added static header')
+    route = selector.select_focus(('newsroom/progress.py',), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_tests'] == ['newsroom/tests/test_header.py']
+    assert route['selected_service_tests'] == []
+
+
+@pytest.mark.parametrize('prefix,declaration', (
+    ('def custom(cls):\n    return cls\n', '@custom\nclass Header:\n    name: str\n'),
+    ('from dataclasses import dataclass\ndef custom(cls):\n    return cls\ndataclass = custom\n', '@dataclass\nclass Header:\n    name: str\n'),
+    ('import dataclasses as dc\ndef custom(cls):\n    return cls\ndc = custom\n', '@dc.dataclass\nclass Header:\n    name: str\n'),
+    ('import dataclasses as dc\ndef custom(cls):\n    return cls\ndc.dataclass = custom\n', '@dc.dataclass\nclass Header:\n    name: str\n'),
+    ('from dataclasses import dataclass\ndef custom(cls):\n    return cls\nif True:\n    dataclass = custom\n', '@dataclass\nclass Header:\n    name: str\n'),
+    ('from dataclasses import dataclass\nif True:\n    from custom import dataclass\n', '@dataclass\nclass Header:\n    name: str\n'),
+    ('from dataclasses import dataclass, field\n', '@dataclass\nclass Header:\n    value: str = field(default_factory=str)\n'),
+    ('from dataclasses import dataclass\n', '@dataclass(slots=bool(1))\nclass Header:\n    name: str\n'),
+    ('from dataclasses import dataclass\n', '@dataclass\nclass Header(object):\n    name: str\n'),
+    ('from dataclasses import dataclass\n', '@dataclass\nclass Header:\n    name: custom()\n'),
+    ('from dataclasses import dataclass\n', '@dataclass\nclass Header:\n    name: str\n    register()\n'),
+    ('from dataclasses import dataclass\nstr = 7\n', '@dataclass\nclass Header:\n    name: str\n'),
+))
+def test_unknown_dataclass_transform_keeps_conservative_fanout(tmp_path, prefix, declaration):
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    source = prefix + '\ndef unchanged():\n    return 1\n'
+    _write(tmp_path, 'newsroom/progress.py', source)
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py', 'from newsroom.progress import unchanged\n')
+    base = _commit(tmp_path, 'base')
+    _write(tmp_path, 'newsroom/progress.py', source + '\n' + declaration)
+    head = _commit(tmp_path, 'uncertain transform')
+    route = selector.select_focus(('newsroom/progress.py',), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_service_tests'] == ['newsroom/tests/test_other_neo4j_service.py']
+
+
+@pytest.mark.parametrize('declaration', (
+    'def added(value=register()):\n    return value\n',
+    'class Added(make_base()):\n    pass\n',
+    'class Added:\n    register()\n',
+))
+def test_added_executable_definition_is_not_a_closed_declaration(tmp_path, declaration):
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    source = 'def unchanged():\n    return 1\n'
+    _write(tmp_path, 'newsroom/progress.py', source)
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py', 'from newsroom.progress import unchanged\n')
+    base = _commit(tmp_path, 'base')
+    _write(tmp_path, 'newsroom/progress.py', source + '\n' + declaration)
+    head = _commit(tmp_path, 'executable definition')
+    route = selector.select_focus(('newsroom/progress.py',), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_service_tests'] == ['newsroom/tests/test_other_neo4j_service.py']
+
+
+def test_exact_diff_first_adopter_retains_focused_graphiti_model_consumers(tmp_path):
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    source = 'class Changed:\n    def value(self):\n        return 1\n\nclass Other:\n    pass\n'
+    _write(tmp_path, 'newsroom/graphiti_adapter/models.py', source)
+    _write(tmp_path, 'newsroom/control_plane/graphiti.py',
+           'from ..graphiti_adapter.models import Changed\n\ndef ingest():\n    return Changed().value()\n')
+    _write(tmp_path, 'newsroom/tests/test_graphiti_models.py', 'from newsroom.graphiti_adapter.models import Changed\n')
+    _write(tmp_path, 'newsroom/tests/test_graphiti_consumer.py', 'from newsroom.control_plane.graphiti import ingest\n')
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py', 'from newsroom.graphiti_adapter.models import Other\n')
+    base = _commit(tmp_path, 'base')
+    _write(tmp_path, 'newsroom/graphiti_adapter/models.py', source.replace('return 1', 'return 2'))
+    head = _commit(tmp_path, 'exact model change')
+    route = selector.select_focus(('newsroom/graphiti_adapter/models.py',), repo_root=tmp_path,
+                                  base_sha=base, head_sha=head)
+    assert route['selected_tests'] == ['newsroom/tests/test_graphiti_consumer.py', 'newsroom/tests/test_graphiti_models.py']
+    assert route['selected_service_tests'] == []
+    assert route['full_health_required'] is False

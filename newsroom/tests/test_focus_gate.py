@@ -143,7 +143,7 @@ def test_issue_789_shape_selects_adapter_and_consumer_without_broad_lanes(
     assert route["owner_authority_required"] is False
 
 
-def test_current_graphiti_adapter_route_is_focused_for_first_adopter() -> None:
+def test_current_graphiti_adapter_without_exact_diff_keeps_conservative_service_fallback() -> None:
     route = select_focus(
         ("newsroom/graphiti_adapter/models.py",),
         repo_root=REPO_ROOT,
@@ -152,7 +152,7 @@ def test_current_graphiti_adapter_route_is_focused_for_first_adopter() -> None:
     assert {"F0", "F1", "F2"} <= set(route["gates"])
     assert len(route["selected_tests"]) >= 2
     assert any("graphiti" in path for path in route["selected_tests"])
-    assert route["selected_service_tests"] == []
+    assert route["selected_service_tests"]
     assert route["research_required"] is False
     assert route["full_health_required"] is False
 
