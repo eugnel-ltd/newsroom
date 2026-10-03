@@ -58,7 +58,11 @@ class _ObjectStoreBase:
         conn = self._connection
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         tables = self._table_names()
-        if version > SCHEMA_VERSION:
+        if version == 44 and self._current_state_only:
+            from .native_current_checkpoint_migrations import require_checkpoint_schema
+            require_checkpoint_schema(conn)
+            self._native_checkpoint_schema = True
+        elif version > SCHEMA_VERSION:
             raise AuthoritySchemaError(
                 f"database schema {version} is newer than supported {SCHEMA_VERSION}"
             )

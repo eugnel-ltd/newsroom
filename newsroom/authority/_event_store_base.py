@@ -72,6 +72,7 @@ class _EventStoreBase:
     """SQLite lifecycle, migration, validation and writer ownership."""
 
     _current_state_only = False
+    _native_checkpoint_schema = False
 
     def __init__(
         self,
@@ -203,6 +204,22 @@ class _EventStoreBase:
         # independent of database/page size; not a bound on total process RSS.
         conn.execute("PRAGMA cache_size=-16384")
 
+    def _checkpoint_header_json(self,event_id):
+        if not self._native_checkpoint_schema:
+            return None
+        from .native_current_checkpoint import checkpoint_member
+        from .canonical import canonical_json_bytes
+        row=self._connection.execute('SELECT native_checkpoint_id FROM ledger_events WHERE event_id=?',(event_id,)).fetchone()
+        if row is None or row[0] is None:
+            return None
+        try:
+            member=checkpoint_member(self,event_id)
+        except DiagnosticHistoryExpired:
+            return canonical_json_bytes({'checkpoint_error':'EXPIRED'}).decode()
+        except AuthorityPersistenceError:
+            return canonical_json_bytes({'checkpoint_error':'CORRUPT'}).decode()
+        return canonical_json_bytes({**member['header'],'idempotency_key':member['key']}).decode()
+
     def _table_names(self) -> set[str]:
         return {
             str(row[0])
@@ -216,6 +233,12 @@ class _EventStoreBase:
         conn = self._connection
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         tables = self._table_names()
+        if version == 44 and self._current_state_only:
+            from .native_current_checkpoint_migrations import require_checkpoint_schema
+            require_checkpoint_schema(conn)
+            self._native_checkpoint_schema = True
+            self._validate_schema_and_integrity()
+            return
         if version > SCHEMA_VERSION:
             raise AuthoritySchemaError(
                 f"database schema {version} is newer than supported "
@@ -234,28 +257,33 @@ class _EventStoreBase:
 
     def _validate_schema_and_integrity(self) -> None:
         conn = self._connection
-        with _validation_stage("schema"):
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version != SCHEMA_VERSION:
-                raise AuthoritySchemaError(
-                    f"database schema {version} does not match {SCHEMA_VERSION}"
+        if self._native_checkpoint_schema:
+            from .native_current_checkpoint_migrations import require_checkpoint_schema
+            require_checkpoint_schema(conn)
+            conn.create_function('native_checkpoint_header',1,self._checkpoint_header_json)
+        else:
+            with _validation_stage("schema"):
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                if version != SCHEMA_VERSION:
+                    raise AuthoritySchemaError(
+                        f"database schema {version} does not match {SCHEMA_VERSION}"
+                    )
+                rows = conn.execute(
+                    "SELECT version,name,checksum FROM authority_migrations "
+                    "ORDER BY version"
+                ).fetchall()
+                history = tuple(
+                    (int(row["version"]), str(row["name"]), str(row["checksum"]))
+                    for row in rows
                 )
-            rows = conn.execute(
-                "SELECT version,name,checksum FROM authority_migrations "
-                "ORDER BY version"
-            ).fetchall()
-            history = tuple(
-                (int(row["version"]), str(row["name"]), str(row["checksum"]))
-                for row in rows
-            )
-            if history != EXPECTED_MIGRATION_HISTORY:
-                raise AuthoritySchemaError(
-                    f"authority migration history mismatch: {history!r}"
-                )
-            if schema_fingerprint(conn) != EXPECTED_SCHEMA_FINGERPRINT:
-                raise AuthoritySchemaError(
-                    "authority schema fingerprint mismatch"
-                )
+                if history != EXPECTED_MIGRATION_HISTORY:
+                    raise AuthoritySchemaError(
+                        f"authority migration history mismatch: {history!r}"
+                    )
+                if schema_fingerprint(conn) != EXPECTED_SCHEMA_FINGERPRINT:
+                    raise AuthoritySchemaError(
+                        "authority schema fingerprint mismatch"
+                    )
         if not self._current_state_only:
             self._validate_retained_database_history(conn)
         with _validation_stage("connection_settings"):
@@ -305,6 +333,13 @@ class _EventStoreBase:
     def _prove_current_record(self, row: sqlite3.Row) -> None:
         """A selected business row needs its exact event proof, not a boot-time sweep."""
         if self._current_state_only:
+            if self._native_checkpoint_schema and row['authority_event_id'] is not None:
+                selected = self._connection.execute('SELECT native_checkpoint_id FROM ledger_events WHERE event_id=?',
+                    (str(row['authority_event_id']),)).fetchone()
+                if selected is not None and selected[0] is not None:
+                    from .native_current_checkpoint import checkpoint_member
+                    checkpoint_member(self,str(row['authority_event_id']))
+                    return
             self._validate_retained_event(str(row["authority_event_id"]))
 
     @staticmethod
@@ -486,11 +521,19 @@ class _EventStoreBase:
         self.close()
 
     def _require_unexpired_key(self, conn, namespace: str, key: str) -> None:
+        if self._native_checkpoint_schema and conn.execute(
+            'SELECT 1 FROM native_expired_command_keys WHERE namespace=? AND key=?', (namespace,key)
+        ).fetchone() is not None:
+            raise DiagnosticHistoryExpired('command diagnostic history expired; identity remains reserved')
         row = conn.execute(
             "SELECT * FROM ledger_events WHERE retired_namespace=? AND retired_key=? "
             "AND retired_header_digest IS NOT NULL", (namespace, key),
         ).fetchone()
         if row is not None:
+            if self._current_state_only and self._native_checkpoint_schema and row['native_checkpoint_id'] is not None:
+                from .native_current_checkpoint import checkpoint_member
+                checkpoint_member(self,str(row['event_id']))
+                return
             self._event_from_row(row)
             raise DiagnosticHistoryExpired("command diagnostic history expired; identity remains reserved")
 
@@ -499,6 +542,11 @@ class _EventStoreBase:
     ) -> CommittedCommandIdentity | None:
         with self._lock:
             self._require_unexpired_key(self._connection, idempotency_namespace, idempotency_key)
+            if self._current_state_only and self._native_checkpoint_schema:
+                from .native_current_checkpoint import checkpoint_identity
+                checkpoint = checkpoint_identity(self,idempotency_namespace,idempotency_key)
+                if checkpoint is not None:
+                    return checkpoint
             row = self._connection.execute(
                 "SELECT c.command_id,c.command_type,"
                 "c.command_definition_version,"

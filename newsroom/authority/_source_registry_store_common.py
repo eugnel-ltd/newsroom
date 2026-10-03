@@ -265,6 +265,27 @@ class _SourceRegistryStoreSupport:
         *,
         event_id: str,
     ) -> sqlite3.Row:
+        header = None
+        if conn.execute('PRAGMA user_version').fetchone()[0] == 44:
+            header = conn.execute('SELECT native_checkpoint_header(?)',(event_id,)).fetchone()[0]
+        if header is not None:
+            import json
+            envelope = json.loads(header)
+            if envelope.get('checkpoint_error') == 'EXPIRED':
+                from .persistence import DiagnosticHistoryExpired
+                raise DiagnosticHistoryExpired('source RPC provenance expired')
+            if 'checkpoint_error' in envelope:
+                raise AuthorityPersistenceError('selected checkpoint original proof differs')
+            payload = conn.execute('SELECT payload_bytes FROM authority_payloads WHERE payload_id=?',
+                (envelope['payload_id'],)).fetchone()
+            if payload is None:
+                raise AuthorityPersistenceError('checkpoint business payload is missing')
+            envelope['payload_bytes'] = payload[0]
+            return envelope
+        expired = conn.execute('SELECT retired_header_digest FROM ledger_events WHERE event_id=?',(event_id,)).fetchone()
+        if expired is not None and expired[0] is not None:
+            from .persistence import DiagnosticHistoryExpired
+            raise DiagnosticHistoryExpired('source RPC provenance expired')
         row = conn.execute(
             "SELECT e.*,c.idempotency_key,p.payload_bytes "
             "FROM ledger_events e "
