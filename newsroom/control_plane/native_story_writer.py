@@ -107,19 +107,26 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
     claims = {claim.claim_id: claim for claim in package.governed_claims}
     sentences, text = _sentences(copy), copy.title + "\n" + copy.body
     links = copy.evidence_links
+    support = review["sentence_support"]
+    headline_ids = {identity for identity, claim in claims.items() if claim.claim_role == "HEADLINE"}
+    reviewed_headline = next((item for item in support if item["sentence_index"] == 0), None)
+    headline_supported = (reviewed_headline is not None
+                          and reviewed_headline["verdict"] == "SUPPORTED"
+                          and bool(set(reviewed_headline["claim_ids"]) & headline_ids))
     check("NATIVE_STORY_PACKAGE_BINDING", copy.writer_id == WRITER_ID and copy.evidence_package_digest == package.digest
           and review["source_package_digest"] == package.digest)
     check("NATIVE_STORY_DRAFT_BINDING", review["draft_digest"] == digest_canonical(_draft(copy, format)))
     check("NATIVE_STORY_CLAIM_COVERAGE", bool(claims) and {link.governed_claim_id for link in links} == set(claims)
           and set(review["covered_claim_ids"]) == set(claims)
           and all(link.rendered_assertion in text for link in links)
-          and all(any(link.governed_claim_id == identity and link.rendered_assertion in
-                      (copy.title if claim.claim_role == "HEADLINE" else copy.body) for link in links)
+          and all((headline_supported and identity in reviewed_headline["claim_ids"])
+                  if claim.claim_role == "HEADLINE" else
+                  any(link.governed_claim_id == identity and link.rendered_assertion in copy.body for link in links)
                   for identity, claim in claims.items()))
-    support = review["sentence_support"]
     check("NATIVE_STORY_SENTENCE_SUPPORT", [item["sentence_index"] for item in support] == list(range(len(sentences)))
           and all(item["verdict"] == "SUPPORTED" and set(item["claim_ids"]) <= set(claims) for item in support)
-          and all(any(link.governed_claim_id in item["claim_ids"] and link.rendered_assertion in
+          and all(headline_supported if item["sentence_index"] == 0 else
+                  any(link.governed_claim_id in item["claim_ids"] and link.rendered_assertion in
                       sentences[item["sentence_index"]] for link in links) for item in support))
     check("NATIVE_STORY_SEPARATE_REVIEW", review["verdict"] == "PASS" and all(review["factual_checks"][key] == "PASS" for key in _FACTS))
     number = re.compile(r"\d+(?:[.,]\d+)*|[零〇一二三四五六七八九十百千萬億兆兩廿卅]+(?:年|月|日|時|分|秒|人|名|個|間|所|座|公里|元|英鎊|%|％)")

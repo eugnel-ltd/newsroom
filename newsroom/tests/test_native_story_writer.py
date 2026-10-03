@@ -199,3 +199,29 @@ def test_source_quotation_keeps_its_closing_mark_with_the_reviewed_sentence():
         return result
 
     assert write_native_story(package, generate=lambda _: draft, review=review).copy.body == draft["body"]
+
+
+def test_reviewed_headline_does_not_require_duplicate_writer_span_metadata():
+    draft = deepcopy(DRAFT)
+    draft['evidence_links'][0]['rendered_assertion'] = '政府計劃開設兩個社區中心'
+    result = write_native_story(_package(), generate=lambda _: draft, review=_review)
+    assert result.copy.title == DRAFT['title']
+    assert result.copy.evidence_links[0].rendered_assertion in result.copy.body
+    assert all(item.result == 'PASS' for item in result.validators)
+
+
+@pytest.mark.parametrize('failure', ['unknown', 'substantive_only', 'unreviewed', 'invented_number'])
+def test_headline_paraphrase_still_requires_bound_headline_support(failure):
+    draft = deepcopy(DRAFT)
+    draft['evidence_links'][0]['rendered_assertion'] = '政府計劃開設兩個社區中心'
+    if failure == 'invented_number':
+        draft['title'] = draft['title'].replace('100', '999')
+    def review(request):
+        result = _review(request)
+        first = result['sentence_support'][0]
+        if failure == 'unknown': first['claim_ids'] = ['missing']
+        elif failure == 'substantive_only': first['claim_ids'] = ['capacity']
+        elif failure == 'unreviewed': first['verdict'] = 'UNKNOWN'
+        return result
+    with pytest.raises(NativeStoryWriterHold):
+        write_native_story(_package(), generate=lambda _: draft, review=review)
