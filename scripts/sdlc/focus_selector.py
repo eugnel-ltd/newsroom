@@ -205,20 +205,62 @@ def _changed_public_symbols(repo_root: Path, path: str, base_sha: str, head_sha:
     ] != [ast.dump(node) for node in new_tree.body if not isinstance(node, kinds)]:
         return None
     changed = {name for name in old_defs if ast.dump(old_defs[name]) != ast.dump(new_defs[name])}
-    if not changed or any(name.startswith("_") for name in changed):
+    if not changed:
         return None
+    return _local_symbol_closure(new_tree, changed)
+
+
+def _local_symbol_closure(
+    tree: ast.AST, symbols: set[str], module_attributes: set[tuple[str, ...]] = frozenset(),
+) -> set[str] | None:
+    """Close bound names over local callers; executable module effects stay broad."""
+    kinds = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    definitions = {node.name: node for node in tree.body if isinstance(node, kinds)}
+    module_names = set(definitions)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            module_names.update(name for target in node.targets for name in _assignment_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            module_names.update(_assignment_names(node.target))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            module_names.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+    changed = set(symbols)
+    if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+           and (node.func.id in {"globals", "locals", "eval", "exec"}
+                or node.func.id == "vars" and not node.args) for node in ast.walk(tree)):
+        return None
+    module_dicts = {(alias.asname or "sys", "modules") for node in ast.walk(tree)
+                    if isinstance(node, ast.Import) for alias in node.names if alias.name == "sys"}
+    module_dicts.update((alias.asname or alias.name,) for node in ast.walk(tree)
+                       if isinstance(node, ast.ImportFrom) and node.module == "sys"
+                       for alias in node.names if alias.name == "modules")
+    if any(_attribute_chain(node) in module_dicts for node in ast.walk(tree)):
+        return None
+
+    def references(node):
+        return any(
+            isinstance(item, ast.Name) and item.id in changed
+            or any((chain := _attribute_chain(item)) is not None and chain[:len(prefix)] == prefix
+                   for prefix in module_attributes)
+            for item in ast.walk(node)
+        )
+
     while True:
-        callers = {
-            name for name, node in new_defs.items()
-            if any(isinstance(item, ast.Name) and item.id in changed for item in ast.walk(node))
-        }
+        callers = {name for name, node in definitions.items() if references(node)}
         expanded = changed | callers
+        if any(node.decorator_list or any(isinstance(item, (ast.Global, ast.Nonlocal)) for item in ast.walk(node))
+               for name, node in definitions.items() if name in expanded):
+            return None
+        for name in expanded & definitions.keys():
+            for item in ast.walk(definitions[name]):
+                if isinstance(item, (ast.Attribute, ast.Subscript)) and isinstance(item.ctx, (ast.Store, ast.Del)):
+                    target = item.value
+                    while isinstance(target, (ast.Attribute, ast.Subscript)):
+                        target = target.value
+                    if isinstance(target, ast.Name) and target.id in module_names:
+                        return None
         if expanded == changed:
-            if any(
-                isinstance(item, ast.Name) and item.id in changed
-                for node in new_tree.body if not isinstance(node, kinds)
-                for item in ast.walk(node)
-            ):
+            if any(references(node) for node in tree.body if not isinstance(node, (*kinds, ast.Import, ast.ImportFrom))):
                 return None
             return changed
         changed = expanded
@@ -304,6 +346,48 @@ def _imports_changed_surface(
     return False
 
 
+def _importer_symbols(
+    tree: ast.AST, module: str, symbols: set[str], importer: str,
+) -> set[str] | None:
+    """Carry imported aliases and their local callers, not every module descendant."""
+    parent, _, leaf = module.rpartition(".")
+    aliases: set[str] = set()
+    modules: set[tuple[str, ...]] = set()
+    exported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == module):
+            return None
+        if isinstance(node, ast.ImportFrom):
+            source = _imported_from(node, importer)
+            if source == module:
+                if any(alias.name == "*" for alias in node.names):
+                    return None
+                aliases.update(alias.asname or alias.name for alias in node.names if alias.name in symbols)
+            elif source == parent:
+                for alias in node.names:
+                    if alias.name == leaf:
+                        modules.add((alias.asname or alias.name,))
+                        if node in tree.body:
+                            exported_modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == module:
+                    modules.add((alias.asname,) if alias.asname else tuple(module.split(".")))
+                    if node in tree.body:
+                        exported_modules.add(alias.asname or alias.name.split(".")[0])
+    if not aliases and not modules:
+        return set()
+    # Passing/reflecting on an imported module escapes the static attribute closure.
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            if _attribute_chain(child) in modules and not isinstance(node, ast.Attribute):
+                return None
+    attributes = {(*prefix, symbol) for prefix in modules for symbol in symbols}
+    affected = _local_symbol_closure(tree, aliases, attributes)
+    return None if affected is None else affected | exported_modules
+
+
 def _discover_tests(
     repo_root: Path,
     source_paths: Sequence[str],
@@ -315,6 +399,7 @@ def _discover_tests(
     dependents: set[str] = set()
     reexports: set[str] = set()
     direct_symbols: dict[str, set[str] | None] = {}
+    surfaces: dict[str, set[str] | None] = {}
     unresolved = False
     try:
         graph = build_dependency_graph(repo_root)
@@ -336,35 +421,41 @@ def _discover_tests(
         direct_symbols[module] = symbols
         if graph is None:
             continue
-        if symbols is None or not hasattr(graph, "reverse_importers"):
+        if not hasattr(graph, "reverse_importers"):
             try:
                 for nested in graph.dependent_paths(relative):
                     retain(nested)
             except DependencyError:
                 unresolved = True
             continue
-        importers = graph.reverse_importers.get(module, frozenset())
-        for importer in importers:
-            importer_path = graph.module_to_path.get(importer)
-            if importer_path is None:
-                continue
-            if symbols is not None:
-                try:
-                    tree = ast.parse((repo_root / importer_path).read_text(encoding="utf-8"))
-                except (OSError, SyntaxError, UnicodeError):
-                    unresolved = True
+        if module not in graph.module_to_path:
+            unresolved = True
+        surfaces[module] = symbols
+    if graph is not None and hasattr(graph, "reverse_importers"):
+        queue = list(surfaces)
+        while queue:
+            module = queue.pop()
+            symbols = surfaces[module]
+            for importer in graph.reverse_importers.get(module, frozenset()):
+                importer_path = graph.module_to_path.get(importer)
+                if importer_path is None or (importer in surfaces and surfaces[importer] is None):
                     continue
-                if not _imports_changed_surface(
-                    tree, module, symbols,
-                    importer=None if importer_path.endswith('/__init__.py') else importer,
-                ):
+                affected = None
+                if symbols is not None:
+                    try:
+                        tree = ast.parse((repo_root / importer_path).read_text(encoding="utf-8"))
+                    except (OSError, SyntaxError, UnicodeError):
+                        unresolved = True
+                    else:
+                        affected = _importer_symbols(tree, module, symbols,
+                            importer + ".__init__" if importer_path.endswith('/__init__.py') else importer)
+                if affected == set():
                     continue
-            retain(importer_path)
-            try:
-                for nested in graph.dependent_paths(importer_path):
-                    retain(nested)
-            except DependencyError:
-                unresolved = True
+                previous = surfaces.get(importer, set())
+                combined = None if affected is None else previous | affected
+                if importer not in surfaces or combined != previous:
+                    surfaces[importer] = combined
+                    queue.append(importer)
     symbols: set[str] = set()
     for relative in source_paths:
         path = repo_root / relative
@@ -395,8 +486,13 @@ def _discover_tests(
             for imported in imports
             for module in dependents
         )
+        surface_hit = any(
+            _imports_changed_surface(tree, module, affected, importer)
+            if affected is not None else any(_imports_module(imported, module) for imported in imports)
+            for module, affected in surfaces.items()
+        )
         reexport_hit = _imports_any_public_symbol(tree, reexports, symbols, importer)
-        if direct_hit or dependent_hit or reexport_hit:
+        if direct_hit or dependent_hit or surface_hit or reexport_hit:
             selected.add(relative)
     return selected, unresolved
 
