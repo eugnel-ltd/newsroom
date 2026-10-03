@@ -258,6 +258,7 @@ class GraphitiModelUsageObserver:
         call_shape_policy: GraphitiCallShapePolicy | None = None,
         fallback_policy: GraphitiFallbackCircuitPolicy | None = None,
         recovered_ambiguous_progression: object | None = None,
+        inherited_empty_for: Callable | None = None,
     ) -> None:
         self._service = service
         self._envelope = envelope
@@ -320,6 +321,7 @@ class GraphitiModelUsageObserver:
             )
         )
         self._owner_stop_check = owner_stop_check
+        self.inherited_empty_for = inherited_empty_for
 
     def allows_fresh_zero_dispatch_retry(
         self, *, episode_uuid: str, attempt_number: int
@@ -1100,6 +1102,7 @@ class EvaluationGraphitiRunner:
         proof: AuthenticationProof | None = None,
         call_shape_policy: GraphitiCallShapePolicy | None = None,
         fallback_policy: GraphitiFallbackCircuitPolicy | None = None,
+        inherited_empty_for: Callable | None = None,
     ) -> None:
         if not isinstance(fallback_permitted, bool):
             raise TypeError("Graphiti fallback permission must be boolean")
@@ -1132,6 +1135,7 @@ class EvaluationGraphitiRunner:
         self._proof = proof
         self._call_shape_policy = call_shape_policy
         self._fallback_policy = fallback_policy
+        self._inherited_empty_for = inherited_empty_for
         self._pending_usage: dict[
             tuple[str, int], tuple[ModelUsageService, WorkEnvelope]
         ] = {}
@@ -1584,6 +1588,10 @@ class EvaluationGraphitiRunner:
             fallback_policy=self._fallback_policy,
             recovered_ambiguous_progression=self._authenticated_recovered_gaps.get(
                 (unit.ingest_id, unit.attempt_number)
+            ),
+            inherited_empty_for=(
+                None if self._inherited_empty_for is None else
+                lambda attempt: self._inherited_empty_for(unit, attempt)
             ),
         )
         self._pending_usage[(unit.ingest_id, unit.attempt_number)] = (

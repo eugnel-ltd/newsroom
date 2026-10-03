@@ -1698,6 +1698,32 @@ class RealGraphitiAdapter:
                 == CombinedTemporalFailureCode.PIPELINE_FAILED.value
             )
 
+        inherited_for = getattr(self._invocation_observer, "inherited_empty_for", None)
+        inherited = inherited_for(attempt) if callable(inherited_for) else None
+        if inherited is not None:
+            from .combined_temporal_extraction import inherited_empty_receipt
+            revision = _source_revision_input(
+                attempt, body=episode_body(attempt), ingested_at=started_at,
+            )
+            current = inherited_empty_receipt(revision, inherited[0], inherited[1])
+            if current is not None:
+                raw = _raw_receipt(
+                    attempt, started_at=started_at, telemetry=telemetry,
+                    result=None, proposals=(),
+                )
+                raw["episode_uuid"] = attempt.episode_uuid or str(attempt.attempt_id)
+                raw["execution_source"] = "INHERITED_NO_PROPOSALS"
+                raw["combined_temporal_receipt"] = current
+                raw.pop("raw_output_digest", None)
+                raw["raw_output_digest"] = digest_bytes(canonical_json_bytes(raw))
+                produced = produced_extraction(
+                    attempt, outcome=ExtractionOutcome.SUCCESS,
+                    failure_code=ExtractionFailureCode.NONE,
+                    validation=ExtractionOutputValidation.VALID,
+                    raw=raw, proposals=(), embedding_usage=telemetry.embedding_usage,
+                )
+                produced.usage.require_within(attempt.extraction_request.budget)
+                return produced
         try:
             _load_graphiti()
             api_key = openrouter_api_key()
