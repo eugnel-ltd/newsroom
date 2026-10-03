@@ -115,3 +115,25 @@ def test_stop_fence_before_transport_settles_actual_zero_and_does_not_call_provi
     with service._connection() as connection:
         raw = connection.execute("SELECT record_json FROM model_invocation_terminals").fetchone()[0]
     assert json.loads(raw)["pre_dispatch_zero_proved"] is True
+
+
+def test_clean_reader_only_upgrade_keeps_qualified_story_route(tmp_path, monkeypatch):
+    model, service, calls = _model(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "cont_writer_implementation_identity", lambda: ("2" * 40, True))
+    assert _call(model) == {"text": "supported copy"}
+    assert _call(model) == {"text": "supported copy"}
+    assert len(calls) == 1
+    with service._connection() as connection:
+        record = json.loads(connection.execute("SELECT record_json FROM model_invocation_context_manifests").fetchone()[0])
+        assert record["implementation_revision"] == "2" * 40
+    assert model.policies["DRAFT"].implementation_revision == "1" * 40
+
+
+def test_dirty_story_implementation_still_has_no_model_effect(tmp_path, monkeypatch):
+    model, service, calls = _model(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "cont_writer_implementation_identity", lambda: ("2" * 40, False))
+    with pytest.raises(ModelUsageAdmissionError, match="implementation differs"):
+        _call(model)
+    assert calls == []
+    with service._connection() as connection:
+        assert connection.execute("SELECT count(*) FROM model_invocation_allocations").fetchone()[0] == 0
