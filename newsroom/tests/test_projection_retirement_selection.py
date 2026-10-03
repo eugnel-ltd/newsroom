@@ -10,17 +10,19 @@ from newsroom.authority.projection_retirement import select_candidates, protect_
 from .test_retired_projection_audit import _seed
 
 
-def _query(connection):
+def _query(connection, generation_id=None):
     """Capture the production staging statement, not a reimplemented predicate."""
-    select_candidates(connection)
+    select_candidates(connection, generation_id=generation_id)
     return connection.selection.split(" AS\n", 1)[1]
 
 
 class CaptureSelection(sqlite3.Connection):
     selection = ""
+    selection_parameters = ()
     def execute(self, sql, parameters=()):
         if sql.startswith("CREATE TEMP TABLE _retirement_candidates AS"):
             self.selection = sql
+            self.selection_parameters = parameters
         return super().execute(sql, parameters)
 
 
@@ -60,9 +62,9 @@ def test_protection_reads_generation_heads_and_reuses_candidate_membership_index
         connection.set_trace_callback(statements.append)
         protect_candidates(connection)
         head_statement = next(sql for sql in statements if sql.startswith(
-            "DELETE FROM _retirement_candidates WHERE event_id IN ("))
+            "DELETE FROM _retirement_candidates AS candidate WHERE EXISTS ("))
         plan = _plan(connection, head_statement)
-        assert any("SEARCH a USING PRIMARY KEY (aggregate_type=?)" in item for item in plan)
+        assert any("SEARCH a USING PRIMARY KEY (aggregate_type=? AND aggregate_id=?)" in item for item in plan)
         assert not any(item == "SCAN e" for item in plan)
         for table, key, column in (
             ("authority_payloads", "payload_id", "payload_id"),
@@ -195,3 +197,35 @@ def test_sparse_and_dense_cohort_selection_is_linear_with_identical_rowsets(tmp_
     record_property(density + "_baseline_vm_steps", json.dumps(before))
     record_property(density + "_state_first_vm_steps", json.dumps(after))
     record_property(density + "_selected_row_counts", json.dumps(sizes))
+
+
+@pytest.mark.parametrize('cohort_size', [8, 64])
+def test_fixed_predecessor_cohort_is_independent_of_unrelated_history(tmp_path, record_property, cohort_size):
+    path = tmp_path / 'authority.sqlite3'
+    request, _ = _seed(path)
+    with sqlite3.connect(path, factory=CaptureSelection) as real:
+        query = _query(real, str(request.generation_id))
+    steps = []
+    for history in (0, 4096):
+        connection, _ = _cohort(cohort_size + 9, 'dense')
+        try:
+            connection.execute("INSERT INTO projection_generations VALUES('unrelated','structural','RETIRED')")
+            offset = connection.execute('SELECT max(ledger_seq) FROM ledger_events').fetchone()[0]
+            connection.executemany('INSERT INTO ledger_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', [
+                (offset+i, f'u-{i}', f'c-u-{i}', f'p-u-{i}', f'a-u-{i}', f'r-u-{i}', f'd-u-{i}',
+                 'projection_generation', 'unrelated', i, 'projection.delivery.recorded', None)
+                for i in range(1, history+1)])
+            connection.executemany('INSERT INTO projection_delivery_states VALUES(?,?,?,?,?,?,?,?)', [
+                ('unrelated', i, f'u-{i}', 'APPLIED', 1, 1, 1, None)
+                for i in range(1, history+1)])
+            count = [0]
+            connection.set_progress_handler(lambda: count.__setitem__(0, count[0]+100) or 0, 100)
+            rows = connection.execute(query, ('retired-0',)).fetchall()
+            connection.set_progress_handler(None, 0)
+            assert len(rows) == cohort_size
+            assert {row[6] for row in rows} == {'retired-0'}
+            steps.append(count[0])
+        finally:
+            connection.close()
+    assert steps[1] <= steps[0] + 100, steps
+    record_property('fixed_predecessor_steps', str(steps))
