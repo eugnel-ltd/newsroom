@@ -5,6 +5,8 @@ import sqlite3
 from collections import Counter
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 
@@ -57,6 +59,57 @@ def _allocated(tmp_path, monkeypatch):
         candidate, _base_package(_ready_package(candidate)[1]), "retained prompt",
     )
     return service, usage, candidate, allocation
+
+
+def _candidate_metadata(tmp_path, versions):
+    path = tmp_path / "candidate-metadata.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE story_candidate_admission_receipts_v2("
+                           "version_id TEXT PRIMARY KEY,candidate_id TEXT,version_digest TEXT,version_bytes BLOB)")
+        connection.executemany("INSERT INTO story_candidate_admission_receipts_v2 VALUES(?,?,?,?)", (
+            (v.version_id, v.candidate_id, v.canonical_digest, v.canonical_bytes) for v in versions
+        ))
+    return str(path)
+
+
+def test_allocation_denial_binds_authoritative_versions_not_journal_ids(tmp_path, monkeypatch):
+    service, usage, candidate, _allocation = _allocated(tmp_path, monkeypatch)
+    other_version = replace(candidate, version_id=str(uuid4()))
+    unallocated = replace(candidate, version_id=str(uuid4()), candidate_id=str(uuid4()))
+    path = _candidate_metadata(tmp_path, (candidate, other_version, unallocated))
+    requested = (candidate.version_id, unallocated.version_id, "missing", None,
+                 other_version.version_id, candidate.version_id)
+    with sqlite3.connect(service.path) as connection:
+        before = connection.execute("SELECT count(*) FROM model_invocation_allocations").fetchone()[0]
+    assert usage.retained_pre_dispatch_allocation_denials(requested, authority_path=path) == (
+        True, False, False, False, True, True,
+    )
+    assert usage.retained_pre_dispatch_allocation_denials(
+        (candidate.version_id, candidate.version_id), authority_path=path,
+        expected_candidate_ids=(candidate.candidate_id, "wrong-journal-candidate"),
+    ) == (True, False)
+    with sqlite3.connect(service.path) as connection:
+        assert connection.execute("SELECT count(*) FROM model_invocation_allocations").fetchone()[0] == before
+
+
+@pytest.mark.parametrize("damage", ("candidate_id", "version_digest", "version_bytes", "envelope", "allocation"))
+def test_allocation_denial_corruption_is_unknown_and_keeps_full_reader(tmp_path, monkeypatch, damage):
+    service, usage, candidate, allocation = _allocated(tmp_path, monkeypatch)
+    path = _candidate_metadata(tmp_path, (candidate,))
+    if damage in {"candidate_id", "version_digest", "version_bytes"}:
+        value = b"{}" if damage == "version_bytes" else "sha256:" + "a" * 64
+        with sqlite3.connect(path) as connection:
+            connection.execute('UPDATE story_candidate_admission_receipts_v2 SET "' + damage + '"=?', (value,))
+    else:
+        table = "model_work_envelopes" if damage == "envelope" else "model_invocation_allocations"
+        with sqlite3.connect(service.path) as connection:
+            connection.execute('UPDATE "' + table + '" SET record_json=?', ('{}',))
+    assert usage.retained_pre_dispatch_allocation_denials((candidate.version_id,), authority_path=path) == (False,)
+
+
+def test_missing_allocation_authority_store_does_not_prove_a_denial(tmp_path, monkeypatch):
+    _service, usage = _usage(tmp_path, monkeypatch)
+    assert usage.retained_pre_dispatch_allocation_denials(("missing",), authority_path=str(tmp_path / "absent.sqlite3")) == (False,)
 
 
 def test_predispatch_batch_authenticates_global_history_once_and_closes_read(
