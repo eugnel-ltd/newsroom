@@ -12,6 +12,7 @@ from typing import ContextManager
 from newsroom.authority import UtcTimestamp
 from newsroom.sources import SourceRevisionId
 
+from .admission import write_admission_revalidation_due
 from .native_cycle import advance_native_cycle
 from .native_assessor import assessor_admission_recovery_due, assessment_revalidation_due, same_assessment_producer
 from .native_evidence import NativeEvidenceHold
@@ -323,6 +324,7 @@ class NativePipeline:
                         "GOVUK_LICENCE_REVIEW_HOLD", "NATIVE_SOURCE_RIGHTS_HOLD",
                         "PUBLICATION_RIGHTS_HOLD",
                     }
+                    and not write_admission_revalidation_due(previous.get("facts", {}))
                     and not assessment_revalidation_due(
                         previous.get("facts", {}), self._assessment_contract_version,
                     )

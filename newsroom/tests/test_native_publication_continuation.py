@@ -1230,3 +1230,57 @@ def test_ack_history_scans_inline_summaries_without_expanding_pairs(tmp_path, mo
         assert calls == ["story-0", "attempt-0", "story-1", "attempt-1"]
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("remaining_hold", (False, True))
+def test_inventory_consumer_reuses_retained_package_once_without_assessor(tmp_path, monkeypatch, remaining_hold):
+    from newsroom.control_plane.admission import WRITE_ADMISSION_POLICY_VERSION, write_admission_revalidation_due
+    from newsroom.increment10.editorial import EditorialHold
+    unit = _native()
+    connection = connect(str(tmp_path / "private.sqlite3"))
+    journal = NativeRevisionJournal(connection)
+    journal.land((unit,))
+    package_id = ObjectAdmissionId.new()
+    decision = _decision(package_id)
+    prior_facts = {"candidate_version_id": "candidate-version", "graphiti_receipts": [{}],
+        "intake_receipt_id": "already-acknowledged", "reason": "INVALID_SUBSTANTIVE_CLAIM_INVENTORY",
+        "package_admission_id": str(package_id), "editorial_decision": json.loads(decision.canonical_bytes()),
+        "acquisition_attempt_count": 3, "acquisition_retryable": False,
+        "assessment_contract_version": "unchanged-producer-and-consumer",
+        "expected_story_version": 0, "expected_publication_version": 0,
+        "expected_delivery_evidence_version": 0, "publication_started_at": "2026-09-08T12:00:00Z"}
+    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts=prior_facts)
+    monkeypatch.setattr(NativeEvidenceController, "acquire_and_retain",
+        lambda *_, **__: pytest.fail("retained inventory repair reached acquisition/assessor"))
+    monkeypatch.setattr("newsroom.control_plane.native_publication.open_private_serving_read_port",
+        lambda *_, **__: _Reader())
+    authority, publication = _Authority(), _Publication()
+    if remaining_hold:
+        def held(*_, **__):
+            publication.calls += 1
+            raise EditorialHold(reason="INVALID_SUBSTANTIVE_CLAIM_INVENTORY")
+        publication.advance = held
+    continuation = NativePublicationContinuation(journal=journal,
+        runtime=SimpleNamespace(authority=authority, ingress=object(), publication=publication,
+            proof=proof(), policies=SimpleNamespace(publication=SimpleNamespace(
+                target_path=tmp_path / "serving.sqlite3", target_id="private", target_context_digest=_DIGEST))),
+        evidence_controller=object.__new__(NativeEvidenceController),
+        sources={unit.revision_id: (_source(unit),)},
+        assessment_contract_version="unchanged-producer-and-consumer",
+        clock=lambda: UtcTimestamp.parse("2026-09-08T12:00:00Z"))
+    try:
+        assert write_admission_revalidation_due(journal.summary(unit.revision_id)["facts"])
+        first = continuation.advance(revision_id=unit.revision_id, candidate_version_id="candidate-version")
+        assert first.state == ("EVIDENCE_HOLD" if remaining_hold else "ACKNOWLEDGED")
+        facts = journal.current(unit.revision_id)["facts"]
+        assert facts["write_admission_policy_version"] == WRITE_ADMISSION_POLICY_VERSION
+        assert not write_admission_revalidation_due(facts)
+        for key in ("package_admission_id", "editorial_decision", "intake_receipt_id", "acquisition_attempt_count", "assessment_contract_version"):
+            assert facts[key] == prior_facts[key]
+        assert publication.calls == 1 and authority.receives == 0
+        if remaining_hold:
+            continuation._journal = NativeRevisionJournal(connection)
+            continuation.advance(revision_id=unit.revision_id, candidate_version_id="candidate-version")
+            assert publication.calls == 1
+    finally:
+        connection.close()
