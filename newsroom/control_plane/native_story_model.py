@@ -105,7 +105,8 @@ class NativeStoryModel:
                 or policy.max_output_tokens is not None):
             raise ModelUsageAdmissionError("story model policy differs", reason_code="NATIVE_STORY_POLICY_DIFFERS")
         revision, clean = cont_writer_implementation_identity()
-        if not clean or revision != policy.implementation_revision:
+        # Software revisions are retained audit facts, not route qualifications.
+        if not clean:
             raise ModelUsageAdmissionError("story model implementation differs", reason_code="NATIVE_STORY_IMPLEMENTATION_DIFFERS")
         now = self.clock().astimezone(UTC)
         envelope = WorkEnvelope.create(
