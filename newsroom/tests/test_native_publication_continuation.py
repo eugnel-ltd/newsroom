@@ -112,6 +112,9 @@ class _Authority:
 
 
 class _Publication:
+    def reconcile_stale_intent(self, *_args, **_kwargs):
+        return None
+
     def __init__(self):
         self.calls = 0
 
@@ -1352,3 +1355,83 @@ def test_accounted_old_provider_failure_reclassifies_interrupted_through_normal_
         assert facts['assessment_contract_version'] == 'newsroom.native-evidence-assessor.v23+consumer.v1'
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('later_sibling', (False, True))
+def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, monkeypatch, later_sibling):
+    from newsroom.increment10.editorial import EditorialError
+
+    first, incoming, later = _native(), _native('stale-successor'), _native('later-sibling')
+    path = str(tmp_path / 'stale-progress.sqlite3')
+    connection = connect(path)
+    journal = NativeRevisionJournal(connection)
+    journal.land((first,))
+    journal.land((incoming,))
+    journal.land((later,))
+    sibling = dict(candidate_id='candidate', candidate_version_id='prior-version',
+        story_event_id='corrected-story', publication_event_id='corrected-publication',
+        delivery_attempt_event_id='corrected-attempt', delivery_evidence_event_id='corrected-evidence')
+    journal.advance(first.revision_id, stage='ACKNOWLEDGED', facts=sibling)
+    package_id = ObjectAdmissionId.new()
+    original_decision = json.loads(_decision(package_id).canonical_bytes())
+    journal.advance(incoming.revision_id, stage='PUBLICATION_STARTED', facts=dict(
+        candidate_id='candidate', candidate_version_id='candidate-version', intake_receipt_id='incoming-intake',
+        package_admission_id=str(package_id), editorial_decision=original_decision,
+        expected_story_version=1, expected_publication_version=2, expected_delivery_evidence_version=0,
+        publication_started_at='2026-09-08T12:04:00Z'))
+
+    class Publication(_Publication):
+        reconciliations = 0
+        interrupted = True
+
+        def reconcile_stale_intent(self, selected, **request):
+            self.reconciliations += 1
+            assert selected == package_id
+            if (request['expected_story_version'], request['expected_publication_version']) == (2, 4):
+                if not later_sibling:
+                    return None  # Own partial slot; no newer authenticated sibling.
+                selected = next(row for row in request['acknowledged'] if row['story_event_id'] == 'later-story')
+                versions = (3, 6)
+            else:
+                assert (request['expected_story_version'], request['expected_publication_version']) == (1, 2)
+                assert request['acknowledged'] == (sibling,)
+                selected, versions = sibling, (2, 4)
+            return SimpleNamespace(story_receipt=SimpleNamespace(aggregate_version=versions[0]),
+                attempt_receipt=SimpleNamespace(aggregate_version=versions[1])), {key: selected[key] for key in (
+                    'story_event_id', 'publication_event_id', 'delivery_attempt_event_id', 'delivery_evidence_event_id')}
+
+        def advance(self, *args, **request):
+            assert (request['expected_story_version'], request['expected_publication_version'],
+                    request['expected_delivery_evidence_version']) == ((3, 6, 0) if later_sibling and not self.interrupted else (2, 4, 0))
+            assert request['reconciled_predecessor']['story_event_id'] == ('later-story' if later_sibling and not self.interrupted else 'corrected-story')
+            if self.interrupted:
+                self.interrupted = False
+                raise EditorialError('interrupted before publication')
+            return super().advance(*args, **request)
+
+    publication = Publication()
+    runtime = SimpleNamespace(authority=_Authority(), ingress=object(), publication=publication, proof=proof(),
+        policies=SimpleNamespace(publication=SimpleNamespace(target_path=tmp_path / 'serving.sqlite3',
+            target_id='private', target_context_digest=_DIGEST)))
+    monkeypatch.setattr('newsroom.control_plane.native_publication.open_private_serving_read_port',
+        lambda *_args, **_kwargs: _Reader())
+    build = lambda journal: NativePublicationContinuation(journal=journal, runtime=runtime,
+        evidence_controller=object.__new__(NativeEvidenceController), sources={incoming.revision_id: (_source(incoming),)},
+        clock=lambda: UtcTimestamp.parse('2026-09-08T12:05:00Z'))
+    with pytest.raises(EditorialError, match='interrupted'):
+        build(journal).advance(revision_id=incoming.revision_id, candidate_version_id='candidate-version')
+    frozen = journal.current(incoming.revision_id)
+    assert frozen['facts']['editorial_decision'] == original_decision
+    assert frozen['facts']['package_admission_id'] == str(package_id)
+    if later_sibling:
+        journal.advance(later.revision_id, stage='ACKNOWLEDGED', facts={**sibling,
+            'story_event_id': 'later-story', 'publication_event_id': 'later-publication',
+            'delivery_attempt_event_id': 'later-attempt', 'delivery_evidence_event_id': 'later-evidence'})
+    connection.close()
+    connection = connect(path)
+    journal = NativeRevisionJournal(connection)
+    result = build(journal).advance(revision_id=incoming.revision_id, candidate_version_id='candidate-version')
+    assert result.state == 'ACKNOWLEDGED'
+    assert publication.reconciliations == 2 and publication.calls == 1
+    assert journal.current(first.revision_id)['facts'] == sibling
+    connection.close()

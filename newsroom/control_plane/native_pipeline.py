@@ -328,6 +328,8 @@ class NativePipeline:
                     and not assessment_revalidation_due(
                         previous.get("facts", {}), self._assessment_contract_version,
                     )
+                    and not (callable(getattr(self._publish, "source_binding_recovery_due", None))
+                             and self._publish.source_binding_recovery_due(previous.get("facts", {})))
                 ):
                     continue
                 stage = "GRAPHITI"
