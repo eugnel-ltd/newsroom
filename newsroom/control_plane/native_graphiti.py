@@ -123,12 +123,96 @@ class NativeGraphitiProcessor:
             proof=proof,
             call_shape_policy=load_checked_native_graphiti_call_shape_policy(),
             fallback_policy=load_checked_native_graphiti_fallback_circuit_policy(),
+            inherited_empty_for=self._inherited_empty_for,
         )
         self._admission = compose_existing_graphiti_admission_consumer(
             connection, adapter=system.graphiti, extraction=system.extraction,
             objects=system.objects, entities=system.entities, relations=system.relations,
             increment4=system.increment4, proof=proof,
         )
+
+    def _inherited_empty_for(self, unit, attempt):
+        """Private receipt hints select an authenticated, source-scoped negative."""
+        from newsroom.extraction.types import ExtractionOutputValidation, ExtractionOutcome
+        self._stop_check()
+        if unit.attempt_number != 1 or len(attempt.extraction_request.input_binding.passages) != 1:
+            return None
+        if self._usage.graphiti_ingest_allocation_count(ingest_id=unit.ingest_id):
+            return None
+        manifest = attempt.manifest
+        if (str(manifest.revision_id) != unit.revision_id
+                or str(manifest.item_id) != unit.authority.item_id
+                or str(manifest.definition_version_id) != unit.authority.definition_version_id):
+            return None
+        passage = attempt.extraction_request.input_binding.passages[0]
+        if digest_bytes(" ".join(unit.episode_body.split()).encode()) != passage.text_digest:
+            return None
+        current_item = self._system.sources.item(manifest.item_id, proof=self._proof).request
+        locator = (current_item.source_native_id or "").partition("|")[2]
+        if not locator:
+            return None
+        rows = self._connection.execute(
+            "SELECT i.ingest_id FROM unpublished_graphiti_ingest i "
+            "JOIN unpublished_graphiti_receipts r USING(ingest_id) "
+            "WHERE i.source_id=? AND i.outcome='COMPLETE' AND i.ingest_id!=? "
+            "AND json_extract(r.receipt_json,'$.proposal_count')=0 "
+            "AND json_extract(r.receipt_json,'$.passages[0].text_digest')=? "
+            "ORDER BY i.at DESC LIMIT 4",
+            (unit.source_id, unit.ingest_id, passage.text_digest),
+        ).fetchall()
+        for (ingest_id,) in rows:
+            self._stop_check()
+            history = self._system.graphiti.attempt_history(
+                typed_id(ExtractionRunId, "run", ingest_id), limit=1, proof=self._proof,
+            )
+            if not history:
+                continue
+            old = history[0]
+            if old.outcome is not GraphitiAdapterOutcome.COMPLETE or old.output_id is None or old.proposal_set_id is not None:
+                continue
+            old_manifest = self._system.graphiti.manifest_for_attempt(old.attempt_id, proof=self._proof)
+            if (old_manifest.definition_id != manifest.definition_id
+                    or old_manifest.definition_version_id != manifest.definition_version_id
+                    or old_manifest.extractor_contract_digest != manifest.extractor_contract_digest
+                    or old_manifest.configuration_digest != manifest.configuration_digest
+                    or len(old_manifest.passages) != 1
+                    or old_manifest.passages[0].text_digest != passage.text_digest):
+                continue
+            old_item = self._system.sources.item(old_manifest.item_id, proof=self._proof).request
+            if (old_item.source_native_id or "").partition("|")[2] != locator:
+                continue
+            accounting = self._usage.graphiti_ingest_retry_evidence(
+                ingest_id=ingest_id, before_attempt_number=old.attempt_number + 1,
+            )
+            if accounting.unresolved_attempts or old.attempt_number not in accounting.settled_provider_attempts:
+                continue
+            # Conservative dispositions settle ownership, not missing telemetry.
+            # The canonical verifier above authenticates these selected rows;
+            # this is an additional denial, never a journal-derived permission.
+            if self._connection.execute(
+                "SELECT 1 FROM model_work_envelopes e JOIN model_invocation_allocations a USING(envelope_id) "
+                "LEFT JOIN model_invocation_terminals t USING(invocation_id) "
+                "WHERE json_extract(e.record_json,'$.ingest_id')=? "
+                "AND (t.invocation_id IS NULL OR t.usage_status!='REPORTED') LIMIT 1",
+                (ingest_id,),
+            ).fetchone() is not None:
+                continue
+            metadata = self._system.extraction.metadata(old.run_version_id, proof=self._proof)
+            if (metadata.outcome is not ExtractionOutcome.SUCCESS or metadata.proposal_count != 0
+                    or metadata.output is None or metadata.output.validation is not ExtractionOutputValidation.VALID):
+                continue
+            retained = self._system.extraction.raw_output(old.output_id, proof=self._proof)
+            raw = json.loads(retained.canonical_bytes)
+            combined = raw.get("combined_temporal_receipt")
+            if (not isinstance(combined, dict) or raw.get("entities") != [] or raw.get("relations") != []
+                    or raw.get("proposals") != [] or raw.get("token_usage", {}).get("unreported_chat_requests") != 0):
+                continue
+            self._stop_check()
+            return combined, {
+                "run_version_id": str(old.run_version_id), "output_id": str(old.output_id),
+                "output_digest": retained.view.canonical_digest, "attempt_id": str(old.attempt_id),
+            }
+        return None
 
     def _rights(self, unit: CorpusIngestUnit) -> dict[str, object] | None:
         self._stop_check()

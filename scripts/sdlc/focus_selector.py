@@ -197,17 +197,172 @@ def _changed_public_symbols(repo_root: Path, path: str, base_sha: str, head_sha:
     except (SyntaxError, UnicodeError):
         return None
 
-    kinds = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
-    old_defs = {node.name: node for node in old_tree.body if isinstance(node, kinds)}
-    new_defs = {node.name: node for node in new_tree.body if isinstance(node, kinds)}
-    if old_defs.keys() != new_defs.keys() or [
-        ast.dump(node) for node in old_tree.body if not isinstance(node, kinds)
-    ] != [ast.dump(node) for node in new_tree.body if not isinstance(node, kinds)]:
+    old, new = _module_declarations(old_tree), _module_declarations(new_tree)
+    if old is None or new is None or old[1:] != new[1:]:
         return None
-    changed = {name for name in old_defs if ast.dump(old_defs[name]) != ast.dump(new_defs[name])}
+    changed = {name for name in old[0].keys() | new[0].keys()
+               if old[0].get(name) != new[0].get(name)}
     if not changed:
         return None
+    for tree, other in ((old_tree, new_tree), (new_tree, old_tree)):
+        other_names = {node.name for node in other.body
+                       if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))}
+        if any(not _static_definition(tree, node) for node in tree.body
+               if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+               and node.name not in other_names):
+            return None
+    if _local_symbol_closure(old_tree, changed) is None:
+        return None
     return _local_symbol_closure(new_tree, changed)
+
+
+def _module_declarations(tree: ast.Module):
+    """Separate precise bindings from executable effects, without evaluating code."""
+    bindings, modules, effects = {}, set(), []
+    for node in tree.body:
+        declared = {}
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            declared[node.name] = ast.dump(node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom) and (node.module is None or any(a.name == '*' for a in node.names)):
+                effects.append(ast.dump(node))
+                continue
+            for alias in node.names:
+                module = ('from', node.module, node.level) if isinstance(node, ast.ImportFrom) else ('import', alias.name)
+                modules.add(module)
+                name = alias.asname or alias.name.split('.')[0]
+                signature = (('import', name), name) if isinstance(node, ast.Import) and alias.asname is None else (module, alias.name)
+                if name in bindings and not (isinstance(node, ast.Import) and alias.asname is None
+                                             and bindings[name] == signature):
+                    return None
+                declared[name] = signature
+        elif isinstance(node, ast.Assign) and all(isinstance(target, ast.Name) for target in node.targets):
+            try:
+                ast.literal_eval(node.value)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                effects.append(ast.dump(node))
+                continue
+            declared = {target.id: ast.dump(node) for target in node.targets}
+        else:
+            effects.append(ast.dump(node))
+        if bindings.keys() & declared.keys() and not isinstance(node, ast.Import):
+            return None  # Rebinding/shadowing keeps the existing broad route.
+        bindings.update(declared)
+    return bindings, modules, effects
+
+
+def _static_definition(tree: ast.Module, node: ast.AST) -> bool:
+    """Added/removed declarations must not execute arbitrary module-time work."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if node.decorator_list:
+            return False
+        for value in (*node.args.defaults, *node.args.kw_defaults):
+            if value is not None:
+                try:
+                    ast.literal_eval(value)
+                except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                    return False
+        annotations = [arg.annotation for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)]
+        annotations += [node.returns, node.args.vararg.annotation if node.args.vararg else None,
+                        node.args.kwarg.annotation if node.args.kwarg else None]
+        deferred = any(isinstance(item, ast.ImportFrom) and item.module == '__future__'
+                       and any(alias.name == 'annotations' for alias in item.names) for item in tree.body)
+        return deferred or all(value is None or isinstance(value, (ast.Name, ast.Constant)) for value in annotations)
+    if _static_dataclass(tree, node):
+        return True
+    if not isinstance(node, ast.ClassDef) or node.decorator_list or node.keywords:
+        return False
+    declarations = _module_declarations(tree)
+    for base in node.bases:
+        name = base.value.id if isinstance(base, ast.Subscript) and isinstance(base.value, ast.Name) else None
+        if (name is None or declarations is None
+                or declarations[0].get(name) != (('from', 'collections.abc', 0), 'Mapping')
+                or any(isinstance(item, (ast.Call, ast.Attribute)) for item in ast.walk(base))):
+            return False
+    return all(_static_definition(tree, item) if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+               else isinstance(item, ast.Pass) or isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant)
+               for item in node.body)
+
+
+def _static_dataclass(tree: ast.Module, node: ast.AST) -> bool:
+    """Recognise only an unshadowed stdlib transform of plain literal fields."""
+    if not isinstance(node, ast.ClassDef) or node.bases or node.keywords or len(node.decorator_list) != 1:
+        return False
+    counts, aliases = {}, set()
+    for statement in tree.body:
+        names = set()
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            for alias in statement.names:
+                name = alias.asname or alias.name.split('.')[0]
+                names.add(name)
+                if isinstance(statement, ast.ImportFrom) and statement.level == 0 and statement.module == 'dataclasses' and alias.name == 'dataclass':
+                    aliases.add((name,))
+                elif isinstance(statement, ast.Import) and alias.name == 'dataclasses':
+                    aliases.add((name, 'dataclass'))
+        elif isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(statement.name)
+        elif isinstance(statement, ast.Assign):
+            names.update(name for target in statement.targets for name in _assignment_names(target))
+        elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+            names.update(_assignment_names(statement.target))
+        for name in names:
+            counts[name] = counts.get(name, 0) + 1
+    decorator = node.decorator_list[0]
+    function = decorator.func if isinstance(decorator, ast.Call) else decorator
+    chain = _attribute_chain(function)
+    if chain not in aliases or counts.get(chain[0]) != 1 or _binding_mutated(tree, chain[0]):
+        return False
+    if isinstance(decorator, ast.Call) and (decorator.args or any(
+            keyword.arg not in {'init', 'repr', 'eq', 'order', 'unsafe_hash', 'frozen', 'match_args', 'kw_only', 'slots', 'weakref_slot'}
+            or not isinstance(keyword.value, ast.Constant) or type(keyword.value.value) is not bool
+            for keyword in decorator.keywords)):
+        return False
+    builtins = {'str', 'int', 'float', 'bool', 'bytes', 'object', 'tuple', 'list', 'dict', 'set', 'frozenset', 'type'}
+    fields = {item.target.id for item in node.body if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)}
+    for item in node.body:
+        if isinstance(item, ast.Pass) or isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant) and isinstance(item.value.value, str):
+            continue
+        if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
+            return False
+        for part in ast.walk(item.annotation):
+            if isinstance(part, ast.Name):
+                if part.id not in builtins or part.id in counts or part.id in fields or _binding_mutated(tree, part.id):
+                    return False
+            elif isinstance(part, ast.Constant):
+                if part.value not in (None, Ellipsis):
+                    return False
+            elif not isinstance(part, (ast.Subscript, ast.Tuple, ast.BinOp, ast.BitOr, ast.Load)):
+                return False
+        if item.value is not None:
+            try:
+                value = ast.literal_eval(item.value)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                return False
+            if type(value) not in (str, bytes, int, float, bool, type(None), tuple):
+                return False
+    return True
+
+
+def _binding_mutated(tree: ast.AST, name: str) -> bool:
+    # Reuse the existing rooted attribute/subscript escape boundary, including
+    # conditional rebinding and reflected module mutation, not just top-level names.
+    for item in ast.walk(tree):
+        if isinstance(item, (ast.Import, ast.ImportFrom)) and item not in tree.body and any(
+                (alias.asname or alias.name.split('.')[0]) == name for alias in item.names):
+            return True
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and item.name == name:
+            return True
+        if isinstance(item, (ast.Name, ast.Attribute, ast.Subscript)) and isinstance(item.ctx, (ast.Store, ast.Del)):
+            target = item
+            while isinstance(target, (ast.Attribute, ast.Subscript)):
+                target = target.value
+            if isinstance(target, ast.Name) and target.id == name:
+                return True
+        if isinstance(item, ast.Call) and any(
+                (chain := _attribute_chain(argument)) is not None and chain[0] == name
+                for argument in (*item.args, *(keyword.value for keyword in item.keywords))):
+            return True
+    return False
 
 
 def _local_symbol_closure(
@@ -239,7 +394,7 @@ def _local_symbol_closure(
 
     def references(node):
         return any(
-            isinstance(item, ast.Name) and item.id in changed
+            isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load) and item.id in changed
             or any((chain := _attribute_chain(item)) is not None and chain[:len(prefix)] == prefix
                    for prefix in module_attributes)
             for item in ast.walk(node)
@@ -248,7 +403,8 @@ def _local_symbol_closure(
     while True:
         callers = {name for name, node in definitions.items() if references(node)}
         expanded = changed | callers
-        if any(node.decorator_list or any(isinstance(item, (ast.Global, ast.Nonlocal)) for item in ast.walk(node))
+        if any(node.decorator_list and not _static_dataclass(tree, node)
+               or any(isinstance(item, (ast.Global, ast.Nonlocal)) for item in ast.walk(node))
                for name, node in definitions.items() if name in expanded):
             return None
         for name in expanded & definitions.keys():
