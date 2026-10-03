@@ -14,6 +14,113 @@ from newsroom.control_plane.veto import OperatorDrainRequested, VetoError
 from newsroom.tests.test_native_graphiti import _native
 
 
+def test_pending_shares_only_equal_bodies_with_exact_units_and_fresh_authority(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    from newsroom.authority.canonical import canonical_json_bytes
+    from newsroom.tests.test_graphiti_operational_readiness import _next_revision
+    pipeline, journal, connection, units, _, dispositions = _open(tmp_path, monkeypatch)
+    units = (*units, _next_revision(units[0]))
+    pipeline._spill_archive_turn = True
+    for unit in units:
+        journal.land((unit,))
+    dispositions[0] = ()
+    seen = []
+
+    def graphiti(selected, **kwargs):
+        assert canonical_json_bytes([asdict(unit) for unit in selected]) == canonical_json_bytes([asdict(unit) for unit in units])
+        assert selected[0].body is selected[1].body
+        assert selected[2].body != selected[0].body
+        assert selected[0].authority is not selected[1].authority
+        assert selected[0].authority.records[0] is not selected[1].authority.records[0]
+        original = selected[0].authority.records[0]["record_id"]
+        selected[0].authority.records[0]["record_id"] = "detached-mutation"
+        assert selected[1].authority.records[0]["record_id"] != "detached-mutation"
+        selected[0].authority.records[0]["record_id"] = original
+        assert journal.units[units[0].revision_id] == (units[0],)
+        assert not seen or selected[0].body is not seen[0]
+        seen.append(selected[0].body)
+        return tuple(NativeGraphitiOutcome(unit.ingest_id, "GRAPHITI_DEFERRED", None, "WORK_QUANTUM_EXHAUSTED") for unit in selected)
+
+    pipeline._graphiti = NS(advance=graphiti)
+    try:
+        pipeline.tick(cycle_id="equal-pending-first")
+        pipeline._journal = NativeRevisionJournal(connection)
+        pipeline.tick(cycle_id="equal-pending-reopen")
+        assert len(seen) == 2 and pipeline._journal._bodies == {}
+        assert {revision for revision in journal.units} == {unit.revision_id for unit in units}
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("error", [OperatorDrainRequested(), VetoError("isolated veto"), KeyboardInterrupt()])
+def test_pending_exception_traceback_keeps_no_pipeline_cohort(error, tmp_path, monkeypatch):
+    pipeline, journal, connection, units, _, dispositions = _open(tmp_path, monkeypatch)
+    for unit in units:
+        journal.land((unit,))
+    dispositions[0] = ()
+
+    def graphiti(selected, **kwargs):
+        raise error
+
+    pipeline._graphiti = NS(advance=graphiti)
+    try:
+        with pytest.raises(type(error)) as caught:
+            pipeline.tick(cycle_id="pending-cancel")
+        assert caught.value is error
+        traceback = caught.value.__traceback__
+        while traceback.tb_frame.f_code.co_name != "tick":
+            traceback = traceback.tb_next
+        assert traceback.tb_frame.f_locals["pending"] == ()
+        assert traceback.tb_frame.f_locals["results"] == ()
+        assert traceback.tb_frame.f_locals["by_ingest"] == {}
+        assert all(journal.summary(unit.revision_id) == {} for unit in units)
+    finally:
+        error.__traceback__ = None
+        connection.close()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_pending_units_are_released_before_downstream_even_after_graphiti_failure(tmp_path, monkeypatch, failure):
+    import gc
+    import weakref
+    from dataclasses import fields
+    from newsroom.control_plane.corpus import CorpusIngestUnit
+    from newsroom.control_plane.native_progress import _CurrentUnits
+
+    class TrackedUnit(CorpusIngestUnit):
+        __slots__ = ("__weakref__",)
+
+    pipeline, journal, connection, units, _, dispositions = _open(tmp_path, monkeypatch)
+    for unit in units:
+        journal.land((unit,))
+    dispositions[0] = ()
+    original = _CurrentUnits.__getitem__
+    monkeypatch.setattr(_CurrentUnits, "__getitem__", lambda self, revision: tuple(
+        TrackedUnit(*(getattr(unit, field.name) for field in fields(CorpusIngestUnit)))
+        for unit in original(self, revision)))
+    retained = []
+
+    def graphiti(selected, **kwargs):
+        retained.extend(weakref.ref(unit) for unit in selected)
+        if failure:
+            raise ValueError("isolated Graphiti failure")
+        return tuple(NativeGraphitiOutcome(unit.ingest_id, "GRAPHITI_COMPLETE", unit.digest, None) for unit in selected)
+
+    def downstream(revisions, **kwargs):
+        if revisions:
+            gc.collect()
+            assert retained and all(reference() is None for reference in retained)
+        return ()
+
+    pipeline._graphiti = NS(advance=graphiti)
+    pipeline._advance_revisions = downstream
+    try:
+        pipeline.tick(cycle_id="pending-lifetime")
+        assert {journal.summary(unit.revision_id)["stage"] for unit in units} == {"GRAPHITI_HOLD" if failure else "GRAPHITI_COMPLETE"}
+    finally:
+        connection.close()
+
+
 def _open(tmp_path, monkeypatch):
     connection = connect(str(tmp_path / "private.sqlite3"))
     journal = NativeRevisionJournal(connection)

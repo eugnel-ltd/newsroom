@@ -724,6 +724,36 @@ def open_native_pipeline(
             })
 
         @contextmanager
+        def retrieval_rights_cohort():
+            # The native daemon owns the authority writer for its lifetime;
+            # Source/terms refresh and retrieval execute synchronously in tick.
+            # This snapshot ends before any retrieval port or provider effect.
+            checked = {}
+            active = True
+
+            def rights(unit):
+                if not active:
+                    raise NativeRetrievalHold("NATIVE_RIGHTS_COHORT_EXPIRED")
+                stop_check()
+                key = (unit.source_id, unit.source_definition_url,
+                       unit.authority.definition_id, unit.authority.definition_version_id)
+                if key not in checked:
+                    checked[key] = (unit, require_rights(unit))
+                return checked[key][1]
+
+            try:
+                yield rights
+                for unit, digest in checked.values():
+                    stop_check()
+                    if require_rights(unit) != digest:
+                        raise NativeRetrievalHold("NATIVE_CURRENT_SOURCE_RIGHTS_HOLD")
+            finally:
+                # Keep only representatives during this operation; no source
+                # body or permission remains cached in the continuation.
+                active = False
+                checked.clear()
+
+        @contextmanager
         def source_fence(source_id, url):
             with stop_fence():
                 stop_check()
@@ -763,6 +793,7 @@ def open_native_pipeline(
             system=runtime.authority, documents=documents, journal=journal,
             connection=private, embedder=embedder, generation_id=generation_id,
             port_for=port_for, rights_check=require_rights,
+            rights_cohort=retrieval_rights_cohort,
         )
         govuk_acquisition = GovUkEvidenceAcquisition(
             sources=runtime.authority.sources, proof=proof,

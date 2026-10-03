@@ -929,3 +929,35 @@ def test_subject_inventory_does_not_decode_sources_without_retained_documents(tm
         assert statements == []
     finally:
         connection.close()
+
+
+def test_native_subject_inventory_uses_owned_rights_cohort_and_keeps_generic_per_unit():
+    from contextlib import contextmanager
+    unit = _native("cohort-first")
+    other = _native("cohort-second")
+    receipts = {value.revision_id: NativeDocumentReceipt(
+        "event:"+value.revision_id, "command:"+value.revision_id, AggregateId.new(), 1,
+        ObjectAdmissionId.new(), digest_bytes(value.ingest_id.encode()),
+        ObjectAdmissionId.new(), ObjectAdmissionId.new()) for value in (unit,other)}
+    journal = SimpleNamespace(units={value.revision_id:(value,) for value in (unit,other)},
+        summary=lambda revision:{"facts":{"retrieval_documents":{journal.units[revision][0].ingest_id:{
+            "receipt":receipts[revision].projection_value(),"graph_root_id":"root"}}}},
+        current=lambda _:pytest.fail("cohort expanded cold facts"),
+        advance=lambda *a,**k:pytest.fail("cohort changed unchanged exclusions"))
+    calls=[]
+    def rights(value):calls.append(value.ingest_id);return digest_bytes(b"current-rights")
+    windows=[]
+    @contextmanager
+    def cohort():
+        windows.append("enter")
+        try:yield rights
+        finally:windows.append("exit")
+    kwargs=dict(system=object(),documents=object(),journal=journal,connection=object(),
+        embedder=object(),generation_id=GENERATION,port_for=object(),rights_check=rights)
+    ordinary=NativeRetrievalContinuation(**kwargs)
+    baseline=ordinary._current_subjects()
+    assert calls==[unit.ingest_id,other.ingest_id]
+    calls.clear()
+    native=NativeRetrievalContinuation(**kwargs,rights_cohort=cohort)
+    assert native._current_subjects()==baseline
+    assert windows==["enter","exit"] and calls==[unit.ingest_id,other.ingest_id]

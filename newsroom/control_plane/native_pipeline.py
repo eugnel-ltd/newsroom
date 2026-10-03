@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import math
 import time
 from typing import ContextManager
@@ -31,6 +31,18 @@ def _source_update_time(item: tuple) -> tuple:
         except ValueError:
             continue
     return False, None
+
+
+def _pending_units(journal, revisions):
+    """Share exact immutable bodies within this cohort, never selected-read state."""
+    bodies = {}
+    try:
+        for revision_id, _ in revisions:
+            for unit in journal.units[revision_id]:
+                body = bodies.setdefault(unit.body, unit.body)
+                yield unit if body is unit.body else replace(unit, body=body)
+    finally:
+        bodies.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,68 +197,73 @@ class NativePipeline:
             return deferred
 
         # Extraction stays per ingest; projection remains one complete cohort.
-        pending = tuple(unit for revision_id, _ in pending_revisions
-                        for unit in self._journal.units[revision_id])
+        pending = tuple(_pending_units(self._journal, pending_revisions))
         if pending:
-            self._drain_between_work()
-            self._check()
+            results, by_ingest = (), {}
             try:
-                results = self._graphiti.advance(
-                    pending, cycle_id=cycle_id,
-                    defer_before_unit=defer_pending,
-                )
-                if len(results) != len(pending) or {item.ingest_id for item in results} != {unit.ingest_id for unit in pending}:
-                    raise ValueError("native Graphiti continuation partition differs")
-                by_ingest = {item.ingest_id: item for item in results}
-                for revision_id, header in pending_revisions:
-                    outcomes = tuple(by_ingest[ingest] for ingest, _ in header.unit_index)
-                    deferred = tuple(item for item in outcomes if item.state == "GRAPHITI_DEFERRED")
-                    if deferred:
-                        if any(item.reason != "WORK_QUANTUM_EXHAUSTED" or item.receipt_digest is not None
-                               for item in deferred):
-                            raise ValueError("native Graphiti deferral reason differs")
-                        # A scheduling decision is not a durable failure. Keep
-                        # the exact previous stage/facts until a later tick.
-                        continue
-                    facts = dict(self._journal.current(revision_id).get("facts", {}))
-                    complete = all(item.state == "GRAPHITI_COMPLETE" for item in outcomes)
-                    if complete:
-                        facts.pop("graphiti_outcomes", None)
-                        facts.pop("reason", None)
-                        facts["graphiti_receipts"] = [asdict(item) for item in outcomes]
-                    else:
-                        held = tuple(
-                            item for item in outcomes
-                            if item.state in {"GRAPHITI_HOLD", "ADMISSION_HOLD"}
-                        )
-                        if not held:
-                            raise ValueError("native Graphiti incomplete revision lacks a hold")
-                        reasons = {
-                            item.reason
-                            for item in held
-                        }
-                        if any(type(reason) is not str or not reason for reason in reasons):
-                            raise ValueError("native Graphiti hold reason differs")
-                        facts.pop("graphiti_receipts", None)
-                        facts["graphiti_outcomes"] = [asdict(item) for item in outcomes]
-                        facts["reason"] = (
-                            next(iter(reasons))
-                            if len(reasons) == 1
-                            else "MULTIPLE_GRAPHITI_HOLDS"
-                        )
-                    self._journal.advance(revision_id, stage="GRAPHITI_COMPLETE" if complete else "GRAPHITI_HOLD", facts=facts)
-                    pending_turn_taken |= complete
                 self._drain_between_work()
-            except OperatorDrainRequested:
-                raise
-            except VetoError:
-                raise
-            except Exception as exc:
-                for revision_id, _ in pending_revisions:
-                    facts = self._journal.current(revision_id).get("facts", {})
-                    self._journal.advance(revision_id, stage="GRAPHITI_HOLD", facts={
-                        **facts, "reason": type(exc).__name__,
-                    })
+                self._check()
+                try:
+                    results = self._graphiti.advance(
+                        pending, cycle_id=cycle_id,
+                        defer_before_unit=defer_pending,
+                    )
+                    if len(results) != len(pending) or {item.ingest_id for item in results} != {unit.ingest_id for unit in pending}:
+                        raise ValueError("native Graphiti continuation partition differs")
+                    by_ingest = {item.ingest_id: item for item in results}
+                    for revision_id, header in pending_revisions:
+                        outcomes = tuple(by_ingest[ingest] for ingest, _ in header.unit_index)
+                        deferred = tuple(item for item in outcomes if item.state == "GRAPHITI_DEFERRED")
+                        if deferred:
+                            if any(item.reason != "WORK_QUANTUM_EXHAUSTED" or item.receipt_digest is not None
+                                   for item in deferred):
+                                raise ValueError("native Graphiti deferral reason differs")
+                            # A scheduling decision is not a durable failure. Keep
+                            # the exact previous stage/facts until a later tick.
+                            continue
+                        facts = dict(self._journal.current(revision_id).get("facts", {}))
+                        complete = all(item.state == "GRAPHITI_COMPLETE" for item in outcomes)
+                        if complete:
+                            facts.pop("graphiti_outcomes", None)
+                            facts.pop("reason", None)
+                            facts["graphiti_receipts"] = [asdict(item) for item in outcomes]
+                        else:
+                            held = tuple(
+                                item for item in outcomes
+                                if item.state in {"GRAPHITI_HOLD", "ADMISSION_HOLD"}
+                            )
+                            if not held:
+                                raise ValueError("native Graphiti incomplete revision lacks a hold")
+                            reasons = {
+                                item.reason
+                                for item in held
+                            }
+                            if any(type(reason) is not str or not reason for reason in reasons):
+                                raise ValueError("native Graphiti hold reason differs")
+                            facts.pop("graphiti_receipts", None)
+                            facts["graphiti_outcomes"] = [asdict(item) for item in outcomes]
+                            facts["reason"] = (
+                                next(iter(reasons))
+                                if len(reasons) == 1
+                                else "MULTIPLE_GRAPHITI_HOLDS"
+                            )
+                        self._journal.advance(revision_id, stage="GRAPHITI_COMPLETE" if complete else "GRAPHITI_HOLD", facts=facts)
+                        pending_turn_taken |= complete
+                    self._drain_between_work()
+                except OperatorDrainRequested:
+                    raise
+                except VetoError:
+                    raise
+                except Exception as exc:
+                    for revision_id, _ in pending_revisions:
+                        facts = self._journal.current(revision_id).get("facts", {})
+                        self._journal.advance(revision_id, stage="GRAPHITI_HOLD", facts={
+                            **facts, "reason": type(exc).__name__,
+                        })
+
+            finally:
+                pending, results = (), ()
+                by_ingest.clear()
 
         self._advance_revisions(pending_revisions, work_deadline=fresh_deadline)
         self._drain_between_work()
