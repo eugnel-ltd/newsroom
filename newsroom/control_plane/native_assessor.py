@@ -794,7 +794,7 @@ def _reference_binding(view: SourceView) -> dict:
                "body_digests": list(view.body_digests)}
     partition = getattr(view, "partition_version", None)
     if partition is not None:
-        if partition != PARTITION_VERSION:
+        if partition not in (PARTITION_VERSION_V1, PARTITION_VERSION):
             raise NativeEvidenceError("native source partition differs")
         binding["partition_version"] = partition
     return binding

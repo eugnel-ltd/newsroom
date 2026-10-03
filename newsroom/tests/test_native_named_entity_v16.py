@@ -78,3 +78,14 @@ def test_future_view_materialises_the_complete_name_not_a_generated_translation(
     names = bounded_named_entities(claim['claim'], source_context=body)
     assert rendered_named_entities(claim['rendered_assertion_zh_hant_hk'], names) == names
     assert "Children's Wellbeing and Schools Act" in claim['rendered_assertion_zh_hant_hk']
+
+
+def test_frozen_source_binding_roundtrips_through_assessor_reader():
+    from newsroom.control_plane.native_assessor import _reference_binding, _source_view_for_binding
+    from newsroom.control_plane.native_assessor_spans import build_lossless_source_view, PARTITION_VERSION_V1
+    body = "Children's Wellbeing and Schools Act changes the official rule."
+    view = build_lossless_source_view((body,), ('UK-05',), version=PARTITION_VERSION_V1)
+    binding = _reference_binding(view)
+    restored = _source_view_for_binding((body,), ('UK-05',), binding)
+    assert restored.manifest == view.manifest
+    assert _reference_binding(restored) == binding
