@@ -1584,6 +1584,14 @@ class NativePublicationContinuation:
         prepared = (progress.get("stage") == "COPY_CORRECTION_PREPARED"
                     or facts.get("copy_correction_result") == "CORRECTED")
         target_writer = getattr(self._runtime.publication, "writer_contract_version", "newsroom.offline-exact-copy.v3")
+        next_upgrade = (progress.get("stage") == "ACKNOWLEDGED"
+                        and facts.get("copy_correction_result") == "CORRECTED"
+                        and self.copy_correction_due(facts, target_writer))
+        if next_upgrade:
+            # A completed earlier correction owns its old versioned slot. A
+            # new writer starts from the latest authenticated ACK, not that
+            # correction's original predecessor; interrupted intents replay.
+            predecessor, prepared = None, False
         try:
             if predecessor is None:
                 writer_id = self._runtime.publication.retained_writer_id(
@@ -1614,6 +1622,8 @@ class NativePublicationContinuation:
             expected = (prior.story_receipt.aggregate_version, prior.attempt_receipt.aggregate_version, 0)
             if not prepared:
                 facts = current_facts()
+                if next_upgrade and "copy_correction_origin" not in facts:
+                    facts["copy_correction_origin"] = facts["copy_correction_of"]
                 facts.update(
                     copy_correction_of=predecessor,
                     expected_story_version=expected[0], expected_publication_version=expected[1],
