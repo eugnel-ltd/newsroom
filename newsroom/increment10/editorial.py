@@ -665,6 +665,7 @@ class NativeEditorial:
                 writer_id=original.copy.writer_id,
                 retained_copy=original.copy if original.writer_review is not None else None,
                 writer_review=original.writer_review, story_format=original.story_format,
+                retained_admission=original.write_admission,
             )
         else:
             story = self._build_story(
@@ -766,6 +767,7 @@ class NativeEditorial:
             writer_id=story.copy.writer_id,
             retained_copy=story.copy if story.writer_review is not None else None,
             writer_review=story.writer_review, story_format=story.story_format,
+            retained_admission=story.write_admission,
         )
         if rebuilt.canonical_bytes() != hydrated.data:
             raise EditorialError("Story Version replay differs")
@@ -779,6 +781,7 @@ class NativeEditorial:
         reference: DecisionReference,
         *, writer_id: str | None = None, retained_copy: WriterCopy | None = None,
         writer_review: dict | None = None, story_format: str | None = None,
+        retained_admission: WriteAdmissionDecision | None = None,
     ) -> StoryVersion:
         package = retained.package
         if str(request.story_id) == package.candidate_id:
@@ -820,6 +823,15 @@ class NativeEditorial:
         )
         if decision.decision != "WRITE_READY":
             raise EditorialHold(decision)
+        if retained_admission is not None:
+            # Recheck current readiness without rewriting immutable policy identity.
+            # Only policy version and its derived ID may differ during read/replay.
+            record = decision.as_record()
+            record.update(policy_version=retained_admission.policy_version,
+                          decision_id=retained_admission.decision_id)
+            if record != retained_admission.as_record():
+                raise EditorialError("Story Version object admission differs: retained write-admission")
+            decision = WriteAdmissionDecision.from_record(record)
         def require_current_sources():
             # A model turn may cross the original observation's currency window.
             now = self._clock()

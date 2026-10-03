@@ -121,3 +121,101 @@ def test_model_delay_cannot_admit_an_expired_observed_source(tmp_path):
     finally:
         candidates.close()
         system.close()
+
+
+_OLD_WRITE_POLICY = (
+    "newsroom.write-admission.v9+newsroom.evid-012.v7+"
+    "newsroom.evidence-approval.v8+newsroom.evidence-gates.v2+"
+    "newsroom.governed-claim.v7+newsroom.governed-input.v10+"
+    "newsroom.named-entity.v15+newsroom.cont-originality.v3+"
+    "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
+    "newsroom.qualification-relation.v3"
+)
+
+
+def test_exact_retained_entity_v15_story_decodes_without_changing_bytes():
+    from pathlib import Path
+    from newsroom.increment10.editorial import StoryVersion
+    from newsroom.authority.canonical import digest_bytes
+    raw = (Path(__file__).parent / "fixtures/native_publication/retained-story-entity-v15.json").read_bytes()
+    assert digest_bytes(raw) == "sha256:7ce68f793f46c326a7be4d39610d086624893f00b0c41de4e8e0c1930fc043a9"
+    assert StoryVersion.from_bytes(raw).canonical_bytes() == raw
+
+
+@pytest.mark.parametrize("field,value", [
+    ("decision_id", "sha256:" + "0" * 64),
+    ("policy_version", _OLD_WRITE_POLICY.replace("named-entity.v15", "named-entity.v999")),
+])
+def test_retained_story_policy_compatibility_does_not_accept_corruption(field, value):
+    import json
+    from pathlib import Path
+    from newsroom.increment10.editorial import EditorialError, StoryVersion
+    value_record = json.loads((Path(__file__).parent / "fixtures/native_publication/retained-story-entity-v15.json").read_bytes())
+    value_record["write_admission"][field] = value
+    with pytest.raises(EditorialError, match="Story Version fields differ"):
+        StoryVersion.from_bytes(canonical_json_bytes(value_record))
+
+
+@pytest.mark.parametrize("writer_id", [
+    "newsroom.offline-exact-copy.v1", "newsroom.offline-exact-copy.v2",
+    "newsroom.offline-exact-copy.v3", "newsroom.native-story-writer.v1",
+])
+def test_retained_policy_story_replays_and_reads_without_upgrading_identity(tmp_path, monkeypatch, writer_id):
+    from newsroom.control_plane import admission
+    system, candidates, port, evidence, registries, retained, reference = _fixture(tmp_path)
+    native, calls = _native(system, evidence, registries), []
+    native._story_writer = _writer(calls) if writer_id.endswith("writer.v1") else None
+    request = StoryVersionRequest(AggregateId.new(), 0, "retained-policy")
+    arguments = dict(package_admission_id=retained.package_admission_id,
+                     decision_reference=reference, candidate_port=port, proof=proof())
+    try:
+        # Create immutable history under the formerly current policy, then upgrade.
+        with monkeypatch.context() as old:
+            old.setattr(admission, "WRITE_ADMISSION_POLICY_VERSION", _OLD_WRITE_POLICY)
+            if writer_id != "newsroom.native-story-writer.v1":
+                original_build = native._build_story
+                def legacy_build(*args, **kwargs):
+                    kwargs.setdefault("writer_id", writer_id)
+                    return original_build(*args, **kwargs)
+                old.setattr(native, "_build_story", legacy_build)
+            receipt, story = native.admit_story_version(request, **arguments)
+        before_calls = list(calls)
+        assert native.read_story_version(receipt, candidate_port=port, proof=proof()).canonical_bytes() == story.canonical_bytes()
+        replay_receipt, replay_story = native.admit_story_version(request, **arguments)
+        assert replay_receipt == receipt and replay_story.canonical_bytes() == story.canonical_bytes()
+        assert replay_story.write_admission.policy_version == _OLD_WRITE_POLICY
+        assert calls == before_calls
+        fresh = native.admit_story_version(StoryVersionRequest(AggregateId.new(), 0, "fresh-policy"), **arguments)[1]
+        assert fresh.write_admission.policy_version == admission.WRITE_ADMISSION_POLICY_VERSION
+        assert fresh.write_admission.decision_id != story.write_admission.decision_id
+    finally:
+        candidates.close()
+        system.close()
+
+
+def test_retained_admission_still_requires_current_readiness_and_exact_fields(tmp_path):
+    from newsroom.control_plane.admission import WriteAdmissionDecision, _decision_id
+    from newsroom.increment10.editorial import EditorialError
+    system, candidates, port, evidence, registries, retained, reference = _fixture(tmp_path)
+    native = _native(system, evidence, registries)
+    request = StoryVersionRequest(AggregateId.new(), 0, "retained-fields")
+    policy = native._read_policy_decision(reference, retained=retained, proof=proof())
+    try:
+        original = native._build_story(request, retained, policy, reference)
+        record = original.write_admission.as_record()
+        record["selection_rationale"] = "A different retained editorial selection"
+        values = {key: value for key, value in record.items() if key not in {"decision_id", "decided_at"}}
+        record["decision_id"] = _decision_id(**values)
+        changed = WriteAdmissionDecision.from_record(record)
+        with pytest.raises(EditorialError, match="object admission differs: retained write-admission"):
+            native._build_story(request, retained, policy, reference, retained_admission=changed)
+        held_policy = type(policy).create(**{name: (
+            (("CLAIM_TRACEABILITY", "HOLD"), ("EVIDENCE_SUFFICIENCY", "PASS"),
+             ("SOURCE_AUTHORITY", "PASS")) if name == "evidence_gate_results"
+            else getattr(policy, name)) for name in policy.__dataclass_fields__ if name != "decision_id"})
+        with pytest.raises(EditorialHold):
+            native._build_story(request, retained, held_policy, reference,
+                                retained_admission=original.write_admission)
+    finally:
+        candidates.close()
+        system.close()
