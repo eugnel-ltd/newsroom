@@ -1846,3 +1846,31 @@ def test_selected_candidate_write_carries_full_pair_and_unknown_facts(monkeypatc
     assert pipeline.tick(cycle_id="selected-full").revision_states == {"ACKNOWLEDGED": 1}
     assert len(journal.writes) == 2
     assert journal.current("selected")["facts"]["retrieval_binding"] == facts["retrieval_binding"]
+
+
+def test_retained_inventory_hold_gets_one_current_consumer_turn(tmp_path, monkeypatch):
+    from newsroom.control_plane.admission import WRITE_ADMISSION_POLICY_VERSION
+    pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
+    unit = units[0]
+    dispositions[0] = ()
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={
+        "candidate_version_id": "candidate:" + unit.item_key, "graphiti_receipts": [{}],
+        "reason": "INVALID_SUBSTANTIVE_CLAIM_INVENTORY", "package_admission_id": "retained-package",
+        "editorial_decision": {"decision_id": "retained-decision"}})
+    attempted = []
+    def advance(**request):
+        attempted.append(request)
+        facts = journal.current(unit.revision_id)["facts"]
+        journal.advance(unit.revision_id, stage="EVIDENCE_HOLD", facts={**facts,
+            "write_admission_policy_version": WRITE_ADMISSION_POLICY_VERSION})
+    pipeline._publish = NS(advance=advance)
+    try:
+        pipeline.tick(cycle_id="current-consumer")
+        assert len(attempted) == 1
+        pipeline._journal = NativeRevisionJournal(connection)
+        pipeline.tick(cycle_id="same-consumer-reopened")
+        assert len(attempted) == 1
+        assert journal.current(unit.revision_id)["facts"]["candidate_version_id"] == "candidate:" + unit.item_key
+    finally:
+        connection.close()
