@@ -1467,3 +1467,100 @@ def test_feed_collection_retains_declared_publication_html_leaves_with_ancestry(
         replay = next(value for value in intake.poll() if value.source_id == 'UK-05')
         assert [unit.ingest_id for unit in replay.units] == [unit.ingest_id for unit in result.units]
         assert len(fetched) > before  # Fresh current observation is still acquired.
+
+
+def test_declared_pdf_source_retains_large_raw_bytes_complete_pages_and_replays_lineage(tmp_path, monkeypatch):
+    from newsroom.tests.test_govuk_pdf import pdf_bytes, parent_bytes, PARENT, ASSET
+    from newsroom.control_plane.native_policies import NATIVE_PDF_OBSERVATION_CLASS, NATIVE_PDF_OBSERVATION_ADMISSION_TYPE
+    from newsroom.authority import ObjectAdmissionRequest
+    from newsroom.authority import HydrationRequest
+    from newsroom.authority.objects import ObjectAdmissionId
+    from newsroom.control_plane.native_policies import NATIVE_PDF_OBSERVATION_PURPOSE
+    from newsroom.control_plane.native_source_intake import native_evidence_sources
+    raw = pdf_bytes('Complete first page: 12 applicants may apply.', 'Complete second page: fees are £45.', padding=1_100_000)
+    parent = json.loads(parent_bytes(raw))
+    parent['first_published_at'] = '2026-09-07T09:00:00Z'
+    parent['public_updated_at'] = '2026-09-08T11:00:00Z'
+    parent = json.dumps(parent).encode()
+    values = {SOURCE_URLS['UK-01']: _atom_for('/government/publications/pdf-guidance'),
+              'https://www.gov.uk/api/content/government/publications/pdf-guidance': parent, ASSET: raw}
+    args = _args(tmp_path, monkeypatch)
+    args['principal_id'] = OPERATOR_PRINCIPAL_ID
+    args['authority_domain'] = OPERATOR_AUTHORITY_DOMAIN
+    with open_native_runtime(**args) as runtime:
+        definition = _seed_uk01(runtime)
+        intake = NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-01': definition}, licence=_licence(),
+            dispatch_fence=lambda *_args: nullcontext(), fetch=lambda url: (200, values[url]), clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC))
+        result = next(row for row in intake.poll() if row.source_id == 'UK-01')
+        assert result.status == 'READY', result.item_holds
+        unit, = result.units
+        assert 'Complete first page: 12 applicants may apply.' in unit.body
+        assert 'Complete second page: fees are £45.' in unit.body
+        observation, = [row for row in result.observations if row[0] == ASSET]
+        admission = runtime.authority.objects.committed_admission(ObjectAdmissionRequest(
+            NATIVE_PDF_OBSERVATION_ADMISSION_TYPE, f'native-source-observation:UK-01:{observation[1]}'),
+            proof=runtime.proof).admission
+        assert admission.object_class == NATIVE_PDF_OBSERVATION_CLASS
+        hydrated = runtime.authority.objects.rehydrate(HydrationRequest(
+            ObjectAdmissionId.parse(observation[2]), NATIVE_PDF_OBSERVATION_PURPOSE, 0, len(raw)), proof=runtime.proof)
+        assert hydrated.data == raw
+        evidence = native_evidence_sources(sources=runtime.authority.sources, objects=runtime.authority.objects, units=result.units,
+            observations={row[1]: row for row in result.observations}, licence=_licence(), proof=runtime.proof)
+        assert len(evidence) == 1
+        repeated = next(row for row in intake.poll() if row.source_id == 'UK-01')
+        assert repeated.units[0].authority == unit.authority
+        from newsroom.control_plane.govuk_pdf_evidence import GovUkPdfEvidenceAcquisition, POLICY_DIGEST as PDF_TRANSPORT
+        from newsroom.control_plane.native_evidence import EvidenceAcquisitionRequest
+        source = evidence[0]
+        request = EvidenceAcquisitionRequest(source_id=unit.source_id,
+            source_definition_id=unit.authority.definition_id,
+            source_definition_version_id=unit.authority.definition_version_id,
+            source_definition_version_digest=source.source_version.canonical_digest,
+            source_revision_id=unit.revision_id, canonical_url=unit.canonical_url,
+            transport_policy_digest=PDF_TRANSPORT)
+        fetched = []
+        acquire = GovUkPdfEvidenceAcquisition(sources=runtime.authority.sources,
+            objects=runtime.authority.objects, proof=runtime.proof, licence=_licence(),
+            transport_policy_digest=PDF_TRANSPORT, dispatch_fence=lambda _: nullcontext(),
+            retained_units={unit.revision_id: result.units},
+            observations={row[1]: row for row in result.observations},
+            fetch=lambda url: (fetched.append(url), (200, values[url]))[1],
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC))
+        independent = acquire(request)
+        assert independent.outcome == 'COMPLETE' and independent.text_only
+        assert fetched == ['https://www.gov.uk/api/content/government/publications/pdf-guidance', ASSET]
+        assert independent.body == (unit.headline + '\n\n' + unit.body).encode()
+        assert independent.rights_eligibility_digest and independent.licence_attribution
+        values[ASSET] = raw.replace(b'1 0 obj', b'2 0 obj', 1)
+        with pytest.raises(NativeEvidenceHold, match='GOVUK_PDF_RAW_CHANGED_HOLD'):
+            acquire(request)
+
+
+def test_pdf_parent_keeps_failed_sibling_obligation_visible(tmp_path, monkeypatch):
+    from newsroom.tests.test_govuk_pdf import pdf_bytes, parent_bytes, PARENT, ASSET
+    good = pdf_bytes('First document page.', 'Second document page.')
+    bad = pdf_bytes('Unsupported font.', 'Unsupported second page.',
+                    font=b'<< /Type /Font /Subtype /Type3 /BaseFont /Unknown >>')
+    other_url = ASSET.replace('guidance.pdf', 'other.pdf')
+    parent = json.loads(parent_bytes(good))
+    parent['first_published_at'] = '2026-09-07T09:00:00Z'
+    parent['public_updated_at'] = '2026-09-08T11:00:00Z'
+    second = dict(parent['details']['attachments'][0])
+    second.update(id='other', url=other_url, filename='other.pdf', file_size=len(bad), title='Other required document')
+    parent['details']['attachments'].append(second)
+    bodies = {SOURCE_URLS['UK-01']: _atom_for('/government/publications/pdf-guidance'),
+        'https://www.gov.uk/api/content/government/publications/pdf-guidance': json.dumps(parent).encode(),
+        ASSET: good, other_url: bad}
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    with open_native_runtime(**args) as runtime:
+        definition = _seed_uk01(runtime)
+        intake = NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-01': definition}, licence=_licence(),
+            dispatch_fence=lambda *_args: nullcontext(), fetch=lambda url: (200, bodies[url]),
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC))
+        result = intake.poll()[0]
+        assert len(result.units) == 1
+        assert (other_url, 'SOURCE_PDF_FONT_MAPPING_HOLD') in result.item_holds
+        assert {row[0] for row in result.observations} >= {ASSET, other_url}
