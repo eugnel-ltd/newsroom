@@ -94,3 +94,82 @@ def test_copy_correction_retains_predecessor_and_replays_exact_intent(tmp_path, 
             assert connection.execute("SELECT payload_json FROM ledger WHERE seq=?", (seq,)).fetchone()[0] == payload
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('fault', (None, 'interrupted', 'current-ack', 'changed-package'))
+def test_second_writer_upgrade_uses_latest_ack_without_reusing_old_story_slot(tmp_path, fault):
+    connection = connect(str(tmp_path / 'second-upgrade.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    unit = _native('second-writer-upgrade')
+    package_id = ObjectAdmissionId.new()
+    decision = _decision(package_id)
+    original_refs = {key: 'original-' + key for key in (
+        'story_event_id', 'publication_event_id', 'delivery_attempt_event_id', 'delivery_evidence_event_id')}
+    current_refs = {key: 'current-' + key for key in original_refs}
+    journal.land((unit,))
+    facts = dict(candidate_id='candidate', candidate_version_id='candidate-version',
+                 graphiti_receipts=[{}], package_admission_id=str(package_id),
+                 editorial_decision=json.loads(decision.canonical_bytes()),
+                 copy_correction_of={**original_refs, 'progress_ordinal': 1},
+                 copy_correction_result='CORRECTED',
+                 copy_correction_checked_version='newsroom.offline-exact-copy.v3',
+                 writer_id='newsroom.offline-exact-copy.v3', **current_refs)
+    journal.advance(unit.revision_id, stage='ACKNOWLEDGED', facts=facts)
+    original_rows = connection.execute('SELECT seq,payload_json FROM ledger').fetchall()
+    prior = NS(story_receipt=NS(aggregate_version=2), attempt_receipt=NS(aggregate_version=3))
+    story = NS(candidate_version_id='candidate-version', package_admission_id=package_id,
+               policy_decision_id=decision.decision_id)
+    calls = []
+
+    class Publication:
+        writer_contract_version = 'newsroom.native-story-writer.v1'
+
+        def retained_writer_id(self, event_id, **kwargs):
+            assert event_id == current_refs['story_event_id']
+            return 'newsroom.offline-exact-copy.v3'
+
+        def read_acknowledged(self, references, **kwargs):
+            if references['story_event_id'] != current_refs['story_event_id'] or fault == 'current-ack':
+                raise NativePublicationError('latest acknowledged predecessor is required')
+            return prior, NS(**{**vars(story), 'package_admission_id': ObjectAdmissionId.new()}) if fault == 'changed-package' else story
+
+        def advance(self, admitted, policy, **kwargs):
+            assert admitted == package_id and policy == decision
+            assert kwargs['correction_of'] is prior
+            assert (kwargs['expected_story_version'], kwargs['expected_publication_version']) == (2, 3)
+            assert journal.current(unit.revision_id)['stage'] == 'COPY_CORRECTION_PREPARED'
+            calls.append(kwargs)
+            if fault == 'interrupted' and len(calls) == 1:
+                raise RuntimeError('interrupted after preparing the next version')
+            receipt = lambda name: NS(event_id=name)
+            return NS(story_receipt=receipt('latest-story'), publication_receipt=receipt('latest-publication'),
+                      attempt_receipt=receipt('latest-attempt'), evidence_receipt=receipt('latest-evidence'),
+                      writer_id=self.writer_contract_version)
+
+    runtime = NS(authority=_Authority(), ingress=object(), publication=Publication(), proof=proof(), policies=object())
+    def continuation():
+        return NativePublicationContinuation(journal=journal, runtime=runtime,
+            evidence_controller=object.__new__(NativeEvidenceController), sources={unit.revision_id: (_source(unit),)},
+            clock=lambda: UtcTimestamp.parse('2026-09-08T12:06:00Z'))
+    try:
+        result = continuation().advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
+        if fault in {'current-ack', 'changed-package'}:
+            assert result.state == 'ACKNOWLEDGED' and result.reason.startswith('COPY_CORRECTION_HOLD')
+            assert not calls
+            assert journal.current(unit.revision_id)['facts']['story_event_id'] == current_refs['story_event_id']
+        else:
+            if fault == 'interrupted':
+                assert result.state == 'COPY_CORRECTION_PREPARED'
+                journal = NativeRevisionJournal(connection)
+                result = continuation().advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
+            assert result.state == 'ACKNOWLEDGED' and result.reason is None
+            retained = journal.current(unit.revision_id)['facts']
+            assert retained['story_event_id'] == 'latest-story'
+            assert retained['copy_correction_of']['story_event_id'] == current_refs['story_event_id']
+            assert retained['copy_correction_origin']['story_event_id'] == original_refs['story_event_id']
+            assert not continuation().copy_correction_due(retained, Publication.writer_contract_version)
+            assert all((call['expected_story_version'], call['expected_publication_version']) == (2, 3) for call in calls)
+        assert all(connection.execute('SELECT payload_json FROM ledger WHERE seq=?', (seq,)).fetchone()[0] == raw
+                   for seq, raw in original_rows)
+    finally:
+        connection.close()
