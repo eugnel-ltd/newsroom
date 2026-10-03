@@ -6445,3 +6445,142 @@ def test_native_accounting_rejects_mixed_shared_body_encoding(tmp_path):
     with pytest.raises(ValueError, match='shared body'):
         import_legacy_native_progress(connection)
     connection.close()
+
+
+def _native_story_policy(route='NATIVE_STORY_DRAFT'):
+    values = asdict(_policy(route=route, model='grok-4.7'))
+    values.update(workload_class=WorkloadClass.NATIVE_STORY_WRITER,
+                  reasoning='high', max_output_tokens=None)
+    return InvocationEfficiencyPolicy.create(**values)
+
+
+@pytest.mark.parametrize('route', ['NATIVE_STORY_DRAFT', 'NATIVE_STORY_REVIEW'])
+def test_native_story_nullable_output_is_exactly_scoped(route):
+    policy = _native_story_policy(route)
+    envelope = _envelope(workload=WorkloadClass.NATIVE_STORY_WRITER)
+    allocation = _allocation(envelope, policy)
+    assert policy.max_output_tokens is None and allocation.max_output_tokens is None
+    assert policy.max_context_tokens == 2000 and policy.max_total_tokens == 2500
+    assert model_usage_module._policy_from_record(policy.as_record()) == policy
+    assert model_usage_module._allocation_from_record(allocation.as_record()) == allocation
+
+
+@pytest.mark.parametrize('workload,provider,route', [
+    ('NATIVE_STORY_WRITER', 'grok-build-cli', 'NATIVE_EVIDENCE_ASSESSOR'),
+    ('NATIVE_STORY_WRITER', 'cursor-agent-cli', 'NATIVE_STORY_DRAFT'),
+    ('NATIVE_STORY_WRITER', 'grok-build-cli', 'CONT_PRIMARY'),
+    ('NATIVE_EVIDENCE_ASSESSOR', 'grok-build-cli', 'NATIVE_STORY_DRAFT'),
+    ('CONT_WRITER_PRIMARY', 'grok-build-cli', 'NATIVE_STORY_DRAFT'),
+    ('GRAPHITI_CHAT_FALLBACK', 'grok-build-cli', 'NATIVE_STORY_REVIEW'),
+])
+def test_native_story_nullable_output_rejects_other_scopes(workload, provider, route):
+    policy = _native_story_policy()
+    changes = dict(workload_class=WorkloadClass(workload), provider=provider, route=route)
+    with pytest.raises(ModelUsageIntegrityError):
+        InvocationEfficiencyPolicy.create(**{**asdict(policy), **changes})
+    allocation = _allocation(_envelope(workload=WorkloadClass.NATIVE_STORY_WRITER), policy)
+    with pytest.raises(ModelUsageIntegrityError):
+        InvocationAllocation.create(**{**asdict(allocation), **changes})
+
+
+@pytest.mark.parametrize('field', [
+    'admission_decision_id', 'candidate_id', 'hypothesis_digest', 'evidence_package_digest',
+    'ingest_id', 'graphiti_attempt_id',
+])
+def test_native_story_envelope_requires_only_admitted_editorial_identities(field):
+    envelope = _envelope(workload=WorkloadClass.NATIVE_STORY_WRITER)
+    invalid = None if field not in {'ingest_id', 'graphiti_attempt_id'} else 'unrelated-authority'
+    with pytest.raises(ModelUsageIntegrityError):
+        WorkEnvelope.create(**{**asdict(envelope), field: invalid})
+    assert model_usage_module._envelope_from_record(envelope.as_record()) == envelope
+
+
+def test_native_story_envelope_resume_keeps_first_timestamp_and_exact_identity(tmp_path):
+    service = _service(tmp_path)
+    envelope = _envelope(workload=WorkloadClass.NATIVE_STORY_WRITER)
+    assert service.resume_or_open_native_story_envelope(envelope) == envelope
+    restarted = WorkEnvelope.create(**{**asdict(envelope), 'admitted_at': T0 + timedelta(minutes=1)})
+    assert restarted.envelope_id == envelope.envelope_id
+    assert restarted.canonical_digest != envelope.canonical_digest
+    assert service.resume_or_open_native_story_envelope(restarted) == envelope
+    with pytest.raises(ModelUsageIntegrityError, match='retained story writer envelope differs'):
+        service.resume_or_open_native_story_envelope(replace(envelope, candidate_id='different-candidate'))
+    with pytest.raises(ModelUsageIntegrityError, match='another workload'):
+        service.resume_or_open_native_story_envelope(_envelope())
+    with sqlite3.connect(service.path) as retained:
+        assert retained.execute('SELECT count(*) FROM model_work_envelopes').fetchone()[0] == 1
+        assert retained.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('state', ['allocated', 'terminal', 'unknown'])
+def test_native_story_envelope_resume_never_retries_allocated_leaf(tmp_path, state):
+    service = _service(tmp_path)
+    envelope, policy, allocation = _open_and_allocate(
+        service, envelope=_envelope(workload=WorkloadClass.NATIVE_STORY_WRITER),
+        policy=_native_story_policy(),
+    )
+    if state == 'terminal':
+        service.complete(_reported(allocation))
+    elif state == 'unknown':
+        service.complete(InvocationTerminal.create(
+            invocation_id=allocation.invocation_id, outcome='TRANSPORT_LOST',
+            failure_class='MISSING_TELEMETRY', usage_status=UsageStatus.UNREPORTED,
+            components=UsageComponents(provenance='UNAVAILABLE'),
+            dispatch_at=allocation.allocated_at,
+            completed_at=allocation.allocated_at + timedelta(seconds=1),
+            observed_at=allocation.allocated_at + timedelta(seconds=1),
+            subscription_cli_chat_not_cash_debited=True,
+        ))
+        assert service.route_state(policy.route)['state'] == 'OPEN'
+    with pytest.raises(ModelUsageAdmissionError, match='already has an allocation'):
+        service.resume_or_open_native_story_envelope(envelope)
+    with sqlite3.connect(service.path) as retained:
+        assert retained.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 1
+        assert retained.execute('SELECT count(*) FROM model_invocation_terminals').fetchone()[0] == int(state != 'allocated')
+
+
+def test_native_story_nullable_output_preserves_total_usage_guard(tmp_path):
+    service = _service(tmp_path)
+    _, policy, allocation = _open_and_allocate(
+        service, envelope=_envelope(workload=WorkloadClass.NATIVE_STORY_WRITER),
+        policy=_native_story_policy(),
+    )
+    service.complete(_reported(allocation, total=policy.max_total_tokens + 1))
+    row = service.query(start=T0, end=T0 + timedelta(minutes=1))['leaves'][0]
+    assert row['policy_breach'] == 'MAX_TOTAL_TOKENS_EXCEEDED'
+    assert service.route_state(policy.route)['state'] == 'OPEN'
+
+
+def test_native_story_nullable_output_preserves_context_usage_guard(tmp_path):
+    service = _service(tmp_path)
+    _, policy, allocation = _open_and_allocate(
+        service, envelope=_envelope(workload=WorkloadClass.NATIVE_STORY_WRITER),
+        policy=_native_story_policy(),
+    )
+    terminal = _reported(allocation, total=policy.max_total_tokens)
+    terminal = InvocationTerminal.create(**{
+        **asdict(terminal),
+        'components': replace(terminal.components, context_tokens=policy.max_context_tokens + 1),
+    })
+    service.complete(terminal)
+    row = service.query(start=T0, end=T0 + timedelta(minutes=1))['leaves'][0]
+    assert row['policy_breach'] == 'MAX_CONTEXT_TOKENS_EXCEEDED'
+    assert service.route_state(policy.route)['state'] == 'OPEN'
+
+
+def test_native_story_nullable_output_retains_subscription_cash_confirmation(tmp_path):
+    service = _service(tmp_path)
+    _, _, allocation = _open_and_allocate(
+        service, envelope=_envelope(workload=WorkloadClass.NATIVE_STORY_WRITER),
+        policy=_native_story_policy(),
+    )
+    with pytest.raises(ModelUsageIntegrityError, match='cash-debit confirmation'):
+        service.complete(replace(_reported(allocation), subscription_cli_chat_not_cash_debited=False))
+    with sqlite3.connect(service.path) as retained:
+        assert retained.execute('SELECT count(*) FROM model_invocation_terminals').fetchone()[0] == 0
+
+
+def test_existing_native_assessor_nullable_output_scope_remains_accepted():
+    values = asdict(_policy(workload=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+                           route='NATIVE_EVIDENCE_ASSESSOR', model='grok-4.7'))
+    assert InvocationEfficiencyPolicy.create(**{**values, 'max_output_tokens': None}).max_output_tokens is None

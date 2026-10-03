@@ -2084,7 +2084,7 @@ def test_passive_admission_phases_do_not_change_completion_or_ledger(tmp_path,mo
     try:
         outcome,=processor.advance((_native(),),cycle_id='phase-fixture')
         assert outcome.state=='GRAPHITI_COMPLETE'
-        assert {data['phase'] for event,data in events}=={'EXTRACTION','ADMISSION','QUEUE_AND_DECIDE','PREFLIGHT','FINALISE'}
+        assert {data['phase'] for event,data in events}=={'RECOVER_AND_ACCOUNT','ATTEMPT_HISTORY','EXTRACTION','ADMISSION','QUEUE_AND_DECIDE','PREFLIGHT','FINALISE'}
         assert all(event=='native_graphiti_phase' and data['cycle_id']=='phase-fixture'
             and data['status']=='COMPLETE' and type(data['elapsed_ms']) is int
             and type(data['cpu_ms']) is int and data['cpu_scope']=='PROCESS' for event,data in events)
@@ -2098,3 +2098,22 @@ def test_native_phase_drop_preserves_original_failure(monkeypatch):
     with pytest.raises(RuntimeError,match='original phase failure'):
         with module._native_phase('FINALISE',cycle_id='fixture',cohort_count=1):
             raise RuntimeError('original phase failure')
+
+
+@pytest.mark.parametrize('phase', ['RECOVER_AND_ACCOUNT', 'ATTEMPT_HISTORY'])
+def test_predispatch_phase_drop_preserves_original_failure(tmp_path, monkeypatch, phase):
+    monkeypatch.setattr(n, 'emit_diagnostic', lambda *_a, **_kw: (_ for _ in ()).throw(OSError('dropped')))
+    processor, connection, _ = _open(tmp_path, monkeypatch, ingest=lambda *_a, **_kw: pytest.fail('ingest after original failure'))
+    def fail(*_a, **_kw):
+        raise RuntimeError('original predispatch failure')
+    if phase == 'RECOVER_AND_ACCOUNT':
+        processor._runner = SimpleNamespace(recover_owned_pending=fail)
+    else:
+        processor._system.graphiti.attempt_history = fail
+    try:
+        before = connection.total_changes
+        with pytest.raises(RuntimeError, match='original predispatch failure'):
+            processor.advance((_native(),), cycle_id='phase-failure')
+        assert connection.total_changes == before
+    finally:
+        connection.close()

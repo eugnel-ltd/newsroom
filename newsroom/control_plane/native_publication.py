@@ -191,6 +191,7 @@ class NativePublicationController:
         evidence_packages: GovernedEvidencePackages,
         bindings: NativePublicationBindings,
         clock: Callable[[], UtcTimestamp] = UtcTimestamp.now,
+        story_writer=None,
     ) -> None:
         if not callable(clock) or not all(
             type(value) is expected
@@ -238,7 +239,10 @@ class NativePublicationController:
             story_admission_definition_digest=(
                 bindings.editorial_story_admission_definition_digest
             ),
+            story_writer=story_writer, clock=clock,
         )
+        self.writer_contract_version = ("newsroom.native-story-writer.v1" if story_writer is not None
+                                        else "newsroom.offline-exact-copy.v3")
         self._publication = OfflinePublication(
             objects=objects,
             commands=commands,
@@ -341,7 +345,10 @@ class NativePublicationController:
             }, proof=proof)
             if (
                 old != correction_of
-                or old_story.copy.writer_id != "newsroom.offline-exact-copy.v2"
+                or old_story.copy.writer_id not in (
+                    {"newsroom.offline-exact-copy.v1", "newsroom.offline-exact-copy.v2", "newsroom.offline-exact-copy.v3"}
+                    if self.writer_contract_version == "newsroom.native-story-writer.v1"
+                    else {"newsroom.offline-exact-copy.v2"})
                 or old_story.package_admission_id != package_admission_id
                 or old_story.policy_decision_id != editorial_decision.decision_id
                 or old_story.candidate_version_id != retained.candidate_version_id
@@ -365,7 +372,7 @@ class NativePublicationController:
             candidate_port=self._candidate_port,
             proof=proof,
         )
-        if correction_of is not None and _story.copy.writer_id != "newsroom.offline-exact-copy.v3":
+        if correction_of is not None and _story.copy.writer_id != self.writer_contract_version:
             raise NativePublicationError("copy correction writer differs")
         publication_receipt, _transaction = self._publication.decide(
             PublicationRequest(
@@ -613,10 +620,10 @@ class NativePublicationContinuation:
         self._clock = clock
 
     @staticmethod
-    def copy_correction_due(facts: dict) -> bool:
+    def copy_correction_due(facts: dict, writer_contract_version="newsroom.offline-exact-copy.v3") -> bool:
         return (
-            facts.get("writer_id") != "newsroom.offline-exact-copy.v3"
-            and facts.get("copy_correction_checked_version") != "newsroom.offline-exact-copy.v3"
+            facts.get("writer_id") != writer_contract_version
+            and facts.get("copy_correction_checked_version") != writer_contract_version
         )
 
     def recover_pre_dispatch(
@@ -790,7 +797,7 @@ class NativePublicationContinuation:
 
         if progress.get("stage") == "COPY_CORRECTION_PREPARED" or (
             progress.get("stage") == "ACKNOWLEDGED"
-            and (self.copy_correction_due(facts) or facts.get("copy_correction_of"))
+            and (self.copy_correction_due(facts, getattr(self._runtime.publication, "writer_contract_version", "newsroom.offline-exact-copy.v3")) or facts.get("copy_correction_of"))
         ):
             return self._advance_copy_correction(revision_id, candidate_version_id, facts, progress, current_facts)
 
@@ -1180,17 +1187,20 @@ class NativePublicationContinuation:
         predecessor = facts.get("copy_correction_of")
         prepared = (progress.get("stage") == "COPY_CORRECTION_PREPARED"
                     or facts.get("copy_correction_result") == "CORRECTED")
+        target_writer = getattr(self._runtime.publication, "writer_contract_version", "newsroom.offline-exact-copy.v3")
         try:
             if predecessor is None:
                 writer_id = self._runtime.publication.retained_writer_id(
                     facts["story_event_id"], proof=self._runtime.proof,
                 )
-                if writer_id in {"newsroom.offline-exact-copy.v1", "newsroom.offline-exact-copy.v3"}:
+                if writer_id == target_writer or (target_writer == "newsroom.offline-exact-copy.v3"
+                    and writer_id == "newsroom.offline-exact-copy.v1"):
                     facts = current_facts()
-                    facts.update(writer_id=writer_id, copy_correction_checked_version="newsroom.offline-exact-copy.v3")
+                    facts.update(writer_id=writer_id, copy_correction_checked_version=target_writer)
                     self._journal.advance(revision_id, stage="ACKNOWLEDGED", facts=facts)
                     return NativePublicationContinuationResult("ACKNOWLEDGED", None, None)
-                if writer_id != "newsroom.offline-exact-copy.v2":
+                if writer_id not in ({"newsroom.offline-exact-copy.v1", "newsroom.offline-exact-copy.v2", "newsroom.offline-exact-copy.v3"}
+                    if target_writer == "newsroom.native-story-writer.v1" else {"newsroom.offline-exact-copy.v2"}):
                     raise NativePublicationError("copy correction predecessor writer differs")
                 predecessor = {key: facts[key] for key in (
                     "story_event_id", "publication_event_id", "delivery_attempt_event_id", "delivery_evidence_event_id",
@@ -1243,7 +1253,7 @@ class NativePublicationContinuation:
             delivery_attempt_event_id=published.attempt_receipt.event_id,
             delivery_evidence_event_id=published.evidence_receipt.event_id,
             writer_id=published.writer_id, copy_correction_result="CORRECTED",
-            copy_correction_checked_version="newsroom.offline-exact-copy.v3",
+            copy_correction_checked_version=target_writer,
         )
         self._journal.advance(revision_id, stage="ACKNOWLEDGED", facts=facts)
         return NativePublicationContinuationResult("ACKNOWLEDGED", None, published)

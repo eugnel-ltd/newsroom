@@ -34,12 +34,12 @@ NOW = datetime(2026, 9, 8, 14, tzinfo=UTC)
 
 
 def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
-    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v22"
+    assert native_assessor.VERSION == "newsroom.native-evidence-assessor.v23"
     assert native_composition.ASSESSMENT_CONTRACT_VERSION == (
-        "newsroom.native-evidence-assessor.v22+newsroom.named-entity.v15+"
+        "newsroom.native-evidence-assessor.v23+newsroom.named-entity.v16+"
         "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
         "newsroom.qualification-relation.v3+newsroom.retained-assessment.v1+"
-        "newsroom.native-assessor-spans.v1"
+        "newsroom.native-assessor-spans.v2"
     )
 
 
@@ -525,7 +525,9 @@ def test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(
     for expected_bootstraps in (1, 2):
         with native_composition.open_native_pipeline(**arguments) as pipeline:
             assert pipeline._publish.copy_correction_due({})
-            assert not pipeline._publish.copy_correction_due({"writer_id": "newsroom.offline-exact-copy.v3"})
+            assert pipeline._publish.copy_correction_due({"writer_id": "newsroom.offline-exact-copy.v3"})
+            assert not pipeline._publish.copy_correction_due({"writer_id": "newsroom.native-story-writer.v1"})
+            assert not pipeline._publish.copy_correction_due({"copy_correction_checked_version": "newsroom.native-story-writer.v1"})
             assert type(pipeline) is NativePipeline
             assert type(pipeline._runtime.authority.commands) is AuthorityCommands
             assert type(pipeline._runtime.authority.events) is AuthorityEvents
@@ -610,7 +612,12 @@ def test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(
                     **facts, "writer_id": "newsroom.offline-exact-copy.v3",
                 })
                 pipeline._advance_revisions(selected, work_deadline=float("inf"))
-                assert recovery_sources == [{}, {}, {}]
+                assert recovery_sources == [{}, {}, {}, {}]
+                pipeline._journal.advance(acknowledged.revision_id, stage="ACKNOWLEDGED", facts={
+                    **facts, "writer_id": "newsroom.native-story-writer.v1",
+                })
+                pipeline._advance_revisions(selected, work_deadline=float("inf"))
+                assert recovery_sources == [{}, {}, {}, {}]
 
     with pytest.raises(NativeRetrievalHold, match="NATIVE_EMBEDDING_POLICY_HOLD"):
         with native_composition.open_native_pipeline(
@@ -624,8 +631,8 @@ def test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(
             raise AssertionError("unqualified composition entered")
     assert _RetrievalProjection.bootstraps == 2
     # Three opens, eleven bounded observation/assessment stop checks per open,
-    # and two bounded ACK turns. No network/provider stage skips its fence.
-    assert stops == ["checked"] * 38
+    # and three bounded ACK turns. No network/provider stage skips its fence.
+    assert stops == ["checked"] * 39
     assert fences == ["entered"] * 8
 
 

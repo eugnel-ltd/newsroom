@@ -69,21 +69,8 @@ VERSION = "hermes-native-source-intake-v1"
 SUPPORTED = frozenset({"UK-01", "UK-02", "UK-03", "UK-05"})
 
 
-class NativeSourceIntakeHold(ValueError):
-    def __init__(
-        self,
-        reason_code: str,
-        *,
-        child_items: tuple[tuple[str, str], ...] = (),
-        unsupported_attachments: tuple[tuple[str, str], ...] = (),
-        exclusion_signals: tuple[str, ...] = (),
-    ) -> None:
-        self.reason_code = reason_code
-        self.child_items = child_items
-        self.unsupported_attachments = unsupported_attachments
-        self.exclusion_signals = exclusion_signals
-        super().__init__(reason_code)
-
+class NativeSourceIntakeHold(GovUkContentHold):
+    """Keep typed GOV.UK coverage and historical-reference metadata at intake."""
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -326,8 +313,12 @@ class NativeSourceIntake:
                     item.canonical_url, "SOURCE_ITEM_RIGHTS_EXCLUSION_HOLD",
                 ),)
             if terminal_html_leaf or (not exc.child_items and not exc.unsupported_attachments):
-                return (), tuple(observations), ((item.canonical_url, exc.reason_code),)
-            units, holds = [], []
+                return (), tuple(observations), ((item.canonical_url, exc.reason_code), *(
+                    (url, "SOURCE_ITEM_HISTORICAL_REFERENCE_COVERAGE_UNASSESSED") for url, _ in exc.archival_references
+                ))
+            units, holds = [], [
+                (url, "SOURCE_ITEM_HISTORICAL_REFERENCE_COVERAGE_UNASSESSED") for url, _ in exc.archival_references
+            ]
             leaf_handoff = publication_leaves and _declared_publication_leaves(
                 raw, item.canonical_url,
             )
@@ -359,6 +350,9 @@ class NativeSourceIntake:
             spreadsheet_declarations = []
             unsupported_attachments = []
             for asset_url, asset_title in exc.unsupported_attachments:
+                if (asset_url, asset_title) in exc.archival_references:
+                    unsupported_attachments.append((asset_url, asset_title))
+                    continue
                 try:
                     spreadsheet_declarations.append(declared_spreadsheet(
                         item.canonical_url, raw, asset_url, retrieved_at=observed,
@@ -944,6 +938,8 @@ def native_evidence_sources(
                     and _utc(document.publication) == unit.published_at
                     and _utc(document.updated) == unit.updated_at
                 )
+        except GovUkContentHold as exc:
+            raise hold(exc.reason_code) from None
         except (TypeError, ValueError, KeyError, UnicodeError, PermissionError):
             raise hold("NATIVE_SOURCE_RAW_OBSERVATION_HOLD") from None
         if (

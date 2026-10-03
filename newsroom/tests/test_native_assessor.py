@@ -271,7 +271,7 @@ def test_native_assessor_schema_is_closed_and_accepts_the_exact_package_shape(tm
     invalid_geography["geography"] = ["Britain"]
     with pytest.raises(ValidationError):
         validator.validate({"package": invalid_geography})
-    assert VERSION == "newsroom.native-evidence-assessor.v22"
+    assert VERSION == "newsroom.native-evidence-assessor.v23"
     assert "ASSESSOR_CLAIM_BINDING_HOLD" in REASSESSABLE_HOLDS
     legacy = native_assessor_module._V17_SYSTEM
     assert "whitespace, newlines and country labels exactly" in legacy
@@ -1520,7 +1520,7 @@ def test_native_assessor_input_bound_has_planning_headroom_not_an_output_limit(
     bound = native_assessment_input_bound(policy)
     assert bound['version'] == INPUT_BOUND_VERSION
     assert CONTEXT_MANIFEST_SCHEMA_VERSION.endswith('.v3')
-    assert VERSION.endswith('.v22')
+    assert VERSION.endswith('.v23')
     assert bound['system_digest'] == digest_bytes(SYSTEM.encode('utf-8'))
     assert bound['system_bytes'] == len(SYSTEM.encode('utf-8'))
     assert bound['schema_digest'] == PROVIDER_SCHEMA_DIGEST
@@ -2721,7 +2721,7 @@ def test_weather_record_metadata_failure_revalidates_once_per_consumer_contract(
     facts = {
         "reason": "EVIDENCE_VALIDATION_HOLD",
         "assessment_contract_version": ASSESSMENT_CONTRACT_VERSION.replace(
-            "newsroom.named-entity.v15", "newsroom.named-entity.v14",
+            "newsroom.named-entity.v16", "newsroom.named-entity.v15",
         ),
     }
     assert assessment_revalidation_due(facts, ASSESSMENT_CONTRACT_VERSION)
@@ -2827,7 +2827,7 @@ def test_current_profile_preserves_v15_v16_v17_v18_v19_v20_contracts():
         _V19_SYSTEM, _V19_PROVIDER_SCHEMA, _V19_PROVIDER_SCHEMA_DIGEST,
         _V20_SYSTEM, _V20_PROVIDER_SCHEMA, _V20_PROVIDER_SCHEMA_DIGEST,
     )
-    assert VERSION == 'newsroom.native-evidence-assessor.v22'
+    assert VERSION == 'newsroom.native-evidence-assessor.v23'
     assert digest_bytes(_V15_SYSTEM.encode()) == 'sha256:5788c3e827199e12932d106ad494c80b71b2691e3f9c7e535a44c5d09811d4a6'
     assert len(_V15_SYSTEM.encode()) == 6797
     assert SCHEMA_DIGEST == _V15_SCHEMA_DIGEST

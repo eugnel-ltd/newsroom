@@ -10,7 +10,7 @@ from newsroom.control_plane.native_assessor_references import (
     build_source_view, materialise,
 )
 from newsroom.control_plane.native_assessor_spans import (
-    PARTITION_VERSION, PartitionedSourceView, _chunks, build_lossless_source_view,
+    PARTITION_VERSION, PARTITION_VERSION_V1, PartitionedSourceView, _chunks, build_lossless_source_view,
 )
 
 
@@ -61,7 +61,10 @@ def test_partition_marker_adds_no_storage_or_historical_manifest_fields():
     assert view.partition_version == PARTITION_VERSION
     assert not hasattr(view, "__dict__")
     assert not hasattr(legacy, "partition_version")
-    assert set(view.manifest) == set(legacy.manifest)
+    old = build_lossless_source_view((body,), ("SOURCE-1",), version=PARTITION_VERSION_V1)
+    assert set(old.manifest) == set(legacy.manifest)
+    assert old.partition_version == PARTITION_VERSION_V1
+    assert set(view.manifest) == set(legacy.manifest) | {"entity_policy_version"}
     assert replace(view).partition_version == PARTITION_VERSION
 
 

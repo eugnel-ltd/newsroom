@@ -9,14 +9,15 @@ from dataclasses import replace
 from itertools import pairwise
 
 from newsroom.authority.canonical import digest_bytes, digest_canonical
-from newsroom.control_plane.evidence import _entity_pattern
+from newsroom.control_plane.evidence import _entity_pattern, NAMED_ENTITY_POLICY_VERSION, NAMED_ENTITY_POLICY_VERSION_V15
 
 from .native_assessor_references import (
     MAX_SEGMENTS, SourceReferenceError, SourceSegment, SourceView,
     _claim_entities, _manifest, build_source_view,
 )
 
-PARTITION_VERSION = "newsroom.native-assessor-spans.v1"
+PARTITION_VERSION_V1 = "newsroom.native-assessor-spans.v1"
+PARTITION_VERSION = "newsroom.native-assessor-spans.v2"
 _CLOSERS = r"[\"'’”）)\]】」』]*+"
 _BOUNDARY = re.compile(
     rf"(?P<latin>[.!?]){_CLOSERS}[ \t]+(?=\S)|"
@@ -37,7 +38,7 @@ class PartitionedSourceView(SourceView):
 
     @property
     def partition_version(self) -> str:
-        return PARTITION_VERSION
+        return PARTITION_VERSION_V1 if self.entity_policy_version == NAMED_ENTITY_POLICY_VERSION_V15 else PARTITION_VERSION
 
 
 def _chunks(segment: SourceSegment) -> Iterator[str]:
@@ -74,12 +75,12 @@ def _chunks(segment: SourceSegment) -> Iterator[str]:
         yield text[first:last]
 
 
-def _range_closed_chunks(line: SourceSegment, body: str) -> tuple[tuple[str, tuple], ...]:
+def _range_closed_chunks(line: SourceSegment, body: str, *, policy_version: str = NAMED_ENTITY_POLICY_VERSION_V15) -> tuple[tuple[str, tuple], ...]:
     """Keep a context-dependent name's occurrences in one selectable unit."""
     texts = tuple(_chunks(line))
     if len(texts) == 1:
         return ((line.text, line.entities),)
-    chunks = tuple((text, _claim_entities(text, body)) for text in texts)
+    chunks = tuple((text, _claim_entities(text, body, policy_version=policy_version)) for text in texts)
     occurrences = sorted(
         [(match.start(), match.end(), name, kind)
          for name, kind in dict.fromkeys(line.entities)
@@ -114,7 +115,7 @@ def _range_closed_chunks(line: SourceSegment, body: str) -> tuple[tuple[str, tup
         offset += len(text)
         if not any(first < offset < last for first, last in neighbourhoods):
             cuts.append(offset)
-    merged = tuple((line.text[first:last], _claim_entities(line.text[first:last], body))
+    merged = tuple((line.text[first:last], _claim_entities(line.text[first:last], body, policy_version=policy_version))
                    for first, last in pairwise(cuts))
     # Each surviving unit must expose exactly its full-line occurrence slice.
     # Ambiguous overlap retains the original physical-line contract instead.
@@ -128,15 +129,18 @@ def _range_closed_chunks(line: SourceSegment, body: str) -> tuple[tuple[str, tup
     return merged
 
 
-def build_lossless_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...]) -> SourceView:
+def build_lossless_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...], *, version: str = PARTITION_VERSION) -> SourceView:
     """Refine the legacy view without changing its bytes or v1 range proof."""
-    original = build_source_view(passages, source_ids)
+    if version not in {PARTITION_VERSION_V1, PARTITION_VERSION}:
+        raise SourceReferenceError("unsupported source partition version")
+    policy = NAMED_ENTITY_POLICY_VERSION_V15 if version == PARTITION_VERSION_V1 else NAMED_ENTITY_POLICY_VERSION
+    original = build_source_view(passages, source_ids, policy_version=policy)
     segments = []
     for passage_index, body in enumerate(passages):
         ordinal = 0
         for line in (item for item in original.segments if item.passage_index == passage_index):
             offset = line.start_byte
-            for text, entities in _range_closed_chunks(line, body):
+            for text, entities in _range_closed_chunks(line, body, policy_version=policy):
                 if len(segments) >= MAX_SEGMENTS:
                     raise SourceReferenceError("source segment count exceeds bound")
                 ordinal += 1
@@ -154,5 +158,5 @@ def build_lossless_source_view(passages: tuple[str, ...], source_ids: tuple[str,
     exact = tuple(segments)
     return PartitionedSourceView(
         passages, source_ids, exact, original.body_digests, original.source_entities,
-        digest_canonical(_manifest(source_ids, original.body_digests, exact)),
+        digest_canonical(_manifest(source_ids, original.body_digests, exact, policy_version=policy)), policy,
     )

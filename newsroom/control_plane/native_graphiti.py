@@ -186,102 +186,104 @@ class NativeGraphitiProcessor:
                     or any(units_by_ingest[ingest_id].chunk_count != chunk_count for ingest_id in members)):
                 raise ValueError("native Graphiti revision chunk coverage differs")
         self._stop_check()
-        recover_owned = getattr(self._runner, "recover_owned_pending", None)
-        if callable(recover_owned):
-            recover_owned(
-                connection=self._connection,
-                owner_stop_check=self._stop_check,
-                rights_fence=self._fence,
-                defer_before_unit=defer_before_unit,
-                deadline=self._clock() + timedelta(milliseconds=GRAPHITI_EXTRACTION_TIMEOUT_MS),
-            )
-        # Resolve retained accounting before considering another provider call.
-        self._settle_missing_subscription_usage(units_by_ingest)
-        terminal_holds = {
-            ingest_id: "REPORTED_OUTPUT_REJECTION_NO_RETRY"
-            for ingest_id in reported_output_rejected_ingests(self._connection, ingest_ids=tuple(units_by_ingest))
-            if ingest_id in units_by_ingest
-        }
+        with _native_phase("RECOVER_AND_ACCOUNT", cycle_id=cycle_id, cohort_count=len(units_by_ingest)):
+            recover_owned = getattr(self._runner, "recover_owned_pending", None)
+            if callable(recover_owned):
+                recover_owned(
+                    connection=self._connection,
+                    owner_stop_check=self._stop_check,
+                    rights_fence=self._fence,
+                    defer_before_unit=defer_before_unit,
+                    deadline=self._clock() + timedelta(milliseconds=GRAPHITI_EXTRACTION_TIMEOUT_MS),
+                )
+            # Resolve retained accounting before considering another provider call.
+            self._settle_missing_subscription_usage(units_by_ingest)
+            terminal_holds = {
+                ingest_id: "REPORTED_OUTPUT_REJECTION_NO_RETRY"
+                for ingest_id in reported_output_rejected_ingests(self._connection, ingest_ids=tuple(units_by_ingest))
+                if ingest_id in units_by_ingest
+            }
         recovered_ambiguous_attempts: dict[str, int] = {}
         authenticated_rejected_attempts: dict[str, tuple[int, ...]] = {}
         authenticated_reentry_attempts: dict[str, int] = {}
-        for ingest_id in units_by_ingest:
-            if ingest_id in terminal_holds:
-                continue
-            # The authority commits before the private receipt/failure journal.
-            # Inspect it even if a crash left no local failure row.
-            if self._connection.execute(
-                "SELECT 1 FROM unpublished_graphiti_ingest WHERE ingest_id=? AND outcome='COMPLETE'",
-                (ingest_id,),
-            ).fetchone() is not None:
-                continue
-            try:
-                history = self._system.graphiti.attempt_history(
-                    typed_id(ExtractionRunId, "run", ingest_id),
-                    limit=2, proof=self._proof,
-                )
-            except GraphitiAdapterRightsDenied:
-                terminal_holds[ingest_id] = "CURRENT_SOURCE_RIGHTS_HOLD"
-                continue
-            if history:
-                head = history[0]
-                next_attempt = self._connection.execute(
-                    "SELECT COALESCE(MAX(attempt_number),0)+1 FROM "
-                    "unpublished_graphiti_attempt_receipts WHERE ingest_id=?",
-                    (ingest_id,),
-                ).fetchone()[0]
-                authenticate_retained = getattr(
-                    self._runner,
-                    "authenticate_retained_recovered_ambiguous_progression",
-                    None,
-                )
-                skipped = (
-                    authenticate_retained(
-                        unit=units_by_ingest[ingest_id],
-                        current_attempt=head,
-                        authoritative_attempt=history[1],
-                        next_attempt_number=int(next_attempt),
-                        connection=self._connection,
-                        model_usage=self._usage,
-                    )
-                    if len(history) == 2 and callable(authenticate_retained)
-                    else None
-                )
-                if skipped is not None:
-                    authenticated_rejected_attempts[ingest_id] = (int(skipped),)
-                    if int(next_attempt) == head.attempt_number:
-                        authenticated_reentry_attempts[ingest_id] = int(next_attempt)
+        with _native_phase("ATTEMPT_HISTORY", cycle_id=cycle_id, cohort_count=len(units_by_ingest)):
+            for ingest_id in units_by_ingest:
+                if ingest_id in terminal_holds:
                     continue
-                if head.outcome.terminal:
-                    prepare_recovery = getattr(
+                # The authority commits before the private receipt/failure journal.
+                # Inspect it even if a crash left no local failure row.
+                if self._connection.execute(
+                    "SELECT 1 FROM unpublished_graphiti_ingest WHERE ingest_id=? AND outcome='COMPLETE'",
+                    (ingest_id,),
+                ).fetchone() is not None:
+                    continue
+                try:
+                    history = self._system.graphiti.attempt_history(
+                        typed_id(ExtractionRunId, "run", ingest_id),
+                        limit=2, proof=self._proof,
+                    )
+                except GraphitiAdapterRightsDenied:
+                    terminal_holds[ingest_id] = "CURRENT_SOURCE_RIGHTS_HOLD"
+                    continue
+                if history:
+                    head = history[0]
+                    next_attempt = self._connection.execute(
+                        "SELECT COALESCE(MAX(attempt_number),0)+1 FROM "
+                        "unpublished_graphiti_attempt_receipts WHERE ingest_id=?",
+                        (ingest_id,),
+                    ).fetchone()[0]
+                    authenticate_retained = getattr(
                         self._runner,
-                        "prepare_recovered_ambiguous_successor",
+                        "authenticate_retained_recovered_ambiguous_progression",
                         None,
                     )
-                    if (
-                        head.outcome is GraphitiAdapterOutcome.AMBIGUOUS_EFFECT
-                        and callable(prepare_recovery)
-                        and prepare_recovery(
+                    skipped = (
+                        authenticate_retained(
                             unit=units_by_ingest[ingest_id],
-                            authoritative_attempt=head,
-                            private_successor_attempt_number=int(next_attempt),
+                            current_attempt=head,
+                            authoritative_attempt=history[1],
+                            next_attempt_number=int(next_attempt),
                             connection=self._connection,
                             model_usage=self._usage,
                         )
-                    ):
-                        recovered_ambiguous_attempts[ingest_id] = int(next_attempt)
-                        authenticated_rejected_attempts[ingest_id] = (
-                            head.attempt_number + 1,
+                        if len(history) == 2 and callable(authenticate_retained)
+                        else None
+                    )
+                    if skipped is not None:
+                        authenticated_rejected_attempts[ingest_id] = (int(skipped),)
+                        if int(next_attempt) == head.attempt_number:
+                            authenticated_reentry_attempts[ingest_id] = int(next_attempt)
+                        continue
+                    if head.outcome.terminal:
+                        prepare_recovery = getattr(
+                            self._runner,
+                            "prepare_recovered_ambiguous_successor",
+                            None,
+                        )
+                        if (
+                            head.outcome is GraphitiAdapterOutcome.AMBIGUOUS_EFFECT
+                            and callable(prepare_recovery)
+                            and prepare_recovery(
+                                unit=units_by_ingest[ingest_id],
+                                authoritative_attempt=head,
+                                private_successor_attempt_number=int(next_attempt),
+                                connection=self._connection,
+                                model_usage=self._usage,
+                            )
+                        ):
+                            recovered_ambiguous_attempts[ingest_id] = int(next_attempt)
+                            authenticated_rejected_attempts[ingest_id] = (
+                                head.attempt_number + 1,
+                            )
+                            continue
+                        # A settled terminal adapter result is not a new retryable
+                        # provider failure. Keep the original cause and its accounting.
+                        terminal_holds[ingest_id] = (
+                            "RETAINED_COMPLETE_RECONCILIATION_REQUIRED"
+                            if head.outcome is GraphitiAdapterOutcome.COMPLETE else
+                            f"{head.outcome.value}:{head.failure_code}"
                         )
                         continue
-                    # A settled terminal adapter result is not a new retryable
-                    # provider failure. Keep the original cause and its accounting.
-                    terminal_holds[ingest_id] = (
-                        "RETAINED_COMPLETE_RECONCILIATION_REQUIRED"
-                        if head.outcome is GraphitiAdapterOutcome.COMPLETE else
-                        f"{head.outcome.value}:{head.failure_code}"
-                    )
-                    continue
         deferred = set()
         considered = set()
 

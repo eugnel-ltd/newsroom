@@ -388,6 +388,8 @@ class StoryVersion:
     write_admission: WriteAdmissionDecision
     copy: WriterCopy
     validators: tuple[WriterValidatorResult, ...]
+    writer_review: dict | None = None
+    story_format: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.story_id) is not AggregateId or (
@@ -416,6 +418,16 @@ class StoryVersion:
             or any(type(item) is not WriterValidatorResult for item in self.validators)
         ):
             raise EditorialError("Story Version editorial values differ")
+        if (self.writer_review is None) != (self.story_format is None):
+            raise EditorialError("Story Version writer review binding differs")
+        if (self.copy.writer_id == "newsroom.native-story-writer.v1") != (self.writer_review is not None):
+            raise EditorialError("Story Version narrative review is required")
+        if self.writer_review is not None and (
+            type(self.writer_review) is not dict
+            or self.story_format not in {"ARTICLE", "BRIEF"}
+            or self.copy.writer_id != "newsroom.native-story-writer.v1"
+        ):
+            raise EditorialError("Story Version narrative identity differs")
 
     @property
     def digest(self) -> str:
@@ -460,6 +472,8 @@ class StoryVersion:
                     }
                     for item in self.validators
                 ],
+                **({"writer_review": self.writer_review, "story_format": self.story_format}
+                   if self.writer_review is not None else {}),
             }
         )
 
@@ -499,6 +513,8 @@ class StoryVersion:
                 validators=tuple(
                     WriterValidatorResult(**item) for item in value["validators"]
                 ),
+                writer_review=value.get("writer_review"),
+                story_format=value.get("story_format"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise EditorialError("Story Version fields differ") from exc
@@ -546,6 +562,7 @@ class NativeEditorial:
         decision_command_definition_digest: str,
         story_command_definition_digest: str,
         story_admission_definition_digest: str,
+        story_writer=None, clock=UtcTimestamp.now,
     ) -> None:
         if not all(
             type(value) is expected
@@ -585,6 +602,8 @@ class NativeEditorial:
         self._decision_definition = decision_command_definition_digest
         self._story_definition = story_command_definition_digest
         self._story_admission_definition = story_admission_definition_digest
+        self._story_writer = story_writer
+        self._clock = clock
 
     def admit_story_version(
         self,
@@ -635,15 +654,31 @@ class NativeEditorial:
         )
         if committed_admission is not None:
             admitted = committed_admission.admission
-            story = legacy_story(admitted.blob.blob_digest)
-            if story is None:
-                story = self._build_story(
-                    request, retained, decision, decision_reference
-                )
+            hydrated = self._objects.hydrate(
+                HydrationRequest(admitted.admission_id, STORY_PURPOSE), proof=proof
+            )
+            self._verify_access(hydrated.decision, policy=self._story_policy,
+                                object_class=STORY_CLASS, allowed_use=STORY_USE)
+            original = StoryVersion.from_bytes(hydrated.data)
+            story = self._build_story(
+                request, retained, decision, decision_reference,
+                writer_id=original.copy.writer_id,
+                retained_copy=original.copy if original.writer_review is not None else None,
+                writer_review=original.writer_review, story_format=original.story_format,
+            )
         else:
             story = self._build_story(
                 request, retained, decision, decision_reference
             )
+            if story.writer_review is not None:
+                refreshed = self._evidence.read(
+                    package_admission_id, candidate_port=candidate_port, proof=proof
+                )
+                if (refreshed.package.digest != retained.package.digest
+                        or refreshed.candidate_version_digest != retained.candidate_version_digest
+                        or refreshed.governing_manifest_digest != retained.governing_manifest_digest):
+                    raise EditorialHold(reason="NATIVE_STORY_SOURCE_DRIFT_HOLD")
+                self._read_policy_decision(decision_reference, retained=refreshed, proof=proof)
             admission = self._objects.admit(
                 admission_request,
                 story.canonical_bytes(),
@@ -729,6 +764,8 @@ class NativeEditorial:
             decision,
             reference,
             writer_id=story.copy.writer_id,
+            retained_copy=story.copy if story.writer_review is not None else None,
+            writer_review=story.writer_review, story_format=story.story_format,
         )
         if rebuilt.canonical_bytes() != hydrated.data:
             raise EditorialError("Story Version replay differs")
@@ -740,7 +777,8 @@ class NativeEditorial:
         retained: GovernedEvidencePackage,
         policy: EditorialPolicyDecision,
         reference: DecisionReference,
-        *, writer_id: str = "newsroom.offline-exact-copy.v3",
+        *, writer_id: str | None = None, retained_copy: WriterCopy | None = None,
+        writer_review: dict | None = None, story_format: str | None = None,
     ) -> StoryVersion:
         package = retained.package
         if str(request.story_id) == package.candidate_id:
@@ -782,6 +820,52 @@ class NativeEditorial:
         )
         if decision.decision != "WRITE_READY":
             raise EditorialHold(decision)
+        def require_current_sources():
+            # A model turn may cross the original observation's currency window.
+            now = self._clock()
+            now_value = now.value
+            for item in policy.currentness:
+                if item.currency_family == "OBSERVED_STATE":
+                    elapsed = (now_value - _utc_timestamp(item.retrieval_time).value).total_seconds()
+                    if elapsed < 0 or elapsed > item.currency_window_seconds:
+                        raise EditorialHold(reason="NATIVE_STORY_SOURCE_CURRENCY_HOLD")
+        if writer_id is None:
+            writer_id = ("newsroom.native-story-writer.v1" if self._story_writer is not None
+                         else "newsroom.offline-exact-copy.v3")
+        if writer_id == "newsroom.native-story-writer.v1":
+            from newsroom.control_plane.native_story_writer import validate_retained_story, NativeStoryWriterHold
+            if retained_copy is None:
+                if self._story_writer is None:
+                    raise EditorialHold(reason="NATIVE_STORY_WRITER_UNAVAILABLE")
+                try:
+                    result = self._story_writer(
+                        evaluated, candidate_id=retained.package.candidate_id,
+                        hypothesis_digest=retained.governing_manifest_digest,
+                        admission_decision_id=decision.decision_id,
+                        require_current=require_current_sources,
+                        source_currentness=policy.currentness,
+                    )
+                except NativeStoryWriterHold as exc:
+                    raise EditorialHold(reason=str(exc)) from exc
+                copy, writer_review, story_format = result.copy, result.review.as_record(), result.format
+                require_current_sources()
+            else:
+                copy = retained_copy
+            validators = validate_retained_story(copy, evaluated, writer_review, story_format)
+            if not validators or any(item.result != "PASS" for item in validators):
+                raise EditorialHold(reason="NATIVE_STORY_SOURCE_SUPPORT_HOLD")
+            return StoryVersion(
+                story_id=request.story_id, aggregate_version=request.expected_aggregate_version + 1,
+                candidate_version_id=retained.candidate_version_id,
+                candidate_version_digest=retained.candidate_version_digest,
+                governing_manifest_digest=retained.governing_manifest_digest,
+                package_admission_id=retained.package_admission_id,
+                retained_package_digest=retained.package.digest, admission_input_digest=evaluated.digest,
+                policy_decision_event_id=reference.event_id,
+                policy_decision_admission_id=reference.admission_id, policy_decision_id=policy.decision_id,
+                write_admission=decision, copy=copy, validators=validators,
+                writer_review=writer_review, story_format=story_format,
+            )
         if writer_id not in {
             "newsroom.offline-exact-copy.v1",
             "newsroom.offline-exact-copy.v2",

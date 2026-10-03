@@ -82,6 +82,13 @@ class GovUkContentHold(ValueError):
         self.reason_code = reason_code
         self.child_items = child_items
         self.unsupported_attachments = unsupported_attachments
+        # References are retained metadata, never an executable fetch route or
+        # proof that historical material is unnecessary for this source.
+        self.archival_references = tuple(
+            (url, title) for url, title in unsupported_attachments
+            if _archival_reference_location(url)
+        )
+        self.historical_coverage_status = "UNASSESSED" if self.archival_references else None
         self.exclusion_signals = exclusion_signals
         super().__init__(reason_code)
 
@@ -462,7 +469,8 @@ def _require_attachment_inventory(
             title = entry.get("title")
             if (
                 type(path) is not str
-                or not _safe_attachment_location(path)
+                or not (_safe_attachment_location(path)
+                        or entry.get("attachment_type") == "external" and _archival_reference_location(path))
                 or type(title) is not str
                 or not title.strip()
             ):
@@ -478,6 +486,22 @@ def _require_attachment_inventory(
         (path, title) for path, title in items.items() if not path.startswith("/")
     )
     return children, unsupported
+
+
+def _archival_reference_location(value: str) -> bool:
+    """Recognise declared historical metadata without authorising its retrieval."""
+    if not isinstance(value, str) or "\\" in value or any(ord(character) < 32 for character in value):
+        return False
+    parsed = urlsplit(value)
+    prefix = "/ukgwa/timeline/"
+    if (parsed.scheme != "https" or parsed.netloc != "webarchive.nationalarchives.gov.uk"
+            or parsed.query or parsed.fragment or not parsed.path.startswith(prefix)):
+        return False
+    try:
+        _api_url(parsed.path.removeprefix(prefix))
+    except ValueError:
+        return False
+    return True
 
 
 def _safe_attachment_location(value: str) -> bool:

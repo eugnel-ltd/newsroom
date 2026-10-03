@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shlex
@@ -379,6 +380,39 @@ def open_native_pipeline(
         resources.callback(proving.close)
         journal = NativeRevisionJournal(private)
         usage = ModelUsageService(str(private_path))
+        def story_writer(package, **identities):
+            from newsroom.increment10.editorial import EditorialHold
+            from .model_usage import ModelUsageAdmissionError
+            from .native_story_model import NativeStoryModel, load_story_model_policies
+            from .native_story_writer import NativeStoryWriterHold
+            from .writer import WriterDispatchError, CliProcessError, CliTimeoutError
+            currentness = identities.pop("source_currentness")
+            def require_story_sources():
+                stop_check()
+                if tuple(item.source_id for item in currentness) != package.source_ids:
+                    raise EditorialHold(reason="NATIVE_STORY_SOURCE_BINDING_HOLD")
+                for item in currentness:
+                    definition = runtime.authority.sources.current_summary(
+                        SourceDefinitionId.parse(item.source_definition_id), proof=proof)
+                    version = runtime.authority.sources.version_details(definition.version_id, proof=proof)
+                    if (version.canonical_digest != item.source_definition_revision_digest
+                            or source_rights(item.source_id, version.request.locator) is None):
+                        raise EditorialHold(reason="NATIVE_STORY_CURRENT_SOURCE_RIGHTS_HOLD")
+            @contextmanager
+            def writer_fence():
+                with stop_fence():
+                    require_story_sources()
+                    yield
+            try:
+                model = NativeStoryModel(usage, load_story_model_policies(usage),
+                    fence=writer_fence, stop_check=require_story_sources, clock=clock)
+                result = model.write(package, **identities)
+                require_story_sources()
+                return result
+            except (ModelUsageAdmissionError, NativeStoryWriterHold) as exc:
+                raise EditorialHold(reason=getattr(exc, "reason_code", str(exc))) from exc
+            except (WriterDispatchError, CliProcessError, CliTimeoutError, json.JSONDecodeError) as exc:
+                raise EditorialHold(reason="NATIVE_STORY_PROVIDER_RESULT_HOLD") from exc
         RetrievalContextJournal(retrieval_path)
         exact = SQLiteExactRetriever(
             authority_database=authority_path, journal=BranchReceiptJournal(retrieval_path),
@@ -418,6 +452,7 @@ def open_native_pipeline(
             intake_path=intake_path, target_path=serving_path, target_id=target_id,
             credential=credential, principal_id=principal, authority_domain=domain,
             neo4j_config=neo4j_config, native_dependency_factory=dependencies, clock=now,
+            story_writer=story_writer,
         ))
         documents = components["documents"]
         from newsroom.increment9.proving import SOURCE_URLS
@@ -715,7 +750,8 @@ def open_native_pipeline(
         )
 
         class Publication:
-            copy_correction_due = staticmethod(NativePublicationContinuation.copy_correction_due)
+            copy_correction_due = staticmethod(lambda facts, decide=NativePublicationContinuation.copy_correction_due:
+                decide(facts, "newsroom.native-story-writer.v1"))
 
             def continuation(self, sources):
                 return NativePublicationContinuation(

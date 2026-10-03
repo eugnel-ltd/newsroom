@@ -113,6 +113,36 @@ def _dfe_correspondence_shape():
     return value
 
 
+def test_declared_archive_reference_is_metadata_with_unassessed_coverage_not_executable_content():
+    value = _dfe_correspondence_shape()
+    archive = "https://webarchive.nationalarchives.gov.uk/ukgwa/timeline/https://www.gov.uk" + value["base_path"]
+    value["details"]["attachments"].append({
+        "attachment_type": "external", "url": archive, "title": "Earlier versions at the National Archives",
+    })
+    with pytest.raises(GovUkContentHold) as caught:
+        parse_govuk_content_document("https://www.gov.uk" + value["base_path"],
+                                    json.dumps(value).encode(), retrieved_at=datetime(2026, 9, 10, tzinfo=UTC))
+    assert caught.value.reason_code == "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE"
+    assert len(caught.value.child_items) == 3
+    assert caught.value.unsupported_attachments == ((archive, "Earlier versions at the National Archives"),)
+    assert caught.value.archival_references == caught.value.unsupported_attachments
+    assert caught.value.historical_coverage_status == "UNASSESSED"
+
+
+@pytest.mark.parametrize("url,attachment_type", [
+    ("https://example.test/archive", "external"),
+    ("http://webarchive.nationalarchives.gov.uk/ukgwa/timeline/https://www.gov.uk/government/example", "external"),
+    ("https://webarchive.nationalarchives.gov.uk/ukgwa/timeline/https://example.test/government/example", "external"),
+    ("https://webarchive.nationalarchives.gov.uk/ukgwa/timeline/https://www.gov.uk/government/example", "file"),
+])
+def test_archive_metadata_does_not_widen_attachment_fetch_authority(url, attachment_type):
+    value = _dfe_correspondence_shape()
+    value["details"]["attachments"].append({"attachment_type": attachment_type, "url": url, "title": "Archive"})
+    with pytest.raises(ValueError, match="source attachment identity differs"):
+        parse_govuk_content_document("https://www.gov.uk" + value["base_path"],
+                                    json.dumps(value).encode(), retrieved_at=datetime(2026, 9, 10, tzinfo=UTC))
+
+
 def _observed_metadata_shape(document_type: str):
     path = "/government/example"
     value = _document(path)

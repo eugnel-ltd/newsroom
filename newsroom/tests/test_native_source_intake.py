@@ -1041,6 +1041,73 @@ def test_feed_child_replay_and_parent_lineage_fail_closed(tmp_path, monkeypatch)
         ),)
 
 
+
+def test_archive_metadata_stays_held_without_fetching_it_and_safe_child_lineage_is_reused(tmp_path, monkeypatch):
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    parent_path, child_path = "/government/publications/example", "/government/publications/example/accessible"
+    parent = json.loads(_parent_with_children("correspondence", parent_path, ((child_path, "Current HTML"),)))
+    archive = "https://webarchive.nationalarchives.gov.uk/ukgwa/timeline/https://www.gov.uk" + parent_path
+    parent["details"]["attachments"].append({"attachment_type": "external", "url": archive, "title": "Earlier versions"})
+    bodies = {SOURCE_URLS["UK-01"]: _atom_for(parent_path),
+              "https://www.gov.uk/api/content" + parent_path: json.dumps(parent).encode(),
+              "https://www.gov.uk/api/content" + child_path: _document(path=child_path)}
+    fetched = []
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects, proof=runtime.proof,
+            definition_ids={"UK-01": _seed_uk01(runtime)}, licence=_licence(),
+            dispatch_fence=lambda *_: nullcontext(), fetch=lambda url: (fetched.append(url), (200, bodies[url]))[1],
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC),
+        )
+        first = intake.poll()[0]
+        assert first.status == "HOLD"
+        assert len(first.units) == 1 and first.units[0].canonical_url == "https://www.gov.uk" + child_path
+        assert (archive, "SOURCE_ITEM_HISTORICAL_REFERENCE_COVERAGE_UNASSESSED") in first.item_holds
+        assert ("https://www.gov.uk" + parent_path, "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE") in first.item_holds
+        assert archive not in fetched
+        assert native_evidence_sources(
+            units=first.units, sources=runtime.authority.sources, objects=runtime.authority.objects,
+            observations={item[1]: item for item in first.observations}, licence=_licence(), proof=runtime.proof,
+        )
+
+
+def test_native_publication_sources_keep_typed_attachment_hold_instead_of_raw_hash_hold(tmp_path, monkeypatch):
+    import newsroom.control_plane.native_source_intake as module
+    from newsroom.control_plane.govuk_evidence import GovUkContentHold
+
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    parent_path, child_path = "/government/collections/example", "/government/publications/example"
+    bodies = {SOURCE_URLS["UK-01"]: _atom_for(parent_path),
+              "https://www.gov.uk/api/content" + parent_path: _parent_with_children("document_collection", parent_path, ((child_path, "Current leaf"),)),
+              "https://www.gov.uk/api/content" + child_path: _document(path=child_path)}
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects, proof=runtime.proof,
+            definition_ids={"UK-01": _seed_uk01(runtime)}, licence=_licence(),
+            dispatch_fence=lambda *_: nullcontext(), fetch=lambda url: (200, bodies[url]),
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC),
+        )
+        first = intake.poll()[0]
+        assert len(first.units) == 1
+
+        original = module.parse_govuk_content_document
+
+        def incomplete(url, *args, **kwargs):
+            if url == "https://www.gov.uk" + child_path:
+                raise GovUkContentHold("SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE")
+            return original(url, *args, **kwargs)
+
+        monkeypatch.setattr(module, "parse_govuk_content_document", incomplete)
+        with pytest.raises(NativeEvidenceHold, match="SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE"):
+            native_evidence_sources(
+                units=first.units, sources=runtime.authority.sources, objects=runtime.authority.objects,
+                observations={item[1]: item for item in first.observations}, licence=_licence(), proof=runtime.proof,
+            )
+
+
+
 def test_native_manual_keeps_successful_sections_when_one_child_holds(tmp_path, monkeypatch):
     args = _args(tmp_path, monkeypatch)
     args["principal_id"] = OPERATOR_PRINCIPAL_ID

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from newsroom.control_plane.admission import _QUALIFICATION_CLASSIFIER_FIELDS
-from newsroom.control_plane.evidence import _entity_pattern, bounded_named_entities
+from newsroom.control_plane.evidence import _entity_pattern, bounded_named_entities, NAMED_ENTITY_POLICY_VERSION_V15
 
 VERSION = "newsroom.native-assessor-references.v1"
 MAX_RESULT_BYTES = 256 * 1024
@@ -82,6 +82,7 @@ class SourceView:
     body_digests: tuple[str, ...]
     source_entities: tuple[tuple[tuple[str, str], ...], ...]
     manifest_digest: str
+    entity_policy_version: str = NAMED_ENTITY_POLICY_VERSION_V15
 
     @property
     def request_segments(self) -> tuple[dict[str, object], ...]:
@@ -89,7 +90,7 @@ class SourceView:
 
     @property
     def manifest(self) -> dict[str, object]:
-        return _manifest(self.source_ids, self.body_digests, self.segments)
+        return _manifest(self.source_ids, self.body_digests, self.segments, policy_version=self.entity_policy_version)
 
     def resolve_range(self, reference: object) -> tuple[str, int, str]:
         if (type(reference) is not dict or set(reference) != {"first_span_id", "last_span_id"}
@@ -121,13 +122,14 @@ class SourceView:
 
 
 def _manifest(source_ids: tuple[str, ...], body_digests: tuple[str, ...],
-              segments: tuple[SourceSegment, ...]) -> dict[str, object]:
+              segments: tuple[SourceSegment, ...], *, policy_version: str = NAMED_ENTITY_POLICY_VERSION_V15) -> dict[str, object]:
     return {"version": VERSION, "source_ids": list(source_ids),
             "body_digests": list(body_digests),
-            "segments": [segment.manifest_record() for segment in segments]}
+            "segments": [segment.manifest_record() for segment in segments],
+            **({"entity_policy_version": policy_version} if policy_version != NAMED_ENTITY_POLICY_VERSION_V15 else {})}
 
 
-def build_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...]) -> SourceView:
+def build_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...], *, policy_version: str = NAMED_ENTITY_POLICY_VERSION_V15) -> SourceView:
     if (type(passages) is not tuple or type(source_ids) is not tuple
             or not 0 < len(passages) == len(source_ids) <= MAX_SOURCES
             or len(set(source_ids)) != len(source_ids)
@@ -150,7 +152,7 @@ def build_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...]) ->
             raw = text.encode("utf-8")
             separator = next((ending for ending in _LINE_SEPARATORS if text.endswith(ending)), "")
             content_end = offset + len(text[:-len(separator)].encode("utf-8")) if separator else offset + len(raw)
-            found = _claim_entities(text, body)
+            found = _claim_entities(text, body, policy_version=policy_version)
             for item in found:
                 if item not in seen_entities:
                     seen_entities.add(item)
@@ -165,9 +167,9 @@ def build_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...]) ->
         all_entities.append(tuple(body_entities))
     exact = tuple(segments)
     digests = tuple(body_digests)
-    manifest = _manifest(source_ids, digests, exact)
+    manifest = _manifest(source_ids, digests, exact, policy_version=policy_version)
     return SourceView(passages, source_ids, exact, digests, tuple(all_entities),
-                      digest_canonical(manifest))
+                      digest_canonical(manifest), policy_version)
 
 
 def make_provider_schema(existing_internal_schema: dict[str, object]) -> dict[str, object]:
@@ -224,11 +226,11 @@ def _exact_source_key(key: object, claim: str, support: str) -> str:
     raise SourceReferenceError("source lookup key is not verbatim")
 
 
-def _claim_entities(claim: str, body: str) -> tuple[tuple[str, str], ...]:
+def _claim_entities(claim: str, body: str, *, policy_version: str = NAMED_ENTITY_POLICY_VERSION_V15) -> tuple[tuple[str, str], ...]:
     found = []
     offset = 0
     for line in claim.splitlines(keepends=True):
-        names = bounded_named_entities(line, source_context=body)
+        names = bounded_named_entities(line, source_context=body, policy_version=policy_version)
         for name, kind in names:
             for match in re.finditer(_entity_pattern(name), line):
                 found.append((offset + match.start(), offset + match.end(), name, kind))
@@ -333,7 +335,7 @@ def materialise(raw_wire: bytes | str | dict[str, object], view: SourceView,
         if range_identity in seen_ranges:
             raise SourceReferenceError("duplicate claim range")
         seen_ranges.add(range_identity)
-        entities = _claim_entities(claim, view.passages[passage_index])
+        entities = _claim_entities(claim, view.passages[passage_index], policy_version=view.entity_policy_version)
         inserted_entity_orders.append([list(item) for item in entities])
         fragments = item["rendered_fragments"]
         if (type(fragments) is not list or len(fragments) != len(entities) + 1

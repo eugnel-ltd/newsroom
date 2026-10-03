@@ -25,7 +25,8 @@ GOVERNED_INPUT_SCHEMA_VERSION = "newsroom.governed-input.v10"
 EVIDENCE_APPROVAL_POLICY_VERSION = "newsroom.evidence-approval.v8"
 EVIDENCE_APPROVAL_PRINCIPAL = "HERMES_EVIDENCE_CONTROLLER"
 ORIGINALITY_POLICY_VERSION = "newsroom.cont-originality.v3"
-NAMED_ENTITY_POLICY_VERSION = "newsroom.named-entity.v15"
+NAMED_ENTITY_POLICY_VERSION_V15 = "newsroom.named-entity.v15"
+NAMED_ENTITY_POLICY_VERSION = "newsroom.named-entity.v16"
 FACTUAL_LOCALISATION_POLICY_VERSION = "newsroom.factual-localisation.v2"
 
 _SOURCE_RECORD_FIELDS = frozenset(
@@ -297,8 +298,13 @@ _LITERAL_CSV_NIL = frozenset({"nil return", "n/a", "none", "not applicable"})
 _ENGLISH_ORGANISATION_CANDIDATES = re.compile(
     rf"(?=({_ENGLISH_ORGANISATION.pattern}))"
 )
-_ENGLISH_OFFICIAL_TERM = re.compile(
+_ENGLISH_OFFICIAL_TERM_V15 = re.compile(
     r"\b(?:[A-Z][A-Za-z-]+(?:\s+(?:and|of|the|for|[A-Z][A-Za-z-]+)){1,7}"
+    r"\s+Act|(?:[A-Z][A-Za-z-]+\s+){1,5}"
+    r"(?:Authorisation|Credit|Scheme|Programme|Benefit|Visa|Permit|Status))\b"
+)
+_ENGLISH_OFFICIAL_TERM = re.compile(
+    r"\b(?:[A-Z][A-Za-z-]+(?:['’]s|['’])?(?:\s+(?:and|of|the|for|[A-Z][A-Za-z-]+(?:['’]s|['’])?)){1,7}"
     r"\s+Act|(?:[A-Z][A-Za-z-]+\s+){1,5}"
     r"(?:Authorisation|Credit|Scheme|Programme|Benefit|Visa|Permit|Status))\b"
 )
@@ -714,6 +720,7 @@ def _entity_pattern(entity: str) -> str:
 
 def rendered_named_entities(
     text: str, source_entities: frozenset[tuple[str, str]],
+    *, policy_version: str = NAMED_ENTITY_POLICY_VERSION,
 ) -> frozenset[tuple[str, str]]:
     """Preserve exact source names without requiring their English verb context.
 
@@ -726,15 +733,19 @@ def rendered_named_entities(
         text, count = re.subn(_entity_pattern(entity), " ", text)
         if count:
             retained.add((entity, kind))
-    return frozenset(retained) | bounded_named_entities(text)
+    return frozenset(retained) | bounded_named_entities(text, policy_version=policy_version)
 
 
 def bounded_named_entities(
     text: str,
     *,
     source_context: str | None = None,
+    policy_version: str = NAMED_ENTITY_POLICY_VERSION,
 ) -> frozenset[tuple[str, str]]:
     """Extract only closed, structurally recognisable entity spans."""
+
+    if policy_version not in {NAMED_ENTITY_POLICY_VERSION_V15, NAMED_ENTITY_POLICY_VERSION}:
+        raise ValueError("unsupported named-entity policy")
 
     candidates: list[tuple[int, int, str, str]] = []
     for entity, entity_type in _OWNER_APPROVED_ENTITY_REGISTRY.items():
@@ -756,7 +767,8 @@ def bounded_named_entities(
         candidates.append(
             (match.start(1), match.end(1), match.group(1), "ORGANISATION")
         )
-    for match in _ENGLISH_OFFICIAL_TERM.finditer(text):
+    official_terms = _ENGLISH_OFFICIAL_TERM_V15 if policy_version == NAMED_ENTITY_POLICY_VERSION_V15 else _ENGLISH_OFFICIAL_TERM
+    for match in official_terms.finditer(text):
         candidates.append((match.start(), match.end(), match.group(0), "OFFICIAL_TERM"))
     for match in _ENGLISH_OFFICIAL_REFERENCE.finditer(text):
         candidates.append((match.start(), match.end(), match.group(0), "OFFICIAL_TERM"))
@@ -841,6 +853,8 @@ def bounded_named_entities(
             (match.start(1), match.end(1), match.group(1), "ORGANISATION")
         )
     for match in re.finditer(r"[《〈][^《》〈〉\n]{1,80}[》〉]", text):
+        if policy_version != NAMED_ENTITY_POLICY_VERSION_V15 and not match.group(0)[1:-1].strip():
+            continue
         candidates.append((match.start(), match.end(), match.group(0), "PRODUCT"))
     selected: list[tuple[int, int, str, str]] = []
     for candidate in sorted(candidates, key=lambda item: (-(item[1] - item[0]), item)):
@@ -2351,6 +2365,9 @@ def validate_governed_evidence_records(
         ):
             rendered_text = claim.rendered_named_entities[index]
             record = records[record_id]
+            entity_policy = record.get("policy_version")
+            if entity_policy not in {NAMED_ENTITY_POLICY_VERSION_V15, NAMED_ENTITY_POLICY_VERSION}:
+                return None
             if record != {
                 "base_package_digest": base_package_digest,
                 "candidate_id": candidate_id,
@@ -2358,7 +2375,7 @@ def validate_governed_evidence_records(
                 "entity_type": entity_type,
                 "evidence_span_digest": digest_bytes(text.encode("utf-8")),
                 "governed_claim_id": claim.claim_id,
-                "policy_version": NAMED_ENTITY_POLICY_VERSION,
+                "policy_version": entity_policy,
                 "record_id": record_id,
                 "record_type": "NAMED_ENTITY_EVIDENCE",
                 "rendered_span_digest": digest_bytes(rendered_text.encode("utf-8")),
