@@ -1292,8 +1292,9 @@ def test_real_successor_commits_then_history_current_and_reopen_retain_both_vers
         reopened.close()
 
 
+@pytest.mark.parametrize("damage", ("upstream", "ancestor"))
 def test_retained_successor_read_uses_only_exact_historical_upstream(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str,
 ) -> None:
     from newsroom.authority import _event_hypothesis_lineage_system as lineage_system
     from newsroom.authority import (
@@ -1308,6 +1309,11 @@ def test_retained_successor_read_uses_only_exact_historical_upstream(
     first = first_handle._opened().admit(
         first_admission.canonical_bytes,
         collision_request=first_collision,
+        proof=location.seed[0][3],
+    )
+    other_admission, other_collision = _admission(location, _generic("record-2"))
+    other = first_handle._opened().admit(
+        other_admission.canonical_bytes, collision_request=other_collision,
         proof=location.seed[0][3],
     )
     first_handle.close()
@@ -1397,7 +1403,21 @@ def test_retained_successor_read_uses_only_exact_historical_upstream(
             .candidate_id
             == first.candidate_id
         )
-        assert port.require_retained_version_in_transaction(first.version_id) == first
+        from newsroom.authority.story_candidate_system import _CandidateStore
+        original_verify_row = _CandidateStore._verify_row
+        checked_versions = []
+
+        def counted_row(store, digest):
+            result = original_verify_row(store, digest)
+            checked_versions.append(result[2].version_id)
+            return result
+
+        with monkeypatch.context() as selected:
+            selected.setattr(_CandidateStore, "_verify_row", counted_row)
+            assert port.require_retained_version_in_transaction(first.version_id) == first
+        assert set(checked_versions) == {first.version_id, second.version_id}
+        assert len(checked_versions) == 2
+        assert other.version_id not in checked_versions
         assert port.require_retained_version_in_transaction(second.version_id) == second
         assert (
             port.require_current_head_in_transaction(
@@ -1407,21 +1427,29 @@ def test_retained_successor_read_uses_only_exact_historical_upstream(
         )
     finally:
         connection.execute("ROLLBACK")
-    trigger = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE name="
-        "'immutable_event_hypothesis_version_update'"
-    ).fetchone()[0]
-    connection.execute("DROP TRIGGER immutable_event_hypothesis_version_update")
-    connection.execute(
-        "UPDATE event_hypothesis_versions_v2 SET canonical_bytes=? "
-        "WHERE version_id=?",
-        (b"{}", first.governing_manifest.hypothesis_version_id),
-    )
-    connection.execute(trigger)
+    if damage == "ancestor":
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("DROP TRIGGER retained_candidate_receipt")
+        connection.execute("DELETE FROM story_candidate_admission_receipts_v2 WHERE version_id=?",
+                           (first.version_id,))
+        connection.execute("PRAGMA foreign_keys=ON")
+        requested = second.version_id
+    else:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name="
+            "'immutable_event_hypothesis_version_update'"
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER immutable_event_hypothesis_version_update")
+        connection.execute(
+            "UPDATE event_hypothesis_versions_v2 SET canonical_bytes=? WHERE version_id=?",
+            (b"{}", first.governing_manifest.hypothesis_version_id),
+        )
+        connection.execute(trigger)
+        requested = first.version_id
     connection.execute("BEGIN")
     try:
         with pytest.raises(ValueError, match="Candidate|Hypothesis|relationship"):
-            port.require_retained_version_in_transaction(first.version_id)
+            port.require_retained_version_in_transaction(requested)
     finally:
         connection.execute("ROLLBACK")
         connection.close()

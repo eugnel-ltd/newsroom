@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
+from time import perf_counter_ns, process_time_ns
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
 
@@ -20,6 +22,7 @@ _SNAPSHOT_NODE = "NewsroomSnapshotNode"
 _SNAPSHOT_RELATIONSHIP = "NewsroomSnapshotRelationship"
 _MARKER = "NewsroomIngestMarker"
 _MARKER_CLAIM_LEASE = "PT15M"
+_LOGGER = logging.getLogger("newsroom.diagnostic")
 # ponytail: fixed conservative write bounds; tune only against retained service evidence.
 _PAGE_TARGET_LIMIT = 64
 _PAGE_PROPERTY_BYTES = 8 * 1024 * 1024
@@ -34,7 +37,48 @@ _SCHEMA_QUERIES = (
     CREATE CONSTRAINT newsroom_ingest_marker_episode IF NOT EXISTS
     FOR (m:{_MARKER}) REQUIRE m.episode_uuid IS UNIQUE
     """,
+    f"""
+    CREATE INDEX newsroom_snapshot_node_identity IF NOT EXISTS
+    FOR (s:{_SNAPSHOT_NODE}) ON (s._newsroom_snapshot_id)
+    """,
+    f"""
+    CREATE INDEX newsroom_snapshot_relationship_identity IF NOT EXISTS
+    FOR (s:{_SNAPSHOT_RELATIONSHIP}) ON (s._newsroom_snapshot_id)
+    """,
 )
+
+
+@contextmanager
+def _guard_phase(phase: str, *, episode_id: str, attempt_number: int):
+    """Optional inclusive timing only; never mutation or recovery authority."""
+    started = None
+    try:
+        started = (perf_counter_ns(), process_time_ns())
+    except Exception:
+        pass
+    status, failure = "FAILED", "NONE"
+    try:
+        yield
+        status = "COMPLETE"
+    except BaseException as exc:
+        failure = type(exc).__name__
+        raise
+    finally:
+        if started is not None:
+            try:
+                data = {
+                    "phase": phase, "episode_id": episode_id[:128],
+                    "attempt_number": attempt_number, "status": status,
+                    "failure_class": failure,
+                    "elapsed_ms": (perf_counter_ns() - started[0]) // 1_000_000,
+                    "cpu_ms": (process_time_ns() - started[1]) // 1_000_000,
+                    "cpu_scope": "PROCESS", "nested_spans_not_additive": True,
+                }
+                _LOGGER.info("graphiti_guard_phase", extra={
+                    "diagnostic_event": "graphiti_guard_phase", "diagnostic_data": data,
+                })
+            except Exception:
+                pass
 
 
 class GuardError(RuntimeError):
@@ -534,66 +578,67 @@ class Neo4jMutationGuard:
         )
 
     async def begin(self) -> GuardMarker:
-        self._snapshot_id = f"{self._episode_uuid}:{self._attempt_number}"
-        # Completed readers remain usable even while another episode owns the group.
-        terminal = await self._marker()
-        if terminal is not None and str(terminal.get("state")) in {
-            "COMPLETE", "RECOVERED_AMBIGUOUS",
-        }:
-            marker = self._bind_marker(terminal)
-            if marker.state is GuardState.COMPLETE or self._attempt_number <= marker.attempt_number:
-                await self._delete_snapshot()
-                return marker
-            taken_over = await self._take_over(terminal, state="RECOVERING", require_expired=False)
-            if taken_over is None:
-                raise GuardError("Graphiti generation cannot claim a new attempt")
-            async with self._generation_fence(("RECOVERING",)):
-                await self._delete_snapshot()
-                await self._discard_taken_over_marker()
-            return await self.begin()
-
-        retained, claimed, active = await self._claim_marker()
-        if not claimed:
-            if active:
-                raise GuardError("Graphiti guard marker is owned by an active attempt")
-            retained_state = str(retained.get("state"))
-            if retained_state in {"SNAPSHOTTING", "RECOVERING"}:
-                if (str(retained.get("group_id") or "") != self._group_id
-                    or str(retained.get("input_digest") or "") != self._input_digest):
-                    raise GuardError("Graphiti guard marker identity differs from this input")
-                try:
-                    retained_attempt = int(retained["attempt_number"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise GuardError("Graphiti guard marker is malformed") from exc
-                if self._marker_episode_uuid != self._episode_uuid and retained_attempt != self._attempt_number:
-                    raise GuardError("Graphiti attempt marker identity differs")
-                self._adopt_retained_snapshot(retained, attempt_number=retained_attempt)
-                taken_over = await self._take_over(retained, state="RECOVERING")
+        with _guard_phase("BEGIN", episode_id=self._episode_uuid, attempt_number=self._attempt_number):
+            self._snapshot_id = f"{self._episode_uuid}:{self._attempt_number}"
+            # Completed readers remain usable even while another episode owns the group.
+            terminal = await self._marker()
+            if terminal is not None and str(terminal.get("state")) in {
+                "COMPLETE", "RECOVERED_AMBIGUOUS",
+            }:
+                marker = self._bind_marker(terminal)
+                if marker.state is GuardState.COMPLETE or self._attempt_number <= marker.attempt_number:
+                    await self._delete_snapshot()
+                    return marker
+                taken_over = await self._take_over(terminal, state="RECOVERING", require_expired=False)
                 if taken_over is None:
-                    raise GuardError("Graphiti generation takeover lost its claim")
+                    raise GuardError("Graphiti generation cannot claim a new attempt")
                 async with self._generation_fence(("RECOVERING",)):
                     await self._delete_snapshot()
                     await self._discard_taken_over_marker()
                 return await self.begin()
-            marker = self._bind_marker(retained)
-            if marker.state not in {GuardState.PENDING, GuardState.ROLLING_BACK}:
-                raise GuardError("Graphiti generation marker is not recoverable")
-            taken_over = await self._take_over(retained, state=retained_state)
-            if taken_over is None:
-                raise GuardError("Graphiti generation takeover lost its claim")
-            return self._bind_marker(taken_over)
 
-        async with self._generation_fence(("SNAPSHOTTING",)):
-            await self._snapshot()
-            pending = await self._owned_query(
-                self._owned_match(("SNAPSHOTTING",)) + """
+            retained, claimed, active = await self._claim_marker()
+            if not claimed:
+                if active:
+                    raise GuardError("Graphiti guard marker is owned by an active attempt")
+                retained_state = str(retained.get("state"))
+                if retained_state in {"SNAPSHOTTING", "RECOVERING"}:
+                    if (str(retained.get("group_id") or "") != self._group_id
+                        or str(retained.get("input_digest") or "") != self._input_digest):
+                        raise GuardError("Graphiti guard marker identity differs from this input")
+                    try:
+                        retained_attempt = int(retained["attempt_number"])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise GuardError("Graphiti guard marker is malformed") from exc
+                    if self._marker_episode_uuid != self._episode_uuid and retained_attempt != self._attempt_number:
+                        raise GuardError("Graphiti attempt marker identity differs")
+                    self._adopt_retained_snapshot(retained, attempt_number=retained_attempt)
+                    taken_over = await self._take_over(retained, state="RECOVERING")
+                    if taken_over is None:
+                        raise GuardError("Graphiti generation takeover lost its claim")
+                    async with self._generation_fence(("RECOVERING",)):
+                        await self._delete_snapshot()
+                        await self._discard_taken_over_marker()
+                    return await self.begin()
+                marker = self._bind_marker(retained)
+                if marker.state not in {GuardState.PENDING, GuardState.ROLLING_BACK}:
+                    raise GuardError("Graphiti generation marker is not recoverable")
+                taken_over = await self._take_over(retained, state=retained_state)
+                if taken_over is None:
+                    raise GuardError("Graphiti generation takeover lost its claim")
+                return self._bind_marker(taken_over)
+
+            async with self._generation_fence(("SNAPSHOTTING",)):
+                await self._snapshot()
+                pending = await self._owned_query(
+                    self._owned_match(("SNAPSHOTTING",)) + """
                 SET m.state = 'PENDING' RETURN m.state AS state
                 """,
-            )
-            if not pending or _record_value(pending[0], "state") != "PENDING":
-                raise GuardError("Graphiti guard marker lost its claim before dispatch")
-        return GuardMarker(state=GuardState.CREATED, attempt_number=self._attempt_number,
-                           input_digest=self._input_digest)
+                )
+                if not pending or _record_value(pending[0], "state") != "PENDING":
+                    raise GuardError("Graphiti guard marker lost its claim before dispatch")
+            return GuardMarker(state=GuardState.CREATED, attempt_number=self._attempt_number,
+                               input_digest=self._input_digest)
 
     async def _snapshot(self) -> None:
         unsafe = await self._query(
@@ -1200,22 +1245,24 @@ class Neo4jMutationGuard:
         return raw
 
     async def _delete_snapshot(self) -> None:
-        while True:
-            records = await self._query(
-                f"""
-                MATCH (s)
-                WHERE (s:{_SNAPSHOT_NODE} OR s:{_SNAPSHOT_RELATIONSHIP})
-                  AND s._newsroom_snapshot_id = $snapshot_id
-                WITH s LIMIT $limit
-                DELETE s RETURN count(*) AS deleted
-                """,
-                snapshot_id=self._snapshot_id, limit=_PAGE_TARGET_LIMIT,
-            )
-            count = None if not records else _record_value(records[0], "deleted")
-            if type(count) is not int or not 0 <= count <= _PAGE_TARGET_LIMIT:
-                raise GuardError("Graphiti bounded snapshot deletion count is invalid")
-            if count < _PAGE_TARGET_LIMIT:
-                return
+        with _guard_phase("SNAPSHOT_CLEANUP", episode_id=self._episode_uuid, attempt_number=self._attempt_number):
+            # Each exact snapshot label has its own property index. A malformed
+            # dual-labelled snapshot is deleted once, by the first matching label.
+            for label in (_SNAPSHOT_NODE, _SNAPSHOT_RELATIONSHIP):
+                while True:
+                    records = await self._query(
+                        f"""
+                        MATCH (s:{label} {{_newsroom_snapshot_id: $snapshot_id}})
+                        WITH s LIMIT $limit
+                        DELETE s RETURN count(*) AS deleted
+                        """,
+                        snapshot_id=self._snapshot_id, limit=_PAGE_TARGET_LIMIT,
+                    )
+                    count = None if not records else _record_value(records[0], "deleted")
+                    if type(count) is not int or not 0 <= count <= _PAGE_TARGET_LIMIT:
+                        raise GuardError("Graphiti bounded snapshot deletion count is invalid")
+                    if count < _PAGE_TARGET_LIMIT:
+                        break
 
 
 __all__ = [

@@ -34,3 +34,14 @@ def test_private_policy_bindings_are_derived_and_have_no_source_or_public_grant(
     contract = policies.payload_schemas.contracts()[0]
     with pytest.raises(PayloadSchemaValidationError):
         contract.canonicalize({"status": "PASS"})
+
+
+def test_native_factory_keeps_exact_v15_reader_pair_not_an_unknown_policy(tmp_path):
+    policies = native_policy_components(principal_id='newsroom.control-plane',
+        authority_domain='newsroom.authority', target_path=tmp_path / 'serving.sqlite3',
+        target_id='hermes-private-serving')
+    old_editorial, old_authorisation = policies.publication.retained_policy_pairs[0]
+    assert old_editorial == 'sha256:e576722159e5a126d60a95e230d667c9da3c83405818c7a3d4584eaba9bef6d5'
+    assert old_authorisation == 'sha256:4d7b98fab375ea20763a907e49a4bbe037f56b5020697e2391ffd3661bdcdd79'
+    assert old_editorial != policies.publication.editorial_policy_bundle_digest
+    assert old_authorisation != policies.publication.publication_authorisation_policy_digest

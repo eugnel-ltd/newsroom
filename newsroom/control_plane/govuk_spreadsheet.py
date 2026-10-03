@@ -26,7 +26,7 @@ from .govuk_evidence import (
     _unique_object, _html_text, parse_govuk_content_document,
 )
 
-VERSION = "hermes-govuk-spreadsheet-text-v2"
+VERSION = "hermes-govuk-spreadsheet-text-v3"
 MAX_EXPANDED_BYTES = 8 * 1_048_576
 MAX_XML_BYTES = 4 * 1_048_576
 MAX_XML_NODES = 200_000
@@ -51,7 +51,8 @@ POLICY_DIGEST = digest_canonical({
     "numeric_formats": "retained-not-executed", "graphics": "excluded-from-text",
     "external_links": "never-followed", "macros": "rejected",
     "formats": MIME_TYPES,
-    "csv": "utf8-optional-bom-comma-doublequote-strict-literal-cells",
+    "csv": "strict-utf8-optional-bom-then-non-bom-strict-windows1252-comma-doublequote-literal-cells",
+    "csv_controls": "reject-c0-c1-del-except-tab-cr-lf",
     "csv_whitespace_empty_multiline": "preserved-no-header-or-type-inference",
     "csv_rights_view": "decoded-cells-with-whitespace-normalised-before-quoting",
 })
@@ -480,9 +481,15 @@ def _xlsx(archive, output):
 def _csv(raw, output):
     # No dialect/header/type guessing, trimming, formula evaluation or global
     # csv.field_size_limit mutation. The existing body/output bounds also apply.
-    text = raw.decode("utf-8-sig")
-    if "\x00" in text:
-        raise ValueError("spreadsheet CSV contains NUL")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        # A BOM declares its encoding; never reinterpret it as Windows-1252.
+        if raw.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")):
+            raise
+        text = raw.decode("cp1252")
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", text):
+        raise ValueError("spreadsheet CSV contains unsupported control characters")
     output.line("Published CSV cells: Row and column identify each literal text cell. Whitespace, empty fields, quoted newlines and formula-like text are preserved; nothing is executed. No header or numeric types are inferred.")
     output.line('Sheet "CSV"')
     try:

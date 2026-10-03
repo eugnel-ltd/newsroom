@@ -562,7 +562,7 @@ class NativeEditorial:
         decision_command_definition_digest: str,
         story_command_definition_digest: str,
         story_admission_definition_digest: str,
-        story_writer=None, clock=UtcTimestamp.now,
+        story_writer=None, clock=UtcTimestamp.now, retained_policy_bundles=(),
     ) -> None:
         if not all(
             type(value) is expected
@@ -597,6 +597,10 @@ class NativeEditorial:
         self._controller_principal = controller_principal_id
         self._story_principal = story_principal_id
         self._policy_bundle_digest = policy_bundle_digest
+        if type(retained_policy_bundles) is not tuple:
+            raise EditorialError("retained editorial policies differ")
+        _digests(*retained_policy_bundles)
+        self._retained_policy_bundles = retained_policy_bundles
         self._decision_policy = decision_hydration_policy_digest
         self._story_policy = story_hydration_policy_digest
         self._decision_definition = decision_command_definition_digest
@@ -668,6 +672,8 @@ class NativeEditorial:
                 retained_admission=original.write_admission,
             )
         else:
+            if decision.policy_bundle_digest != self._policy_bundle_digest:
+                raise EditorialHold(reason="CURRENT_EDITORIAL_POLICY_REQUIRED")
             story = self._build_story(
                 request, retained, decision, decision_reference
             )
@@ -973,13 +979,27 @@ class NativeEditorial:
             != retained.governing_manifest_digest
             or decision.package_admission_id != retained.package_admission_id
             or decision.package_digest != retained.package.digest
-            or decision.policy_bundle_digest != self._policy_bundle_digest
+            or decision.policy_bundle_digest not in (
+                self._policy_bundle_digest, *self._retained_policy_bundles
+            )
             or tuple(item.source_id for item in decision.currentness)
             != retained.package.source_ids
             or actual_integrity != expected_integrity
         ):
             raise EditorialError("editorial decision binding differs")
         return decision
+
+    def current_copy_decision(self, decision: EditorialPolicyDecision) -> EditorialPolicyDecision:
+        """Rebind only an explicitly compatible immutable article decision."""
+        if type(decision) is not EditorialPolicyDecision or decision.policy_bundle_digest not in (
+            self._policy_bundle_digest, *self._retained_policy_bundles
+        ):
+            raise EditorialError("unknown retained editorial policy")
+        if decision.policy_bundle_digest == self._policy_bundle_digest:
+            return decision
+        values = {name: getattr(decision, name) for name in decision.__dataclass_fields__
+                  if name != "decision_id"}
+        return EditorialPolicyDecision.create(**{**values, "policy_bundle_digest": self._policy_bundle_digest})
 
     def _verify_story_event(
         self, receipt: StoryVersionReceipt, *, proof: AuthenticationProof

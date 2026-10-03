@@ -1087,3 +1087,62 @@ def test_actual_service_active_suffix_reopen_and_replay(tmp_path, monkeypatch):
         ) == 0
     finally:
         _cleanup(config, first_id, fallback_id)
+
+
+def test_actual_guard_snapshot_cleanup_seeks_indexes_and_protects_other_snapshot() -> None:
+    """Disposable gated service only; EXPLAIN never executes the DELETE itself."""
+    from newsroom.graphiti_adapter.neo4j_guard import Neo4jMutationGuard
+
+    async def exercise() -> None:
+        config = _service_config()
+        suffix = str(uuid.uuid4())
+        snapshot, protected = f'cleanup-{suffix}:1', f'protected-{suffix}:1'
+        driver = _DatabaseBoundAsyncDriver(
+            AsyncGraphDatabase.driver(config.uri, auth=(config.username, config.password)),
+            database=config.database,
+        )
+        cleanup_plans = []
+
+        class PlannedGuard(Neo4jMutationGuard):
+            async def _query(self, cypher, **parameters):
+                if 'DELETE s RETURN count(*) AS deleted' in cypher:
+                    _, summary, _ = await driver.execute_query(
+                        'EXPLAIN ' + cypher, params=parameters, routing_='w',
+                    )
+                    def operators(plan):
+                        return [plan['operatorType'], *(operator for child in plan.get('children', [])
+                                                        for operator in operators(child))]
+                    actual = operators(summary.plan)
+                    assert any(operator.startswith('NodeIndexSeek') for operator in actual), actual
+                    assert not any(operator.startswith('AllNodesScan') for operator in actual), actual
+                    cleanup_plans.append(actual)
+                return await super()._query(cypher, **parameters)
+
+        async def query(cypher, **parameters):
+            return await driver.execute_query(cypher, params=parameters, routing_='w')
+
+        try:
+            await Neo4jMutationGuard.bootstrap_schema(driver)
+            await query('CALL db.awaitIndexes(10)')
+            for label in ('NewsroomSnapshotNode', 'NewsroomSnapshotRelationship'):
+                await query(f'UNWIND range(1,130) AS i CREATE (:{label} '
+                            '{_newsroom_snapshot_id:$snapshot,fixture:$fixture})',
+                            snapshot=snapshot, fixture=suffix)
+                await query(f'CREATE (:{label} '
+                            '{_newsroom_snapshot_id:$snapshot,fixture:$fixture})',
+                            snapshot=protected, fixture=suffix)
+            await query('CREATE (:NewsroomSnapshotNode:NewsroomSnapshotRelationship '
+                        '{_newsroom_snapshot_id:$snapshot,fixture:$fixture})',
+                        snapshot=snapshot, fixture=suffix)
+            guard = PlannedGuard(driver, group_id=f'cleanup-{suffix}', episode_uuid=f'cleanup-{suffix}',
+                                 attempt_number=1, input_digest='sha256:' + '0' * 64)
+            await guard._delete_snapshot()
+            rows, _, _ = await query('MATCH (n {fixture:$fixture}) '
+                                    'RETURN n._newsroom_snapshot_id AS snapshot', fixture=suffix)
+            assert [row['snapshot'] for row in rows] == [protected, protected]
+            assert len(cleanup_plans) == 6
+        finally:
+            await query('MATCH (n {fixture:$fixture}) DELETE n', fixture=suffix)
+            await driver.close()
+
+    asyncio.run(exercise())

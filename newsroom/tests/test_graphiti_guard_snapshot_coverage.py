@@ -908,3 +908,185 @@ def test_retained_uuid_stream_is_fetch_one_bounded_and_preserves_native_values(d
         assert all(actual is expected for actual, expected in zip(retained, values, strict=True))
         assert len(retained) == len(values)
         assert type(retained[2]) is bool and type(retained[3]) is int
+
+
+class _SnapshotCleanupDriver(_JournalDriver):
+    def __init__(self):
+        super().__init__()
+        self.snapshots = {}
+        self.deleted = []
+        self.cleanup_queries = []
+        self.cancel_cleanup_at = None
+
+    def apply(self, query, params):
+        if 'DELETE s RETURN count(*) AS deleted' not in query:
+            return super().apply(query, params)
+        assert 'MATCH (s)\n' not in query and ' OR ' not in query
+        label, = [label for label in ('NewsroomSnapshotNode', 'NewsroomSnapshotRelationship')
+                  if f'MATCH (s:{label} {{_newsroom_snapshot_id: $snapshot_id}})' in query]
+        assert params == {'snapshot_id': 'episode-a:1', 'limit': 64}
+        self.cleanup_queries.append((label, params.copy()))
+        if len(self.cleanup_queries) == self.cancel_cleanup_at:
+            raise asyncio.CancelledError()
+        selected = [key for key, (labels, snapshot) in self.snapshots.items()
+                    if label in labels and snapshot == params['snapshot_id']][:params['limit']]
+        for key in selected:
+            del self.snapshots[key]
+        self.deleted.extend(selected)
+        self.events.append('snapshot-deleted')
+        return [{'deleted': len(selected)}]
+
+
+class _ActualCleanupJournalGuard(_JournalGuard):
+    _delete_snapshot = Neo4jMutationGuard._delete_snapshot
+
+
+def _cleanup_fixture():
+    driver = _SnapshotCleanupDriver()
+    for label, count in [('NewsroomSnapshotNode', 129), ('NewsroomSnapshotRelationship', 65)]:
+        for index in range(count):
+            driver.snapshots[f'{label}-{index}'] = ({label}, 'episode-a:1')
+    driver.snapshots['dual-labelled'] = ({'NewsroomSnapshotNode', 'NewsroomSnapshotRelationship'}, 'episode-a:1')
+    driver.snapshots['other-generation'] = ({'NewsroomSnapshotNode'}, 'episode-b:1')
+    driver.snapshots['ordinary-node'] = ({'Entity'}, 'episode-a:1')
+    guard = _ActualCleanupJournalGuard(driver, group_id='group-id', episode_uuid='episode-a',
+                                      attempt_number=1, input_digest='sha256:' + '0' * 64)
+    return driver, guard
+
+
+def test_snapshot_cleanup_uses_exact_labelled_bounded_pages_and_protects_other_snapshots():
+    driver, guard = _cleanup_fixture()
+    asyncio.run(guard._delete_snapshot())
+    assert len(driver.deleted) == len(set(driver.deleted)) == 195
+    assert driver.snapshots == {'other-generation': ({'NewsroomSnapshotNode'}, 'episode-b:1'),
+                                'ordinary-node': ({'Entity'}, 'episode-a:1')}
+    assert [label for label, _ in driver.cleanup_queries] == ['NewsroomSnapshotNode'] * 3 + ['NewsroomSnapshotRelationship'] * 2
+    asyncio.run(guard._delete_snapshot())
+    assert len(driver.deleted) == 195, 'repeat cleanup must be idempotent'
+
+
+@pytest.mark.parametrize('count', [None, True, -1, 65, 1.0, '1'])
+def test_snapshot_cleanup_rejects_invalid_per_query_count(count):
+    driver, guard = _cleanup_fixture()
+    async def invalid(_query, **params):
+        assert params['limit'] == 64
+        return [{'deleted': count}]
+    guard._query = invalid
+    with pytest.raises(GuardError, match='snapshot deletion count is invalid'):
+        asyncio.run(guard._delete_snapshot())
+    assert len(driver.snapshots) == 197
+
+
+@pytest.mark.parametrize('terminal', ['COMPLETE', 'RECOVERED_AMBIGUOUS'])
+def test_snapshot_cleanup_preserves_terminal_replay_and_exact_owned_recovery(terminal):
+    async def exercise():
+        driver, guard = _cleanup_fixture()
+        await guard.begin()
+        if terminal == 'COMPLETE':
+            await guard.complete({'provider_attempt_number': 1})
+        else:
+            driver.markers['episode-a']['active'] = False
+            marker = await guard.recover_owned_pending()
+            assert marker.state.value == terminal
+        assert driver.markers['episode-a']['state'] == terminal
+        assert not driver.owner
+        assert len(driver.deleted) == 195
+        replay = _ActualCleanupJournalGuard(driver, group_id='group-id', episode_uuid='episode-a',
+                                            attempt_number=1, input_digest='sha256:' + '0' * 64)
+        assert (await replay.begin()).state.value == terminal
+        assert len(driver.deleted) == 195
+    asyncio.run(exercise())
+
+
+def test_snapshot_cleanup_cancellation_keeps_completed_marker_and_replay_finishes_remainder():
+    async def exercise():
+        driver, guard = _cleanup_fixture()
+        await guard.begin()
+        driver.cancel_cleanup_at = 2
+        with pytest.raises(asyncio.CancelledError):
+            await guard.complete({'provider_attempt_number': 1})
+        assert driver.markers['episode-a']['state'] == 'COMPLETE' and not driver.owner
+        assert len(driver.deleted) == 64
+        driver.cancel_cleanup_at = None
+        assert (await guard.begin()).state.value == 'COMPLETE'
+        assert len(driver.deleted) == len(set(driver.deleted)) == 195
+        assert set(driver.snapshots) == {'other-generation', 'ordinary-node'}
+    asyncio.run(exercise())
+
+
+def test_snapshot_cleanup_bootstrap_has_two_idempotent_labelled_snapshot_indexes():
+    async def exercise():
+        queries = []
+        async def query(cypher, **_values):
+            queries.append(cypher)
+            return [], None, None
+        await Neo4jMutationGuard.bootstrap_schema(SimpleNamespace(execute_query=query))
+        indexes = [query for query in queries if 'CREATE INDEX' in query]
+        assert len(indexes) == 2
+        for label in ('NewsroomSnapshotNode', 'NewsroomSnapshotRelationship'):
+            query, = [query for query in indexes if f'FOR (s:{label})' in query]
+            assert 'IF NOT EXISTS' in query and 'ON (s._newsroom_snapshot_id)' in query
+    asyncio.run(exercise())
+
+
+def test_passive_guard_begin_and_cleanup_timers_do_not_change_marker_or_delete_outcomes(monkeypatch):
+    import newsroom.graphiti_adapter.neo4j_guard as module
+    events = []
+    monkeypatch.setattr(module._LOGGER, 'info', lambda event, *, extra: events.append((event, extra['diagnostic_data'])))
+    async def exercise():
+        driver, guard = _cleanup_fixture()
+        assert (await guard.begin()).state.value == 'CREATED'
+        await guard.complete({'provider_attempt_number': 1})
+        assert driver.markers['episode-a']['state'] == 'COMPLETE' and len(driver.deleted) == 195
+    asyncio.run(exercise())
+    assert [data['phase'] for _, data in events] == ['BEGIN', 'SNAPSHOT_CLEANUP']
+    assert all(event == 'graphiti_guard_phase' and data['episode_id'] == 'episode-a'
+               and data['attempt_number'] == 1 and data['status'] == 'COMPLETE'
+               and type(data['elapsed_ms']) is int and type(data['cpu_ms']) is int
+               and data['cpu_scope'] == 'PROCESS' and data['nested_spans_not_additive']
+               for event, data in events)
+
+
+@pytest.mark.parametrize('diagnostic_defect', ['drop', 'clock'])
+def test_passive_guard_cleanup_timer_failure_preserves_original_cancellation(monkeypatch, diagnostic_defect):
+    import newsroom.graphiti_adapter.neo4j_guard as module
+    def fail(*_args, **_values):
+        raise OSError('optional diagnostic failure')
+    monkeypatch.setattr(module._LOGGER, 'info', fail)
+    if diagnostic_defect == 'clock':
+        monkeypatch.setattr(module, 'perf_counter_ns', fail, raising=False)
+    driver, guard = _cleanup_fixture()
+    driver.cancel_cleanup_at = 1
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(guard._delete_snapshot())
+    assert not driver.deleted
+
+
+@pytest.mark.parametrize('failure', [None, RuntimeError('original begin failure'), asyncio.CancelledError()])
+def test_passive_guard_begin_timer_records_exact_clock_and_preserves_exception(monkeypatch, failure):
+    import newsroom.graphiti_adapter.neo4j_guard as module
+    events = []
+    wall, cpu = iter([10_000_000, 17_000_000]), iter([20_000_000, 23_000_000])
+    monkeypatch.setattr(module, 'perf_counter_ns', lambda: next(wall))
+    monkeypatch.setattr(module, 'process_time_ns', lambda: next(cpu))
+    monkeypatch.setattr(module._LOGGER, 'info', lambda event, *, extra: events.append(extra['diagnostic_data']))
+    class SelectedGuard(_JournalGuard):
+        async def _snapshot(self):
+            if failure is not None:
+                raise failure
+    driver = _JournalDriver()
+    guard = SelectedGuard(driver, group_id='group-id', episode_uuid='episode-a',
+                          attempt_number=1, input_digest='sha256:' + '0' * 64)
+    if failure is None:
+        assert asyncio.run(guard.begin()).state.value == 'CREATED'
+    else:
+        with pytest.raises(type(failure)) as error:
+            asyncio.run(guard.begin())
+        assert error.value is failure
+    assert events == [{
+        'phase': 'BEGIN', 'episode_id': 'episode-a', 'attempt_number': 1,
+        'status': 'COMPLETE' if failure is None else 'FAILED',
+        'failure_class': 'NONE' if failure is None else type(failure).__name__,
+        'elapsed_ms': 7, 'cpu_ms': 3, 'cpu_scope': 'PROCESS',
+        'nested_spans_not_additive': True,
+    }]

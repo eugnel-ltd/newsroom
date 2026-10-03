@@ -47,9 +47,9 @@ from newsroom.increment10.editorial import (
     DECISION_COMMAND,
     DECISION_USE,
     DecisionReference,
+    EditorialError,
     EditorialHold,
     EditorialPolicyDecision,
-    EditorialHold,
     NativeEditorial,
     STORY_COMMAND,
     STORY_EVENT,
@@ -140,8 +140,16 @@ class NativePublicationBindings:
     serving_attempt_command_definition_digest: str
     serving_evidence_command_definition_digest: str
     source_licence_policy: tuple[tuple[str, str, str], ...] = ()
+    retained_policy_pairs: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
+        if type(self.retained_policy_pairs) is not tuple or any(
+            type(pair) is not tuple or len(pair) != 2 for pair in self.retained_policy_pairs
+        ):
+            raise NativePublicationError("retained publication policy pairs differ")
+        for pair in self.retained_policy_pairs:
+            for digest in pair:
+                validate_sha256_digest(digest)
         if not isinstance(self.target_path, Path):
             raise NativePublicationError("native publication target path is required")
         for name in (
@@ -240,6 +248,7 @@ class NativePublicationController:
                 bindings.editorial_story_admission_definition_digest
             ),
             story_writer=story_writer, clock=clock,
+            retained_policy_bundles=tuple(pair[0] for pair in bindings.retained_policy_pairs),
         )
         self.writer_contract_version = ("newsroom.native-story-writer.v1" if story_writer is not None
                                         else "newsroom.offline-exact-copy.v3")
@@ -272,6 +281,7 @@ class NativePublicationController:
             ),
             command_definition_digest=bindings.publication_command_definition_digest,
             source_licence_policy=bindings.source_licence_policy,
+            retained_policy_pairs=bindings.retained_policy_pairs,
         )
         self._delivery = open_private_serving_delivery(
             bindings.target_path,
@@ -343,6 +353,15 @@ class NativePublicationController:
                 "delivery_attempt_event_id": correction_of.attempt_receipt.event_id,
                 "delivery_evidence_event_id": correction_of.evidence_receipt.event_id,
             }, proof=proof)
+            prior_decision = self._editorial._read_policy_decision(
+                DecisionReference(old_story.policy_decision_event_id, old_story.policy_decision_admission_id),
+                retained=retained, proof=proof,
+            )
+            try:
+                current_decision = self._editorial.current_copy_decision(editorial_decision)
+                expected_decision = self._editorial.current_copy_decision(prior_decision)
+            except EditorialError as exc:
+                raise NativePublicationError("copy correction predecessor binding differs") from exc
             if (
                 old != correction_of
                 or old_story.copy.writer_id not in (
@@ -350,13 +369,15 @@ class NativePublicationController:
                     if self.writer_contract_version == "newsroom.native-story-writer.v1"
                     else {"newsroom.offline-exact-copy.v2"})
                 or old_story.package_admission_id != package_admission_id
-                or old_story.policy_decision_id != editorial_decision.decision_id
+                or old_story.policy_decision_id != prior_decision.decision_id
+                or current_decision.canonical_bytes() != expected_decision.canonical_bytes()
                 or old_story.candidate_version_id != retained.candidate_version_id
                 or old.story_receipt.aggregate_version != expected_story_version
                 or old.attempt_receipt.aggregate_version != expected_publication_version
                 or expected_delivery_evidence_version != 0
             ):
                 raise NativePublicationError("copy correction predecessor binding differs")
+            editorial_decision = current_decision
         identity = retained.package.candidate_id
         story_id = _aggregate("story", identity)
         publication_id = _aggregate("publication", identity)

@@ -37,7 +37,7 @@ from newsroom.tests.test_native_source_intake import (
 )
 
 
-def _retained_spreadsheet(tmp_path, monkeypatch, suffix="xlsx", *, nested=False, duplicate=False):
+def _retained_spreadsheet(tmp_path, monkeypatch, suffix="xlsx", *, nested=False, duplicate=False, csv_bytes=None):
     args = _args(tmp_path, monkeypatch)
     args.update(
         principal_id=OPERATOR_PRINCIPAL_ID,
@@ -49,7 +49,9 @@ def _retained_spreadsheet(tmp_path, monkeypatch, suffix="xlsx", *, nested=False,
         "https://assets.publishing.service.gov.uk/media/asset/"
         f"funding-values.{suffix}"
     )
-    asset = _xlsx_asset() if suffix == "xlsx" else b"Provider,Funding\nExample College,125000\n"
+    asset = _xlsx_asset() if suffix == "xlsx" else (
+        csv_bytes if csv_bytes is not None else b"Provider,Funding\nExample College,125000\n"
+    )
     parent = _spreadsheet_parent(parent_path, asset_url, asset)
     bodies = {
         SOURCE_URLS["UK-01"]: _atom_for(parent_path),
@@ -112,12 +114,16 @@ def _retained_spreadsheet(tmp_path, monkeypatch, suffix="xlsx", *, nested=False,
 
 
 @pytest.mark.parametrize("nested,duplicate", ((False, False), (True, False), (True, True)))
-@pytest.mark.parametrize("suffix", ("xlsx", "csv"))
+@pytest.mark.parametrize(("suffix", "csv_bytes"), (
+    ("xlsx", None), ("csv", None),
+    ("csv", b'Provider,Funding\r\nExample College,125000\r\nPublisher note,\x93exact\x94\r\n'),
+))
 def test_spreadsheet_acquisition_refetches_parent_and_asset_with_exact_binding(
-    tmp_path, monkeypatch, suffix, nested, duplicate,
+    tmp_path, monkeypatch, suffix, csv_bytes, nested, duplicate,
 ) -> None:
     context, runtime, disposition, source, request, bodies, parent_url, asset_url = (
-        _retained_spreadsheet(tmp_path, monkeypatch, suffix, nested=nested, duplicate=duplicate)
+        _retained_spreadsheet(tmp_path, monkeypatch, suffix, nested=nested,
+                              duplicate=duplicate, csv_bytes=csv_bytes)
     )
     fetched = []
     fences = []
@@ -153,6 +159,9 @@ def test_spreadsheet_acquisition_refetches_parent_and_asset_with_exact_binding(
         assert result.canonical_url == source.unit.canonical_url
         assert result.canonical_url.startswith("https://www.gov.uk/")
         assert result.text_only is True
+        if csv_bytes is not None:
+            assert 'B="“exact”"' in source.unit.body
+            assert 'B="“exact”"' in result.body.decode()
         assert result.rights_eligibility_digest
         assert result.licence_attribution
         assert b'Row 1: A="Provider"' in result.body

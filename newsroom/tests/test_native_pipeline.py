@@ -70,6 +70,50 @@ def test_native_pipeline_continues_multiple_revisions_and_skips_acknowledged(tmp
         connection.close()
 
 
+def test_ordinary_phase_timing_keeps_pipeline_decisions_and_ledger_when_dropped(tmp_path, monkeypatch):
+    from newsroom.control_plane import native_graphiti
+    events = []
+    monkeypatch.setattr(native_graphiti, "emit_diagnostic", lambda event, value: events.append((event, value)))
+    pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
+    pipeline._publish.recover_pre_dispatch = lambda *_args, **_kwargs: ()
+    try:
+        first = pipeline.tick(cycle_id="timed")
+        assert first.revision_states == {"ACKNOWLEDGED": 2}
+        assert {value["phase"] for _, value in events} == {"CLASSIFY", "ORDINARY_RECOVERY", "ORDINARY_ADVANCE"}
+        assert all(value["status"] == "COMPLETE" and value["cpu_scope"] == "PROCESS"
+                   and type(value["elapsed_ms"]) is int for _, value in events)
+        before_calls, before_changes = tuple(calls), connection.total_changes
+        monkeypatch.setattr(native_graphiti, "emit_diagnostic", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("dropped")))
+        second = pipeline.tick(cycle_id="dropped")
+        assert second.revision_states == first.revision_states
+        assert tuple(calls) == before_calls + (("rights", "current"),)
+        assert connection.total_changes == before_changes
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("phase", ["CLASSIFY", "ORDINARY_RECOVERY", "ORDINARY_ADVANCE"])
+def test_ordinary_phase_drop_preserves_original_exception(tmp_path, monkeypatch, phase):
+    from newsroom.control_plane import native_graphiti
+    monkeypatch.setattr(native_graphiti, "emit_diagnostic", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("dropped")))
+    pipeline, journal, connection, _units, _calls, _dispositions = _open(tmp_path, monkeypatch)
+
+    def failure(*_args, **_kwargs):
+        raise RuntimeError("original ordinary failure")
+
+    if phase == "CLASSIFY":
+        monkeypatch.setattr(journal, "summary", failure)
+    elif phase == "ORDINARY_RECOVERY":
+        pipeline._publish.recover_pre_dispatch = failure
+    else:
+        monkeypatch.setattr(pipeline, "_advance_revisions", failure)
+    try:
+        with pytest.raises(RuntimeError, match="original ordinary failure"):
+            pipeline.tick(cycle_id="phase-failure")
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize("same_producer", (True, False))
 def test_exact_consumer_revalidation_precedes_new_provider_work(tmp_path, monkeypatch, same_producer):
     pipeline, journal, connection, units, calls, _ = _open(tmp_path, monkeypatch)
