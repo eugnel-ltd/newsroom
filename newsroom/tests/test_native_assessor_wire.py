@@ -355,7 +355,7 @@ def test_exact_v21_status_hold_replays_and_has_independent_status_qualification(
     body = hko_evidence_body(fixture['retained_warning_body'].encode()).decode()
     receipt = fixture['materialisation_receipt']
     assert digest_bytes(body.encode()) == receipt['body_digests'][0]
-    view = build_lossless_source_view((body,), (fixture['source_id'],))
+    view = build_lossless_source_view((body,), (fixture['source_id'],), version='newsroom.native-assessor-spans.v1')
     materialised, derived = _materialise_reference_result(
         fixture['raw_result_text'], view, receipt['request_identity'],
         'newsroom.native-evidence-assessor.v21',
@@ -389,7 +389,7 @@ def test_exact_v21_status_hold_replays_and_has_independent_status_qualification(
 
 def test_current_prompt_uses_independent_qualification_tests_and_preserves_v21():
     from newsroom.control_plane.native_assessor import SYSTEM, VERSION, _V21_SYSTEM
-    assert VERSION == 'newsroom.native-evidence-assessor.v22'
+    assert VERSION == 'newsroom.native-evidence-assessor.v23'
     assert 'qualification tests are independent alternatives' in SYSTEM
     assert 'STATUS is not restricted to laws, rights or public policy' in SYSTEM
     assert 'Do not require affected_group for STATUS' in SYSTEM

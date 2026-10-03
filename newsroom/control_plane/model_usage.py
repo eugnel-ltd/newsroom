@@ -111,6 +111,7 @@ class ModelUsageAdmissionError(RuntimeError):
 
 class WorkloadClass(StrEnum):
     NATIVE_EVIDENCE_ASSESSOR = "NATIVE_EVIDENCE_ASSESSOR"
+    NATIVE_STORY_WRITER = "NATIVE_STORY_WRITER"
     NATIVE_RETRIEVAL_EMBEDDING = "NATIVE_RETRIEVAL_EMBEDDING"
     CONT_WRITER_PRIMARY = "CONT_WRITER_PRIMARY"
     CONT_WRITER_FALLBACK = "CONT_WRITER_FALLBACK"
@@ -120,13 +121,17 @@ class WorkloadClass(StrEnum):
     GRAPHITI_EMBEDDING = "GRAPHITI_EMBEDDING"
 
 
-def _nullable_native_assessor_output(
+def _nullable_native_output(
     workload: WorkloadClass, provider: str, route: str,
 ) -> bool:
     return (
-        workload is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
-        and provider == "grok-build-cli"
-        and route == "NATIVE_EVIDENCE_ASSESSOR"
+        provider == "grok-build-cli"
+        and (
+            (workload is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
+             and route == "NATIVE_EVIDENCE_ASSESSOR")
+            or (workload is WorkloadClass.NATIVE_STORY_WRITER
+                and route in {"NATIVE_STORY_DRAFT", "NATIVE_STORY_REVIEW"})
+        )
     )
 
 
@@ -2436,10 +2441,10 @@ class InvocationEfficiencyPolicy:
             if not _is_int(value) or value <= 0:
                 raise ModelUsageIntegrityError(f"{name} must be positive")
         if self.max_output_tokens is None:
-            if not _nullable_native_assessor_output(self.workload_class, self.provider, self.route):
-                raise ModelUsageIntegrityError("unbounded output is outside native assessor")
+            if not _nullable_native_output(self.workload_class, self.provider, self.route):
+                raise ModelUsageIntegrityError("unbounded output is outside scoped native routes")
         elif not _is_int(self.max_output_tokens) or self.max_output_tokens <= 0:
-            raise ModelUsageIntegrityError("max_output_tokens must be positive or assessor-only null")
+            raise ModelUsageIntegrityError("max_output_tokens must be positive or scoped native null")
         if not isinstance(self.one_turn, bool) or not isinstance(
             self.exact_input, bool
         ):
@@ -2607,6 +2612,7 @@ class WorkEnvelope:
         native_embedding = (
             self.workload_class is WorkloadClass.NATIVE_RETRIEVAL_EMBEDDING
         )
+        native_story = self.workload_class is WorkloadClass.NATIVE_STORY_WRITER
         cont = self.workload_class in {
             WorkloadClass.CONT_WRITER_PRIMARY,
             WorkloadClass.CONT_WRITER_FALLBACK,
@@ -2640,6 +2646,15 @@ class WorkEnvelope:
             raise ModelUsageIntegrityError(
                 "native assessor envelope lacks acquired evidence identities"
             )
+        if (
+            native_story
+            and (
+                not all((self.admission_decision_id, self.candidate_id,
+                         self.hypothesis_digest, self.evidence_package_digest))
+                or self.ingest_id is not None or self.graphiti_attempt_id is not None
+            )
+        ):
+            raise ModelUsageIntegrityError("native story envelope lacks admitted editorial identities")
         if (
             cont
             and self.workload_class is not WorkloadClass.CONT_ROUTE_HEALTH_PROBE
@@ -2794,8 +2809,8 @@ class InvocationAllocation:
         if not _is_int(self.prompt_bytes) or self.prompt_bytes < 0:
             raise ModelUsageIntegrityError("prompt bytes must be non-negative")
         if self.max_output_tokens is None:
-            if not _nullable_native_assessor_output(self.workload_class, self.provider, self.route):
-                raise ModelUsageIntegrityError("unbounded allocation output is outside native assessor")
+            if not _nullable_native_output(self.workload_class, self.provider, self.route):
+                raise ModelUsageIntegrityError("unbounded allocation output is outside scoped native routes")
         elif not _is_int(self.max_output_tokens) or self.max_output_tokens <= 0:
             raise ModelUsageIntegrityError("max output tokens must be positive")
         for name in (
@@ -3583,9 +3598,22 @@ class ModelUsageService:
 
     def resume_or_open_native_assessor_envelope(self, envelope: WorkEnvelope) -> WorkEnvelope:
         """Reuse exact pre-dispatch intent, never an allocated assessor attempt."""
+        return self._resume_or_open_native_envelope(
+            envelope, workload=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR, label="assessor",
+        )
+
+    def resume_or_open_native_story_envelope(self, envelope: WorkEnvelope) -> WorkEnvelope:
+        """Reuse exact admitted intent, never an allocated draft or review leaf."""
+        return self._resume_or_open_native_envelope(
+            envelope, workload=WorkloadClass.NATIVE_STORY_WRITER, label="story writer",
+        )
+
+    def _resume_or_open_native_envelope(
+        self, envelope: WorkEnvelope, *, workload: WorkloadClass, label: str,
+    ) -> WorkEnvelope:
         envelope._validate()
-        if envelope.workload_class is not WorkloadClass.NATIVE_EVIDENCE_ASSESSOR:
-            raise ModelUsageIntegrityError("assessor envelope targets another workload")
+        if envelope.workload_class is not workload:
+            raise ModelUsageIntegrityError(f"{label} envelope targets another workload")
         connection = self._connection()
         try:
             connection.execute("BEGIN")
@@ -3603,12 +3631,12 @@ class ModelUsageService:
                 if (tuple(row[:5]) != (retained.envelope_id, retained.cycle_id, retained.workload_class.value,
                                       _utc_text(retained.admitted_at), retained.canonical_digest)
                         or record != expected or retained.as_record() != record or row[5] != _json(record)):
-                    raise ModelUsageIntegrityError("retained assessor envelope differs")
+                    raise ModelUsageIntegrityError(f"retained {label} envelope differs")
                 if connection.execute(
                     "SELECT 1 FROM model_invocation_allocations WHERE envelope_id=?",
                     (envelope.envelope_id,),
                 ).fetchone():
-                    raise ModelUsageAdmissionError("assessor envelope already has an allocation")
+                    raise ModelUsageAdmissionError(f"{label} envelope already has an allocation")
                 return retained
         finally:
             connection.close()

@@ -87,6 +87,7 @@ def open_native_runtime(
     retrieval_authority: RetrievalContextAuthority | None = None,
     collision_enforcer: CurrentCollisionEffectEnforcer | None = None,
     native_dependency_factory: NativeDependencyFactory | None = None,
+    story_writer=None,
     clock: Callable[[], UtcTimestamp] = UtcTimestamp.now,
 ) -> NativeRuntime:
     """Bind the existing native boundaries to actual private runtime identities."""
@@ -239,6 +240,7 @@ def open_native_runtime(
             objects=authority.objects, commands=authority.commands,
             events=authority.events, candidate_port=authority.candidate_read_port,
             evidence_packages=evidence, bindings=policies.publication, clock=clock,
+            story_writer=story_writer,
         )
         proof = AuthenticationProof(
             method="STATIC_TOKEN", credential=credential,

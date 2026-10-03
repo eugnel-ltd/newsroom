@@ -802,9 +802,10 @@ def _render(
     *, correction: bool = False,
 ) -> tuple[SurfacePayload, SurfacePayload]:
     prefix = "【未出版】"
-    if not story.copy.title.startswith(prefix) or story.copy.title.count(prefix) != 1:
+    narrative = story.copy.writer_id == "newsroom.native-story-writer.v1"
+    if not narrative and (not story.copy.title.startswith(prefix) or story.copy.title.count(prefix) != 1):
         raise PublicationError("Story Version lacks exact unpublished presentation")
-    headline = story.copy.title.removeprefix(prefix)
+    headline = story.copy.title if narrative else story.copy.title.removeprefix(prefix)
     common = {
         "story_id": str(story.story_id),
         "story_aggregate_version": story.aggregate_version,
@@ -847,6 +848,9 @@ def _render(
             if field == "HEADLINE"
         )
         common["renderer_version"] = "newsroom.context-preserving-surface.v1"
+    if narrative:
+        common["renderer_version"] = ("newsroom.source-grounded-brief.v1" if story.story_format == "BRIEF"
+                                      else "newsroom.source-grounded-report.v1")
     feed_links = tuple(item for item in article_links if item[1] == "HEADLINE")
     return (
         SurfacePayload.create(

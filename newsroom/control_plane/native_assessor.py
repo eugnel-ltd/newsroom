@@ -92,7 +92,7 @@ from .native_assessor_references import (
     build_source_view, make_provider_schema, materialise as materialise_v17,
 )
 
-from .native_assessor_spans import PARTITION_VERSION, build_lossless_source_view
+from .native_assessor_spans import PARTITION_VERSION, PARTITION_VERSION_V1, build_lossless_source_view
 
 from .native_assessor_wire import (
     make_provider_schema as make_v18_provider_schema, materialise as materialise_v18,
@@ -104,8 +104,9 @@ _V18_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v18"
 _V19_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v19"
 _V20_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v20"
 _V21_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v21"
-_REFERENCE_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v22"
-_REFERENCE_PRODUCERS = (_V17_PRODUCER_VERSION, _V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, _V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION)
+_V22_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v22"
+_REFERENCE_PRODUCER_VERSION = "newsroom.native-evidence-assessor.v23"
+_REFERENCE_PRODUCERS = (_V17_PRODUCER_VERSION, _V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, _V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION, _V22_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION)
 VERSION = _REFERENCE_PRODUCER_VERSION
 MODEL = "grok-4.7"
 REASONING = "high"
@@ -128,6 +129,11 @@ REASSESSABLE_HOLDS = frozenset({
 
 def assessment_revalidation_due(facts: dict, contract_version: str | None) -> bool:
     previous = facts.get("assessment_contract_version")
+    if (type(previous) is str and type(contract_version) is str
+            and previous.split("+", 1)[0] == _V22_PRODUCER_VERSION
+            and contract_version.split("+", 1)[0] == _REFERENCE_PRODUCER_VERSION):
+        # New source views cannot repair a settled old rendering by redispatch.
+        return False
     if (type(previous) is str and type(contract_version) is str
             and previous.split("+", 1)[0] in {_V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION}
             and contract_version.split("+", 1)[0] in {_V21_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION}
@@ -423,6 +429,12 @@ SYSTEM += (
     "headline must independently pass at least one test. This does not make a title, "
     "standing guidance, first observation, unchanged status or record-update time "
     "a qualifying change, and does not establish present safety after cancellation."
+)
+_V22_SYSTEM = SYSTEM
+SYSTEM += (
+    " Treat apostrophes inside complete official names as part of the name, not a word boundary. "
+    "Use the supplied complete recognised legal title literally in rendering; never translate an "
+    "unrecognised prefix or advertise a partial recognised title as the full name."
 )
 _V15_SCHEMA_DIGEST = "sha256:6f7e0726d3e35da1d5343b5b3dc162841c8262631ba7d00e3f71733aab14ea7f"
 _V15_SCHEMA_BYTES = 6976
@@ -723,12 +735,14 @@ def native_assessment_input_bound(policy: InvocationEfficiencyPolicy) -> dict[st
                      _V18_PRODUCER_VERSION: _V18_SYSTEM,
                      _V19_PRODUCER_VERSION: _V19_SYSTEM,
                      _V20_PRODUCER_VERSION: _V20_SYSTEM,
-                     _V21_PRODUCER_VERSION: _V21_SYSTEM}.get(contract, SYSTEM)).encode("utf-8")
+                     _V21_PRODUCER_VERSION: _V21_SYSTEM,
+                     _V22_PRODUCER_VERSION: _V22_SYSTEM}.get(contract, SYSTEM)).encode("utf-8")
     schema = {_V17_PRODUCER_VERSION: _V17_PROVIDER_SCHEMA,
               _V18_PRODUCER_VERSION: _V18_PROVIDER_SCHEMA,
               _V19_PRODUCER_VERSION: _V19_PROVIDER_SCHEMA,
               _V20_PRODUCER_VERSION: _V20_PROVIDER_SCHEMA,
-              _V21_PRODUCER_VERSION: _V21_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
+              _V21_PRODUCER_VERSION: _V21_PROVIDER_SCHEMA,
+              _V22_PRODUCER_VERSION: _V21_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
     schema_digest = _V15_SCHEMA_DIGEST if historical else digest_canonical(schema)
     schema_size = _V15_SCHEMA_BYTES if historical else len(canonical_json_bytes(schema))
     framing = 16_384 if historical else _FRAMING_RESERVE_TOKENS
@@ -763,11 +777,12 @@ def native_assessment_input_bound(policy: InvocationEfficiencyPolicy) -> dict[st
 def _materialise_reference_result(raw, view, request_identity, contract):
     if contract == _V17_PRODUCER_VERSION:
         return materialise_v17(raw, view, request_identity, provider_schema=_V17_PROVIDER_SCHEMA)
-    if contract in (_V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, _V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION):
+    if contract in (_V18_PRODUCER_VERSION, _V19_PRODUCER_VERSION, _V20_PRODUCER_VERSION, _V21_PRODUCER_VERSION, _V22_PRODUCER_VERSION, _REFERENCE_PRODUCER_VERSION):
         schema = {_V18_PRODUCER_VERSION: _V18_PROVIDER_SCHEMA,
                   _V19_PRODUCER_VERSION: _V19_PROVIDER_SCHEMA,
                   _V20_PRODUCER_VERSION: _V20_PROVIDER_SCHEMA,
-                  _V21_PRODUCER_VERSION: _V21_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
+                  _V21_PRODUCER_VERSION: _V21_PROVIDER_SCHEMA,
+              _V22_PRODUCER_VERSION: _V21_PROVIDER_SCHEMA}.get(contract, PROVIDER_SCHEMA)
         return materialise_v18(raw, view, request_identity,
                               provider_schema=schema, v17_schema=_V17_PROVIDER_SCHEMA)
     raise SourceReferenceError("unsupported reference producer contract")
@@ -791,8 +806,8 @@ def _source_view_for_binding(passages, source_ids, binding) -> SourceView:
     partition = binding.get("partition_version")
     if partition is None:
         view = build_source_view(passages, source_ids)
-    elif partition == PARTITION_VERSION:
-        view = build_lossless_source_view(passages, source_ids)
+    elif partition in (PARTITION_VERSION_V1, PARTITION_VERSION):
+        view = build_lossless_source_view(passages, source_ids, version=partition)
     else:
         raise NativeEvidenceError("native source partition differs")
     if _reference_binding(view) != binding:
