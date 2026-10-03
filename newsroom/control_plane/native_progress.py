@@ -396,11 +396,8 @@ class NativeRevisionJournal:
     def _pair_facts(self, revision_id: str) -> dict:
         record = self._records[revision_id]
         if self._current_state:
-            from .native_progress_state import checked_json
-            row = self._connection.execute('SELECT pair_json FROM native_current_pairs WHERE pair_digest=?', (record.pair_digest,)).fetchone()
-            if row is None:
-                raise ValueError('native CURRENT retrieval pair root is missing')
-            value = checked_json(row[0], record.pair_digest, label='retrieval pair')
+            from .native_progress_state import read_pair
+            value = read_pair(self._connection, record.pair_digest)
             if set(value) != set(_RETRIEVAL_FIELDS):
                 raise ValueError('native CURRENT retrieval pair fields differ')
             return value

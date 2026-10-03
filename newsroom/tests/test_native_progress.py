@@ -596,9 +596,10 @@ def test_metadata_iteration_is_bounded_and_selected_current_uses_one_root_pk(tmp
     assert all("retrieval_binding" not in value["facts"] for _, value in snapshots)
     assert statements == []
     first_current = journal.current(first.revision_id)
-    assert len(statements) == 1 and "WHERE pair_digest=" in statements[0]
+    assert len(statements) == 4 and "WHERE pair_digest=" in statements[0]
+    assert all("FROM ledger" not in statement for statement in statements)
     second_current = journal.current(first.revision_id)
-    assert len(statements) == 2
+    assert len(statements) == 8
     first_current["facts"]["retrieval_rights_inventory"][0]["rights"] = "caller only"
     snapshots[0][1]["facts"]["retrieval_embeddings"].clear()
     assert second_current["facts"] == _retrieval_facts()
