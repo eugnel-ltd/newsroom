@@ -827,7 +827,7 @@ def _materialisation_record(allocation, context, raw_digest, receipt) -> dict:
         allocation.prompt_contract_version not in _REFERENCE_PRODUCERS
         or type(binding) is not dict
         or binding.get("version") != SOURCE_REFERENCE_VERSION
-        or binding.get("partition_version") not in (None, PARTITION_VERSION)
+        or binding.get("partition_version") not in (None, PARTITION_VERSION_V1, PARTITION_VERSION)
         or receipt.get("version") != binding.get("version")
         or receipt.get("request_identity") != allocation.request_digest
         or receipt.get("raw_digest") != raw_digest
@@ -1708,7 +1708,7 @@ class NativeAssessmentUsage:
                             if type(binding) is not dict:
                                 return None
                             partition = binding.get("partition_version")
-                            if partition is not None and partition != PARTITION_VERSION:
+                            if partition not in (None, PARTITION_VERSION_V1, PARTITION_VERSION):
                                 return None
                             if partition not in reference_views:
                                 reference_views[partition] = _source_view_for_binding(

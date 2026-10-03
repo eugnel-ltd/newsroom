@@ -421,9 +421,13 @@ def test_current_v20_reads_frozen_v16_full_package_without_relabelling_or_dispat
         assert connection.execute("SELECT count(*) FROM ledger WHERE kind='NATIVE_ASSESSMENT_MATERIALISATION'").fetchone() == (0,)
 
 
-@pytest.mark.parametrize("historical_version", ("v17", "v18", "v19"))
+@pytest.mark.parametrize(("historical_version", "partition_version"), (
+    ("v17", None), ("v18", None), ("v19", None),
+    ("v22", "newsroom.native-assessor-spans.v1"),
+    ("v22", "newsroom.native-assessor-spans.v999"),
+))
 def test_current_v20_reads_frozen_reference_materialisation_without_dispatch(
-    tmp_path, monkeypatch, historical_version,
+    tmp_path, monkeypatch, historical_version, partition_version,
 ):
     from newsroom.control_plane import native_assessor as module
 
@@ -438,6 +442,26 @@ def test_current_v20_reads_frozen_reference_materialisation_without_dispatch(
         materialiser = lambda value, source_view, request: materialise_v17(
             value, source_view, request, provider_schema=historical_schema,
         )
+    elif historical_version == "v22":
+        from newsroom.control_plane.native_assessor_spans import (
+            PARTITION_VERSION_V1, build_lossless_source_view,
+        )
+
+        view = build_lossless_source_view(base.passages, base.source_ids,
+                                          version=PARTITION_VERSION_V1)
+        for claim, segment in zip(wire["package"]["governed_claims"],
+                                  (view.segments[0], view.segments[-1]), strict=True):
+            claim["claim_range"] = claim["support_range"] = {
+                "first_span_id": segment.span_id, "last_span_id": segment.span_id,
+            }
+        historical_contract = module._V22_PRODUCER_VERSION
+        historical_system = module._V22_SYSTEM
+        historical_schema = module._V21_PROVIDER_SCHEMA
+        historical_wire = _current_wire_from_v17(wire)
+        materialiser = lambda value, source_view, request: materialise_v18(
+            value, source_view, request, provider_schema=historical_schema,
+            v17_schema=module._V17_PROVIDER_SCHEMA,
+        )
     else:
         historical_contract = getattr(module, f"_{historical_version.upper()}_PRODUCER_VERSION")
         historical_system = getattr(module, f"_{historical_version.upper()}_SYSTEM")
@@ -450,6 +474,14 @@ def test_current_v20_reads_frozen_reference_materialisation_without_dispatch(
     raw = canonical_json_bytes(historical_wire).decode()
     execution = NativeAssessmentExecution(raw, dict(_USAGE))
     with monkeypatch.context() as historical:
+        if partition_version:
+            # Seed the historical retainer; the current reader stays unpatched.
+            historical.setattr(module, "PARTITION_VERSION", partition_version)
+        if partition_version and partition_version.endswith(".v999"):
+            reference_binding = module._reference_binding
+            historical.setattr(module, "_reference_binding", lambda source_view: {
+                **reference_binding(source_view), "partition_version": partition_version,
+            })
         historical.setattr(module, "VERSION", historical_contract)
         historical.setattr(module, "SYSTEM", historical_system)
         historical.setattr(module, "PROVIDER_SCHEMA", historical_schema)
@@ -459,16 +491,19 @@ def test_current_v20_reads_frozen_reference_materialisation_without_dispatch(
             digest_canonical(historical_schema),
         )
         service, old_usage = _usage(tmp_path, historical)
-        assert old_usage._policy.model == "grok-4.6"
-        assert old_usage._policy.reasoning == ("medium" if historical_version == "v19" else "low")
-        assert old_usage._policy.max_output_tokens == 10_000
+        assert old_usage._policy.model == ("grok-4.7" if historical_version == "v22" else "grok-4.6")
+        assert old_usage._policy.reasoning == (
+            "high" if historical_version == "v22"
+            else "medium" if historical_version == "v19" else "low"
+        )
+        assert old_usage._policy.max_output_tokens == (None if historical_version == "v22" else 10_000)
         allocation = old_usage.begin(
             candidate, base, f"historical {historical_version} request",
             source_view=view,
         )
-        assert allocation.model == "grok-4.6"
+        assert allocation.model == old_usage._policy.model
         assert allocation.reasoning == old_usage._policy.reasoning
-        assert allocation.max_output_tokens == 10_000
+        assert allocation.max_output_tokens == old_usage._policy.max_output_tokens
         package, receipt = materialiser(
             historical_wire, view, allocation.request_digest,
         )
@@ -499,16 +534,22 @@ def test_current_v20_reads_frozen_reference_materialisation_without_dispatch(
         ),
         usage=current_usage, dispatch_fence=nullcontext,
     )
-    result = EvidenceAssessor(assessor).assess(
-        candidate, base, (source,), (acquired,),
-        cached_only=True,
-    )
-    retained, = current_usage.retained_assessments(candidate, base)
-    assert retained.contract_version == historical_contract
-    assert retained.execution.text == canonical_json_bytes(package).decode()
-    assert result.governed_claims[1].claim == (
-        package["package"]["governed_claims"][1]["claim"]
-    )
+    if partition_version and partition_version.endswith(".v999"):
+        assert current_usage.retained_assessments(candidate, base) is None
+        with pytest.raises(NativeEvidenceHold, match="ASSESSOR_REVALIDATION_UNRESOLVED_HOLD"):
+            EvidenceAssessor(assessor).assess(
+                candidate, base, (source,), (acquired,), cached_only=True,
+            )
+    else:
+        result = EvidenceAssessor(assessor).assess(
+            candidate, base, (source,), (acquired,), cached_only=True,
+        )
+        retained, = current_usage.retained_assessments(candidate, base)
+        assert retained.contract_version == historical_contract
+        assert retained.execution.text == canonical_json_bytes(package).decode()
+        assert result.governed_claims[1].claim == (
+            package["package"]["governed_claims"][1]["claim"]
+        )
     with sqlite3.connect(service.path) as connection:
         assert connection.execute(
             "SELECT record_json FROM model_invocation_allocations"

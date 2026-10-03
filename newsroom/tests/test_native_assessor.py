@@ -1450,6 +1450,8 @@ def _usage(tmp_path, monkeypatch):
     current = (
         native_assessor_module.VERSION in {
             native_assessor_module._V20_PRODUCER_VERSION,
+            native_assessor_module._V21_PRODUCER_VERSION,
+            native_assessor_module._V22_PRODUCER_VERSION,
             native_assessor_module._REFERENCE_PRODUCER_VERSION,
         }
     )
