@@ -2177,6 +2177,7 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
         prior_generation_id: ProjectionGenerationId | None,
         reason_code: str,
         required_source_ledger_seq: int | None = None,
+        expire_prior_diagnostics: bool = False,
     ) -> ProjectionGenerationPromotionView:
         with self._lock, self._transaction() as conn:
             recorded_at = self._clock().to_text()
@@ -2437,6 +2438,16 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                     recorded_at,
                 ),
             )
+            if expire_prior_diagnostics and actual_prior_id is not None:
+                from .projection_retirement import retire_predecessor_diagnostics
+                try:
+                    retire_predecessor_diagnostics(conn, actual_prior_id)
+                except BaseException:
+                    # The shared transaction wrapper handles Exception only.
+                    # Native interruption must also undo promotion and expiry.
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
             target_view = self._generation_view(conn, str(generation_id))
             return ProjectionGenerationPromotionView(
                 promotion_digest=promotion_digest,

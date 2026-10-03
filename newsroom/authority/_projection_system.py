@@ -417,6 +417,7 @@ class _ProjectionBoundary:
         request: ProjectionGenerationPromotionRequest,
         *,
         required_source_ledger_seq: int | None = None,
+        expire_prior_diagnostics: bool = False,
     ) -> ProjectionGenerationPromotionView:
         return self._store.promote_generation(
             target_grant,
@@ -427,6 +428,7 @@ class _ProjectionBoundary:
             prior_generation_id=request.prior_generation_id,
             reason_code=request.reason_code,
             required_source_ledger_seq=required_source_ledger_seq,
+            expire_prior_diagnostics=expire_prior_diagnostics,
         )
 
     def promote_generation(

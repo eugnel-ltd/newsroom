@@ -20,7 +20,7 @@ from .test_projection_b3_authority import (
 )
 
 
-def _seed(path, *, retire=True, activate=True, kind="ignored", required=False, checkpoint_anchor=False):
+def _seed(path, *, retire=True, activate=True, kind="ignored", required=False, checkpoint_anchor=False, delivery_count=1):
     with open_projection_system(path) as system:
         _register(system)
         source_seq = 1
@@ -30,6 +30,13 @@ def _seed(path, *, retire=True, activate=True, kind="ignored", required=False, c
                 expected_aggregate_version=0, payload=InlinePayload({"headline": "optional", "count": 1}),
                 idempotency_key="optional-source",
             ), proof=proof()).ledger_seq
+        source_seqs = [source_seq]
+        if delivery_count > 1:
+            source_seqs = [system.commands.execute(SemanticCommand(
+                command_type="candidate.fixture.write", aggregate_id=AggregateId.new(),
+                expected_aggregate_version=0, payload=InlinePayload({"headline": "optional", "count": number}),
+                idempotency_key=f"cohort-source-{number}",
+            ), proof=proof()).ledger_seq for number in range(delivery_count)]
         outcomes = {
             "ignored": (ProjectionDeliveryOutcome.IGNORED_OPTIONAL,),
             "applied": (ProjectionDeliveryOutcome.APPLIED,),
@@ -44,15 +51,16 @@ def _seed(path, *, retire=True, activate=True, kind="ignored", required=False, c
             def current():
                 return next(g for g in system.projections.generations(FAMILY_ID, proof=proof())
                             if g.generation_id == generation.generation_id)
-            for number, outcome in enumerate(outcomes):
-                request = ProjectionDeliveryRequest(
-                    generation.generation_id, current().authority_aggregate_version,
-                    source_seq, outcome, f"delivery-{index}-{number}",
-                    error_code="TRANSIENT" if outcome is ProjectionDeliveryOutcome.RETRYABLE_FAILURE else None,
-                )
-                result = system.projections.record_delivery(request, proof=proof())
-                if first_request is None:
-                    first_request, first_result = request, result
+            for source_seq in source_seqs:
+                for number, outcome in enumerate(outcomes):
+                    request = ProjectionDeliveryRequest(
+                        generation.generation_id, current().authority_aggregate_version,
+                        source_seq, outcome, f"delivery-{index}-{source_seq}-{number}",
+                        error_code="TRANSIENT" if outcome is ProjectionDeliveryOutcome.RETRYABLE_FAILURE else None,
+                    )
+                    result = system.projections.record_delivery(request, proof=proof())
+                    if first_request is None:
+                        first_request, first_result = request, result
             if checkpoint_anchor:
                 system.projections.record_delivery(ProjectionDeliveryRequest(
                     generation.generation_id, current().authority_aggregate_version,

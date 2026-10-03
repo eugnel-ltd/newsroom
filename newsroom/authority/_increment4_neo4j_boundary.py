@@ -690,6 +690,7 @@ class _Increment4Neo4jBoundary:
             prior_grant,
             promotion_request,
             required_source_ledger_seq=source_watermark,
+            expire_prior_diagnostics=isinstance(request, Increment4Neo4jCurrentBuildRequest),
         )
 
     def _result(

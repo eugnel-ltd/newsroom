@@ -15,7 +15,7 @@ def test_real_command_expiry_indexes_generated_fk_and_restores_schema(tmp_path, 
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
         before_plan = _plan(connection)
-        assert any(item.startswith("SCAN ledger_events") for item in before_plan)
+        assert not any(item.startswith("SCAN ledger_events") for item in before_plan)
     snapshot = _snapshot(path)[1]
     observed = []
     connect = sqlite3.connect

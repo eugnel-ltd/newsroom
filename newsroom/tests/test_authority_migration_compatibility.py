@@ -61,6 +61,7 @@ _EXPECTED_NAMES = {
     40: "relationship_open_index_v40",
     41: "command_bound_request_result_storage_v41",
     42: "retired_projection_diagnostic_reservations_v42",
+    43: "native_projection_retirement_lookup_indexes_v43",
 }
 _EXPECTED_CHECKSUMS = {
     13: "sha256:c3e5ae627dda1c04bebc50952786413d977bd399e67b7f5b87452794f08f49ab",
@@ -92,6 +93,7 @@ _EXPECTED_CHECKSUMS = {
     40: "sha256:1f126c29773eded31cb36abcf6f6101dd827e0032c9e379adabbbaffd06c1c79",
     41: "sha256:e2beb20eb921e69a8892234f2e4cae2349369700de2f615ffc9d744e8833fd22",
     42: "sha256:6d8074762801dbb74e966ea4a441ad035a7eebea178372523dab69e5e91fd2e5",
+    43: "sha256:f9aecc8859aec5b6a19acbacb8b1eea7e1a179c99a8d01b638976f4080b52832",
 }
 
 _EXPECTED_MATRIX = """version | migration | objects | history fingerprint | schema fingerprint | object fingerprint
@@ -125,6 +127,7 @@ v39 | graphiti_recovered_ambiguous_progression_v39 | 1524 | sha256:fa2d3fc80a04d
 v40 | relationship_open_index_v40 | 1525 | sha256:864fd85321ff4cfec55870a3d3737e94582f22cab32e9adcea9cf66bea6f3f7f | sha256:1e6a22fbc1b755d1eebd957378dc691b4e41e0ca405f2ef00d7ddcbd629206c7 | sha256:bff1d52da6dc88a67095977d8a737c710891af420efd07238ed16423040a466c
 v41 | command_bound_request_result_storage_v41 | 1525 | sha256:71dcf0dd7c21734f7d44261451c99c244bb6cdadb9e13c54a805a589089e8773 | sha256:94014382880d8d9cda0a7b727dea90ca522c65299345e5ea6f80cf857311a3e9 | sha256:2159817f0d9e5a0d7b11d00820eb0485f88168a140393c1c98c13ef2dd8f46de
 v42 | retired_projection_diagnostic_reservations_v42 | 1530 | sha256:f9b00420523752d7a736693da3288d922ec2895c79e21565e96596fefb9d4d9c | sha256:30bbcbc39e452773ae141b19794601c7ff8d294b09fa47624e561dc9de5ba104 | sha256:79901ff4764b2faf118d9aab2c2a1ed5a0a308f1bff6dfa69bc54e66feee99d7
+v43 | native_projection_retirement_lookup_indexes_v43 | 1576 | sha256:500a535d2b2b4f49a2a66a4b68878aa8d2b791255608c674aa0fbdaf0a540727 | sha256:a00dd159b3743d3e964c99a8fe4f59e3e772d8321cc472c779ded19d82779b0b | sha256:2169b4d8f65c9d4dacb24282cc59298bc56ece0f2f86e0805fa92404383c282a
 """
 
 
@@ -159,7 +162,7 @@ def test_registry_history_and_statement_pins_are_complete_and_named() -> None:
     assert RETAINED_MIN_VERSION == 13
     assert RETAINED_VERSIONS == tuple(_EXPECTED_NAMES)
     assert tuple(record.version for record in MIGRATION_REGISTRY) == tuple(
-        (*range(1, 33), 34, 35, 36, 37, 38, 39, 40, 41, 42)
+        (*range(1, 33), 34, 35, 36, 37, 38, 39, 40, 41, 42, 43)
     )
     assert (
         tuple(
@@ -275,6 +278,29 @@ def test_exact_prefix_invokes_v42_procedure_only_at_its_release(
         original(connection, expected_history=expected_history)
 
     monkeypatch.setattr(authority_migrations, "migrate_projection_retirement", counted)
+    build_exact_prefix(tmp_path / f"procedural-v{version}.sqlite3", version)
+    assert calls == expected_calls
+
+
+@pytest.mark.parametrize(("version", "expected_calls"), ((42, 0), (43, 1)))
+def test_exact_prefix_invokes_v43_procedure_only_at_its_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+    expected_calls: int,
+) -> None:
+    calls = 0
+    original = authority_migrations.migrate_retirement_lookup
+
+    def counted(connection: sqlite3.Connection, *, expected_history) -> None:
+        nonlocal calls
+        calls += 1
+        assert connection.in_transaction
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert expected_history == history_through(42)
+        original(connection, expected_history=expected_history)
+
+    monkeypatch.setattr(authority_migrations, "migrate_retirement_lookup", counted)
     build_exact_prefix(tmp_path / f"procedural-v{version}.sqlite3", version)
     assert calls == expected_calls
 
