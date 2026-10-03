@@ -18,13 +18,13 @@ from .native_assessor import assessor_admission_recovery_due, assessment_revalid
 from .native_evidence import NativeEvidenceHold
 from .native_graphiti import _native_phase
 
-from .native_progress import NativeRevisionJournal
+from .native_progress import NativeRevisionJournal, source_header
 from .native_source_disposition import archival_nil_return_candidate, archival_nil_return_disposition
 from .veto import OperatorDrainRequested, VetoError
 
 
 def _source_update_time(item: tuple) -> tuple:
-    unit = item[1][0]
+    unit = item[1]
     for value in (unit.updated_at, unit.published_at):
         try:
             return True, UtcTimestamp.parse(value).value
@@ -118,7 +118,7 @@ class NativePipeline:
             # Fixed disjoint cohorts attempt each revision at most once per tick.
             # Retained downstream work must not wait behind fresh model requests.
             ordinary, reassessments, pending_revisions = [], [], []
-            for revision_id, units in self._journal.units.items():
+            for revision_id in self._journal.units:
                 previous = self._journal.summary(revision_id)
                 facts = previous.get("facts", {})
                 if not facts.get("graphiti_receipts"):
@@ -133,7 +133,7 @@ class NativePipeline:
                     ) else reassessments
                 else:
                     cohort = ordinary
-                cohort.append((revision_id, units))
+                cohort.append((revision_id, source_header(self._journal.units, revision_id)))
             # Use the same current/archive turn for already-admitted downstream
             # work; recent source updates must not wait behind old recovery backlog.
             if not self._spill_archive_turn:
@@ -185,7 +185,8 @@ class NativePipeline:
             return deferred
 
         # Extraction stays per ingest; projection remains one complete cohort.
-        pending = tuple(unit for _, units in pending_revisions for unit in units)
+        pending = tuple(unit for revision_id, _ in pending_revisions
+                        for unit in self._journal.units[revision_id])
         if pending:
             self._drain_between_work()
             self._check()
@@ -197,8 +198,8 @@ class NativePipeline:
                 if len(results) != len(pending) or {item.ingest_id for item in results} != {unit.ingest_id for unit in pending}:
                     raise ValueError("native Graphiti continuation partition differs")
                 by_ingest = {item.ingest_id: item for item in results}
-                for revision_id in dict.fromkeys(unit.revision_id for unit in pending):
-                    outcomes = tuple(by_ingest[unit.ingest_id] for unit in self._journal.units[revision_id])
+                for revision_id, header in pending_revisions:
+                    outcomes = tuple(by_ingest[ingest] for ingest, _ in header.unit_index)
                     deferred = tuple(item for item in outcomes if item.state == "GRAPHITI_DEFERRED")
                     if deferred:
                         if any(item.reason != "WORK_QUANTUM_EXHAUSTED" or item.receipt_digest is not None
@@ -241,7 +242,7 @@ class NativePipeline:
             except VetoError:
                 raise
             except Exception as exc:
-                for revision_id in dict.fromkeys(unit.revision_id for unit in pending):
+                for revision_id, _ in pending_revisions:
                     facts = self._journal.current(revision_id).get("facts", {})
                     self._journal.advance(revision_id, stage="GRAPHITI_HOLD", facts={
                         **facts, "reason": type(exc).__name__,
@@ -254,7 +255,7 @@ class NativePipeline:
         # This finite old-contract cohort drains once: repair recent evidence
         # before older failures, without reordering fresh work or unknown effects.
         reassessments.sort(
-            key=lambda item: max(UtcTimestamp.parse(unit.observed_at).value for unit in item[1]),
+            key=lambda item: max(UtcTimestamp.parse(value).value for value in item[1].observed_ats),
             reverse=True,
         )
         ready_spill = deadline_deferred_ready
@@ -286,7 +287,7 @@ class NativePipeline:
         # Each revision remains in the journal even when it disappears from the
         # next feed page. This is work continuation, not a fresh provider retry.
         deadline_deferred_ready = []
-        for revision_id, units in revisions:
+        for revision_id, header in revisions:
             self._drain_between_work()
             self._check()
             previous = self._journal.summary(revision_id)
@@ -294,7 +295,7 @@ class NativePipeline:
                 if (previous.get("stage") == "GRAPHITI_COMPLETE"
                         and previous.get("facts", {}).get("graphiti_receipts")
                         and not previous.get("facts", {}).get("candidate_version_id")):
-                    deadline_deferred_ready.append((revision_id, units))
+                    deadline_deferred_ready.append((revision_id, header))
                 continue
             facts = dict(previous.get("facts", {}))
             stage = "PUBLICATION"
@@ -341,6 +342,7 @@ class NativePipeline:
                     continue
                 candidate_version_id = facts.get("candidate_version_id")
                 if candidate_version_id is None:
+                    units = self._journal.units[revision_id]
                     receipts = facts["graphiti_receipts"]
                     if (previous.get("stage") == "GRAPHITI_COMPLETE"
                             and archival_nil_return_candidate(units[0])

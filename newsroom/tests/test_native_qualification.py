@@ -929,3 +929,19 @@ def test_legitimate_new_current_state_invalidates_old_qualification_binding(tmp_
             validate_qualification(connection, IDENTITY)
     finally:
         connection.close()
+
+
+def test_invocation_inventory_uses_validated_ingest_headers_without_source_reads(tmp_path):
+    from newsroom.control_plane.native_qualification import _invocations
+    connection = _open(tmp_path / 'qualification-unit-headers.sqlite3')
+    journal = NativeRevisionJournal(connection)
+    unit = _native('invocation-headers')
+    journal.land((unit,))
+    journal = NativeRevisionJournal(connection)
+    statements = []
+    connection.set_trace_callback(statements.append)
+    try:
+        assert _invocations(connection, journal) == ()
+        assert not any('content_json' in sql for sql in statements)
+    finally:
+        connection.close()

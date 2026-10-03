@@ -338,9 +338,11 @@ class NativePublicationController:
         groups = {}
         for revision, progress in journal.iter_summaries():
             facts = progress.get('facts', {})
+            if (progress.get('stage') != 'ACKNOWLEDGED' or not facts.get('candidate_id')
+                    or not all(facts.get(key) for key in references)):
+                continue
             units = journal.units.get(revision, ())
-            if (units and units[0].source_id == 'HK-02' and progress.get('stage') == 'ACKNOWLEDGED'
-                    and facts.get('candidate_id') and all(facts.get(key) for key in references)):
+            if units and units[0].source_id == 'HK-02':
                 groups.setdefault(facts['candidate_id'], []).append((revision,facts))
         for members in groups.values():
             try:

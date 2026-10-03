@@ -28,6 +28,7 @@ SCHEMA = (
     "CREATE TABLE IF NOT EXISTS native_current_observations(observation_digest TEXT PRIMARY KEY, reference_json TEXT NOT NULL, reference_digest TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS native_current_portfolio(singleton INTEGER PRIMARY KEY CHECK(singleton=1), diagnostic_seq INTEGER NOT NULL, diagnostic_digest TEXT NOT NULL, portfolio_json TEXT NOT NULL, portfolio_digest TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS native_current_units(ingest_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL REFERENCES native_current_sources(revision_id), effective_revision_digest TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS native_current_units_revision ON native_current_units(revision_id)",
     "CREATE TABLE IF NOT EXISTS native_embedding_progress_pins(passage_id TEXT NOT NULL, cycle_id TEXT NOT NULL, progress_seq INTEGER NOT NULL REFERENCES ledger(seq), unit_ingest_id TEXT NOT NULL, revision_id TEXT NOT NULL REFERENCES native_current_sources(revision_id), progress_digest TEXT NOT NULL, PRIMARY KEY(passage_id,cycle_id,progress_seq,unit_ingest_id))",
 )
 

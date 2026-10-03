@@ -662,7 +662,7 @@ def test_multi_chunk_embeddings_and_context_are_reused_across_restart(tmp_path, 
         final_connection.close()
     if not drop_diagnostics:
         assert {value["phase"] for _, value in diagnostic_events} == {
-            "RETRIEVAL_REQUEST_RIGHTS", "RETRIEVAL_CURRENT_SUBJECTS", "RETRIEVAL_AUTHENTICATED_INVENTORY",
+            "RETRIEVAL_REQUEST_RIGHTS", "RETRIEVAL_PREPARE", "RETRIEVAL_CURRENT_SUBJECTS", "RETRIEVAL_AUTHENTICATED_INVENTORY",
             "RETRIEVAL_PORT_BUILD", "RETRIEVAL_PORT_EXECUTE", "RETRIEVAL_CONTEXT_READ",
         }
         assert all(value["cycle_id"] == base.revision_id and type(value["cohort_count"]) is int
@@ -906,5 +906,26 @@ def test_terminal_receipt_tamper_holds_before_embedding(tmp_path):
             continuation.retrieve(lead, proof=proof())
         assert embedder.calls == []
         assert documents.admit_calls == []
+    finally:
+        connection.close()
+
+
+def test_subject_inventory_does_not_decode_sources_without_retained_documents(tmp_path):
+    connection = connect(str(tmp_path / 'metadata-only-subjects.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    unit = _native('no-documents')
+    journal.land((unit,))
+    journal = NativeRevisionJournal(connection)
+    continuation = NativeRetrievalContinuation(
+        system=object(), documents=object(), journal=journal,
+        connection=connection, embedder=object(), generation_id=GENERATION,
+        port_for=lambda *_: pytest.fail('empty inventory opened port'),
+        rights_check=lambda _: pytest.fail('unselected source read rights'),
+    )
+    statements = []
+    connection.set_trace_callback(statements.append)
+    try:
+        assert continuation._current_subjects() == ((), [])
+        assert statements == []
     finally:
         connection.close()

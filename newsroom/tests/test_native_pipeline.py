@@ -1827,7 +1827,7 @@ def test_global_terminal_routing_uses_inline_summaries_without_cold_pair_reads()
             "retrieval_binding": {"cold": [5]}, "retrieval_rights_inventory": {"cold": [6]},
         }},
     }
-    units = {key: (NS(updated_at="2026-09-08T12:00:00Z", published_at="2026-09-08T12:00:00Z"),) for key in states}
+    units = {key: (replace(_native(key), updated_at="2026-09-08T12:00:00Z", published_at="2026-09-08T12:00:00Z"),) for key in states}
     journal = _ColdPairJournal(states, units)
     pipeline = n.NativePipeline(
         runtime=NS(authority=object(), proof=object()), journal=journal,
@@ -1841,7 +1841,7 @@ def test_global_terminal_routing_uses_inline_summaries_without_cold_pair_reads()
 
 
 def test_selected_candidate_write_carries_full_pair_and_unknown_facts(monkeypatch):
-    unit = NS(revision_id="selected", updated_at="2026-09-08T12:00:00Z", published_at="2026-09-08T12:00:00Z")
+    unit = replace(_native("selected"), updated_at="2026-09-08T12:00:00Z", published_at="2026-09-08T12:00:00Z")
     facts = {"graphiti_receipts": [{}], "retrieval_binding": {"documents": [1, 2]},
              "retrieval_rights_inventory": {"rights": [3]}, "unknown_inline": {"future": True}}
     journal = _ColdPairJournal({"selected": {"revision_id": "selected", "ordinal": 1, "stage": "GRAPHITI_COMPLETE", "facts": facts}}, {"selected": (unit,)})
@@ -1922,5 +1922,23 @@ def test_unknown_continuation_failure_reports_only_site_without_changing_intent(
             assert "PRIVATE_SOURCE_PROVIDER_TEXT" not in repr(events)
         else:
             assert events == []
+    finally:
+        connection.close()
+
+
+def test_reopened_quiescent_ticks_never_select_cold_source_bodies(tmp_path, monkeypatch):
+    pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
+    try:
+        pipeline.tick(cycle_id='first-complete')
+        pipeline._journal = NativeRevisionJournal(connection)
+        dispositions[0] = ()
+        statements = []
+        connection.set_trace_callback(statements.append)
+        original_calls = tuple(calls)
+        for cycle_id in ('reopened-one', 'reopened-two'):
+            assert pipeline.tick(cycle_id=cycle_id).revision_states == {'ACKNOWLEDGED': 2}
+        assert tuple(calls) == original_calls + (('rights', 'current'),) * 2
+        assert not any('content_json' in sql for sql in statements)
+        assert pipeline._journal._bodies == {}
     finally:
         connection.close()

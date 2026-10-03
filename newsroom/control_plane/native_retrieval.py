@@ -107,7 +107,8 @@ class NativeRetrievalContinuation:
             raise NativeRetrievalHold("NATIVE_FULLTEXT_QUERY_BOUND_HOLD") from exc
         retained = self._facts(revision_id).get("retrieval_binding")
         if retained is None:
-            self._prepare(units, proof=proof)
+            with _native_phase("RETRIEVAL_PREPARE", cycle_id=revision_id, cohort_count=len(units)):
+                self._prepare(units, proof=proof)
         with _native_phase("RETRIEVAL_CURRENT_SUBJECTS", cycle_id=revision_id, cohort_count=len(self._journal.units)):
             subjects, rights_inventory = self._current_subjects()
         rights_inventory_digest = digest_canonical(rights_inventory)
@@ -173,11 +174,12 @@ class NativeRetrievalContinuation:
         # Historical documents are re-authorised independently. A held source
         # is removed from all real projection branches without blocking a new,
         # currently authorised revision from another source.
-        for source_revision, source_units in self._journal.units.items():
+        for source_revision in self._journal.units:
             facts = self._journal.summary(source_revision).get("facts", {})
             records = facts.get("retrieval_documents", {})
             if not records:
                 continue
+            source_units = self._journal.units[source_revision]
             exclusions = dict(facts.get("retrieval_exclusions", {}))
             for unit in source_units:
                 record = records.get(unit.ingest_id)

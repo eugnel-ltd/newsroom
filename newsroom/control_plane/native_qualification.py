@@ -29,7 +29,7 @@ from .model_usage import (
     _valid_native_graphiti_embedding_cancellation_disposition_record,
     _valid_native_graphiti_fallback_cancellation_disposition_record,
 )
-from .native_progress import LAND, PORTFOLIO, STATE, NativeRevisionJournal
+from .native_progress import LAND, PORTFOLIO, STATE, NativeRevisionJournal, iter_source_headers
 from .store import LEDGER_GENESIS, append_ledger
 
 _STARTED = "NATIVE_SERVICE_CYCLE_STARTED"
@@ -412,7 +412,7 @@ def _invocations(
     if retained_ids == ():
         return ()
     ingest_ids = {
-        unit.ingest_id for units in journal.units.values() for unit in units
+        ingest for header in iter_source_headers(journal.units) for ingest, _ in header.unit_index
     }
     selected_workloads = tuple(sorted(_NATIVE_WORKLOADS | _GRAPHITI_WORKLOADS))
     values = retained_ids if retained_ids is not None else selected_workloads
