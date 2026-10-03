@@ -57,6 +57,7 @@ from newsroom.increment10.editorial import (
     EditorialPolicyDecision,
     NativeEditorial,
     STORY_COMMAND,
+    STORY_ADMISSION_TYPE,
     STORY_EVENT,
     STORY_PURPOSE,
     STORY_CLASS,
@@ -331,6 +332,7 @@ class NativePublicationController:
         expected_delivery_evidence_version: int,
         proof: AuthenticationProof,
         correction_of: NativePublicationResult | None = None,
+        reconciled_predecessor: dict | None = None,
     ) -> NativePublicationResult:
         if (
             type(package_admission_id) is not ObjectAdmissionId
@@ -351,6 +353,25 @@ class NativePublicationController:
             candidate_port=self._candidate_port,
             proof=proof,
         )
+        if reconciled_predecessor is not None:
+            prior, prior_story = self.read_acknowledged(reconciled_predecessor, proof=proof)
+            prior_package = self._evidence.read(
+                prior_story.package_admission_id, candidate_port=self._candidate_port, proof=proof,
+            )
+            if (
+                correction_of is not None
+                or prior_story.package_admission_id == package_admission_id
+                or prior_package.package.candidate_id != retained.package.candidate_id
+                or prior.story_receipt.story_id != _aggregate("story", retained.package.candidate_id)
+                or prior.attempt_receipt.publication_id != _aggregate("publication", retained.package.candidate_id)
+                or prior.story_receipt.aggregate_version != expected_story_version
+                or prior.attempt_receipt.aggregate_version != expected_publication_version
+                or expected_delivery_evidence_version != 0
+            ):
+                raise NativePublicationError("stale publication predecessor binding differs")
+            # The original decision remains retained; only the fresh Story uses
+            # the canonical current member of this exact known policy pair.
+            editorial_decision = self._editorial.current_copy_decision(editorial_decision)
         if correction_of is not None:
             old, old_story = self.read_acknowledged({
                 "story_event_id": correction_of.story_receipt.event_id,
@@ -462,6 +483,54 @@ class NativePublicationController:
             read_proof,
             _story.copy.writer_id,
         )
+
+    def reconcile_stale_intent(
+        self, package_admission_id: ObjectAdmissionId, *, expected_story_version: int,
+        expected_publication_version: int, acknowledged: tuple[dict, ...],
+        proof: AuthenticationProof,
+    ) -> tuple[NativePublicationResult, dict] | None:
+        """Move a blocked intent only beyond its exact, fully acknowledged sibling."""
+        retained = self._evidence.read(
+            package_admission_id, candidate_port=self._candidate_port, proof=proof,
+        )
+        story_id = _aggregate("story", retained.package.candidate_id)
+        occupied = self._objects.committed_admission(ObjectAdmissionRequest(
+            STORY_ADMISSION_TYPE, f"story-version:{story_id}:{expected_story_version + 1}",
+        ), proof=proof)
+        if occupied is None:
+            return None
+        admission = occupied.admission
+        material = self._objects.hydrate(HydrationRequest(admission.admission_id, STORY_PURPOSE), proof=proof)
+        self._editorial._verify_access(
+            material.decision, policy=self._bindings.editorial_story_hydration_policy_digest,
+            object_class=STORY_CLASS, allowed_use=STORY_USE,
+        )
+        story = StoryVersion.from_bytes(material.data)
+        if (
+            admission.definition_digest != self._bindings.editorial_story_admission_definition_digest
+            or not admission.active or admission.blob.blob_digest != story.digest
+            or story.story_id != story_id or story.aggregate_version != expected_story_version + 1
+        ):
+            raise NativePublicationError("occupied Story authority differs")
+        if story.package_admission_id == package_admission_id:
+            return None  # Own partial intent must replay its exact original slot.
+        keys = ("story_event_id", "publication_event_id", "delivery_attempt_event_id", "delivery_evidence_event_id")
+        for facts in acknowledged:
+            if not all(key in facts for key in keys):
+                continue
+            event = self._events.provenance(facts["story_event_id"], proof=proof).event
+            if event.object_admission_id != str(admission.admission_id):
+                continue
+            prior, original = self.read_acknowledged(facts, proof=proof)
+            if (
+                original.canonical_bytes() != story.canonical_bytes()
+                or prior.story_receipt.story_id != story_id
+                or prior.attempt_receipt.publication_id != _aggregate("publication", retained.package.candidate_id)
+                or prior.attempt_receipt.aggregate_version <= expected_publication_version
+            ):
+                raise NativePublicationError("stale publication predecessor binding differs")
+            return prior, {key: facts[key] for key in keys}
+        return None
 
     def read_acknowledged(
         self, facts: dict, *, proof: AuthenticationProof,
@@ -1198,6 +1267,31 @@ class NativePublicationContinuation:
             self._journal.advance(
                 revision_id, stage="PUBLICATION_PREPARED", facts=facts
             )
+        else:
+            siblings = tuple(
+                dict(summary.get("facts", {}))
+                for other_revision_id, summary in self._journal.iter_summaries()
+                if other_revision_id != revision_id
+                and summary.get("stage") == "ACKNOWLEDGED"
+                and summary.get("facts", {}).get("candidate_id") == candidate_id
+            )
+            if siblings:
+                reconciled = self._runtime.publication.reconcile_stale_intent(
+                    ObjectAdmissionId.parse(str(package_id)),
+                    expected_story_version=facts["expected_story_version"],
+                    expected_publication_version=facts["expected_publication_version"],
+                    acknowledged=siblings, proof=self._runtime.proof,
+                )
+                if reconciled is not None:
+                    prior, predecessor = reconciled
+                    facts = current_facts()
+                    facts.update(
+                        expected_story_version=prior.story_receipt.aggregate_version,
+                        expected_publication_version=prior.attempt_receipt.aggregate_version,
+                        expected_delivery_evidence_version=0,
+                        publication_predecessor=predecessor,
+                    )
+                    self._journal.advance(revision_id, stage="PUBLICATION_PREPARED", facts=facts)
 
         # Legacy progress named its intent times applied/observed. Keep those
         # historical facts readable, but never use them as effect timestamps.
@@ -1223,6 +1317,8 @@ class NativePublicationContinuation:
                     facts["expected_delivery_evidence_version"]
                 ),
                 proof=self._runtime.proof,
+                **({"reconciled_predecessor": facts["publication_predecessor"]}
+                   if "publication_predecessor" in facts else {}),
             )
         except EditorialHold as exc:
             reason_codes = (

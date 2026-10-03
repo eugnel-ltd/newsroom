@@ -410,3 +410,120 @@ def test_known_policy_pair_upgrade_reads_old_ack_and_corrects_once(tmp_path, mon
         assert calls == ['draft','review']
     finally:
         controller.close(); candidates.rollback(); candidates.close(); system.close()
+
+
+@pytest.mark.parametrize('boundary', ('complete', 'own-partial', 'incomplete', 'corrupt', 'revoked', 'legacy', 'unknown-policy', 'stop', 'empty-slot', 'second-sibling'))
+def test_stale_story_slot_requires_exact_acknowledged_sibling(tmp_path, monkeypatch, boundary):
+    from dataclasses import replace
+    from newsroom.increment10.editorial import EditorialError
+
+    candidates, port, version = _candidate(tmp_path)
+    ingress = open_evidence_intake_ingress(tmp_path / 'stale-intake.sqlite3')
+    acknowledgement = _receive(ingress, candidates, port, version, request_id='stale-slot')
+    clock = lambda: UtcTimestamp.parse('2026-07-16T12:00:00Z')
+    system, registries, hydration, definitions, commands = _open(tmp_path / 'stale-authority.sqlite3', clock=clock)
+    evidence = _evidence_facade(system, ingress, registries)
+    passage, package, records = _ready_package(version)
+    source = system.objects.admit(ObjectAdmissionRequest('evidence.source', 'stale-source'), passage.encode(), proof=proof()).admission
+    ids = tuple(system.objects.admit(ObjectAdmissionRequest('evidence.record', f'stale-record-{i}'),
+        canonical_json_bytes(value), proof=proof()).admission.admission_id for i, value in enumerate(records))
+    candidates.execute('BEGIN IMMEDIATE')
+    retain = lambda value: evidence.retain(value, receipt_id=acknowledgement.receipt_id, candidate_port=port,
+        source_admission_ids=(source.admission_id,), record_admission_ids=ids, proof=proof())
+    retained = retain(package)
+    incoming = retain(replace(package, selection_rationale=package.selection_rationale + ' Another retained selection.'))
+    third = retain(replace(package, selection_rationale=package.selection_rationale + ' A third retained selection.')) if boundary == 'second-sibling' else None
+    bindings = _bindings(tmp_path, registries, hydration, definitions, commands)
+    if boundary in ('legacy', 'unknown-policy'):
+        from newsroom.control_plane.native_policies import native_policy_components
+        qualified = native_policy_components(principal_id='principal.alpha', authority_domain='newsroom.authority',
+            target_path=bindings.target_path, target_id=bindings.target_id).publication
+        bindings = replace(bindings, editorial_policy_bundle_digest=qualified.editorial_policy_bundle_digest,
+            publication_authorisation_policy_digest=qualified.publication_authorisation_policy_digest,
+            target_policy_digest=qualified.target_policy_digest, retained_policy_pairs=qualified.retained_policy_pairs)
+    def decision_for(value, policy=None):
+        original = _decision(value, source.admission_id)
+        return type(original).create(**{name: (policy or bindings.editorial_policy_bundle_digest) if name == 'policy_bundle_digest' else getattr(original, name)
+            for name in original.__dataclass_fields__ if name != 'decision_id'})
+    controller = NativePublicationController(objects=system.objects, commands=system.commands, events=system.events,
+        candidate_port=port, evidence_packages=evidence, bindings=bindings, clock=clock)
+    request = dict(expected_story_version=0, expected_publication_version=0, expected_delivery_evidence_version=0, proof=proof())
+    references = lambda result: dict(story_event_id=result.story_receipt.event_id,
+        publication_event_id=result.publication_receipt.event_id, delivery_attempt_event_id=result.attempt_receipt.event_id,
+        delivery_evidence_event_id=result.evidence_receipt.event_id)
+    builder = controller._editorial._build_story
+    def old_copy(*args, **kwargs):
+        kwargs['writer_id'] = 'newsroom.offline-exact-copy.v2'
+        return builder(*args, **kwargs)
+    monkeypatch.setattr(controller._editorial, '_build_story', old_copy)
+    first = controller.advance(retained.package_admission_id, decision_for(retained), **request)
+    monkeypatch.setattr(controller._editorial, '_build_story', builder)
+    stale = {**request, 'expected_story_version': 1, 'expected_publication_version': 2}
+    corrected = controller.advance(retained.package_admission_id, decision_for(retained), **stale, correction_of=first)
+    frozen = controller.read_acknowledged(references(corrected), proof=proof())[1].canonical_bytes()
+    selected = retained if boundary == 'own-partial' else incoming
+    sibling = references(corrected)
+    if boundary == 'incomplete': sibling.pop('delivery_evidence_event_id')
+    if boundary == 'corrupt': sibling['delivery_evidence_event_id'] = first.evidence_receipt.event_id
+    if boundary == 'revoked':
+        system.objects.revoke(source.admission_id, reason_code='SOURCE_NO_LONGER_CURRENT', idempotency_key='stale-revoke', proof=proof())
+    if boundary == 'stop':
+        from newsroom.control_plane.veto import OperatorDrainRequested
+        def stopped(*args, **kwargs):
+            raise OperatorDrainRequested('operator drain')
+        monkeypatch.setattr(controller, 'read_acknowledged', stopped)
+    try:
+        if boundary in ('corrupt', 'revoked', 'stop'):
+            with pytest.raises(Exception):
+                controller.reconcile_stale_intent(selected.package_admission_id,
+                    expected_story_version=1, expected_publication_version=2, acknowledged=(sibling,), proof=proof())
+            return
+        if boundary == 'empty-slot':
+            assert controller.reconcile_stale_intent(incoming.package_admission_id,
+                expected_story_version=2, expected_publication_version=4, acknowledged=(sibling,), proof=proof()) is None
+            return
+        reconciled = controller.reconcile_stale_intent(selected.package_admission_id,
+            expected_story_version=1, expected_publication_version=2, acknowledged=(sibling,), proof=proof())
+        if boundary in ('own-partial', 'incomplete'):
+            assert reconciled is None
+            return
+        assert reconciled == (corrected, sibling)
+        with pytest.raises(EditorialError, match='retained write-admission'):
+            controller.advance(incoming.package_admission_id, decision_for(incoming), **stale)
+        next_request = {**request, 'expected_story_version': 2, 'expected_publication_version': 4,
+                        'reconciled_predecessor': sibling}
+        incoming_decision = decision_for(incoming, bindings.retained_policy_pairs[0][0] if boundary == 'legacy' else None)
+        if boundary == 'unknown-policy':
+            with pytest.raises(EditorialError, match='policy'):
+                controller.advance(incoming.package_admission_id, decision_for(incoming, 'sha256:' + '0' * 64), **next_request)
+            return
+        def interrupted(*args, **kwargs):
+            raise RuntimeError('own partial publication')
+        with monkeypatch.context() as fault:
+            fault.setattr(controller._publication, 'decide', interrupted)
+            with pytest.raises(RuntimeError, match='own partial'):
+                controller.advance(incoming.package_admission_id, incoming_decision, **next_request)
+        assert controller.reconcile_stale_intent(incoming.package_admission_id,
+            expected_story_version=2, expected_publication_version=4, acknowledged=(sibling,), proof=proof()) is None
+        controller.close()
+        controller = NativePublicationController(objects=system.objects, commands=system.commands, events=system.events,
+            candidate_port=port, evidence_packages=evidence, bindings=bindings, clock=clock)
+        published = controller.advance(incoming.package_admission_id, incoming_decision, **next_request)
+        assert (published.story_receipt.aggregate_version, published.attempt_receipt.aggregate_version) == (3, 6)
+        assert controller.advance(incoming.package_admission_id, incoming_decision, **next_request) == published
+        assert controller.read_acknowledged(references(corrected), proof=proof())[1].canonical_bytes() == frozen
+        if third is not None:
+            assert controller.reconcile_stale_intent(third.package_admission_id,
+                expected_story_version=2, expected_publication_version=4, acknowledged=(sibling,), proof=proof()) is None
+            with pytest.raises(EditorialError, match='retained write-admission'):
+                controller.advance(third.package_admission_id, decision_for(third), **next_request)
+            later, later_facts = controller.reconcile_stale_intent(third.package_admission_id,
+                expected_story_version=2, expected_publication_version=4, acknowledged=(sibling, references(published)), proof=proof())
+            assert (later.story_receipt.aggregate_version, later.attempt_receipt.aggregate_version) == (3, 6)
+            final_request = {**request, 'expected_story_version': 3, 'expected_publication_version': 6,
+                             'reconciled_predecessor': later_facts}
+            final = controller.advance(third.package_admission_id, decision_for(third), **final_request)
+            assert (final.story_receipt.aggregate_version, final.attempt_receipt.aggregate_version) == (4, 8)
+            assert controller.advance(third.package_admission_id, decision_for(third), **final_request) == final
+    finally:
+        controller.close(); candidates.rollback(); candidates.close(); system.close()
