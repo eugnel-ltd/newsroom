@@ -487,6 +487,54 @@ def _require_pipeline(pipeline: CombinedTemporalPipeline | None) -> None:
         )
 
 
+def inherited_empty_receipt(
+    revision: SourceRevisionInput,
+    retained: Mapping[str, object],
+    source_refs: Mapping[str, str],
+) -> dict[str, object] | None:
+    """Build current metadata from an authenticated native empty source.
+
+    This pure constructor grants no authority. Its native caller authenticates
+    source/output provenance, settled usage and current rights/leaf absence.
+    """
+    prompt = build_compact_prompt(revision)
+    prompt_digest = _candidate_prompt_digest(prompt)
+    proposal = retained.get("proposal_receipt")
+    if (
+        retained.get("prompt_digest") != prompt_digest
+        or retained.get("configuration_digest") != configuration_digest()
+        or retained.get("zero_proposal_effect") != "EXPLICIT"
+        or not isinstance(proposal, Mapping)
+        or proposal.get("wire_payload") != {"entities": [], "facts": []}
+        or set(source_refs) != {"run_version_id", "output_id", "output_digest", "attempt_id"}
+        or any(type(value) is not str or not value for value in source_refs.values())
+    ):
+        return None
+    payload, ranges, nodes, edges, projection = _validate_and_expand(
+        revision=revision, prompt=prompt, raw={"entities": [], "facts": []},
+    )
+    if payload != {"entities": [], "facts": []} or ranges or nodes or edges:
+        return None
+    return {
+        "execution_source": "INHERITED_NO_PROPOSALS",
+        "inherited_source": dict(source_refs),
+        "prompt_digest": prompt_digest,
+        "ingest_id": revision.ingest_id,
+        "source_revision_id": revision.revision_id,
+        "predecessor_revision_id": revision.predecessor_revision_id,
+        "temporal_basis": revision.temporal_basis,
+        "configuration_digest": configuration_digest(),
+        "temporal_policy_digest": digest_canonical(TEMPORAL_POLICY_VERSION),
+        "invocation_count": 0,
+        "transport_calls": [],
+        "pipeline_chat_invocations": [],
+        "proposal_receipt": _proposal_receipt(revision=revision, payload=payload, ranges=ranges),
+        "projection_receipt": projection,
+        "zero_proposal_effect": "EXPLICIT",
+        "graph_effect_attempted": False,
+    }
+
+
 def _proposal_receipt(
     *,
     revision: SourceRevisionInput,

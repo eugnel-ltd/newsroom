@@ -4187,6 +4187,13 @@ class ModelUsageService:
         )
         return evidence
 
+    def graphiti_ingest_allocation_count(self, *, ingest_id: str) -> int:
+        """Authenticate allocated leaves, independent of an open controller envelope."""
+        _evidence, allocation_count = self._graphiti_ingest_retry_evidence(
+            ingest_id=ingest_id,
+        )
+        return allocation_count
+
     def graphiti_ingest_retry_evidence_many(
         self, *, ingest_ids: tuple[str, ...],
     ) -> dict[str, GraphitiIngestRetryEvidence]:
