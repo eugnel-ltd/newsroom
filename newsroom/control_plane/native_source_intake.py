@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 from newsroom.authority import (
     AuthenticationProof, HydrationRequest, ObjectAccessDecisionId, ObjectAdmissionId,
-    ObjectAdmissionRequest, UtcTimestamp,
+    ObjectAdmissionRequest, UtcTimestamp, AuthorityPersistenceError,
 )
 from newsroom.authority.canonical import (
     digest_bytes, digest_canonical, validate_sha256_digest,
@@ -54,7 +54,9 @@ from .govuk_spreadsheet import (
     is_spreadsheet_url,
     parse_govuk_spreadsheet,
 )
-from .govuk_pdf import declared_pdf, is_pdf_url, parse_govuk_pdf, MAX_RAW_BYTES as MAX_PDF_RAW_BYTES
+from .govuk_pdf import (declared_pdf, is_pdf_url, parse_govuk_pdf, GovUkPdfHold,
+    pdf_parse_binding, pdf_parse_receipt, read_pdf_parse_receipt,
+    MAX_RAW_BYTES as MAX_PDF_RAW_BYTES)
 from .native_policies import (
     NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE,
     NATIVE_SOURCE_OBSERVATION_PURPOSE,
@@ -65,7 +67,7 @@ from .native_evidence import (
 )
 from .native_progress import NativeRevisionJournal
 
-from .veto import VetoError
+from .veto import OperatorDrainRequested, VetoError
 
 VERSION = "hermes-native-source-intake-v1"
 SUPPORTED = frozenset({"UK-01", "UK-02", "UK-03", "UK-05"})
@@ -387,11 +389,14 @@ class NativeSourceIntake:
                         str(asset_admission.admission_id),
                         str(asset_access.access_decision_id),
                     ))
-                    parse = parse_govuk_pdf if is_pdf_url(asset_url) else parse_govuk_spreadsheet
-                    document = parse(
-                        item.canonical_url, raw, asset_url, asset_raw,
-                        retrieved_at=asset_observed,
-                    )
+                    if is_pdf_url(asset_url):
+                        document = self._parse_pdf(
+                            item.canonical_url, raw, asset_url, asset_raw,
+                            retrieved_at=asset_observed, source_version=str(version_id))
+                    else:
+                        document = parse_govuk_spreadsheet(
+                            item.canonical_url, raw, asset_url, asset_raw,
+                            retrieved_at=asset_observed)
                     asset_item = SourceItem(
                         source_id, observation_digest + "|" + asset_url,
                         document.title, document.body_text, item.canonical_url,
@@ -617,6 +622,46 @@ class NativeSourceIntake:
             published_at=_utc(document.publication),
             updated_at=_utc(document.updated),
         )
+
+    def _parse_pdf(self, parent_url, parent_raw, asset_url, raw, *, retrieved_at, source_version):
+        binding = pdf_parse_binding(parent_url, parent_raw, asset_url, raw,
+            retrieved_at=retrieved_at, source_version=source_version)
+        request = ObjectAdmissionRequest(NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE,
+            'native-pdf-parse:' + digest_canonical(binding))
+        existing = None
+        try:
+            existing = self._objects.committed_admission(request, proof=self._proof)
+            if existing is not None:
+                admission = existing.admission
+                if not 0 < admission.blob.size_bytes <= MAX_BODY_BYTES:
+                    raise ValueError('PDF parse receipt exceeds metadata bound')
+                receipt = self._objects.rehydrate(HydrationRequest(admission.admission_id,
+                    NATIVE_SOURCE_OBSERVATION_PURPOSE, 0, admission.blob.size_bytes), proof=self._proof)
+                outcome = read_pdf_parse_receipt(receipt.data, binding)
+                if isinstance(outcome, str):
+                    raise GovUkPdfHold(outcome)
+                return outcome
+        except GovUkPdfHold:
+            raise
+        except (VetoError, OperatorDrainRequested):
+            raise
+        except (TypeError, ValueError, LookupError, AuthorityPersistenceError):
+            # Invalid optimisation metadata is not source authority. Reparse the
+            # freshly acquired declared bytes; never rewrite an immutable receipt.
+            existing = False
+        try:
+            document = parse_govuk_pdf(parent_url, parent_raw, asset_url, raw, retrieved_at=retrieved_at)
+        except GovUkPdfHold as exc:
+            encoded = pdf_parse_receipt(binding, exc.reason_code)
+            if existing is None and encoded is not None:
+                admission = self._objects.admit(request, encoded, proof=self._proof).admission
+                self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, encoded)
+            raise
+        encoded = pdf_parse_receipt(binding, document)
+        if existing is None and encoded is not None:
+            admission = self._objects.admit(request, encoded, proof=self._proof).admission
+            self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, encoded)
+        return document
 
     def _admit_observation(self, source_id: str, raw: bytes, *, pdf=False):
         admission = self._objects.admit(ObjectAdmissionRequest(

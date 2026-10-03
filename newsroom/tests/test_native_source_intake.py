@@ -1537,6 +1537,134 @@ def test_declared_pdf_source_retains_large_raw_bytes_complete_pages_and_replays_
             acquire(request)
 
 
+@pytest.mark.parametrize('negative', [False, True])
+def test_pdf_parse_receipt_survives_reopen_without_worker_or_audit_regrowth(tmp_path, monkeypatch, negative, record_property):
+    from time import perf_counter
+    from newsroom.tests.test_govuk_pdf import pdf_bytes, parent_bytes, ASSET
+    from newsroom.control_plane import native_source_intake as intake_module
+    options = {'catalog': b'/AcroForm << /Fields [<< /FT /Tx >>] >>'} if negative else {}
+    raw = pdf_bytes('Complete first page.', 'Complete second page.', **options)
+    parent = json.loads(parent_bytes(raw))
+    parent.update(first_published_at='2026-09-07T09:00:00Z', public_updated_at='2026-09-08T11:00:00Z')
+    bodies = {SOURCE_URLS['UK-01']: _atom_for('/government/publications/pdf-guidance'),
+        'https://www.gov.uk/api/content/government/publications/pdf-guidance': json.dumps(parent).encode(), ASSET: raw}
+    calls, fetched, timings = [], [], []
+    original = intake_module.parse_govuk_pdf
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(intake_module, 'parse_govuk_pdf', counted)
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    retained = {}
+    def intake(runtime, definition):
+        return NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-01': definition}, licence=_licence(),
+            dispatch_fence=lambda *_: nullcontext(), retained_units=retained,
+            fetch=lambda url: (fetched.append(url), (200, bodies[url]))[1],
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC))
+    with open_native_runtime(**args) as runtime:
+        definition = _seed_uk01(runtime)
+        poller = intake(runtime, definition)
+        start = perf_counter(); first = poller.poll()[0]; timings.append(perf_counter() - start)
+        retained.update({unit.revision_id: first.units for unit in first.units})
+        counts = _source_read_audit_counts(args['authority_path'])
+        start = perf_counter(); second = poller.poll()[0]; timings.append(perf_counter() - start)
+        assert second == first
+        assert len(calls) == 1
+        assert len(fetched) == 6  # Both ticks still fetch feed, parent and asset.
+        assert _source_read_audit_counts(args['authority_path']) == counts
+        poller._licence = SimpleNamespace(for_source=lambda **_: SimpleNamespace(decision='HOLD'))
+        assert poller.poll()[0].reason_code == 'CURRENT_RIGHTS_HOLD'
+        assert len(fetched) == 6 and len(calls) == 1
+        assert _source_read_audit_counts(args['authority_path']) == counts
+    with open_native_runtime(**args) as runtime:
+        start = perf_counter(); replay = intake(runtime, definition).poll()[0]; timings.append(perf_counter() - start)
+        assert replay == first and len(calls) == 1
+        assert _source_read_audit_counts(args['authority_path']) == counts
+    assert bool(first.item_holds) is negative
+    record_property('whole_fixture_poll_seconds_first_hit_reopen', str(timings))
+
+
+@pytest.mark.parametrize('change', ['raw', 'declaration', 'parser-policy', 'source-version', 'missing', 'corrupt'])
+def test_pdf_parse_receipt_changes_or_invalid_metadata_reparse_exact_bytes(tmp_path, monkeypatch, change):
+    from newsroom.tests.test_govuk_pdf import pdf_bytes, parent_bytes, PARENT, ASSET
+    from newsroom.control_plane import native_source_intake as intake_module, govuk_pdf
+    raw = pdf_bytes('Complete first page.', 'Complete second page.')
+    parent = parent_bytes(raw)
+    calls = []
+    original = intake_module.parse_govuk_pdf
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(intake_module, 'parse_govuk_pdf', counted)
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    with open_native_runtime(**args) as runtime:
+        poller = NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={}, licence=_licence(), dispatch_fence=lambda *_: nullcontext())
+        kwargs = {'retrieved_at': datetime(2026, 10, 3, tzinfo=UTC), 'source_version': 'fixture-version-one'}
+        first = poller._parse_pdf(PARENT, parent, ASSET, raw, **kwargs)
+        assert poller._parse_pdf(PARENT, parent, ASSET, raw, **kwargs) == first and len(calls) == 1
+        if change == 'raw':
+            raw = pdf_bytes('Changed first page.', 'Complete second page.')
+            parent = parent_bytes(raw)
+        elif change == 'declaration':
+            value = json.loads(parent); value['details']['attachments'][0]['title'] = 'Updated title'
+            parent = json.dumps(value).encode()
+        elif change == 'parser-policy':
+            monkeypatch.setattr(govuk_pdf, 'POLICY_DIGEST', 'sha256:' + 'e' * 64)
+        elif change == 'source-version':
+            kwargs['source_version'] = 'fixture-version-two'
+        elif change == 'missing':
+            monkeypatch.setattr(type(runtime.authority.objects), 'committed_admission', lambda *_args, **_kwargs: None)
+        else:
+            original_read = intake_module.read_pdf_parse_receipt
+            monkeypatch.setattr(intake_module, 'read_pdf_parse_receipt', lambda _raw, binding: original_read(b'{}', binding))
+        reparsed = poller._parse_pdf(PARENT, parent, ASSET, raw, **kwargs)
+        assert len(calls) == 2 and reparsed.raw_digest == digest_bytes(raw)
+
+
+@pytest.mark.parametrize('reason', ['SOURCE_PDF_PARSER_WARNING_HOLD', 'SOURCE_PDF_WORKER_BOUND_HOLD', 'SOURCE_PDF_MEMORY_BOUND_HOLD', 'SOURCE_PDF_STRUCTURE_HOLD'])
+def test_transient_or_unspecified_pdf_failure_is_never_retained(tmp_path, monkeypatch, reason):
+    from newsroom.tests.test_govuk_pdf import pdf_bytes, parent_bytes, PARENT, ASSET
+    from newsroom.control_plane import native_source_intake as intake_module
+    from newsroom.control_plane.govuk_pdf import GovUkPdfHold
+    calls = []
+    def failed(*_args, **_kwargs):
+        calls.append(1); raise GovUkPdfHold(reason)
+    monkeypatch.setattr(intake_module, 'parse_govuk_pdf', failed)
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    raw = pdf_bytes('Complete first page.', 'Complete second page.')
+    with open_native_runtime(**args) as runtime:
+        poller = NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={}, licence=_licence(), dispatch_fence=lambda *_: nullcontext())
+        before = _source_read_audit_counts(args['authority_path'])
+        for _ in range(2):
+            with pytest.raises(GovUkPdfHold, match=reason):
+                poller._parse_pdf(PARENT, parent_bytes(raw), ASSET, raw,
+                    retrieved_at=datetime(2026, 10, 3, tzinfo=UTC), source_version='fixture-version')
+        assert len(calls) == 2 and _source_read_audit_counts(args['authority_path']) == before
+
+
+@pytest.mark.parametrize('failure', ['veto', 'drain'])
+def test_pdf_receipt_lookup_stop_is_not_swallowed_by_reparse_fallback(monkeypatch, failure):
+    from newsroom.tests.test_govuk_pdf import pdf_bytes, parent_bytes, PARENT, ASSET
+    from newsroom.control_plane.veto import OperatorDrainRequested, VetoError
+    from newsroom.control_plane import native_source_intake as intake_module
+    error = VetoError if failure == 'veto' else OperatorDrainRequested
+    def stopped(*_args, **_kwargs):
+        raise error('owner stop')
+    intake = object.__new__(NativeSourceIntake)
+    intake._objects, intake._proof = SimpleNamespace(committed_admission=stopped), None
+    monkeypatch.setattr(intake_module, 'parse_govuk_pdf', lambda *_a, **_k: pytest.fail('parser after stop'))
+    raw = pdf_bytes('Complete first page.', 'Complete second page.')
+    with pytest.raises(error, match='owner stop'):
+        intake._parse_pdf(PARENT, parent_bytes(raw), ASSET, raw,
+            retrieved_at=datetime(2026, 10, 3, tzinfo=UTC), source_version='fixture-version')
+
+
 def test_pdf_parent_keeps_failed_sibling_obligation_visible(tmp_path, monkeypatch):
     from newsroom.tests.test_govuk_pdf import pdf_bytes, parent_bytes, PARENT, ASSET
     good = pdf_bytes('First document page.', 'Second document page.')
