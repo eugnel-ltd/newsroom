@@ -1328,6 +1328,14 @@ class NativeAssessmentUsage:
         latest = max(results, key=lambda item: (item.completed_at, item.contract_version == VERSION))
         return latest.proof if latest.outcome == "ASSESSOR_VALIDATION_FAILED" else None
 
+    def retained_old_provider_failure(self, candidate: object) -> RetainedAssessorResult | None:
+        """Read an accounted old failure, not a validation result or retry grant."""
+        results = self.retained_assessments(candidate)
+        if not results or any(item.contract_version == VERSION for item in results):
+            return None
+        latest = max(results, key=lambda item: (item.completed_at, item.contract_version == VERSION))
+        return latest if latest.outcome == "ASSESSOR_PROVIDER_FAILED" else None
+
     def retained_assessments(
         self, candidate: object, base: EvidencePackage | None = None,
     ) -> tuple[RetainedAssessorResult, ...] | None:
@@ -1352,7 +1360,7 @@ class NativeAssessmentUsage:
                 # invocation from the independently derived cycle identity.
                 cycles = sorted({
                     _assessment_cycle_id(version_id, base.digest, contract)
-                    for contract in (VERSION, *(f"newsroom.native-evidence-assessor.v{i}" for i in range(6, 21)))
+                    for contract in (VERSION, *(f"newsroom.native-evidence-assessor.v{i}" for i in range(6, 24)))
                 })
                 cycle_clause = " OR cycle_id IN (" + ",".join("?" for _ in cycles) + ")"
                 parameters.extend(cycles)
@@ -1486,6 +1494,22 @@ class NativeAssessmentUsage:
                     )
                 except (TypeError, ValueError, ModelUsageIntegrityError):
                     return None
+                bounded_provider_failure = (
+                    VERSION == self._policy.prompt_contract_version == _REFERENCE_PRODUCER_VERSION
+                    and self._policy.qualified
+                    and allocation.prompt_contract_version in (
+                        _V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION, *_REFERENCE_PRODUCERS,
+                    )
+                    and allocation.prompt_contract_version != VERSION
+                    and terminal.outcome == "ASSESSOR_PROVIDER_FAILED"
+                    and terminal.failure_class == "UNKNOWN_PROVIDER_FAILURE"
+                    and terminal.usage_status is UsageStatus.ESTIMATED
+                    and terminal.provider_telemetry_digest is None
+                    and terminal.raw_telemetry_pointer is None
+                    and (allocation.one_turn, allocation.exact_input, allocation.skills_enabled,
+                         allocation.tools_enabled, allocation.mcp_enabled, allocation.prior_message_count)
+                    == (True, True, False, False, False, 0)
+                )
                 if type(policy_record) is not dict:
                     return None
                 unsigned_policy = dict(policy_record)
@@ -1603,11 +1627,13 @@ class NativeAssessmentUsage:
                     )
                     or terminal.as_record() != terminal_record
                     or terminal.invocation_id != allocation.invocation_id
-                    or terminal.usage_status is not UsageStatus.REPORTED
-                    or (terminal.outcome, terminal.failure_class) not in {
+                    or (not bounded_provider_failure and (
+                        terminal.usage_status is not UsageStatus.REPORTED
+                        or (terminal.outcome, terminal.failure_class) not in {
                         ("ASSESSOR_VALIDATION_FAILED", "ASSESSMENT_VALIDATION_FAILED"),
                         ("ASSESSOR_ACCEPTED", None),
-                    }
+                        }
+                    ))
                     or terminal.dispatch_at is None
                     or terminal.pre_dispatch_zero_proved
                     or terminal.policy_breach is not None
@@ -1644,17 +1670,24 @@ class NativeAssessmentUsage:
                     is not None
                 ):
                     return None
-                try:
-                    _require_reported_telemetry(connection, terminal)
-                except ModelUsageIntegrityError:
-                    return None
+                if bounded_provider_failure:
+                    if any(connection.execute(
+                        f"SELECT 1 FROM {table} WHERE invocation_id=?",
+                        (allocation.invocation_id,),
+                    ).fetchone() for table in ("model_provider_telemetry", "model_usage_reconciliations")):
+                        return None
+                else:
+                    try:
+                        _require_reported_telemetry(connection, terminal)
+                    except ModelUsageIntegrityError:
+                        return None
                 result_rows = connection.execute(
                     "SELECT payload_json,payload_digest FROM ledger WHERE kind=? "
                     "AND json_extract(payload_json,'$.invocation_id')=?",
                     (_ASSESSMENT_RESULT_KIND, allocation.invocation_id),
                 ).fetchall()
                 execution = None
-                if len(result_rows) > 1:
+                if len(result_rows) > 1 or (bounded_provider_failure and result_rows):
                     return None
                 if result_rows:
                     raw, result_digest = result_rows[0]
