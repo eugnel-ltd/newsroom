@@ -78,3 +78,19 @@ def test_uncertain_or_material_source_keeps_ordinary_qualification(mutation):
             source_updated_time=SourceTime.exact(UtcTimestamp.parse(unit.updated_at)),
             source_native_revision_token=unit.updated_at)
     assert archival_nil_return_disposition(unit, original, now=NOW) is None
+
+
+def test_closed_reporting_quarter_can_be_published_in_the_same_archival_year():
+    from newsroom.control_plane.native_source_disposition import archival_nil_return_disposition
+    unit, original = _fixture()
+    published = "2018-10-18T10:00:00.000000Z"
+    unit = replace(unit, headline=unit.headline.replace("July to September 2019", "April to June 2018"),
+        published_at=published, updated_at=published)
+    original = replace(original, permitted_state_digest=unit.revision_digest,
+        source_published_time=SourceTime.exact(UtcTimestamp.parse(published)),
+        source_updated_time=SourceTime.exact(UtcTimestamp.parse(published)), source_native_revision_token=published)
+    witness = archival_nil_return_disposition(unit, original, now=NOW)
+    assert witness is not None and witness["reporting_period_end"] == "2018-06-30"
+    future_period = replace(unit, headline=unit.headline.replace("April to June", "October to December"))
+    original = replace(original, permitted_state_digest=future_period.revision_digest)
+    assert archival_nil_return_disposition(future_period, original, now=NOW) is None

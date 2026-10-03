@@ -23,7 +23,7 @@ _PERIODS = {"January to March": (3, 31), "April to June": (6, 30),
             "July to September": (9, 30), "October to December": (12, 31)}
 _TITLE = re.compile(r"Home Office's ministerial special advisers (meetings|hospitality), (January to March|April to June|July to September|October to December) ([0-9]{4})")
 POLICY_DIGEST = digest_canonical({"version": VERSION, "parser": PARSER_POLICY_DIGEST,
-    "headers": _HEADERS, "periods": _PERIODS, "dates": "report-year<publication-year<original-observation-year;publication=update",
+    "headers": _HEADERS, "periods": _PERIODS, "dates": "report-period-end<publication-date;publication-year<original-observation-year;publication=update",
     "source": SOURCE_VERSION, "observation_cells": "literal-Nil-Return-plus-whitespace"})
 
 
@@ -71,7 +71,7 @@ def archival_nil_return_disposition(unit, original, *, now):
     try:
         role, period, year = _TITLE.fullmatch(unit.headline).groups()
         period_end = date(int(year), *_PERIODS[period])
-        if not (published == updated and int(year) < published.value.year < original.observed_at.value.year
+        if not (published == updated and published.value.year < original.observed_at.value.year
                 and original.observed_at.value <= now.value and period_end < published.value.date()):
             return None
         lines = unit.body.splitlines()

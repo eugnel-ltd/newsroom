@@ -297,7 +297,15 @@ def test_current_selection_reaches_existing_admission_without_duplicate_inventor
         missing_body = replace(package,governed_claims=tuple(c for c in package.governed_claims if c.claim_role=='HEADLINE'),
             substantive_new_information=(package.substantive_new_information[0],),
             evidence_gate_evidence=tuple(replace(g,governed_claim_ids=(claims[0],))for g in package.evidence_gate_evidence))
-        assert 'INVALID_SUBSTANTIVE_CLAIM_INVENTORY' in decide(missing_body).stable_reason_codes
+        assert decide(missing_body).decision == 'WRITE_READY'
+        background = replace(package, governed_claims=tuple(
+            replace(c, claim_role='CONTEXT') if c.claim_role == 'SUBSTANTIVE' else c
+            for c in package.governed_claims),
+            substantive_new_information=(package.substantive_new_information[0],))
+        assert decide(background).decision == 'WRITE_READY'
+        assert decide(replace(background, qualification_evidence=())).stable_reason_codes == ('UNQUALIFIED_HEADLINE_CLAIM',)
+        assert 'INVALID_SUBSTANTIVE_CLAIM_INVENTORY' in decide(replace(background,
+            substantive_new_information=(package.substantive_new_information[1],))).stable_reason_codes
     else:
         assert package.substantive_new_information == ()
         assert package.qualification_evidence

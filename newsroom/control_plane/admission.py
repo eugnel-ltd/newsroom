@@ -122,8 +122,17 @@ _PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS = frozenset(
     "newsroom.qualification-relation.v3"
 }
 QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v3"
+# Known historical identity; later consumer subpolicy changes must not relabel it.
+_PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION = (
+    "newsroom.write-admission.v9+newsroom.evid-012.v7+"
+    "newsroom.evidence-approval.v8+newsroom.evidence-gates.v2+"
+    "newsroom.governed-claim.v7+newsroom.governed-input.v10+"
+    "newsroom.named-entity.v16+newsroom.cont-originality.v3+"
+    "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
+    "newsroom.qualification-relation.v3"
+)
 WRITE_ADMISSION_POLICY_VERSION = (
-    "newsroom.write-admission.v9+"
+    "newsroom.write-admission.v10+"
     f"{EVID_012_POLICY_VERSION}+{EVIDENCE_APPROVAL_POLICY_VERSION}+"
     f"{EVIDENCE_GATE_POLICY_VERSION}+"
     f"{GOVERNED_CLAIM_POLICY_VERSION}+{GOVERNED_INPUT_SCHEMA_VERSION}+"
@@ -721,6 +730,7 @@ class WriteAdmissionDecision:
             _EARLIER_WRITE_ADMISSION_POLICY_VERSION,
             _OLDEST_WRITE_ADMISSION_POLICY_VERSION,
             *_PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS,
+            _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION,
         }:
             raise ValueError("unsupported write-admission policy version")
         expected = _decision_id(
@@ -1155,14 +1165,9 @@ class DeterministicWriteAdmission:
                 for claim in package.governed_claims
             )
             for fact in package.substantive_new_information
-        ) or (
-            package.substantive_new_information
-            and not any(
-                claim.claim_role == "SUBSTANTIVE"
-                and claim.claim in package.substantive_new_information
-                for claim in package.governed_claims
-            )
         ):
+            # The independently qualified headline is itself substantive news.
+            # Background must not be promoted or duplicated to fill another role.
             missing.append("INVALID_SUBSTANTIVE_CLAIM_INVENTORY")
         expected_claim_ids = frozenset(governed_claims)
         gate_evidence = {item.gate: item for item in package.evidence_gate_evidence}
@@ -1377,3 +1382,11 @@ def select_write_ready(
         )
         selected.append((*item, record))
     return tuple(selected)
+
+
+def write_admission_revalidation_due(facts: dict) -> bool:
+    """Reconsider only a retained inventory HOLD under the changed consumer."""
+    return (facts.get("reason") == "INVALID_SUBSTANTIVE_CLAIM_INVENTORY"
+            and facts.get("write_admission_policy_version") != WRITE_ADMISSION_POLICY_VERSION
+            and type(facts.get("package_admission_id")) is str
+            and isinstance(facts.get("editorial_decision"), dict))
