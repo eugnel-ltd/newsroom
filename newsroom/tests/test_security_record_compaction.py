@@ -67,6 +67,8 @@ def test_current_security_storage_is_compact_with_exact_public_provenance(tmp_pa
              command_migration.COMMAND_BOUND_STORAGE_MIGRATION_CHECKSUM),
             (42, retirement_migration.PROJECTION_RETIREMENT_MIGRATION_NAME,
              retirement_migration.PROJECTION_RETIREMENT_MIGRATION_CHECKSUM),
+            (43, 'native_projection_retirement_lookup_indexes_v43',
+             'sha256:f9aecc8859aec5b6a19acbacb8b1eea7e1a179c99a8d01b638976f4080b52832'),
         )
         assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
     with open_test_system(path) as system:

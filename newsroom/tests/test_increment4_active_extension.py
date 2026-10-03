@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 
+from newsroom.authority.persistence import DiagnosticHistoryExpired
 from newsroom.increment4 import Increment4Neo4jCurrentBuildRequest, Increment4Neo4jActiveReadRequest
 from newsroom.projection import ProjectionDeliveryOutcome, ProjectionGenerationId, ProjectionStateError
 from newsroom.projection.neo4j import Neo4jAuthorityCommitPending, Neo4jIdentityConflict
@@ -184,8 +185,12 @@ def test_historical_revocation_uses_replacement_not_suffix(tmp_path):
     assert second.generation.generation_id == G2
     assert second.prior_generation.generation_id == G1
     assert all(gen == str(G2) for gen, _ in adapter.deliveries)
-    with pytest.raises(ProjectionStateError, match='no longer ACTIVE'):
+    # Native replacement deliberately expires this retired generation's diagnostics.
+    # Exact replay remains denied, with no new write or adapter mutation.
+    before = commands(state), adapter.apply_count, adapter.cleanup_count
+    with pytest.raises(DiagnosticHistoryExpired, match='checkpoint history expired'):
         build(state, adapter, request())
+    assert (commands(state), adapter.apply_count, adapter.cleanup_count) == before
 
 
 def test_source_watermark_race_stays_unvalidated(initial, monkeypatch):

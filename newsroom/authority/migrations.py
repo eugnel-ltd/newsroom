@@ -367,6 +367,7 @@ from .projection_retirement_migrations import (
 from .projection_retirement_lookup_migrations import (
     RETIREMENT_LOOKUP_SCHEMA_VERSION, RETIREMENT_LOOKUP_MIGRATION,
     RETIREMENT_LOOKUP_MIGRATION_NAME, RETIREMENT_LOOKUP_MIGRATION_CHECKSUM,
+    RETIREMENT_LOOKUP_MIGRATION_STATEMENTS,
     migrate_retirement_lookup,
 )
 
