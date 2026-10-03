@@ -168,6 +168,35 @@ class _Response(io.BytesIO):
 
 
 def _install_boundaries(monkeypatch, counters):
+    from newsroom.control_plane import native_story_model
+    from newsroom.control_plane.native_story_writer import DRAFT_SYSTEM
+    original_model = native_story_model.NativeStoryModel
+    def story_call(prompt, **arguments):
+        request = json.loads(prompt)
+        claims = request["evidence"]["approved_governed_claims"]
+        if arguments["system_instruction"] == DRAFT_SYSTEM:
+            counters["writer"] = counters.get("writer", 0) + 1
+            title = next(item["rendered_assertion"] for item in claims if item["claim_role"] == "HEADLINE")
+            value = {"title": title, "body": "\n\n".join(item["rendered_assertion"] for item in claims),
+                     "format": "BRIEF", "evidence_links": [
+                         {"governed_claim_id": item["governed_claim_id"], "rendered_assertion": item["rendered_assertion"]}
+                         for item in claims]}
+        else:
+            counters["writer_review"] = counters.get("writer_review", 0) + 1
+            links = request["draft"]["evidence_links"]
+            value = {"source_package_digest": request["source_package_digest"], "draft_digest": request["draft_digest"],
+                     "verdict": "PASS", "covered_claim_ids": [item["governed_claim_id"] for item in claims],
+                     "sentence_support": [{"sentence_index": i, "verdict": "SUPPORTED",
+                         "claim_ids": [item["governed_claim_id"] for item in links if item["rendered_assertion"] in sentence]}
+                         for i, sentence in enumerate(request["sentences"])],
+                     "factual_checks": {name: "PASS" for name in ("numbers", "entities", "modality", "quotations")}}
+        return SimpleNamespace(text=canonical_json_bytes(value).decode(), usage={
+            "usage_basis": "PROVIDER_REPORTED", "input_tokens": 1, "output_tokens": 1,
+            "context_tokens": 1, "total_tokens": 2})
+    monkeypatch.setattr(native_story_model, "NativeStoryModel", lambda *args, **kwargs:
+        original_model(*args, **kwargs, invoke=story_call))
+    monkeypatch.setattr(native_story_model, "cont_writer_implementation_identity", lambda: ("1" * 40, True))
+    monkeypatch.setattr(native_story_model, "read_grok_command_semantic_version", lambda: "1.0.8")
     monkeypatch.setattr(
         "newsroom.authority._graphiti_increment4_system._open_structural_graph_adapter",
         lambda _: MemoryNeo4jAdapter(),
@@ -431,6 +460,13 @@ def test_native_vertical_reaches_private_ack_and_reopens_without_provider_repeat
         "stop_check": lambda: None,
         "stop_fence": nullcontext,
     }
+    from newsroom.control_plane.model_usage import ModelUsageService
+    from newsroom.control_plane.native_story_model import story_model_policy
+    from newsroom.control_plane.native_story_writer import DRAFT_SCHEMA, REVIEW_SCHEMA
+    usage = ModelUsageService(str(arguments["private_path"]))
+    for phase, schema in (("DRAFT", DRAFT_SCHEMA), ("REVIEW", REVIEW_SCHEMA)):
+        usage.register_policy(story_model_policy(arguments["assessment_policy"], phase=phase, schema=schema,
+            revision="1" * 40, evidence_digest="sha256:" + "a" * 64))
     with native_composition.open_native_pipeline(**arguments) as setup:
         definition_id = _seed_uk01(setup._runtime)
     arguments["source_definition_ids"] = {"UK-01": definition_id}
@@ -494,3 +530,5 @@ def test_native_vertical_reaches_private_ack_and_reopens_without_provider_repeat
     assert counters["graphiti"] == dispatched["graphiti"]
     assert counters["embedding"] == dispatched["embedding"]
     assert counters["assessor"] == dispatched["assessor"]
+    assert counters["writer"] == dispatched["writer"]
+    assert counters["writer_review"] == dispatched["writer_review"]
