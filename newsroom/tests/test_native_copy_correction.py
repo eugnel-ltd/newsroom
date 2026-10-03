@@ -96,8 +96,12 @@ def test_copy_correction_retains_predecessor_and_replays_exact_intent(tmp_path, 
         connection.close()
 
 
-@pytest.mark.parametrize('fault', (None, 'interrupted', 'current-ack', 'changed-package'))
-def test_second_writer_upgrade_uses_latest_ack_without_reusing_old_story_slot(tmp_path, fault):
+@pytest.mark.parametrize('fault,prepared_legacy', (
+    (None, False), (None, True), ('interrupted', False), ('interrupted', True),
+    ('current-ack', False), ('current-ack', True), ('changed-package', False), ('changed-package', True),
+    ('pending-slot', True), ('missing-slot', True),
+))
+def test_second_writer_upgrade_uses_latest_ack_without_reusing_old_story_slot(tmp_path, fault, prepared_legacy):
     connection = connect(str(tmp_path / 'second-upgrade.sqlite3'))
     journal = NativeRevisionJournal(connection)
     unit = _native('second-writer-upgrade')
@@ -114,7 +118,14 @@ def test_second_writer_upgrade_uses_latest_ack_without_reusing_old_story_slot(tm
                  copy_correction_result='CORRECTED',
                  copy_correction_checked_version='newsroom.offline-exact-copy.v3',
                  writer_id='newsroom.offline-exact-copy.v3', **current_refs)
-    journal.advance(unit.revision_id, stage='ACKNOWLEDGED', facts=facts)
+    if prepared_legacy:
+        facts.update(expected_story_version=1, expected_publication_version=2)
+    if fault in {'pending-slot', 'missing-slot'}:
+        if fault == 'pending-slot':
+            facts['expected_story_version'] = 2
+        else:
+            facts.pop('expected_story_version')
+    journal.advance(unit.revision_id, stage='COPY_CORRECTION_PREPARED' if prepared_legacy else 'ACKNOWLEDGED', facts=facts)
     original_rows = connection.execute('SELECT seq,payload_json FROM ledger').fetchall()
     prior = NS(story_receipt=NS(aggregate_version=2), attempt_receipt=NS(aggregate_version=3))
     story = NS(candidate_version_id='candidate-version', package_admission_id=package_id,
@@ -153,8 +164,8 @@ def test_second_writer_upgrade_uses_latest_ack_without_reusing_old_story_slot(tm
             clock=lambda: UtcTimestamp.parse('2026-09-08T12:06:00Z'))
     try:
         result = continuation().advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
-        if fault in {'current-ack', 'changed-package'}:
-            assert result.state == 'ACKNOWLEDGED' and result.reason.startswith('COPY_CORRECTION_HOLD')
+        if fault in {'current-ack', 'changed-package', 'pending-slot', 'missing-slot'}:
+            assert result.state == ('COPY_CORRECTION_PREPARED' if prepared_legacy else 'ACKNOWLEDGED') and result.reason.startswith('COPY_CORRECTION_HOLD')
             assert not calls
             assert journal.current(unit.revision_id)['facts']['story_event_id'] == current_refs['story_event_id']
         else:
