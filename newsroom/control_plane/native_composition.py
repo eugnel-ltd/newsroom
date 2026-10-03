@@ -766,6 +766,15 @@ def open_native_pipeline(
         class Publication:
             copy_correction_due = staticmethod(lambda facts, decide=NativePublicationContinuation.copy_correction_due:
                 decide(facts, "newsroom.native-story-writer.v1"))
+            source_binding_recovery_due = staticmethod(lambda facts, decide=NativePublicationContinuation.source_binding_recovery_due:
+                decide(facts, ASSESSMENT_CONTRACT_VERSION))
+
+            def sources_for(self, revision_id):
+                return native_evidence_sources(
+                    units=journal.units[revision_id], sources=runtime.authority.sources,
+                    objects=runtime.authority.objects, licence=licence, proof=proof,
+                    observations=journal.observations,
+                )
 
             def continuation(self, sources):
                 return NativePublicationContinuation(
@@ -778,6 +787,7 @@ def open_native_pipeline(
                         assessment_usage.retained_pre_dispatch_failure
                     ),
                     assessment_old_provider_failure=assessment_usage.retained_old_provider_failure,
+                    evidence_sources_for=self.sources_for,
                     assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,
                     clock=now,
                 )
@@ -795,16 +805,10 @@ def open_native_pipeline(
             def advance(self, *, revision_id, candidate_version_id):
                 progress = journal.summary(revision_id)
                 sources = ()
-                if progress.get("stage") != "ASSESSMENT_INTERRUPTED":
+                if (progress.get("stage") != "ASSESSMENT_INTERRUPTED"
+                        and not self.source_binding_recovery_due(progress.get("facts", {}))):
                     try:
-                        sources = native_evidence_sources(
-                            units=journal.units[revision_id],
-                            sources=runtime.authority.sources,
-                            objects=runtime.authority.objects,
-                            licence=licence,
-                            proof=proof,
-                            observations=journal.observations,
-                        )
+                        sources = self.sources_for(revision_id)
                     except NativeEvidenceHold:
                         if progress.get("stage") not in {"ACKNOWLEDGED", "COPY_CORRECTION_PREPARED"}:
                             raise
