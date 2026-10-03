@@ -263,7 +263,7 @@ def test_candidate_historical_read_does_not_impose_current_upstream_state(
     connection.close()
 
 
-def test_candidate_bulk_snapshot_authenticates_global_history_once_and_reproves_next_read(
+def test_candidate_bulk_snapshot_authenticates_selected_histories_once_and_reproves_next_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from newsroom.authority.story_candidate_system import _CandidateStore
@@ -286,9 +286,9 @@ def test_candidate_bulk_snapshot_authenticates_global_history_once_and_reproves_
     local_calls, upstream_calls = [], []
     verify_local, verify_upstream = _CandidateStore._verify_local, _CandidateStore._verify_upstream
 
-    def local(store):
-        local_calls.append(True)
-        return verify_local(store)
+    def local(store, **options):
+        local_calls.append(options["candidate_ids"])
+        return verify_local(store, **options)
 
     def upstream(store, selected, **options):
         upstream_calls.append(tuple(item[2].version_id for item in selected.values()))
@@ -307,17 +307,20 @@ def test_candidate_bulk_snapshot_authenticates_global_history_once_and_reproves_
     with pytest.raises(CandidateContractError, match="partition differs"):
         port.require_retained_versions_in_transaction((None,))
     connection.execute("ROLLBACK")
-    # Another retained head changed after the read. No verified state survives.
+    # A retained selected head changed after the read. No verified state survives.
     connection.execute("BEGIN IMMEDIATE")
     connection.execute("DROP TRIGGER candidate_head_update_guard")
     connection.execute("UPDATE story_candidate_heads SET candidate_bytes=? WHERE candidate_id=?", (b"{}", versions[1].candidate_id))
     connection.execute("COMMIT")
     connection.execute("BEGIN")
-    with pytest.raises(CandidateContractError):
-        port.require_retained_versions_in_transaction((versions[0].version_id,))
+    assert port.require_retained_versions_in_transaction((versions[0].version_id,)) == (versions[0],)
     assert len(local_calls) == 2
+    assert local_calls[-1] == frozenset({versions[0].candidate_id})
     with pytest.raises(CandidateContractError):
-        port.require_retained_versions_in_transaction(("missing",))
+        port.require_retained_versions_in_transaction((versions[1].version_id,))
     assert len(local_calls) == 3
+    assert port.require_retained_versions_in_transaction(("missing",)) == (None,)
+    assert len(local_calls) == 4
+    assert local_calls[-1] == frozenset()
     connection.execute("ROLLBACK")
     connection.close()
