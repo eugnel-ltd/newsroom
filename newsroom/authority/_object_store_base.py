@@ -58,7 +58,7 @@ class _ObjectStoreBase:
         conn = self._connection
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         tables = self._table_names()
-        if version == 44 and self._current_state_only:
+        if version in (44,45) and self._current_state_only:
             from .native_current_checkpoint_migrations import require_checkpoint_schema
             require_checkpoint_schema(conn)
             self._native_checkpoint_schema = True

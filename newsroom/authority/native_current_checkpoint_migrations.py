@@ -132,7 +132,13 @@ def require_checkpoint_schema(connection):
     from . import migrations
     expected=(*migrations.EXPECTED_MIGRATION_HISTORY,
               (44,NATIVE_CHECKPOINT_MIGRATION_NAME,NATIVE_CHECKPOINT_MIGRATION_CHECKSUM))
-    if (connection.execute('PRAGMA user_version').fetchone()[0]!=44
+    version=connection.execute('PRAGMA user_version').fetchone()[0]
+    fingerprint=NATIVE_CHECKPOINT_SCHEMA_FINGERPRINT
+    if version==45:
+        from .native_marker_layout_migrations import NAME,CHECKSUM,FINGERPRINT
+        expected=(*expected,(45,NAME,CHECKSUM))
+        fingerprint=FINGERPRINT
+    if (version not in (44,45)
         or tuple(tuple(row) for row in connection.execute('SELECT version,name,checksum FROM authority_migrations ORDER BY version'))!=expected
-        or migrations.schema_fingerprint(connection)!=NATIVE_CHECKPOINT_SCHEMA_FINGERPRINT):
+        or migrations.schema_fingerprint(connection)!=fingerprint):
         raise sqlite3.DatabaseError('native checkpoint schema/history differs')
