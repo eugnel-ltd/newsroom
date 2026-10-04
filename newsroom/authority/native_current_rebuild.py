@@ -181,7 +181,13 @@ def copy_selected_native_store(store, destination: sqlite3.Connection, *, roots,
             elif table=='authority_aggregates':
                 matching('authority_aggregate_versions',('aggregate_type','aggregate_id','aggregate_version'),
                     (values['aggregate_type'],values['aggregate_id'],values['current_version']))
+            elif table=='authority_payloads' and values['mode']=='OBJECT_ADMISSION':
+                # Admission/initial activation are typed payload proof, not SQL FKs.
+                matching('object_admissions',('admission_id',),(values['object_admission_id'],),required=True)
+                matching('object_admission_versions',('admission_id','lifecycle_version'),(values['object_admission_id'],1),required=True)
             elif table=='object_admissions':
+                # Pending/staged admissions need not have an initial activation.
+                matching('object_admission_versions',('admission_id','lifecycle_version'),(values['admission_id'],1))
                 matching('object_admission_heads',('admission_id',),(values['admission_id'],))
                 matching('blob_lifecycle_heads',('blob_digest',),(values['blob_digest'],))
             elif table=='source_definition_versions':
@@ -200,6 +206,17 @@ def copy_selected_native_store(store, destination: sqlite3.Connection, *, roots,
                 matching('extraction_proposal_evidence',('proposal_id',),(values['proposal_id'],))
             elif table=='graphiti_adapter_attempts':
                 matching('graphiti_adapter_attempt_replays',('attempt_id',),(values['attempt_id'],))
+            elif table=='projection_generations':
+                matching('projection_generation_versions',('generation_id','lifecycle_version'),
+                    (values['generation_id'],values['lifecycle_version']),required=True)
+                checkpoint=source.execute('SELECT checkpoint_version FROM projection_checkpoint_versions WHERE generation_id=? ORDER BY checkpoint_version DESC LIMIT 1',(values['generation_id'],)).fetchone()
+                if checkpoint is None:raise AuthorityPersistenceError('selected generation checkpoint is absent')
+                matching('projection_checkpoint_versions',('generation_id','checkpoint_version'),(values['generation_id'],checkpoint[0]),required=True)
+            elif table=='projection_generation_validations':
+                matching('projection_generation_versions',('generation_id','lifecycle_version'),
+                    (values['generation_id'],values['lifecycle_version']),required=True)
+                matching('projection_generation_versions',('generation_id','lifecycle_version'),
+                    (values['generation_id'],values['lifecycle_version']-1),required=True)
             elif table=='projection_delivery_states':
                 matching('projection_delivery_attempts',('generation_id','ledger_seq'),(values['generation_id'],values['ledger_seq']))
             elif table=='projection_gaps':
