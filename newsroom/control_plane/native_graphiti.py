@@ -54,19 +54,26 @@ def _native_phase(phase: str, *, cycle_id: str, cohort_count: int):
         started = (perf_counter_ns(), process_time_ns())
     except Exception:
         pass
-    status, failure = "FAILED", "NONE"
+    status, failure, location = "FAILED", "NONE", {}
     try:
         yield
         status = "COMPLETE"
     except BaseException as exc:
         failure = type(exc).__name__
+        point = exc.__traceback__
+        while point is not None and point.tb_next is not None:
+            point = point.tb_next
+        if point is not None:
+            location = {"file": point.tb_frame.f_code.co_filename.rsplit("/", 1)[-1],
+                        "function": point.tb_frame.f_code.co_name, "line": point.tb_lineno}
+        point = None  # Keep only scalar code location, not finalise frames.
         raise
     finally:
         if started is not None:
             try:
                 emit_diagnostic("native_graphiti_phase", {
                     "phase": phase, "cycle_id": cycle_id[:128], "cohort_count": cohort_count,
-                    "status": status, "failure_class": failure,
+                    "status": status, "failure_class": failure, **location,
                     "elapsed_ms": (perf_counter_ns() - started[0]) // 1_000_000,
                     "cpu_ms": (process_time_ns() - started[1]) // 1_000_000,
                     "cpu_scope": "PROCESS", "nested_spans_not_additive": True,
