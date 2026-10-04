@@ -283,7 +283,10 @@ class NativePipeline:
         deferred = self._advance_revisions(
             # Unattempted canonical work must not starve behind an unresolved
             # predecessor. Reuse this existing assessment budget, once per unit.
-            ready_spill + tuple(reassessments),
+            # Current turns finish newly ready work; archive turns give the
+            # finite changed-contract cohort priority, without a new quantum.
+            (tuple(reassessments) + ready_spill if self._spill_archive_turn
+             else ready_spill + tuple(reassessments)),
             work_deadline=self._monotonic_clock() + self._reassessment_quantum,
         )
         if ordinary_turn_taken or pending_turn_taken or len(deferred) < len(ready_spill):
