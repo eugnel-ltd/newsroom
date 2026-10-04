@@ -265,7 +265,9 @@ class NativePipeline:
                 pending, results = (), ()
                 by_ingest.clear()
 
-        self._advance_revisions(pending_revisions, work_deadline=fresh_deadline)
+        # Completed extraction may have exhausted its quantum; retain only
+        # unattempted ready work for the existing final spill below.
+        pending_ready = self._advance_revisions(pending_revisions, work_deadline=fresh_deadline)
         self._drain_between_work()
         # Changed-contract reassessment has its own quantum after fresh work;
         # stale model requests cannot delay a newly landed revision's first turn.
@@ -275,13 +277,16 @@ class NativePipeline:
             key=lambda item: max(UtcTimestamp.parse(value).value for value in item[1].observed_ats),
             reverse=True,
         )
-        ready_spill = deadline_deferred_ready
+        ready_spill = deadline_deferred_ready + pending_ready
         if not self._spill_archive_turn:
             ready_spill = tuple(sorted(ready_spill, key=_source_update_time, reverse=True))
         deferred = self._advance_revisions(
             # Unattempted canonical work must not starve behind an unresolved
             # predecessor. Reuse this existing assessment budget, once per unit.
-            ready_spill + tuple(reassessments),
+            # Current turns finish newly ready work; archive turns give the
+            # finite changed-contract cohort priority, without a new quantum.
+            (tuple(reassessments) + ready_spill if self._spill_archive_turn
+             else ready_spill + tuple(reassessments)),
             work_deadline=self._monotonic_clock() + self._reassessment_quantum,
         )
         if ordinary_turn_taken or pending_turn_taken or len(deferred) < len(ready_spill):

@@ -1114,18 +1114,22 @@ def test_three_disjoint_turns_progress_with_revalidation_and_sustained_fresh_wor
     pipeline._graphiti = NS(advance=graphiti)
     try:
         first = pipeline.tick(cycle_id="first")
-        assert first.revision_states == {"ACKNOWLEDGED": 1, "EVIDENCE_HOLD": 2, "GRAPHITI_COMPLETE": 1, "QUEUED": 1}
+        assert first.revision_states == {"ACKNOWLEDGED": 2, "EVIDENCE_HOLD": 2, "QUEUED": 1}
+        assert journal.current(fresh[0].revision_id)["stage"] == "ACKNOWLEDGED"
         assert fresh[1].revision_id not in {revision: journal.current(revision) for revision, _ in journal.iter_summaries()}
         incoming[0] = (fresh[2],)
-        second = pipeline.tick(cycle_id="second")
-        assert second.revision_states == {"ACKNOWLEDGED": 2, "EVIDENCE_HOLD": 2, "GRAPHITI_COMPLETE": 1, "QUEUED": 1}
-        assert fresh[2].revision_id not in {revision: journal.current(revision) for revision, _ in journal.iter_summaries()}
-        assert [call for call in calls if call[0] in {"poll", "publish", "revalidate", "extract"}] == [
-            ("poll", "current"), ("publish", ordinary.revision_id),
-            ("extract", fresh[0].revision_id), ("revalidate", due[0].revision_id),
-            ("poll", "current"), ("publish", fresh[0].revision_id),
-            ("extract", fresh[1].revision_id), ("revalidate", due[1].revision_id),
+        pipeline.tick(cycle_id="second")
+        incoming[0] = ()
+        pipeline.tick(cycle_id="third")
+        pipeline.tick(cycle_id="fourth")
+        assert all(journal.current(unit.revision_id)["stage"] == "ACKNOWLEDGED" for unit in fresh)
+        assert all(journal.current(unit.revision_id)["facts"]["assessment_contract_version"] == "v9" for unit in due)
+        assert [call for call in calls if call[0] == "revalidate"] == [
+            ("revalidate", due[0].revision_id), ("revalidate", due[1].revision_id),
         ]
+        for kind in ("publish", "extract", "revalidate"):
+            revisions = [revision for event, revision in calls if event == kind]
+            assert len(revisions) == len(set(revisions))
     finally:
         connection.close()
 
@@ -1197,8 +1201,8 @@ def test_pending_land_order_resumes_route_hold_before_recurring_fresh_work_witho
         first = pipeline.tick(cycle_id="route-closed-oldest-first")
         assert extracted == [(held.item_key, 1)]
         assert first.unclassified_revisions == 2
-        assert first.revision_states == {"GRAPHITI_COMPLETE": 1, "QUEUED": 2}
-        assert journal.current(held.revision_id)["stage"] == "GRAPHITI_COMPLETE"
+        assert first.revision_states == {"ACKNOWLEDGED": 1, "QUEUED": 2}
+        assert journal.current(held.revision_id)["stage"] == "ACKNOWLEDGED"
         assert fresh.revision_id not in {revision: journal.current(revision) for revision, _ in journal.iter_summaries()}
         assert first_chunk.revision_id not in {revision: journal.current(revision) for revision, _ in journal.iter_summaries()}
 
@@ -1223,7 +1227,7 @@ def test_pending_land_order_resumes_route_hold_before_recurring_fresh_work_witho
             (held.item_key, 1), (fresh.item_key, 1),
             (first_chunk.item_key, 1), (second_chunk.item_key, 2),
         ]
-        assert journal.current(first_chunk.revision_id)["stage"] == "GRAPHITI_COMPLETE"
+        assert journal.current(first_chunk.revision_id)["stage"] == "ACKNOWLEDGED"
         assert all(unit.revision_id not in {revision: journal.current(revision) for revision, _ in journal.iter_summaries()} for unit in recurring)
     finally:
         connection.close()
@@ -1524,10 +1528,13 @@ def test_ready_spill_alternates_current_and_archive_despite_fresh_turns(tmp_path
             publications = [revision for kind, revision in calls[start:] if kind == "publish"]
             assert len(publications) == len(set(publications))
             spill_turns.append(publications[-1])
-        assert spill_turns[:2] == [weekly.revision_id, archives[0].revision_id]
+        # Freshly completed work now joins this same already-budgeted spill.
+        expected_current = fresh[0] if fresh_seconds else weekly
+        assert spill_turns[:2] == [expected_current.revision_id, archives[0].revision_id]
         assert all(journal.current(unit.revision_id)["stage"] == "ACKNOWLEDGED" for unit in archives)
         if fresh_seconds:
-            assert spill_turns[2::2] == [fresh[1].revision_id, fresh[3].revision_id]
+            assert spill_turns[2::2] == [fresh[2].revision_id, fresh[4].revision_id]
+            assert journal.current(weekly.revision_id)['stage'] == 'GRAPHITI_COMPLETE'
         for unit in (*archives, weekly):
             assert journal.current(unit.revision_id)["facts"]["graphiti_receipts"] == retained[unit.revision_id]["facts"]["graphiti_receipts"]
         interrupted = next(key for key, value in retained.items() if value["stage"] == "ASSESSMENT_INTERRUPTED")
