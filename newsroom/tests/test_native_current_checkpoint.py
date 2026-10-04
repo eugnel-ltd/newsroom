@@ -730,3 +730,47 @@ def test_candidate_semantic_closure_retains_complete_real_two_lead_disposition_g
         assert len(retained['triage_proposal_validation_findings'])==2
         assert len(retained['triage_proposal_dispositions'])==2
     finally:connection.close()
+
+
+@pytest.mark.parametrize('high_water_source',['copied','sequence','reservation'])
+def test_new44_fresh_licence_admission_skips_expired_tail_sequences_and_reopens(tmp_path,monkeypatch,high_water_source):
+    from newsroom.authority.native_current_rebuild import copy_selected_native_store
+    from newsroom.authority.native_current_checkpoint_migrations import initialise_empty_checkpoint_store
+    from newsroom.authority.canonical import digest_bytes
+    target=tmp_path/'tail-selected.sqlite3'
+    with source_fixture(tmp_path,monkeypatch) as (args,runtime,_,_,before,root):
+        raw=b'<html>retained official licence observation</html>'
+        old_key='govuk-licence:'+digest_bytes(raw)
+        old=runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.source',old_key),raw,proof=runtime.proof)
+        old_event=root._connection.execute('SELECT event_id FROM object_admission_versions WHERE admission_id=? AND lifecycle_version=1',
+            (str(old.admission.admission_id),)).fetchone()[0]
+        maximum=root._connection.execute('SELECT max(ledger_seq) FROM ledger_events').fetchone()[0]
+        with sqlite3.connect(target,isolation_level=None) as destination:
+            initialise_empty_checkpoint_store(destination)
+            copy_selected_native_store(root,destination,roots={'source_revisions':((str(before.request.revision_id),),)},dev_rebuild=True)
+            assert destination.execute('SELECT max(ledger_seq) FROM ledger_events').fetchone()[0]<maximum
+            assert destination.execute('SELECT max(ledger_seq) FROM native_expired_command_keys').fetchone()[0]==maximum
+            assert destination.execute("SELECT seq FROM sqlite_sequence WHERE name='ledger_events'").fetchone()[0]==maximum
+            if high_water_source=='sequence':
+                maximum+=5
+                destination.execute("UPDATE sqlite_sequence SET seq=? WHERE name='ledger_events'",(maximum,))
+            elif high_water_source=='reservation':
+                destination.execute("DELETE FROM sqlite_sequence WHERE name='ledger_events'")
+    target.chmod(0o600);args['authority_path']=target
+    fresh_raw=b'<html>new official licence observation</html>'
+    fresh_key='govuk-licence:'+digest_bytes(fresh_raw)
+    with open_native_runtime(**args) as runtime:
+        root=runtime.authority._base._authority_composition(_AUTHORITY_COMPOSITION_TOKEN)[0]
+        reservation=tuple(root._connection.execute('SELECT * FROM native_expired_command_keys WHERE event_id=?',(old_event,)).fetchone())
+        admitted=runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.source',fresh_key),fresh_raw,proof=runtime.proof)
+        event=root._connection.execute('SELECT e.ledger_seq FROM object_admission_versions v JOIN ledger_events e ON e.event_id=v.event_id '
+            'WHERE v.admission_id=? AND v.lifecycle_version=1',(str(admitted.admission.admission_id),)).fetchone()[0]
+        assert event==maximum+1
+        assert tuple(root._connection.execute('SELECT * FROM native_expired_command_keys WHERE event_id=?',(old_event,)).fetchone())==reservation
+        with pytest.raises(DiagnosticHistoryExpired):root.find(idempotency_namespace=reservation[0],idempotency_key=reservation[1])
+        assert root._connection.execute('PRAGMA foreign_key_check').fetchall()==[]
+    with open_native_runtime(**args) as runtime:
+        replay=runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.source',fresh_key),fresh_raw,proof=runtime.proof)
+        assert replay.replayed and replay.admission==admitted.admission
+        root=runtime.authority._base._authority_composition(_AUTHORITY_COMPOSITION_TOKEN)[0]
+        assert root._connection.execute('SELECT max(ledger_seq) FROM ledger_events').fetchone()[0]==event

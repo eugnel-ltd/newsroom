@@ -127,11 +127,17 @@ class _EventStoreCommitMixin:
             event_id = str(EventId.new())
             audit_id = str(AuditId.new())
             payload_id = str(PayloadId.new())
-            ledger_seq = int(
-                conn.execute(
-                    "SELECT COALESCE(MAX(ledger_seq),0)+1 FROM ledger_events"
-                ).fetchone()[0]
-            )
+            sequence_query = "SELECT COALESCE(MAX(ledger_seq),0)+1 FROM ledger_events"
+            if self._native_checkpoint_schema:
+                # Selected NEW stores preserve gaps as immutable reservations.
+                # The next event must also honour the original high-water mark.
+                sequence_query = (
+                    "SELECT MAX(high_water)+1 FROM ("
+                    "SELECT COALESCE(MAX(ledger_seq),0) high_water FROM ledger_events "
+                    "UNION ALL SELECT COALESCE(MAX(seq),0) FROM sqlite_sequence WHERE name='ledger_events' "
+                    "UNION ALL SELECT COALESCE(MAX(ledger_seq),0) FROM native_expired_command_keys)"
+                )
+            ledger_seq = int(conn.execute(sequence_query).fetchone()[0])
             result_value = {
                 "command_id": command_id,
                 "aggregate_type": grant.definition.aggregate_type,
