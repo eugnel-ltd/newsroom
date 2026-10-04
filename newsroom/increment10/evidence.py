@@ -166,7 +166,7 @@ class GovernedEvidencePackages:
         candidate_port: StoryCandidateReadPort,
         proof: AuthenticationProof,
     ) -> GovernedEvidencePackage:
-        hydrated = self._objects.hydrate(
+        hydrated = self._objects.rehydrate(
             HydrationRequest(package_admission_id, _PACKAGE_PURPOSE), proof=proof
         )
         self._require_decision(
@@ -196,6 +196,7 @@ class GovernedEvidencePackages:
             source_admission_ids=source_ids,
             record_admission_ids=record_ids,
             proof=proof,
+            reuse_retained=True,
         )
         if rebuilt != hydrated.data:
             raise EvidencePackageError("retained package object differs")
@@ -217,6 +218,7 @@ class GovernedEvidencePackages:
         source_admission_ids: tuple[ObjectAdmissionId, ...],
         record_admission_ids: tuple[ObjectAdmissionId, ...],
         proof: AuthenticationProof,
+        reuse_retained: bool = False,
     ) -> tuple[EvidencePackage, bytes, tuple[tuple[str, str], ...]]:
         if type(package) is not EvidencePackage or package.admitted_context is not None:
             raise EvidencePackageError("native package must use exact evidence values")
@@ -258,9 +260,10 @@ class GovernedEvidencePackages:
         ):
             raise EvidencePackageError("governed material inventory differs")
 
+        hydrate = self._objects.rehydrate if reuse_retained else self._objects.hydrate
         source_digests: list[str] = []
         for index, admission_id in enumerate(source_admission_ids):
-            material = self._objects.hydrate(
+            material = hydrate(
                 HydrationRequest(admission_id, _SOURCE_PURPOSE), proof=proof
             )
             self._require_decision(
@@ -285,7 +288,7 @@ class GovernedEvidencePackages:
 
         rows: list[tuple[object, object, object, object]] = []
         for admission_id in record_admission_ids:
-            material = self._objects.hydrate(
+            material = hydrate(
                 HydrationRequest(admission_id, _RECORD_PURPOSE), proof=proof
             )
             self._require_decision(

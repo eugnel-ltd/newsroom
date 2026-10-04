@@ -664,7 +664,7 @@ class NativePublicationController:
         if occupied is None:
             return None
         admission = occupied.admission
-        material = self._objects.hydrate(HydrationRequest(admission.admission_id, STORY_PURPOSE), proof=proof)
+        material = self._objects.rehydrate(HydrationRequest(admission.admission_id, STORY_PURPOSE), proof=proof)
         self._editorial._verify_access(
             material.decision, policy=self._bindings.editorial_story_hydration_policy_digest,
             object_class=STORY_CLASS, allowed_use=STORY_USE,
@@ -705,7 +705,7 @@ class NativePublicationController:
 
         def metadata(key, purpose):
             event = event_for(key)
-            material = self._objects.hydrate(
+            material = self._objects.rehydrate(
                 HydrationRequest(ObjectAdmissionId.parse(event.object_admission_id), purpose),
                 proof=proof,
             )
@@ -773,7 +773,7 @@ class NativePublicationController:
             event.aggregate_version, ObjectAdmissionId.parse(event.object_admission_id), event.payload_digest,
         )
         self._editorial._verify_story_event(receipt, proof=proof)
-        material = self._objects.hydrate(
+        material = self._objects.rehydrate(
             HydrationRequest(receipt.admission_id, STORY_PURPOSE), proof=proof,
         )
         self._editorial._verify_access(
