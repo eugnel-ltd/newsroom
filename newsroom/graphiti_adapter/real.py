@@ -665,12 +665,15 @@ async def _ensure_episode(
     name: str,
     body: str,
     reference_time: datetime,
-) -> tuple[Any, str]:
+    create: bool = True,
+) -> tuple[Any, str] | None:
     """Create the deterministic episode once, or validate the retained identity."""
 
     try:
         retained = await runtime.EpisodicNode.get_by_uuid(graphiti.driver, episode_id)
     except runtime.NodeNotFoundError:
+        if not create:
+            return None
         retained = runtime.EpisodicNode(
             uuid=episode_id,
             name=name,
@@ -1037,20 +1040,33 @@ async def _add_episode(
             restore_result(dict(completed), telemetry)
             return SimpleNamespace(episode=None, nodes=(), edges=())
 
-        # Recheck the exact owner before this deterministic graph write; release
-        # the generation lock before any provider leaf.
+        async def prepare_execution() -> None:
+            async with guard.fenced_graph_mutation():
+                created = await _ensure_episode(
+                    graphiti=graphiti, runtime=runtime, episode_id=episode_id,
+                    name=name, body=body, reference_time=reference_time,
+                )
+            if created is None or created[1] != "CREATED" and not (
+                fresh_retry and created[1] == "RETAINED"
+            ):
+                raise GraphitiAdapterContractError(
+                    "deterministic episode predates its durable mutation marker"
+                )
+
+        pipeline.prepare_execution = prepare_execution
+        # Keep the owner/identity read before provider work, but defer business
+        # creation until typed extraction and pipeline context are validated.
         async with guard.fenced_graph_mutation():
-            _retained, state = await _ensure_episode(
+            retained = await _ensure_episode(
                 graphiti=graphiti,
                 runtime=runtime,
                 episode_id=episode_id,
                 name=name,
                 body=body,
                 reference_time=reference_time,
+                create=False,
             )
-        if state != "CREATED" and not (
-            fresh_retry and state == "RETAINED"
-        ):
+        if retained is not None and not fresh_retry:
             raise GraphitiAdapterContractError(
                 "deterministic episode predates its durable mutation marker"
             )
