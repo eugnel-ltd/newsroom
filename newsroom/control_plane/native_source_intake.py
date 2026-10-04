@@ -180,6 +180,7 @@ class NativeSourceIntake:
         dispatch_fence: Callable[[str, str], AbstractContextManager[None]],
         other_source_poll: Callable[..., NativeSourceDisposition] | None = None,
         retained_units: Mapping[str, tuple[CorpusIngestUnit, ...]] | None = None,
+        observations: Mapping[str, tuple[str, str, str, str]] | None = None,
         fetch: Callable[[str], tuple[int, bytes]] = _fetch_exact,
         clock: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
     ) -> None:
@@ -194,6 +195,7 @@ class NativeSourceIntake:
         self._other_source_poll = other_source_poll
         self._retained_units = {} if retained_units is None else retained_units
         self._pending_units = {}
+        self._observations = {} if observations is None else observations
 
     def bind_definitions(
         self, definition_ids: Mapping[str, SourceDefinitionId],
@@ -261,16 +263,16 @@ class NativeSourceIntake:
             return NativeSourceDisposition(source_id, "HOLD", "SOURCE_BODY_TOO_LARGE")
         if status != 200 or not raw:
             return NativeSourceDisposition(source_id, "HOLD", "SOURCE_FETCH_INCOMPLETE")
-        raw_admission, raw_access = self._admit_observation(source_id, raw)
+        raw_admission, raw_access = self._admit_observation(source_id, raw, url=expected_url)
         observations = [(
-            expected_url, digest_bytes(raw), str(raw_admission.admission_id),
+            expected_url, digest_bytes(raw), str(raw_admission),
             str(raw_access.access_decision_id),
         )]
         items = parse_observation(source_id=source_id, url=expected_url, body=raw)
         if not items:
             return NativeSourceDisposition(
                 source_id, "HOLD", "SOURCE_PARSE_EMPTY", (),
-                str(raw_admission.admission_id), str(raw_access.access_decision_id),
+                str(raw_admission), str(raw_access.access_decision_id),
                 tuple(observations),
             )
         units, item_holds = [], []
@@ -304,7 +306,7 @@ class NativeSourceIntake:
             source_id, status,
             "SOURCE_ITEMS_HELD" if item_holds else "GOVERNED_REVISIONS_RETAINED",
             tuple(unique_units.values()),
-            str(raw_admission.admission_id), str(raw_access.access_decision_id),
+            str(raw_admission), str(raw_access.access_decision_id),
             tuple(observations),
             tuple(item_holds),
         )
@@ -314,10 +316,10 @@ class NativeSourceIntake:
         item_url, raw, observed, rights_id, *, follow_children=True,
         publication_leaves=False, terminal_html_leaf=False,
     ):
-        admission, access = self._admit_observation(source_id, raw)
+        admission, access = self._admit_observation(source_id, raw, url=item_url)
         observation_digest = digest_bytes(raw)
         observations = [(
-            item_url, observation_digest, str(admission.admission_id),
+            item_url, observation_digest, str(admission),
             str(access.access_decision_id),
         )]
         try:
@@ -381,12 +383,12 @@ class NativeSourceIntake:
                 try:
                     asset_url, asset_raw, asset_observed = fetched.result()
                     asset_admission, asset_access = self._admit_observation(
-                        source_id, asset_raw, pdf=is_pdf_url(asset_url),
+                        source_id, asset_raw, url=asset_url, pdf=is_pdf_url(asset_url),
                     )
                     asset_digest = digest_bytes(asset_raw)
                     observations.append((
                         asset_url, asset_digest,
-                        str(asset_admission.admission_id),
+                        str(asset_admission),
                         str(asset_access.access_decision_id),
                     ))
                     if is_pdf_url(asset_url):
@@ -440,9 +442,9 @@ class NativeSourceIntake:
             return NativeSourceDisposition(source_id, "HOLD", "SOURCE_BODY_TOO_LARGE")
         if status != 200 or not raw:
             return NativeSourceDisposition(source_id, "HOLD", "SOURCE_FETCH_INCOMPLETE")
-        admission, access = self._admit_observation(source_id, raw)
+        admission, access = self._admit_observation(source_id, raw, url=endpoint)
         root_digest = digest_bytes(raw)
-        observations = [(endpoint, root_digest, str(admission.admission_id),
+        observations = [(endpoint, root_digest, str(admission),
                          str(access.access_decision_id))]
         retrieved = self._clock().astimezone(UTC)
         canonical_root = _canonical_url_from_api(endpoint)
@@ -465,12 +467,12 @@ class NativeSourceIntake:
             except (TypeError, ValueError, KeyError, UnicodeError):
                 return NativeSourceDisposition(
                     source_id, "HOLD", "MULTIPART_COVERAGE_INCOMPLETE", (),
-                    str(admission.admission_id), str(access.access_decision_id),
+                    str(admission), str(access.access_decision_id),
                     tuple(observations),
                 )
             return NativeSourceDisposition(
                 source_id, "READY", "GOVERNED_REVISIONS_RETAINED", units,
-                str(admission.admission_id), str(access.access_decision_id),
+                str(admission), str(access.access_decision_id),
                 tuple(observations),
             )
         try:
@@ -480,7 +482,7 @@ class NativeSourceIntake:
         except (TypeError, ValueError, KeyError, UnicodeError):
             return NativeSourceDisposition(
                 source_id, "HOLD", "MANUAL_CHILD_COVERAGE_INCOMPLETE", (),
-                str(admission.admission_id), str(access.access_decision_id),
+                str(admission), str(access.access_decision_id),
                 tuple(observations),
             )
         units, item_holds = [], []
@@ -488,9 +490,9 @@ class NativeSourceIntake:
             canonical_url = item.canonical_url
             try:
                 item_url, item_raw, observed = fetched.result()
-                item_admission, item_access = self._admit_observation(source_id, item_raw)
+                item_admission, item_access = self._admit_observation(source_id, item_raw, url=item_url)
                 observations.append((
-                    item_url, digest_bytes(item_raw), str(item_admission.admission_id),
+                    item_url, digest_bytes(item_raw), str(item_admission),
                     str(item_access.access_decision_id),
                 ))
                 item = self._parse_complete_item(item, item_raw, observed)
@@ -508,7 +510,7 @@ class NativeSourceIntake:
         return NativeSourceDisposition(
             source_id, "HOLD" if item_holds else "READY",
             "SOURCE_ITEMS_HELD" if item_holds else "GOVERNED_REVISIONS_RETAINED",
-            tuple(units), str(admission.admission_id), str(access.access_decision_id),
+            tuple(units), str(admission), str(access.access_decision_id),
             tuple(observations), tuple(item_holds),
         )
 
@@ -663,13 +665,29 @@ class NativeSourceIntake:
             self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, encoded)
         return document
 
-    def _admit_observation(self, source_id: str, raw: bytes, *, pdf=False):
+    def _admit_observation(self, source_id: str, raw: bytes, *, url: str | None = None, pdf=False):
+        """Consume exact CURRENT raw evidence, or normally admit a new artifact."""
+        digest = digest_bytes(raw)
+        purpose = NATIVE_PDF_OBSERVATION_PURPOSE if pdf else NATIVE_SOURCE_OBSERVATION_PURPOSE
+        reference = self._observations.get(digest) if url is not None else None
+        if reference is not None:
+            if (type(reference) is not tuple or len(reference) != 4
+                    or any(type(value) is not str or not value for value in reference)
+                    or reference[1] != digest):
+                raise ValueError("CURRENT source observation binding differs")
+            if reference[0] == url:
+                identity = ObjectAdmissionId.parse(reference[2])
+                hydrated = self._objects.rehydrate(HydrationRequest(identity, purpose, 0, len(raw)), proof=self._proof)
+                if (hydrated.data != raw or hydrated.decision.admission_id != identity
+                        or hydrated.decision.purpose != purpose or hydrated.decision.allowed_bytes != len(raw)):
+                    raise ValueError("CURRENT source observation bytes differ")
+                return identity, hydrated.decision
         admission = self._objects.admit(ObjectAdmissionRequest(
             NATIVE_PDF_OBSERVATION_ADMISSION_TYPE if pdf else NATIVE_SOURCE_OBSERVATION_ADMISSION_TYPE,
-            f"native-source-observation:{source_id}:{digest_bytes(raw)}"
+            f"native-source-observation:{source_id}:{digest}"
         ), raw, proof=self._proof).admission
-        access = self._hydrate(admission, NATIVE_PDF_OBSERVATION_PURPOSE if pdf else NATIVE_SOURCE_OBSERVATION_PURPOSE, raw)
-        return admission, access
+        access = self._hydrate(admission, purpose, raw)
+        return admission.admission_id, access
 
     @staticmethod
     def _govuk_item_path(item):

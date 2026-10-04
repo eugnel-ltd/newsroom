@@ -1016,7 +1016,7 @@ def test_feed_child_replay_and_parent_lineage_fail_closed(tmp_path, monkeypatch)
         wrong_parent = dict(observations)
         wrong_parent[unrelated_digest] = (
             "https://www.gov.uk/api/content" + unrelated_parent_path,
-            unrelated_digest, str(unrelated_admission.admission_id),
+            unrelated_digest, str(unrelated_admission),
             str(unrelated_access.access_decision_id),
         )
         with pytest.raises(NativeEvidenceHold, match="NATIVE_SOURCE_AUTHORITY_HOLD"):

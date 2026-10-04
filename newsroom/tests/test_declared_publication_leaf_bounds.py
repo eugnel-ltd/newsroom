@@ -36,8 +36,8 @@ def _stubbed_intake(monkeypatch, responses, *, fence=lambda *_: nullcontext()):
         sources=None, objects=None, proof=None, definition_ids={}, licence=None,
         dispatch_fence=fence, fetch=fetch, clock=lambda: NOW,
     )
-    monkeypatch.setattr(intake, "_admit_observation", lambda *_: (
-        SimpleNamespace(admission_id="admission"),
+    monkeypatch.setattr(intake, "_admit_observation", lambda *_, **_kwargs: (
+        ObjectAdmissionId.parse("00000000-0000-4000-8000-000000000099"),
         SimpleNamespace(access_decision_id="access"),
     ))
     monkeypatch.setattr(intake, "_retain_item", lambda *args: (args[4],))
