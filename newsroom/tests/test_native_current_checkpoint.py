@@ -592,3 +592,141 @@ def test_selected_retired_parent_keeps_expired_checkpoint_absence(tmp_path,monke
     with open_projection_system(selected) as system:
         root=system.projections._NativeProjections__validation.__self__._store
         assert root.projection_generation(request.generation_id).state.value=='RETIRED'
+
+
+@pytest.mark.parametrize('missing_parent',[None,'relationship','disposition'])
+def test_selected_copy_reopens_real_candidate_chain_and_acknowledged_story(tmp_path,monkeypatch,missing_parent):
+    from . import test_increment10_private_serving as serving
+    from . import test_increment6e2_candidate_store as candidates
+    from .test_native_publication import _bindings
+    from .test_increment10_editorial import _evidence_facade
+    from .authority_helpers import proof
+    from newsroom.authority import story_candidate_system as candidate_system
+    from newsroom.authority.native_current_rebuild import publication_event_roots,copy_selected_native_store
+    from newsroom.authority.native_current_checkpoint_migrations import initialise_empty_checkpoint_store
+    from newsroom.control_plane.native_publication import NativePublicationController
+    locations=[]
+    create=candidates._Adapter.create_location
+    def capture(adapter):
+        location=create(adapter);locations.append(location)
+        from newsroom.increment6.relationships import open_event_hypothesis_relationship_authority
+        from .test_increment6d2_relationship_store import _assessment
+        subject=location.seed[2];comparator=location.subjects['record-2']
+        location.subjects['record-1']=subject
+        assessment,evidence=_assessment(subject,comparator,'REL_NO_ADEQUATE_PRIOR_MATCH')
+        assert assessment.comparator is None and len(assessment.comparator_manifest.comparators)==1
+        relationship=open_event_hypothesis_relationship_authority(**candidates._collaborators(location.seed))
+        try:relationship.retain(assessment.canonical_bytes,evidence,proof=location.seed[0][3])
+        finally:relationship.close()
+        location.relationships[subject.version_id]=assessment.canonical_digest
+        return location
+    monkeypatch.setattr(candidates._Adapter,'create_location',capture)
+    context=serving._context(tmp_path);delivery=serving._delivery(tmp_path,context)
+    selected_objects=None;controller=None;selected_connection=None
+    try:
+        request=dict(story_receipt=context[-2],candidate_port=context[1],proof=proof())
+        attempt,_=delivery.begin(context[-1],**request)
+        delivery.apply(attempt,publication_receipt=context[-1],applied_at='2026-07-16T11:00:00Z',**request)
+        observed=delivery.observe(attempt,publication_receipt=context[-1],observed_at='2026-07-16T11:30:00Z',**request)
+        evidence=delivery.record(observed,attempt,expected_version=0,proof=proof())
+        refs=dict(story_event_id=context[-2].event_id,publication_event_id=context[-1].event_id,
+            delivery_attempt_event_id=attempt.event_id,delivery_evidence_event_id=evidence.event_id)
+        bindings=_bindings(tmp_path,*context[4:8])
+        original=NativePublicationController(objects=context[3].objects,commands=context[3].commands,
+            events=context[3].events,candidate_port=context[1],evidence_packages=context[8],bindings=bindings)
+        expected=original.read_acknowledged(refs,proof=proof());original.close()
+        context[0].rollback()
+        location,=locations;arguments=candidates._collaborators(location.seed)
+        candidate_path=tmp_path/'selected-candidates.sqlite3'
+        store=candidate_system._CandidateStore(candidate_system._TOKEN,
+            arguments.pop('database'),collision_enforcer=candidates._enforcer(location),**arguments)
+        try:
+            store._current_state_only=True
+            receipt=store._connection.execute('SELECT admission_digest FROM story_candidate_admission_receipts_v2 LIMIT 1').fetchone()[0]
+            with sqlite3.connect(candidate_path,isolation_level=None) as destination:
+                initialise_empty_checkpoint_store(destination)
+                roots={'story_candidate_admission_receipts_v2':((receipt,),),
+                    'story_candidate_heads':tuple(tuple(row) for row in store._connection.execute('SELECT candidate_id FROM story_candidate_heads')),
+                    'story_candidate_collision_bindings':tuple(tuple(row) for row in store._connection.execute('SELECT collision_namespace,collision_key_digest FROM story_candidate_collision_bindings'))}
+                if missing_parent:
+                    from newsroom.authority.native_current_checkpoint_migrations import require_checkpoint_schema
+                    table={'relationship':'event_hypothesis_relationship_decisions','disposition':'triage_proposal_dispositions'}[missing_parent]
+                    # Corrupt only this disposable source, preserving real producer shape.
+                    for trigger in store._connection.execute("SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name=?",(table,)).fetchall():
+                        store._connection.execute('DROP TRIGGER '+trigger[0])
+                    store._connection.execute('DELETE FROM '+table)
+                    with pytest.raises(AuthorityPersistenceError,match='parent is absent'):
+                        copy_selected_native_store(store,destination,roots=roots,dev_rebuild=True)
+                    assert destination.execute('SELECT count(*) FROM ledger_events').fetchone()[0]==0
+                    assert not destination.in_transaction
+                    require_checkpoint_schema(destination)
+                    return
+                copy_selected_native_store(store,destination,roots=roots,dev_rebuild=True)
+                assert destination.execute('PRAGMA foreign_key_check').fetchall()==[]
+                assert destination.execute('SELECT 1 FROM event_hypothesis_versions_v2 WHERE version_id=?',(location.subjects['record-2'].version_id,)).fetchone()
+        finally:store.close()
+        root=context[3].objects._GovernedObjects__hydrate.__self__._store;root._current_state_only=True
+        objects_path=tmp_path/'selected-objects.sqlite3'
+        # The production planner also selects immutable package/source/CAS members.
+        roots=publication_event_roots(root._connection,refs)
+        decision_event=expected[1].policy_decision_event_id
+        decision_sequence=root._connection.execute('SELECT ledger_seq FROM ledger_events WHERE event_id=?',(decision_event,)).fetchone()[0]
+        roots['ledger_events']=(*roots['ledger_events'],(decision_sequence,))
+        roots['object_admissions']=tuple(tuple(row) for row in root._connection.execute('SELECT admission_id FROM object_admissions'))
+        with sqlite3.connect(objects_path,isolation_level=None) as destination:
+            initialise_empty_checkpoint_store(destination)
+            copy_selected_native_store(root,destination,roots=roots,dev_rebuild=True)
+        objects_path.chmod(0o600);candidate_path.chmod(0o600)
+        selected_connection=sqlite3.connect(candidate_path,isolation_level=None)
+        selected_connection.row_factory=sqlite3.Row;selected_connection.execute('PRAGMA foreign_keys=ON')
+        selected_connection.execute('PRAGMA journal_mode=WAL');selected_connection.execute('PRAGMA synchronous=FULL')
+        port=candidate_system._create_story_candidate_read_port(selected_connection,
+            retrieval_authority=arguments['retrieval_authority'],authenticator=arguments['authenticator'],
+            command_registry=arguments['command_registry'],payload_schemas=arguments['payload_schemas'],clock=arguments['clock'])
+        # Share original immutable CAS; no archive or altered source bytes.
+        open_objects=serving.open_object_system
+        def shared_cas(path,**kwargs):
+            return open_objects(path,object_root=(tmp_path/'objects.objects'),**kwargs)
+        monkeypatch.setattr(serving,'open_object_system',shared_cas)
+        from newsroom.authority._object_store import _GovernedObjectAuthorityStore
+        monkeypatch.setattr(_GovernedObjectAuthorityStore,'_current_state_only',True)
+        selected_objects,registries,hydration,definitions,commands=serving._open(objects_path)
+        facade=_evidence_facade(selected_objects,context[2],registries)
+        controller=NativePublicationController(objects=selected_objects.objects,commands=selected_objects.commands,
+            events=selected_objects.events,candidate_port=port,evidence_packages=facade,bindings=bindings)
+        selected_connection.execute('BEGIN IMMEDIATE')
+        assert controller.read_acknowledged(refs,proof=proof())==expected
+    finally:
+        if controller is not None:controller.close()
+        if selected_connection is not None:selected_connection.rollback();selected_connection.close()
+        if selected_objects is not None:selected_objects.close()
+        serving._close(context,delivery)
+
+
+def test_candidate_semantic_closure_retains_complete_real_two_lead_disposition_group(tmp_path,monkeypatch):
+    from . import test_increment6d1_hypothesis_store as hypotheses
+    from newsroom.authority.native_current_rebuild import candidate_semantic_parents
+    fixtures=[]
+    create=hypotheses._authority_fixture
+    def capture(*args,**kwargs):
+        fixture=create(*args,**kwargs);fixtures.append(fixture);return fixture
+    monkeypatch.setattr(hypotheses,'_authority_fixture',capture)
+    # Existing real producer proves the exact group, not synthetic row shells.
+    hypotheses.test_complete_two_lead_proposal_group_retains_once_and_partial_writes_zero(tmp_path)
+    connection=fixtures[0][0]
+    try:
+        connection.row_factory=sqlite3.Row
+        group=connection.execute('SELECT work_item_version_id,proposal_id FROM triage_proposal_dispositions '
+            'GROUP BY work_item_version_id,proposal_id HAVING count(*)=2').fetchone()
+        assert group is not None
+        selected=connection.execute('SELECT * FROM triage_proposal_dispositions WHERE work_item_version_id=? AND proposal_id=?',tuple(group)).fetchone()
+        retained={}
+        def matching(table,names,values,*,required):
+            assert required
+            rows=tuple(tuple(row) for row in connection.execute('SELECT * FROM '+table+' WHERE '+
+                ' AND '.join(name+'=?' for name in names),values))
+            assert rows;retained[table]=rows
+        candidate_semantic_parents('triage_proposal_dispositions',selected,matching)
+        assert len(retained['triage_proposal_validation_findings'])==2
+        assert len(retained['triage_proposal_dispositions'])==2
+    finally:connection.close()

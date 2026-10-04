@@ -8,6 +8,7 @@ journal/serving/usage/stop files and the immutable CAS are not rewritten here.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import json
 import sqlite3
 
 from .native_current_checkpoint import discovery_current_root_ids
@@ -98,6 +99,51 @@ def projection_roots_from_current(connection: sqlite3.Connection):
     return {table:tuple(sorted(ids)) for table,ids in roots.items()}
 
 
+def candidate_semantic_parents(table, row, matching):
+    """Exact retained Candidate reader dependencies not represented by SQL FKs.
+
+    ``matching`` selects required rows by indexed typed columns. Complete
+    disposition groups and comparator manifests are proof inputs, not history.
+    The offline CAS planner uses this same closure before selecting blob pins.
+    """
+    if table == 'story_candidate_admission_receipts_v2':
+        from newsroom.increment6.candidates import StoryCandidateVersion
+        version = StoryCandidateVersion.from_canonical_bytes(bytes(row['version_bytes']))
+        manifest = version.governing_manifest
+        matching('event_hypothesis_versions_v2', ('version_id',), (manifest.hypothesis_version_id,), required=True)
+        matching('event_hypothesis_relationship_decisions', ('decision_id',), (manifest.relationship_assessment_digest,), required=True)
+        for digest in manifest.lineage_history_digests:
+            matching('event_hypothesis_lineage', ('receipt_digest',), (digest,), required=True)
+        for disposition in json.loads(bytes(row['disposition_ids_bytes'])):
+            matching('triage_proposal_dispositions', ('disposition_id',), (disposition,), required=True)
+    elif table == 'event_hypothesis_relationship_decisions':
+        from newsroom.increment6.relationships import RelationshipAssessment
+        assessment = RelationshipAssessment.from_canonical_bytes(bytes(row['assessment_bytes']))
+        for version in (assessment.subject, *assessment.comparator_manifest.comparators):
+            matching('event_hypothesis_versions_v2', ('version_id',), (version.version_id,), required=True)
+    elif table == 'event_hypothesis_versions_v2':
+        # Its authority_event_id is a deterministic UUID5, not a ledger FK.
+        from newsroom.increment6.hypotheses import EventHypothesisVersion
+        version = EventHypothesisVersion.from_canonical_bytes(bytes(row['canonical_bytes']))
+        for binding in version.source_bindings:
+            matching('triage_proposal_dispositions', ('disposition_id',), (binding.disposition_id,), required=True)
+    elif table == 'event_hypotheses_v2':
+        matching('event_hypothesis_heads_v2', ('hypothesis_id',), (row['hypothesis_id'],), required=True)
+    elif table == 'triage_work_items':
+        matching('triage_work_item_heads', ('work_item_id',), (row['work_item_id'],), required=True)
+    elif table == 'triage_proposal_dispositions':
+        for child in ('triage_proposal_validation_findings', 'triage_proposal_dispositions'):
+            matching(child, ('work_item_version_id', 'proposal_id'),
+                     (row['work_item_version_id'], row['proposal_id']), required=True)
+    elif table == 'event_hypothesis_lineage':
+        from newsroom.increment6.lineage import HypothesisLineageReceipt
+        receipt = HypothesisLineageReceipt.from_canonical_bytes(bytes(row['receipt_bytes']))
+        for node in (*receipt.inputs, *receipt.outputs):
+            matching('event_hypothesis_versions_v2', ('version_id',), (node.version_id,), required=True)
+        for relationship in receipt.relationships:
+            matching('event_hypothesis_relationship_decisions', ('decision_id',), (relationship.assessment_digest,), required=True)
+
+
 def copy_selected_native_store(store, destination: sqlite3.Connection, *, roots, dev_rebuild=False):
     """Copy supplied verified CURRENT roots and exact parents under writer lock.
 
@@ -173,6 +219,7 @@ def copy_selected_native_store(store, destination: sqlite3.Connection, *, roots,
             for group in parents[table]:
                 parent=group[0][2]
                 matching(parent,tuple(r[4] or keys[parent][r[1]] for r in group),tuple(values.get(r[3]) for r in group),required=True)
+            candidate_semantic_parents(table, values, matching)
             if table=='authority_commands':
                 for child in ('ledger_events','authority_audit_events','authority_aggregate_versions','object_lifecycle_operations'):
                     matching(child,('command_id',),(values['command_id'],))
