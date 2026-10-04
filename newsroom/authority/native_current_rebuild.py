@@ -266,6 +266,12 @@ def copy_selected_native_store(store, destination: sqlite3.Connection, *, roots,
                         raise AuthorityPersistenceError('selected generation checkpoint is absent')
                 else:
                     matching('projection_checkpoint_versions',('generation_id','checkpoint_version'),(values['generation_id'],checkpoint[0]),required=True)
+            elif table=='projection_generation_promotions':
+                # Replay reads the exact results, not the later generation head.
+                for event in ('target_authority_event_id','prior_authority_event_id'):
+                    if values[event] is not None:
+                        matching('projection_generation_versions',('authority_event_id',),
+                            (values[event],),required=True)
             elif table=='projection_generation_validations':
                 matching('projection_generation_versions',('generation_id','lifecycle_version'),
                     (values['generation_id'],values['lifecycle_version']),required=True)
