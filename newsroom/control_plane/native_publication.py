@@ -1474,7 +1474,7 @@ class NativePublicationContinuation:
             )
         else:
             siblings = tuple(
-                dict(summary.get("facts", {}))
+                self._acknowledged_current_facts(dict(summary.get("facts", {})))
                 for other_revision_id, summary in self._journal.iter_summaries()
                 if other_revision_id != revision_id
                 and summary.get("stage") == "ACKNOWLEDGED"
@@ -1686,6 +1686,25 @@ class NativePublicationContinuation:
         self._journal.advance(revision_id, stage="ACKNOWLEDGED", facts=facts)
         return NativePublicationContinuationResult("ACKNOWLEDGED", None, published)
 
+    def _acknowledged_current_facts(self, facts: dict) -> dict:
+        """Select an authenticated derived ACK without changing original lineage."""
+        correction = facts.get("factual_correction_result")
+        if correction is None:
+            return facts
+        keys = ("story_event_id", "publication_event_id", "delivery_attempt_event_id", "delivery_evidence_event_id")
+        if type(correction) is not dict or any(type(correction.get(key)) is not str or not correction[key] for key in keys):
+            raise NativePublicationError("factual correction acknowledged references differ")
+        original, story = self._runtime.publication.read_acknowledged(
+            {key: facts[key] for key in keys}, proof=self._runtime.proof,
+        )
+        derived, derived_story = self._runtime.publication.read_acknowledged(correction, proof=self._runtime.proof)
+        if (derived_story.story_id != story.story_id
+                or derived.attempt_receipt.publication_id != original.attempt_receipt.publication_id
+                or derived.story_receipt.aggregate_version <= original.story_receipt.aggregate_version
+                or derived.attempt_receipt.aggregate_version <= original.attempt_receipt.aggregate_version):
+            raise NativePublicationError("factual correction belongs to another acknowledged chain")
+        return {**facts, **{key: correction[key] for key in keys}}
+
     def _prior_acknowledged_versions(
         self, *, revision_id: str, candidate_id: str
     ) -> tuple[int, int]:
@@ -1696,6 +1715,7 @@ class NativePublicationContinuation:
             retained = progress.get("facts", {})
             if retained.get("candidate_id") != candidate_id:
                 continue
+            retained = self._acknowledged_current_facts(retained)
             story = self._prior_event(
                 retained.get("story_event_id"),
                 command=STORY_COMMAND,

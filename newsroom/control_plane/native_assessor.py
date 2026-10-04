@@ -93,7 +93,7 @@ from .native_assessor_references import (
     build_source_view, make_provider_schema, materialise as materialise_v17,
 )
 
-from .native_assessor_spans import PARTITION_VERSION, PARTITION_VERSION_V1, build_lossless_source_view
+from .native_assessor_spans import PARTITION_VERSION, PARTITION_VERSION_V1, build_lossless_source_view, source_wire_lower_bound_bytes
 
 from .native_assessor_wire import (
     make_provider_schema as make_v18_provider_schema, materialise as materialise_v18,
@@ -2212,9 +2212,9 @@ class AutonomousNativeEvidenceAssessor:
         reference_view = None
         provider_base = evidence_package_value(base)
         if VERSION in _REFERENCE_PRODUCERS:
-            # The lossless segment view cannot be smaller than its source bytes.
-            # Reject known over-bound inputs before per-line entity extraction.
-            if self._usage is not None and sum(len(text.encode("utf-8")) for text in base.passages) > (
+            # Mandatory lossless CSV framing can already exceed admission before
+            # contextual entities are built. Final exact-request checks remain.
+            if self._usage is not None and source_wire_lower_bound_bytes(base.passages, base.source_ids) > (
                 native_assessment_input_bound(self._usage._policy)["max_request_bytes"]
             ):
                 raise NativeEvidenceHold("ASSESSOR_EXACT_INPUT_BOUND_HOLD", source_id)

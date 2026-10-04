@@ -41,7 +41,7 @@ from .graphiti_admission import GraphitiAdmissionConsumerError
 from .graphiti_admission_integration import compose_existing_graphiti_admission_consumer
 from .model_usage import ModelUsageAdmissionError, ModelUsageService, reported_output_rejected_ingests
 from .native_cycle import _uuid4_for
-from .store import append_ledger, graphiti_failure_state
+from .store import append_ledger, graphiti_failure_state, next_graphiti_attempt_number
 from .veto import OperatorDrainRequested, VetoError
 from .diagnostic_logging import emit_diagnostic
 
@@ -375,6 +375,11 @@ class NativeGraphitiProcessor:
                             f"{head.outcome.value}:{head.failure_code}"
                         )
                         continue
+                    # Re-entry of the exact retained head and its ordinary next
+                    # attempt remain valid. Private failures never extend authority.
+                    selected_attempt = next_graphiti_attempt_number(self._connection, ingest_id)
+                    if selected_attempt not in {head.attempt_number, head.attempt_number + 1}:
+                        terminal_holds[ingest_id] = "SETTLEMENT_PENDING:LINEAGE_CONFLICT"
         deferred = set()
         considered = set()
 

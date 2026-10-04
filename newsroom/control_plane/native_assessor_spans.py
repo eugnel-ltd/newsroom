@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from itertools import pairwise
 
-from newsroom.authority.canonical import digest_bytes, digest_canonical
+from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from newsroom.control_plane.evidence import _entity_pattern, NAMED_ENTITY_POLICY_VERSION, NAMED_ENTITY_POLICY_VERSION_V15
 
 from .native_assessor_references import (
@@ -18,6 +18,7 @@ from .native_assessor_references import (
 
 PARTITION_VERSION_V1 = "newsroom.native-assessor-spans.v1"
 PARTITION_VERSION = "newsroom.native-assessor-spans.v2"
+_CSV_ROW = re.compile(r"Row [1-9][0-9]*: ")
 _CLOSERS = r"[\"'’”）)\]】」』]*+"
 _BOUNDARY = re.compile(
     rf"(?P<latin>[.!?]){_CLOSERS}[ \t]+(?=\S)|"
@@ -44,7 +45,7 @@ class PartitionedSourceView(SourceView):
 def _chunks(segment: SourceSegment) -> Iterator[str]:
     text = segment.text
     # Literal CSV rows remain one evidence unit, including quoted cell prose.
-    if re.match(r"Row [1-9][0-9]*: ", text):
+    if _CSV_ROW.match(text):
         yield text
         return
     protected = sorted(
@@ -127,6 +128,30 @@ def _range_closed_chunks(line: SourceSegment, body: str, *, policy_version: str 
             return ((line.text, line.entities),)
         offset = end
     return merged
+
+
+def source_wire_lower_bound_bytes(passages: tuple[str, ...], source_ids: tuple[str, ...]) -> int:
+    """Count mandatory CSV wire bytes without contextual entity extraction.
+
+    CSV physical rows stay intact in both partition versions. Empty entities,
+    fragment count one and the original physical-line ordinal are minima:
+    refinement can only add entities/segments or increase the span ordinal.
+    Non-CSV source text still supplies the existing raw-byte lower bound.
+    This is not the final exact request size or an admission decision.
+    """
+    rows_bytes = 0
+    for passage_index, (body, source_id) in enumerate(zip(passages, source_ids, strict=True), 1):
+        count, size = 0, 2  # One source's JSON segments array, including brackets.
+        for ordinal, text in enumerate(body.splitlines(keepends=True), 1):
+            if _CSV_ROW.match(text):
+                size += (count > 0) + len(canonical_json_bytes({
+                    "span_id": f"S{passage_index}L{ordinal}", "source_id": source_id,
+                    "text": text, "entities": [], "rendering_fragment_count": 1,
+                }))
+                count += 1
+        if count:
+            rows_bytes += size
+    return max(rows_bytes, sum(len(body.encode("utf-8")) for body in passages))
 
 
 def build_lossless_source_view(passages: tuple[str, ...], source_ids: tuple[str, ...], *, version: str = PARTITION_VERSION) -> SourceView:
