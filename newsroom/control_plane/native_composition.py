@@ -776,7 +776,9 @@ def open_native_pipeline(
             retained = tuple(retained_by_event[item.event_id] for item in receipts)
             for missing in projector.reconcile_membership(receipts):
                 documents.reproject(missing, proof=proof)
-            watermark = max(runtime.authority.events.provenance(item.event_id, proof=proof).event.ledger_seq for item in receipts)
+            watermark = documents.authenticated_inventory_watermark(
+                document_inventory, receipts, proof=proof,
+            )
             snapshot = projector.snapshot(
                 generation_identity_digest=generation_digest,
                 rights_manifest_digest=digest_canonical(tuple(sorted(
