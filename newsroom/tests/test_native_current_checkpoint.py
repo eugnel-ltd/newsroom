@@ -502,3 +502,66 @@ def test_discovery_expiry_interrupt_restores_every_original_row_and_guard(tmp_pa
         assert conn.execute('PRAGMA foreign_key_check').fetchall()==[]
         assert conn.execute("SELECT count(*) FROM sqlite_temp_schema WHERE name LIKE '_checkpoint_%'").fetchone()[0]==0
         require_checkpoint_schema(conn)
+
+
+def test_selected_ack_payload_keeps_typed_admission_and_initial_activation(tmp_path):
+    from .test_increment10_private_serving import _context,_delivery,_close
+    from .authority_helpers import proof
+    from newsroom.authority.native_current_rebuild import publication_event_roots,copy_selected_native_store
+    from newsroom.authority.native_current_checkpoint_migrations import initialise_empty_checkpoint_store
+    from newsroom.authority._projection_store import _ProjectionAuthorityStore
+    context=_context(tmp_path);delivery=_delivery(tmp_path,context)
+    try:
+        request=dict(story_receipt=context[-2],candidate_port=context[1],proof=proof())
+        attempt,_=delivery.begin(context[-1],**request)
+        delivery.apply(attempt,publication_receipt=context[-1],applied_at='2026-07-16T11:00:00Z',**request)
+        observed=delivery.observe(attempt,publication_receipt=context[-1],observed_at='2026-07-16T11:30:00Z',**request)
+        evidence=delivery.record(observed,attempt,expected_version=0,proof=proof())
+        root=context[3].objects._GovernedObjects__hydrate.__self__._store
+        root._current_state_only=True
+        refs={'story_event_id':context[-2].event_id,'publication_event_id':context[-1].event_id,
+            'delivery_attempt_event_id':attempt.event_id,'delivery_evidence_event_id':evidence.event_id}
+        ids=publication_event_roots(root._connection,refs)
+        with sqlite3.connect(tmp_path/'ack-selected.sqlite3',isolation_level=None) as c:
+            c.row_factory=sqlite3.Row;initialise_empty_checkpoint_store(c)
+            copy_selected_native_store(root,c,roots=ids,dev_rebuild=True)
+            for event_id in refs.values():
+                payload=c.execute('SELECT p.* FROM ledger_events e JOIN authority_payloads p USING(payload_id) WHERE e.event_id=?',(event_id,)).fetchone()
+                original=root._connection.execute('SELECT * FROM object_admission_versions WHERE admission_id=? AND lifecycle_version=1',(payload['object_admission_id'],)).fetchone()
+                retained=c.execute('SELECT * FROM object_admission_versions WHERE admission_id=? AND lifecycle_version=1',(payload['object_admission_id'],)).fetchone()
+                assert retained is not None and tuple(retained)==tuple(original)
+                _ProjectionAuthorityStore._validate_object_admission_payload_record(c,payload)
+                assert c.execute('SELECT 1 FROM ledger_events WHERE event_id=?',(retained['event_id'],)).fetchone()
+            assert c.execute('PRAGMA foreign_key_check').fetchall()==[]
+    finally:_close(context,delivery)
+
+
+def test_selected_older_projection_validation_keeps_exact_and_previous_versions(tmp_path,monkeypatch):
+    from .projection_b1_helpers import open_projection_system,proof,FAMILY_ID
+    from .test_projection_b3_authority import _register,_create,_validate
+    from newsroom.authority._projection_store import _ProjectionAuthorityStore
+    from newsroom.authority.native_current_rebuild import copy_selected_native_store
+    from newsroom.authority.native_current_checkpoint_migrations import initialise_empty_checkpoint_store
+    monkeypatch.setattr(_ProjectionAuthorityStore,'_current_state_only',True)
+    origin=tmp_path/'validation-original.sqlite3';target=tmp_path/'validation-selected.sqlite3'
+    with open_projection_system(origin) as system:
+        _register(system);created=_create(system,'typed-validation-create')
+        _validate(system,created,'typed-validation-2')
+        root=system.projections._NativeProjections__validation.__self__._store
+        generation=root.projection_generation(created.generation_id)
+        selected=_validate(system,generation,'typed-validation-3')
+        current=root.projection_generation(created.generation_id)
+        _validate(system,current,'typed-validation-4')
+        current=root.projection_generation(created.generation_id)
+        assert selected.lifecycle_version==3 and current.lifecycle_version==4
+        namespace=root._connection.execute("SELECT idempotency_namespace FROM authority_commands WHERE idempotency_key='typed-validation-3'").fetchone()[0]
+        with sqlite3.connect(target,isolation_level=None) as c:
+            c.row_factory=sqlite3.Row;initialise_empty_checkpoint_store(c)
+            copy_selected_native_store(root,c,roots={'projection_generation_validations':((selected.validation_digest,),)},dev_rebuild=True)
+            assert [tuple(row) for row in c.execute('SELECT lifecycle_version FROM projection_generation_versions WHERE generation_id=? AND lifecycle_version IN(2,3) ORDER BY lifecycle_version',(str(created.generation_id),))]==[(2,),(3,)]
+            assert c.execute('PRAGMA foreign_key_check').fetchall()==[]
+    target.chmod(0o600)
+    with open_projection_system(target) as system:
+        restored=system.projections._NativeProjections__validation.__self__._store
+        assert restored.projection_generation_validation_for_key(namespace,'typed-validation-3')==selected
+        assert restored.projection_generation(created.generation_id)==current
