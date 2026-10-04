@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Final, Protocol
 
 from newsroom.control_plane.child_environment import unprivileged_child_environment
 from newsroom.graphiti_adapter.evaluation_packet import OPENROUTER_BASE_URL
+from newsroom.graphiti_adapter.types import BROKER_SETUP_FAILURE_REASON_CODES
 
 if TYPE_CHECKING:
     from newsroom.projection.neo4j.models import Neo4jProjectorConfig
@@ -38,6 +39,12 @@ NEO4J_PROJECTOR_KEYCHAIN_SKIP: Final[str] = (
 
 class BrokerError(RuntimeError):
     """Credential injection failed closed."""
+
+    def __init__(self, message: str, *, reason_code: str | None = None) -> None:
+        super().__init__(message)
+        if reason_code is not None and reason_code not in BROKER_SETUP_FAILURE_REASON_CODES:
+            raise ValueError("broker setup failure reason is not allow-listed")
+        self.reason_code = reason_code
 
 
 class _Neo4jRecord(Protocol):
@@ -84,6 +91,15 @@ def keychain_present(*, account: str, service: str) -> bool:
     return result.returncode == 0
 
 
+def _keychain_failure_code(account: str, service: str, failure: str) -> str | None:
+    credential = {
+        (OPENROUTER_ACCOUNT, OPENROUTER_SERVICE): "OPENROUTER",
+        (NEO4J_ACCOUNT, NEO4J_SERVICE): "NEO4J_COMMUNITY",
+        (NEO4J_PROJECTOR_ACCOUNT, NEO4J_PROJECTOR_SERVICE): "NEO4J_PROJECTOR",
+    }.get((account, service))
+    return None if credential is None else f"BROKER_{credential}_{failure}"
+
+
 def _keychain_password(*, account: str, service: str) -> str:
     try:
         result = subprocess.run(
@@ -103,16 +119,16 @@ def _keychain_password(*, account: str, service: str) -> str:
             env=unprivileged_child_environment(),
         )
     except subprocess.TimeoutExpired:
-        raise BrokerError(f"Keychain class {account} lookup timed out") from None
+        raise BrokerError(f"Keychain class {account} lookup timed out", reason_code=_keychain_failure_code(account, service, "LOOKUP_TIMEOUT")) from None
     except OSError:
-        raise BrokerError(f"Keychain class {account} lookup failed") from None
+        raise BrokerError(f"Keychain class {account} lookup failed", reason_code=_keychain_failure_code(account, service, "LOOKUP_FAILED")) from None
     except UnicodeError:
-        raise BrokerError(f"Keychain class {account} lookup failed") from None
+        raise BrokerError(f"Keychain class {account} lookup failed", reason_code=_keychain_failure_code(account, service, "LOOKUP_FAILED")) from None
     if result.returncode != 0:
-        raise BrokerError(f"Keychain class {account} is absent")
+        raise BrokerError(f"Keychain class {account} lookup unavailable", reason_code=_keychain_failure_code(account, service, "LOOKUP_UNAVAILABLE"))
     secret = result.stdout.strip()
     if len(secret) < _MIN_SECRET_CHARS:
-        raise BrokerError(f"Keychain class {account} is empty")
+        raise BrokerError(f"Keychain class {account} is empty", reason_code=_keychain_failure_code(account, service, "EMPTY_OR_TOO_SHORT"))
     return secret
 
 

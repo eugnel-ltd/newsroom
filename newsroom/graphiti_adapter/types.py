@@ -14,12 +14,18 @@ class GraphitiAdapterError(RuntimeError):
 
 GRAPHITI_EXTRA_REQUIRED = "GRAPHITI_EXTRA_REQUIRED"
 GRAPHITI_CORE_RELEASE_MISMATCH = "GRAPHITI_CORE_RELEASE_MISMATCH"
-GRAPHITI_SETUP_FAILURE_REASON_CODES = frozenset(
+_DEPENDENCY_FAILURE_REASON_CODES = frozenset(
     {
         GRAPHITI_EXTRA_REQUIRED,
         GRAPHITI_CORE_RELEASE_MISMATCH,
     }
 )
+BROKER_SETUP_FAILURE_REASON_CODES = frozenset(
+    f"BROKER_{credential}_{failure}"
+    for credential in ("OPENROUTER", "NEO4J_COMMUNITY", "NEO4J_PROJECTOR")
+    for failure in ("LOOKUP_TIMEOUT", "LOOKUP_FAILED", "LOOKUP_UNAVAILABLE", "EMPTY_OR_TOO_SHORT")
+)
+GRAPHITI_SETUP_FAILURE_REASON_CODES = _DEPENDENCY_FAILURE_REASON_CODES | BROKER_SETUP_FAILURE_REASON_CODES
 
 
 class GraphitiAdapterContractError(ValueError):
@@ -33,7 +39,7 @@ class GraphitiAdapterContractError(ValueError):
     ) -> None:
         super().__init__(message)
         if reason_code is not None and (
-            reason_code not in GRAPHITI_SETUP_FAILURE_REASON_CODES
+            reason_code not in _DEPENDENCY_FAILURE_REASON_CODES
         ):
             raise ValueError("graphiti setup failure reason is not allow-listed")
         self.reason_code = reason_code
