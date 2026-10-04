@@ -221,7 +221,7 @@ class CursorSdkExecution:
             "tool_call_count": self.tool_call_count,
             "cancelled": self.cancelled,
             "duration_ms": self.duration_ms,
-            "stream_message_classes": list(self.stream_message_classes),
+            "stream_message_classes": list(dict.fromkeys(self.stream_message_classes)),
             "diagnostic_digest": self.diagnostic_digest,
         }
 
@@ -593,6 +593,7 @@ def _consume_run(
 ) -> CursorSdkExecution:
     started = time.monotonic()
     chunks: list[str] = []
+    streamed_bytes = 0
     streamed_usage: list[object] = []
     classes: list[str] = []
     request_id = "UNOBSERVED"
@@ -612,7 +613,9 @@ def _consume_run(
             elif kind == "usage":
                 streamed_usage.append(_field(message, "usage"))
             elif kind == "assistant":
-                chunks.append(_assistant_text(message))
+                text = _assistant_text(message)
+                chunks.append(text)
+                streamed_bytes += len(text.encode("utf-8"))
             elif kind == "tool_call":
                 call_id = _field(message, "call_id")
                 identity = str(call_id) if call_id else f"anon:{len(seen_ids)}"
@@ -622,7 +625,7 @@ def _consume_run(
                 cancel_class = "TOOL_CALL"
                 _cancel_once(run)
                 break
-            if len("".join(chunks).encode("utf-8")) > max_output_bytes:
+            if streamed_bytes > max_output_bytes:
                 cancel_class = "OUTPUT_BOUND"
                 _cancel_once(run)
                 break
@@ -657,7 +660,10 @@ def _consume_run(
         mapped.usage = mapped.execution.usage
         raise mapped from exc
 
-    final_text = "".join(chunks) or _terminal_text(terminal)
+    # SDK assistant deltas can span several reasoning/answer steps; wait()
+    # supplies the final answer, not the concatenation of intermediate steps.
+    terminal_text = _terminal_text(terminal) if _terminal_status(terminal) == "finished" else ""
+    final_text = terminal_text or "".join(chunks)
     # A runtime may report text only from wait(). It has the same actual UTF-8
     # ceiling as streamed assistant text, independently of token consumption.
     post_wait_output_bound = not cancel_class and len(final_text.encode("utf-8")) > max_output_bytes
@@ -695,7 +701,7 @@ def _consume_run(
             error_class="TIMEOUT",
             execution=execution,
         )
-    if execution.status in {"error", "expired"}:
+    if execution.status in {"error", "expired", "cancelled"}:
         raise CursorSdkError(
             "Cursor SDK Graphiti run ended in a typed error",
             error_class=execution.error_class or "SDK_ERROR",
