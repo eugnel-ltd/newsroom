@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+import json
+import uuid
 from threading import RLock
 from typing import Any, Protocol
 
 from newsroom.authority.auth import AuthenticationProof
-from newsroom.authority.canonical import digest_canonical
+from newsroom.authority.canonical import digest_canonical, validate_sha256_digest
 from newsroom.authority.persistence import (
     AuthorityPersistenceError,
     ExpectedVersionConflict,
@@ -532,6 +534,7 @@ class _Increment4Neo4jBoundary:
         batches: tuple[StructuralBatch, ...],
         source_watermark: int,
         proof: AuthenticationProof,
+        logical_request=None,
     ):
         metadata = self._transition_to_validating(
             request=request,
@@ -545,6 +548,7 @@ class _Increment4Neo4jBoundary:
         compatibility_digest = neo4j_compatibility_digest(
             self._adapter.verify_compatibility()
         )
+        source_request = request if logical_request is None else logical_request
         try:
             validation = self._store.projection_generation_validation(
                 request.generation_id
@@ -561,7 +565,7 @@ class _Increment4Neo4jBoundary:
                     projection_state_digest=state_digest,
                     reason_code=request.reason_code,
                     idempotency_key=(
-                        self._current_validation_key(request)
+                        self._current_validation_key(source_request)
                         if isinstance(request, Increment4Neo4jCurrentBuildRequest)
                         and request.allow_active_extension
                         else self._operation_key(
@@ -571,7 +575,7 @@ class _Increment4Neo4jBoundary:
                              "snapshot_digest": snapshot_digest},
                         )
                     ),
-                    **self._source_binding(request, snapshot_digest, source_watermark),
+                    **self._source_binding(source_request, snapshot_digest, source_watermark),
                 ),
                 proof,
                 required_source_ledger_seq=source_watermark,
@@ -787,6 +791,7 @@ class _Increment4Neo4jBoundary:
         active_promotion,
         pre_purged_prior,
         proof: AuthenticationProof,
+        logical_request=None,
     ) -> Increment4Neo4jBuildResult:
         source_watermark = inputs.source_watermark
         snapshot_digest = inputs.snapshot_digest
@@ -886,6 +891,7 @@ class _Increment4Neo4jBoundary:
             batches=batches,
             source_watermark=source_watermark,
             proof=proof,
+            logical_request=logical_request,
         )
         promotion = self._promote(
             request=request,
@@ -934,6 +940,122 @@ class _Increment4Neo4jBoundary:
             "source_request_digest": cls._source_request_digest(request),
         }
 
+    def _creation_identity(self, request, generation_id):
+        row = self._store._connection.execute(
+            "SELECT v.authority_event_id,c.idempotency_key,p.payload_bytes FROM projection_generation_versions v "
+            "JOIN ledger_events e ON e.event_id=v.authority_event_id "
+            "JOIN authority_commands c ON c.command_id=e.command_id "
+            "JOIN authority_payloads p ON p.payload_id=c.payload_id "
+            "WHERE v.generation_id=? AND v.lifecycle_version=1 AND c.command_type='projection.generation.create'",
+            (str(generation_id),),
+        ).fetchone()
+        if row is None:
+            raise ProjectionStateError("CURRENT generation creation proof is absent")
+        self._store._validate_retained_event(row[0])
+        if json.loads(row[2]) != {"generation_id": str(generation_id),
+                "family_id": INCREMENT4_ADMITTED_FAMILY_ID, "reason_code": request.reason_code}:
+            raise ProjectionStateError("CURRENT generation creation intent differs")
+        return row[0], row[1]
+
+    def _replacement_id(self, request, creation_event, snapshot_digest):
+        identity = digest_canonical({"request": self._source_request_digest(request),
+            "creation_event": creation_event, "snapshot_digest": snapshot_digest})
+        return ProjectionGenerationId.parse(str(uuid.UUID(hex=identity[7:39], version=4)))
+
+    def _supersession_target(self, request, metadata):
+        generation = metadata.generation
+        creation, _ = self._creation_identity(request, generation.generation_id)
+        row = self._store._connection.execute(
+            "SELECT v.reason_code,v.authority_event_id,c.idempotency_key FROM projection_generation_versions v "
+            "JOIN ledger_events e ON e.event_id=v.authority_event_id "
+            "JOIN authority_commands c ON c.command_id=e.command_id "
+            "WHERE v.generation_id=? AND v.lifecycle_version=? AND c.command_type='projection.generation.transition'",
+            (str(generation.generation_id), generation.lifecycle_version),
+        ).fetchone()
+        if row is None or not row[0].startswith("CURRENT_NEXT:"):
+            raise ProjectionStateError("CURRENT FAILED generation has no supersession intent")
+        self._store._validate_retained_event(row[1])
+        parts = row[0].split(":")
+        if len(parts) != 3:
+            raise ProjectionStateError("CURRENT supersession reason differs")
+        target = ProjectionGenerationId.parse(parts[1]); snapshot = "sha256:" + parts[2]
+        validate_sha256_digest(snapshot)
+        expected = self._operation_key(request.idempotency_key, "supersede-current", {
+            "request": self._source_request_digest(request), "creation_event": creation,
+            "target": str(target), "snapshot_digest": snapshot})
+        if target != self._replacement_id(request, creation, snapshot) or row[2] != expected:
+            raise ProjectionStateError("CURRENT supersession request binding differs")
+        return target, snapshot
+
+    def _require_replacement_validation(self, request, validation):
+        generation_id = request.generation_id; visited = set()
+        while generation_id != validation.generation_id:
+            if generation_id in visited:
+                raise ProjectionStateError("CURRENT supersession cycle differs")
+            visited.add(generation_id)
+            metadata = self._store.projection_generation_metadata(generation_id)
+            self._require_family(metadata)
+            if metadata.generation.state is not ProjectionGenerationState.FAILED:
+                raise ProjectionStateError("CURRENT replacement lacks FAILED predecessor")
+            generation_id, snapshot = self._supersession_target(request, metadata)
+        if snapshot != validation.source_snapshot_digest:
+            raise ProjectionStateError("CURRENT replacement validation snapshot differs")
+
+    def _prepare_current_generation(self, request, inputs, proof):
+        if not request.allow_active_extension:
+            return request, inputs
+        logical = request; expected_snapshot = inputs.snapshot_digest; visited = set()
+        while True:
+            if request.generation_id in visited:
+                raise ProjectionStateError("CURRENT supersession cycle differs")
+            visited.add(request.generation_id)
+            metadata = self._metadata_or_none(request.generation_id)
+            if metadata is None and request.generation_id != logical.generation_id:
+                # A normal FAILED transition already declared this exact next
+                # namespace. Finish its create even after fail-before-create.
+                self._create_generation(request=request, snapshot_digest=expected_snapshot, proof=proof)
+                metadata = self._store.projection_generation_metadata(request.generation_id)
+            if metadata is None or metadata.generation.state is ProjectionGenerationState.ACTIVE:
+                break
+            self._require_family(metadata)
+            if metadata.generation.state is ProjectionGenerationState.FAILED:
+                target, expected_snapshot = self._supersession_target(logical, metadata)
+                request = replace(logical, generation_id=target)
+                continue
+            creation, creation_key = self._creation_identity(logical, request.generation_id)
+            wanted = self._operation_key(request.idempotency_key, "create", {
+                "generation_id": str(request.generation_id), "snapshot_digest": inputs.snapshot_digest,
+                "purge_retired_generation": request.purge_retired_generation})
+            if creation_key == wanted or metadata.generation.state is not ProjectionGenerationState.BUILDING:
+                break
+            if metadata.generation.validated_through_ledger_seq is not None or self._store._connection.execute(
+                "SELECT 1 FROM projection_generation_validations WHERE generation_id=? LIMIT 1",
+                (str(request.generation_id),),
+            ).fetchone() is not None:
+                raise ProjectionStateError("CURRENT validated intent cannot be superseded")
+            target = self._replacement_id(logical, creation, inputs.snapshot_digest)
+            self._projection_boundary.transition_generation(ProjectionGenerationTransitionRequest(
+                generation_id=request.generation_id,
+                expected_authority_version=metadata.generation.authority_aggregate_version,
+                target_state=ProjectionGenerationState.FAILED,
+                reason_code=f"CURRENT_NEXT:{target}:{inputs.snapshot_digest[7:]}",
+                idempotency_key=self._operation_key(logical.idempotency_key, "supersede-current", {
+                    "request": self._source_request_digest(logical), "creation_event": creation,
+                    "target": str(target), "snapshot_digest": inputs.snapshot_digest}),
+            ), proof)
+            request = replace(logical, generation_id=target); expected_snapshot = inputs.snapshot_digest
+        if request.generation_id == logical.generation_id:
+            return request, inputs
+        # Relation identities themselves bind the graph namespace. Re-derive
+        # through the existing mapper, never relabel an old batch UUID.
+        replacement = self._store._increment4_current_build_inputs(
+            generation_id=request.generation_id,
+            family=self._store.projection_family_definition(INCREMENT4_ADMITTED_FAMILY_ID),
+        )
+        if (replacement.snapshot_digest, replacement.source_watermark) != (inputs.snapshot_digest, inputs.source_watermark):
+            raise ProjectionStateError("CURRENT source changed during supersession")
+        return request, replacement
+
     def _replay_current_validation(self, request, validation, proof):
         if validation.source_request_digest != self._source_request_digest(request):
             raise ProjectionStateError("Increment 4 retained build request differs")
@@ -943,7 +1065,7 @@ class _Increment4Neo4jBoundary:
             # Validation committed before initial promotion. Resume the existing
             # full-build protocol, never attach this intent to another generation.
             if validation.generation_id != request.generation_id:
-                raise ProjectionStateError("Increment 4 unfinished build request differs")
+                self._require_replacement_validation(request, validation)
             return None
         if metadata.generation.state is not ProjectionGenerationState.ACTIVE:
             raise ProjectionStateError("Increment 4 retained build is no longer ACTIVE")
@@ -1156,11 +1278,14 @@ class _Increment4Neo4jBoundary:
                 family=self._store.projection_family_definition(INCREMENT4_ADMITTED_FAMILY_ID),
             )
             self._authenticate_build(request, inputs.snapshot_digest, inputs.source_watermark, proof)
+            logical_request = request
+            request, inputs = self._prepare_current_generation(request, inputs, proof)
             active_promotion, pre_purged_prior = self._retry_active_predecessor_cleanup(
                 request=request, snapshot_digest=inputs.snapshot_digest, proof=proof,
             )
             return self._build_prepared(
                 request, inputs, active_promotion, pre_purged_prior, proof,
+                logical_request=logical_request,
             )
 
     def generation_status(

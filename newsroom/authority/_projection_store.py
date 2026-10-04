@@ -3092,8 +3092,14 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
         )
         if upper <= current:
             return current
+        sequences = "ledger_events"
+        if self._current_state_only and self._native_checkpoint_schema:
+            # v44 expires unavailable diagnostic RPCs but reserves their exact
+            # identities/sequences. Account for those holes only in CURRENT
+            # mode; required retained mappings below remain unchanged blockers.
+            sequences = "(SELECT ledger_seq FROM ledger_events UNION SELECT ledger_seq FROM native_expired_command_keys)"
         if conn.execute(
-            "SELECT 1 FROM ledger_events WHERE ledger_seq=?",
+            f"SELECT 1 FROM {sequences} WHERE ledger_seq=?",
             (current + 1,),
         ).fetchone() is None:
             return current
@@ -3102,15 +3108,15 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
         expected = upper - current
         observed = int(
             conn.execute(
-                "SELECT COUNT(*) FROM ledger_events "
+                f"SELECT COUNT(*) FROM {sequences} "
                 "WHERE ledger_seq>? AND ledger_seq<=?",
                 (current, upper),
             ).fetchone()[0]
         )
         if observed != expected:
             hole = conn.execute(
-                "SELECT e.ledger_seq + 1 FROM ledger_events e "
-                "LEFT JOIN ledger_events n ON n.ledger_seq=e.ledger_seq + 1 "
+                f"SELECT e.ledger_seq + 1 FROM {sequences} e "
+                f"LEFT JOIN {sequences} n ON n.ledger_seq=e.ledger_seq + 1 "
                 "WHERE e.ledger_seq>=? AND e.ledger_seq<? "
                 "AND n.ledger_seq IS NULL "
                 "ORDER BY e.ledger_seq LIMIT 1",

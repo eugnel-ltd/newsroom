@@ -17,7 +17,7 @@ import urllib.request
 
 from lxml import html
 
-from newsroom.authority import HydrationRequest, ObjectAdmissionId, ObjectAdmissionRequest, UtcTimestamp
+from newsroom.authority import HydrationRequest, ObjectAdmissionId, ObjectAdmissionRequest, UtcTimestamp, DiagnosticHistoryExpired
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical, validate_sha256_digest
 from newsroom.increment9.proving import SOURCE_URLS
 
@@ -185,11 +185,27 @@ def _rights_snapshot_values(
     return observation_value, assessment_value
 
 
-def _retain_assessment(*, objects, proof, value):
+def _retain_assessment(*, objects, proof, value, reobservation_epoch=None):
     assessment_bytes = canonical_json_bytes(value)
-    retained = objects.admit(ObjectAdmissionRequest(
-        "evidence.source", f"native-rights-assessment:{value['record_id']}",
-    ), assessment_bytes, proof=proof).admission
+    original = ObjectAdmissionRequest("evidence.source", f"native-rights-assessment:{value['record_id']}")
+    fallback = None
+    if reobservation_epoch is not None:
+        validate_sha256_digest(reobservation_epoch)
+        if value["decision"] == "HOLD":
+            fallback = ObjectAdmissionRequest("evidence.source",
+                f"{original.idempotency_key}:native-reobservation:{reobservation_epoch}")
+    # Recover the current store's exact reobservation before touching the expired
+    # original again. Current auth/rights and the bytes are still rechecked.
+    recovered = None if fallback is None else objects.committed_admission(fallback, proof=proof)
+    if recovered is not None:
+        retained = recovered.admission
+    else:
+        try:
+            retained = objects.admit(original, assessment_bytes, proof=proof).admission
+        except DiagnosticHistoryExpired:
+            if fallback is None:
+                raise
+            retained = objects.admit(fallback, assessment_bytes, proof=proof).admission
     hydrated = objects.rehydrate(
         HydrationRequest(retained.admission_id, "evidence.source"), proof=proof,
     )
@@ -273,7 +289,7 @@ def _bundle_members(value):
     return members
 
 
-def retain_rights_snapshot_bundle(*, objects, proof, snapshots, stop_check):
+def retain_rights_snapshot_bundle(*, objects, proof, snapshots, stop_check, reobservation_epoch=None):
     """Retain every fresh source fact in one immutable portfolio envelope."""
     if type(snapshots) is not dict or set(snapshots) != set(SOURCE_URLS):
         raise ValueError("rights observation bundle inventory differs")
@@ -298,7 +314,8 @@ def retain_rights_snapshot_bundle(*, objects, proof, snapshots, stop_check):
     result = {}
     for source, (_, assessment) in values.items():
         stop_check()
-        retained = _retain_assessment(objects=objects, proof=proof, value=assessment)
+        retained = _retain_assessment(objects=objects, proof=proof, value=assessment,
+                                      reobservation_epoch=reobservation_epoch)
         result[source] = RightsSnapshotReference(
             str(retained.admission_id), retained.blob.blob_digest,
             str(admission.admission_id), admission.blob.blob_digest,

@@ -521,6 +521,14 @@ def open_native_pipeline(
             source_currentness_fence=source_currentness_fence,
         ))
         documents = components["documents"]
+        # Capture the existing checked store-instance identity only after the
+        # runtime owns its writer. Content, observations and releases are not epochs.
+        if authority_path.is_symlink():
+            raise ValueError("native rights store is a symlink")
+        store_stat = authority_path.stat()
+        rights_reobservation_epoch = digest_canonical({
+            "path": str(authority_path.resolve()), "device": store_stat.st_dev, "inode": store_stat.st_ino,
+        })
         from newsroom.increment9.proving import SOURCE_URLS
         if licence is None:
             def refresh_current_rights():
@@ -578,6 +586,7 @@ def open_native_pipeline(
                 snapshots = retain_rights_snapshot_bundle(
                     objects=runtime.authority.objects, proof=proof,
                     snapshots=snapshot_inputs, stop_check=stop_check,
+                    reobservation_epoch=rights_reobservation_epoch,
                 )
                 return govuk, govuk_reason, evidence, snapshots
 
