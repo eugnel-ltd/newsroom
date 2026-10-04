@@ -14,12 +14,18 @@ from .writer import WriterCopy, WriterEvidenceLink, WriterValidatorResult, _writ
 from .zh_hant import contains_discourse_filler, contains_non_han_letter, contains_simplified_variant
 
 WRITER_ID = "newsroom.native-story-writer.v1"
-DRAFT_SYSTEM = (
+LEGACY_DRAFT_SYSTEM = (
     "Write original Hong Kong Traditional Chinese news, not claim declarations. Use only approved facts "
     "and supporting source windows: a natural headline, attributed lead, detail and available context. "
     "Preserve numbers, entities, attribution, quotations and provisional/uncertain meaning. "
     "Map verbatim draft spans to approved claim IDs. Rich material deserves coherent paragraphs; "
     "sparse warnings may be BRIEF, never padded to a word quota. No external knowledge or planning prose."
+)
+DRAFT_SYSTEM = LEGACY_DRAFT_SYSTEM + (
+    " Write reader-facing official actions, not decoder or classifier preambles such as 'official status changed'. "
+    "When approved issue and update timestamps are exactly equal, state the time once and combine the actions "
+    "without losing either approved fact. One verbatim draft span may map to several approved claim IDs. "
+    "Keep exact approved dates and factual meaning; do not introduce relative time such as 'tonight' unless approved."
 )
 REVIEW_SYSTEM = (
     "You are the separate source-support reviewer, not the writer. Review the exact draft against the "
