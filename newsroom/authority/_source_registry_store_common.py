@@ -266,7 +266,7 @@ class _SourceRegistryStoreSupport:
         event_id: str,
     ) -> sqlite3.Row:
         header = None
-        if conn.execute('PRAGMA user_version').fetchone()[0] == 44:
+        if conn.execute('PRAGMA user_version').fetchone()[0] in (44,45):
             header = conn.execute('SELECT native_checkpoint_header(?)',(event_id,)).fetchone()[0]
         if header is not None:
             import json
