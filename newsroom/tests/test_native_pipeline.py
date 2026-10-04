@@ -1524,10 +1524,13 @@ def test_ready_spill_alternates_current_and_archive_despite_fresh_turns(tmp_path
             publications = [revision for kind, revision in calls[start:] if kind == "publish"]
             assert len(publications) == len(set(publications))
             spill_turns.append(publications[-1])
-        assert spill_turns[:2] == [weekly.revision_id, archives[0].revision_id]
+        # Freshly completed work now joins this same already-budgeted spill.
+        expected_current = fresh[0] if fresh_seconds else weekly
+        assert spill_turns[:2] == [expected_current.revision_id, archives[0].revision_id]
         assert all(journal.current(unit.revision_id)["stage"] == "ACKNOWLEDGED" for unit in archives)
         if fresh_seconds:
-            assert spill_turns[2::2] == [fresh[1].revision_id, fresh[3].revision_id]
+            assert spill_turns[2::2] == [fresh[2].revision_id, fresh[4].revision_id]
+            assert journal.current(weekly.revision_id)['stage'] == 'GRAPHITI_COMPLETE'
         for unit in (*archives, weekly):
             assert journal.current(unit.revision_id)["facts"]["graphiti_receipts"] == retained[unit.revision_id]["facts"]["graphiti_receipts"]
         interrupted = next(key for key, value in retained.items() if value["stage"] == "ASSESSMENT_INTERRUPTED")
