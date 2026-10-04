@@ -382,13 +382,50 @@ class NativeGraphitiProcessor:
                         terminal_holds[ingest_id] = "SETTLEMENT_PENDING:LINEAGE_CONFLICT"
         deferred = set()
         considered = set()
+        setup_deferred = set()
+        setup_unavailable = False
+        offered_attempt = None
+
+        def systemic_failure(code: str, provider_dispatched: bool) -> None:
+            nonlocal setup_unavailable
+            # The existing ingest boundary settles/authenticates the first
+            # result. Only its known global pre-provider credential setup cause
+            # defers this operation; unknown/content failures retain their path.
+            if code != "BrokerError" or provider_dispatched or offered_attempt is None:
+                return
+            row = self._connection.execute(
+                "SELECT outcome,receipt_digest,receipt_json FROM unpublished_graphiti_attempt_receipts "
+                "WHERE ingest_id=? AND attempt_number=?", offered_attempt,
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                receipt = json.loads(row[2])
+                if type(receipt) is not dict:
+                    return
+                retained_digest = receipt.pop("receipt_digest", None)
+                actual_digest = digest_bytes(canonical_json_bytes(receipt))
+            except (ValueError, TypeError):
+                return
+            if (retained_digest == row[1] == actual_digest
+                    and (receipt.get("ingest_id"), receipt.get("attempt_number")) == offered_attempt
+                    and row[0] == receipt.get("outcome") == "FAILED"
+                    and receipt.get("setup_failure") == "BrokerError"
+                    and receipt.get("dispatch_state") == "NOT_DISPATCHED"):
+                setup_unavailable = True
 
         def defer(unit: CorpusIngestUnit) -> bool:
+            nonlocal offered_attempt
             considered.add(unit.ingest_id)
             self._stop_check()
+            if setup_unavailable:
+                deferred.add(unit.ingest_id)
+                setup_deferred.add(unit.ingest_id)
+                return True
             if defer_before_unit(unit):
                 deferred.add(unit.ingest_id)
                 return True
+            offered_attempt = (unit.ingest_id, next_graphiti_attempt_number(self._connection, unit.ingest_id))
             return False
 
         remaining = {
@@ -414,6 +451,7 @@ class NativeGraphitiProcessor:
                     recovered_ambiguous_attempts=recovered_ambiguous_attempts,
                     authenticated_rejected_attempts=authenticated_rejected_attempts,
                     authenticated_reentry_attempts=authenticated_reentry_attempts,
+                    on_systemic_failure=systemic_failure,
                 )
             for ingest_id in considered:
                 remaining.pop(ingest_id, None)
@@ -455,7 +493,7 @@ class NativeGraphitiProcessor:
             elif ingest_id in deferred:
                 outcomes.append(NativeGraphitiOutcome(
                     ingest_id, "GRAPHITI_DEFERRED", None,
-                    "WORK_QUANTUM_EXHAUSTED",
+                    "SYSTEMIC_SETUP_UNAVAILABLE" if ingest_id in setup_deferred else "WORK_QUANTUM_EXHAUSTED",
                 ))
             else:
                 failures, dead = graphiti_failure_state(self._connection, ingest_id)
