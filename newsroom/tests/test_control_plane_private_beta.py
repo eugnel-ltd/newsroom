@@ -1615,7 +1615,7 @@ def test_broker_error_does_not_include_secret(
         "run",
         lambda *args, **kwargs: Result(),
     )
-    with pytest.raises(broker.BrokerError, match="OPENROUTER_API is absent") as caught:
+    with pytest.raises(broker.BrokerError, match="Keychain class OPENROUTER_API lookup unavailable") as caught:
         broker.openrouter_api_key()
     assert "super-secret-openrouter-key" not in str(caught.value)
 
