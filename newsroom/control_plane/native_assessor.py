@@ -113,6 +113,7 @@ MODEL = "grok-4.7"
 REASONING = "high"
 COMMAND_FLAGS = _grok_command_flags(REASONING, model=MODEL)
 RETAINED_ASSESSMENT_POLICY_VERSION = "newsroom.retained-assessment.v1"
+QUALIFICATION_CLAUSE_CONSUMER_VERSION = "newsroom.native-hko-qualification-clause.v1"
 REASSESSABLE_HOLDS = frozenset({
     "ASSESSOR_CLAIM_BINDING_HOLD", "ASSESSOR_NAMED_ENTITY_CONTRACT_HOLD",
     "INVALID_GOVERNED_CLAIM_EVIDENCE",
@@ -2050,6 +2051,34 @@ def _required_historical_headline(result) -> dict | None:
             "localised_factual_expressions": [[source_date, rendered_date]]}
 
 
+def _complete_hko_qualification_clause(item, claim, result, base):
+    """Resolve a unique clipped witness to the exact canonical completed event."""
+    evidence = dict(item.test_evidence)
+    span = evidence.get("material_relation_span")
+    if (item.test is not Evid012QualificationTest.LAW_RIGHT_STATUS_POLICY
+            or evidence.get("change_kind") != "STATUS"
+            or claim.claim_role != "HEADLINE" or claim.source_ids != ("HK-02",)
+            or type(span) is not str or not span.strip()):
+        return item
+    required = _required_historical_headline(result)
+    if required is None:
+        return item
+    complete = required["claim"]
+    body = result.body.decode("utf-8")
+    index = claim.passage_index
+    if (claim.claim != complete or claim.supporting_excerpt != complete
+            or span == complete or complete.count(span) != 1 or body.count(complete) != 1
+            or index >= len(base.passages) or base.passages[index] != body
+            or index >= len(base.observation_digests)
+            or base.observation_digests[index] != digest_bytes(result.body)
+            or result.body_digest != base.observation_digests[index]):
+        return item
+    evidence["material_relation_span"] = complete
+    return replace(item, test_evidence=tuple(evidence.items()),
+                   qualification_record_id=_qualification_record_id(
+                       item.governed_claim_id, item.test.value, evidence))
+
+
 class AutonomousNativeEvidenceAssessor:
     """Dispatch one fixed-schema transform, then prove its output locally."""
 
@@ -2601,6 +2630,9 @@ class AutonomousNativeEvidenceAssessor:
             claim = claims_by_id.get(item.governed_claim_id)
             if claim is None:
                 raise EvidencePackageError("assessment qualification claim differs")
+            item = _complete_hko_qualification_clause(
+                item, claim, acquired[claim.passage_index], base,
+            )
             if (
                 not _qualification_relation_is_proven(
                     item, claim,
@@ -2634,6 +2666,7 @@ class AutonomousNativeEvidenceAssessor:
             # validated claim and the original accounted raw output, but issue
             # qualification records only for locally proved suggestions. The
             # headline must independently qualify; admission checks are unchanged.
+        if tuple(verified_qualifications) != package.qualification_evidence:
             package = replace(package, qualification_evidence=tuple(verified_qualifications))
         assessment_records = [
             {
