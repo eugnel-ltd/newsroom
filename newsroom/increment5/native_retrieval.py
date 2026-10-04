@@ -1031,12 +1031,12 @@ _DOCUMENT_INVENTORY_TOKEN = object()
 class _AuthenticatedDocumentInventory:
     """Documents authenticated once for one synchronous retrieval call."""
 
-    __slots__ = ("_consumed", "_documents", "_owner", "_proof", "_receipts")
+    __slots__ = ("_consumed", "_documents", "_owner", "_proof", "_receipts", "_watermark")
 
     def __init__(
         self,
         owner: "NativeRetrievalDocuments",
-        values: tuple[tuple[NativeDocumentReceipt, NativePassageDocument], ...],
+        values: tuple[tuple[NativeDocumentReceipt, NativePassageDocument, int], ...],
         proof: AuthenticationProof,
         *,
         _token: object,
@@ -1046,10 +1046,11 @@ class _AuthenticatedDocumentInventory:
         self._owner = owner
         self._proof = proof
         self._consumed = False
-        self._receipts = tuple(receipt for receipt, _document in values)
+        self._receipts = tuple(receipt for receipt, _document, _sequence in values)
         self._documents = {
-            receipt.event_id: document for receipt, document in values
+            receipt.event_id: document for receipt, document, _sequence in values
         }
+        self._watermark = max(sequence for _receipt, _document, sequence in values)
 
     def inspect(
         self,
@@ -1071,6 +1072,12 @@ class _AuthenticatedDocumentInventory:
             raise NativeRetrievalError("native document inventory proof differs")
         self._consumed = True
         return documents
+
+    def watermark(self, owner, receipts, proof) -> int:
+        self.inspect(owner, receipts)
+        if type(proof) is not AuthenticationProof or proof != self._proof:
+            raise NativeRetrievalError("native document inventory proof differs")
+        return self._watermark
 
 
 class NativeRetrievalContextReadPort:
@@ -1145,9 +1152,13 @@ class NativeRetrievalDocuments:
             or len({item.event_id for item in receipts}) != len(receipts)
         ):
             raise NativeRetrievalError("native document inventory differs")
+        values = []
+        for receipt in receipts:
+            document, _vector, sequence = self._read_with_sequence(receipt, proof)
+            values.append((receipt, document, sequence))
         return _AuthenticatedDocumentInventory(
             self,
-            tuple((receipt, self._read(receipt, proof)[0]) for receipt in receipts),
+            tuple(values),
             proof,
             _token=_DOCUMENT_INVENTORY_TOKEN,
         )
@@ -1171,6 +1182,16 @@ class NativeRetrievalDocuments:
         if type(inventory) is not _AuthenticatedDocumentInventory:
             raise NativeRetrievalError("native document inventory type differs")
         return inventory.consume(self, receipts, proof)
+
+    def authenticated_inventory_watermark(self, inventory, receipts, *, proof: AuthenticationProof) -> int:
+        """Use this call's verified sequence evidence, retaining current proof validation."""
+        if type(inventory) is not _AuthenticatedDocumentInventory:
+            raise NativeRetrievalError("native document inventory type differs")
+        watermark = inventory.watermark(self, receipts, proof)
+        # The old watermark pass refreshed read authorisation after inventory
+        # construction. Keep that boundary once, not once per immutable event.
+        self._verify_event(receipts[0], proof)
+        return watermark
 
     def reproject(
         self, receipt: NativeDocumentReceipt, *, proof: AuthenticationProof,
@@ -1488,7 +1509,11 @@ class NativeRetrievalDocuments:
         return context
 
     def _read(self, receipt: NativeDocumentReceipt, proof: AuthenticationProof) -> tuple[NativePassageDocument, tuple[float, ...]]:
-        self._verify_event(receipt, proof)
+        document, vector, _sequence = self._read_with_sequence(receipt, proof)
+        return document, vector
+
+    def _read_with_sequence(self, receipt: NativeDocumentReceipt, proof: AuthenticationProof) -> tuple[NativePassageDocument, tuple[float, ...], int]:
+        sequence = self._verify_event(receipt, proof)
         hydrated = self._objects.rehydrate(HydrationRequest(receipt.admission_id, NATIVE_DOCUMENT_USE), proof=proof)
         self._access(hydrated.decision, self._document_policy, NATIVE_DOCUMENT_CLASS, NATIVE_DOCUMENT_USE)
         document = NativePassageDocument.from_bytes(hydrated.data)
@@ -1504,13 +1529,14 @@ class NativeRetrievalDocuments:
         embedding = NativeEmbeddingReceipt.from_bytes(receipt_object.data)
         if digest_bytes(receipt_object.data) != document.embedding_receipt_digest or embedding.vector_digest != document.vector_digest or embedding.input_text_digest != document.text_digest:
             raise NativeRetrievalError("native embedding provenance differs")
-        return document, vector
+        return document, vector, sequence
 
-    def _verify_event(self, receipt: NativeDocumentReceipt, proof: AuthenticationProof) -> None:
+    def _verify_event(self, receipt: NativeDocumentReceipt, proof: AuthenticationProof) -> int:
         provenance = self._events.provenance(receipt.event_id, proof=proof)
         event = provenance.event
         if provenance.command_definition.command_type != NATIVE_DOCUMENT_COMMAND or provenance.command_definition.definition_digest != self._command_definition or event.command_definition_digest != self._command_definition or event.event_type != NATIVE_DOCUMENT_EVENT or event.object_admission_id != str(receipt.admission_id) or event.payload_digest != receipt.document_digest or event.command_id != receipt.command_id or event.aggregate_id != str(receipt.aggregate_id) or event.aggregate_version != receipt.aggregate_version or event.principal_id != self._controller or provenance.authentication.principal_id != self._controller or provenance.authentication.authority_domain != self._domain or event.trust_scope != TrustScope.ADMITTED.value or event.security_scope != NATIVE_SECURITY_SCOPE or event.retention_scope != NATIVE_RETENTION_SCOPE:
             raise NativeRetrievalError("native retrieval authority event differs")
+        return event.ledger_seq
 
     def _receipt_for_event(self, event_id: str, proof: AuthenticationProof) -> NativeDocumentReceipt:
         provenance = self._events.provenance(event_id, proof=proof)
