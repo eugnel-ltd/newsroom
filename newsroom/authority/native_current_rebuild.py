@@ -210,8 +210,11 @@ def copy_selected_native_store(store, destination: sqlite3.Connection, *, roots,
                 matching('projection_generation_versions',('generation_id','lifecycle_version'),
                     (values['generation_id'],values['lifecycle_version']),required=True)
                 checkpoint=source.execute('SELECT checkpoint_version FROM projection_checkpoint_versions WHERE generation_id=? ORDER BY checkpoint_version DESC LIMIT 1',(values['generation_id'],)).fetchone()
-                if checkpoint is None:raise AuthorityPersistenceError('selected generation checkpoint is absent')
-                matching('projection_checkpoint_versions',('generation_id','checkpoint_version'),(values['generation_id'],checkpoint[0]),required=True)
+                if checkpoint is None:
+                    if values['state'] in ('BUILDING','VALIDATING','ACTIVE'):
+                        raise AuthorityPersistenceError('selected generation checkpoint is absent')
+                else:
+                    matching('projection_checkpoint_versions',('generation_id','checkpoint_version'),(values['generation_id'],checkpoint[0]),required=True)
             elif table=='projection_generation_validations':
                 matching('projection_generation_versions',('generation_id','lifecycle_version'),
                     (values['generation_id'],values['lifecycle_version']),required=True)

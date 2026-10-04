@@ -565,3 +565,30 @@ def test_selected_older_projection_validation_keeps_exact_and_previous_versions(
         restored=system.projections._NativeProjections__validation.__self__._store
         assert restored.projection_generation_validation_for_key(namespace,'typed-validation-3')==selected
         assert restored.projection_generation(created.generation_id)==current
+
+
+def test_selected_retired_parent_keeps_expired_checkpoint_absence(tmp_path,monkeypatch):
+    from .test_projection_chain_retirement import _fixture
+    from newsroom.authority.audit_retention import retire_native_projection_diagnostics
+    from .projection_b1_helpers import open_projection_system
+    from newsroom.authority._projection_store import _ProjectionAuthorityStore
+    from newsroom.authority.native_current_rebuild import copy_selected_native_store
+    from newsroom.authority.native_current_checkpoint_migrations import initialise_empty_checkpoint_store
+    monkeypatch.setattr(_ProjectionAuthorityStore,'_current_state_only',True)
+    data,original,request,_=_fixture(tmp_path)
+    selected=tmp_path/'retired-selected.sqlite3'
+    assert retire_native_projection_diagnostics(data,apply=True)['retired_projection_chains']==1
+    with open_projection_system(original) as system:
+        root=system.projections._NativeProjections__validation.__self__._store
+        row=root._connection.execute('SELECT state,diagnostic_history_expired FROM projection_generations WHERE generation_id=?',(str(request.generation_id),)).fetchone()
+        assert tuple(row)==('RETIRED',1)
+        assert root._connection.execute('SELECT 1 FROM projection_checkpoint_versions WHERE generation_id=?',(str(request.generation_id),)).fetchone()is None
+        with sqlite3.connect(selected,isolation_level=None) as c:
+            initialise_empty_checkpoint_store(c)
+            copy_selected_native_store(root,c,roots={'projection_generations':((str(request.generation_id),),)},dev_rebuild=True)
+            assert c.execute('SELECT 1 FROM projection_checkpoint_versions WHERE generation_id=?',(str(request.generation_id),)).fetchone()is None
+            assert c.execute('PRAGMA foreign_key_check').fetchall()==[]
+    selected.chmod(0o600)
+    with open_projection_system(selected) as system:
+        root=system.projections._NativeProjections__validation.__self__._store
+        assert root.projection_generation(request.generation_id).state.value=='RETIRED'
