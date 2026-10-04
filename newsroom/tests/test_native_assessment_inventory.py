@@ -155,3 +155,19 @@ def test_large_reason_is_bounded_and_digest_keeps_distinct_groups(tmp_path):
     groups=inventory(path,limit=10,seconds=2)['groups']
     assert len(groups)==4 and len({g['reason_digest']for g in groups})==4
     assert all(len(g['reason'])==512 and g['reason_truncated']for g in groups)
+
+
+@pytest.mark.parametrize("stage", ("ACKNOWLEDGED", "SAME_STATE_ASSOCIATED"))
+def test_completed_current_stage_takes_precedence_over_stale_failure_and_candidate(tmp_path, stage):
+    path=tmp_path/'journal.sqlite3';seed(path)
+    with sqlite3.connect(path) as c:
+        for revision,raw in c.execute('SELECT revision_id,state_json FROM native_current_heads').fetchall():
+            value=json.loads(raw);value['stage']=stage
+            value['facts'].update(reason='EditorialError',candidate_id='retained-candidate',candidate_version_id='retained-version')
+            c.execute('UPDATE native_current_heads SET state_json=?,state_digest=? WHERE revision_id=?',
+                (canonical_json_bytes(value).decode(),digest_canonical({'state':value,'pair_digest':None}),revision))
+    before=path.read_bytes();group=inventory(path,limit=10,seconds=2)['groups'][0]
+    assert group['reason']==stage
+    assert group['disposition']=='NOT_ASSESSOR_WORK'
+    assert all(r['availability']['accounting']=='NOT_APPLICABLE'for r in group['representatives'])
+    assert path.read_bytes()==before
