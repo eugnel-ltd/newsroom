@@ -90,8 +90,8 @@ def poll_other_source(intake, source_id, definition_id, version_id, version):
     if status != 200 or not raw or len(raw) > MAX_BODY_BYTES:
         return NativeSourceDisposition(source_id, "HOLD", "SOURCE_FETCH_INCOMPLETE", observations=tuple(observations))
     observed = intake._clock()
-    admission, access = intake._admit_observation(source_id, raw)
-    observations.append((url, digest_bytes(raw), str(admission.admission_id), str(access.access_decision_id)))
+    admission, access = intake._admit_observation(source_id, raw, url=url)
+    observations.append((url, digest_bytes(raw), str(admission), str(access.access_decision_id)))
     try:
         items = weather_items(source_id, raw, observed_at=observed)
     except (ValueError, TypeError, KeyError, UnicodeError, etree.XMLSyntaxError):
@@ -109,6 +109,6 @@ def poll_other_source(intake, source_id, definition_id, version_id, version):
     return NativeSourceDisposition(
         source_id, "HOLD" if holds else "READY",
         "SOURCE_ITEMS_HELD" if holds else "GOVERNED_REVISIONS_RETAINED" if items else "NO_ACTIVE_WARNINGS_OBSERVED",
-        tuple(units), str(admission.admission_id), str(access.access_decision_id),
+        tuple(units), str(admission), str(access.access_decision_id),
         tuple(observations), tuple(holds),
     )

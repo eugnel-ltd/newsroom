@@ -342,7 +342,7 @@ def test_collection_attachment_requires_every_retained_ancestry_link(tmp_path, m
                     value['details']['body'] = '<p>All rights <em>reserved</em> for the linked files.</p>'
                 raw = json.dumps(value).encode()
                 admission, access = intake._admit_observation('UK-01', raw)
-                replacement = (collection_url, digest_bytes(raw), str(admission.admission_id), str(access.access_decision_id))
+                replacement = (collection_url, digest_bytes(raw), str(admission), str(access.access_decision_id))
             changed[replacement[1]] = replacement
             invalid.append(changed)
         for changed in invalid:

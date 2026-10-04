@@ -932,7 +932,7 @@ def open_native_pipeline(
             sources=runtime.authority.sources, objects=runtime.authority.objects,
             proof=proof, definition_ids=definitions, licence=licence,
             dispatch_fence=source_fence, clock=clock,
-            retained_units=journal.units,
+            retained_units=journal.units, observations=journal.observations,
             other_source_poll=lambda **request: poll_other_source(intake, **request),
         )
 
