@@ -215,7 +215,7 @@ class NativePipeline:
                         outcomes = tuple(by_ingest[ingest] for ingest, _ in header.unit_index)
                         deferred = tuple(item for item in outcomes if item.state == "GRAPHITI_DEFERRED")
                         if deferred:
-                            if any(item.reason != "WORK_QUANTUM_EXHAUSTED" or item.receipt_digest is not None
+                            if any(item.reason not in {"WORK_QUANTUM_EXHAUSTED", "SYSTEMIC_SETUP_UNAVAILABLE"} or item.receipt_digest is not None
                                    for item in deferred):
                                 raise ValueError("native Graphiti deferral reason differs")
                             # A scheduling decision is not a durable failure. Keep
