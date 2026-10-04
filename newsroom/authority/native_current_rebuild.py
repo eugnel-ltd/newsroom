@@ -237,6 +237,10 @@ def copy_selected_native_store(store, destination: sqlite3.Connection, *, roots,
                 matching('object_admission_versions',('admission_id','lifecycle_version'),(values['admission_id'],1))
                 matching('object_admission_heads',('admission_id',),(values['admission_id'],))
                 matching('blob_lifecycle_heads',('blob_digest',),(values['blob_digest'],))
+            elif table=='check_outcomes':
+                # The observed-item index is a complete positive child of its
+                # canonical outcome, not expendable historical diagnostics.
+                matching('check_outcome_observed_items',('outcome_id',),(values['outcome_id'],))
             elif table=='source_definition_versions':
                 for child in ('source_version_roles','source_version_portfolio_functions','source_version_gaps','source_version_coverage_mappings','source_version_dependencies'):
                     matching(child,('version_id',),(values['version_id'],))

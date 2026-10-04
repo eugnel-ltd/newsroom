@@ -276,6 +276,57 @@ def test_current_source_inventory_copy_preserves_rights_cas_and_repoll(tmp_path,
     journal_connection.close()
 
 
+def test_selected_check_observation_survives_new_source_revision_after_new44(tmp_path, monkeypatch):
+    from newsroom.authority import UtcTimestamp
+    from newsroom.authority.native_current_rebuild import copy_selected_native_store
+    from newsroom.authority.native_current_checkpoint_migrations import initialise_empty_checkpoint_store
+    from newsroom.control_plane.native_discovery import NativeDiscovery
+    from newsroom.checks import ObservableTransitionKind
+    now = UtcTimestamp.parse('2026-09-10T10:00:00Z')
+    later = UtcTimestamp.parse('2026-09-10T10:01:00Z')
+    destination = tmp_path / 'observed-selected.sqlite3'
+    with sqlite3.connect(':memory:') as proving:
+        with source_fixture(tmp_path, monkeypatch) as (args, runtime, intake, first, _, original):
+            old_unit, = first.units
+            controller = NativeDiscovery(sources=runtime.authority.sources, checks=runtime.authority.checks,
+                                         discovery=runtime.authority.discovery, proving=proving)
+            prior = controller.deliver(old_unit, now=now, proof=runtime.proof)
+            fresh_atom = ATOM.replace(b'2026-09-08T11:00:00Z', b'2026-09-10T09:45:00Z')
+            intake._clock = lambda: datetime(2026, 9, 10, 10, tzinfo=UTC)
+            intake._fetch = lambda url: (200, fresh_atom if url == SOURCE_URLS['UK-01'] else
+                _document(body='A genuinely changed retained source statement.', updated='2026-09-10T09:45:00+00:00'))
+            fresh = intake.poll()[0]
+            assert fresh.status == 'READY', fresh
+            fresh_unit, = fresh.units
+            assert fresh_unit.revision_id != old_unit.revision_id
+            assert fresh_unit.authority.item_id == old_unit.authority.item_id, (old_unit.authority, fresh_unit.authority)
+            with sqlite3.connect(destination, isolation_level=None) as selected:
+                initialise_empty_checkpoint_store(selected)
+                copy_selected_native_store(original, selected, roots={
+                    'discovery_occurrences': ((str(prior.occurrence_id),),),
+                    'check_outcomes': ((str(prior.outcome.request.outcome_id),),),
+                    'source_revisions': ((fresh_unit.revision_id,),),
+                    'discovery_representations': ((fresh_unit.authority.representation_id,),),
+                }, dev_rebuild=True)
+            expected_index = tuple(tuple(row) for row in original._connection.execute(
+                'SELECT * FROM check_outcome_observed_items WHERE outcome_id=?',
+                (str(prior.outcome.request.outcome_id),)))
+        destination.chmod(0o600)
+        with open_native_runtime(**dict(args, authority_path=destination)) as current:
+            store = current.authority._base._authority_composition(_AUTHORITY_COMPOSITION_TOKEN)[0]
+            assert store._connection.execute('SELECT count(*) FROM discovery_occurrences WHERE occurrence_id=?', (str(prior.occurrence_id),)).fetchone()[0] == 1
+            controller = NativeDiscovery(sources=current.authority.sources, checks=current.authority.checks,
+                                         discovery=current.authority.discovery, proving=proving)
+            delivered = controller.deliver(fresh_unit, now=later, proof=current.proof)
+            assert delivered.transition.request.prior_revision_id == prior.transition.request.current_revision_id
+            assert delivered.transition.request.kind is ObservableTransitionKind.REVISED
+            store = current.authority._base._authority_composition(_AUTHORITY_COMPOSITION_TOKEN)[0]
+            assert tuple(tuple(row) for row in store._connection.execute(
+                'SELECT * FROM check_outcome_observed_items WHERE outcome_id=?',
+                (str(prior.outcome.request.outcome_id),))) == expected_index
+            assert store._connection.execute('PRAGMA foreign_key_check').fetchall() == []
+
+
 @pytest.mark.parametrize('failure',[RuntimeError('copy failure'),KeyboardInterrupt('copy interrupt')])
 def test_selected_copy_rolls_back_all_destination_rows_and_temp_state(tmp_path,monkeypatch,failure):
     from newsroom.authority.native_current_rebuild import copy_selected_native_store
