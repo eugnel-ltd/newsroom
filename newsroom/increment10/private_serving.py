@@ -767,7 +767,7 @@ class PrivateServingDelivery:
         if admission.blob.blob_digest != digest_bytes(raw):
             if not first_ack:
                 raise PrivateServingError("serving evidence admission differs")
-            material = self._objects.hydrate(
+            material = self._objects.rehydrate(
                 HydrationRequest(admission.admission_id, EVIDENCE_PURPOSE),
                 proof=proof,
             )
@@ -828,7 +828,7 @@ class PrivateServingDelivery:
             aggregate_version=evidence_receipt.aggregate_version,
             proof=proof,
         )
-        material = self._objects.hydrate(
+        material = self._objects.rehydrate(
             HydrationRequest(evidence_receipt.admission_id, EVIDENCE_PURPOSE),
             proof=proof,
         )
@@ -981,7 +981,7 @@ class PrivateServingDelivery:
             aggregate_version=receipt.aggregate_version,
             proof=proof,
         )
-        material = self._objects.hydrate(
+        material = self._objects.rehydrate(
             HydrationRequest(receipt.admission_id, ATTEMPT_PURPOSE), proof=proof
         )
         self._access(material.decision, self._attempt_policy, ATTEMPT_CLASS, ATTEMPT_USE)
@@ -996,7 +996,7 @@ class PrivateServingDelivery:
         return batch
 
     def _projection_row(self, attempt, *, applied_at, proof):
-        material = self._objects.hydrate(
+        material = self._objects.rehydrate(
             HydrationRequest(attempt.surface_admission_id, SURFACE_PURPOSE), proof=proof
         )
         if digest_bytes(material.data) != attempt.surface_digest:

@@ -524,7 +524,7 @@ class OfflinePublication:
         committed_admission = self._objects.committed_admission(admission_request, proof=proof)
         retained = None
         if committed_admission is not None:
-            material = self._objects.hydrate(
+            material = self._objects.rehydrate(
                 HydrationRequest(committed_admission.admission.admission_id, TRANSACTION_PURPOSE), proof=proof,
             )
             self._access(material.decision, self._transaction_policy, TRANSACTION_CLASS, TRANSACTION_USE)
@@ -549,7 +549,7 @@ class OfflinePublication:
             else:
                 admissions = tuple(item[1] for item in retained.bundle.surface_payloads)
                 for surface, admission_id in zip(surfaces, admissions, strict=True):
-                    material = self._objects.hydrate(HydrationRequest(admission_id, SURFACE_PURPOSE), proof=proof)
+                    material = self._objects.rehydrate(HydrationRequest(admission_id, SURFACE_PURPOSE), proof=proof)
                     self._access(material.decision, self._surface_policy, SURFACE_CLASS, SURFACE_USE)
                     if material.data != surface.canonical_bytes():
                         raise PublicationError("surface payload replay differs")
@@ -605,7 +605,7 @@ class OfflinePublication:
         if type(receipt) is not PublicationReceipt:
             raise PublicationError("exact PublicationReceipt is required")
         self._verify_event(receipt, proof=proof)
-        hydrated = self._objects.hydrate(
+        hydrated = self._objects.rehydrate(
             HydrationRequest(receipt.admission_id, TRANSACTION_PURPOSE), proof=proof
         )
         self._access(
@@ -645,7 +645,7 @@ class OfflinePublication:
             )
             admissions = tuple(item[1] for item in transaction.bundle.surface_payloads)
             for surface, admission_id in zip(surfaces, admissions, strict=True):
-                material = self._objects.hydrate(
+                material = self._objects.rehydrate(
                     HydrationRequest(admission_id, SURFACE_PURPOSE), proof=proof
                 )
                 self._access(

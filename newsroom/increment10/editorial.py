@@ -659,7 +659,7 @@ class NativeEditorial:
         )
         if committed_admission is not None:
             admitted = committed_admission.admission
-            hydrated = self._objects.hydrate(
+            hydrated = self._objects.rehydrate(
                 HydrationRequest(admitted.admission_id, STORY_PURPOSE), proof=proof
             )
             self._verify_access(hydrated.decision, policy=self._story_policy,
@@ -755,7 +755,7 @@ class NativeEditorial:
         if type(receipt) is not StoryVersionReceipt:
             raise EditorialError("immutable Story Version receipt is required")
         self._verify_story_event(receipt, proof=proof)
-        hydrated = self._objects.hydrate(
+        hydrated = self._objects.rehydrate(
             HydrationRequest(receipt.admission_id, STORY_PURPOSE), proof=proof
         )
         self._verify_access(
@@ -966,7 +966,7 @@ class NativeEditorial:
             definition_digest=self._decision_definition,
             producer_principal=self._controller_principal,
         )
-        hydrated = self._objects.hydrate(
+        hydrated = self._objects.rehydrate(
             HydrationRequest(reference.admission_id, DECISION_PURPOSE), proof=proof
         )
         self._verify_access(
