@@ -827,12 +827,45 @@ def messages_to_prompt(messages: list[Any]) -> str:
     )
 
 
-def _parsed_object(raw: str) -> dict[str, Any] | None:
+def _parsed_object(
+    raw: str, *, diagnostic: dict[str, object] | None = None,
+) -> dict[str, Any] | None:
+    """Keep object extraction unchanged; optional failure positions are raw characters."""
+    extracted = True
     try:
-        payload = json.loads(extract_json(raw))
-    except (RuntimeError, json.JSONDecodeError, TypeError, ValueError):
+        try:
+            candidate = extract_json(raw)
+        except RuntimeError:
+            if diagnostic is None:
+                return None
+            if not raw.strip():
+                diagnostic["parse_class"] = "EMPTY"
+                return None
+            # Diagnose a scalar/array without accepting it or decoding twice.
+            candidate, extracted = raw, False
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        if diagnostic is not None:
+            diagnostic.update(
+                parse_class="JSON_SYNTAX",
+                json_error_position=exc.pos + (raw.find("{") if extracted else 0),
+            )
         return None
-    return payload if isinstance(payload, dict) else None
+    except (RuntimeError, TypeError, ValueError):
+        if diagnostic is not None:
+            diagnostic["parse_class"] = "PARSER_REJECTED"
+        return None
+    if isinstance(payload, dict):
+        return payload if extracted else None
+    if diagnostic is not None:
+        diagnostic.update(
+            parse_class="NON_OBJECT",
+            json_type={
+                type(None): "NULL", bool: "BOOLEAN", int: "NUMBER",
+                float: "NUMBER", str: "STRING", list: "ARRAY",
+            }[type(payload)],
+        )
+    return None
 
 
 def _payload_matches_response_schema(
@@ -1680,7 +1713,8 @@ async def run_cli_chain(
         payload = None
     else:
         cursor_execution = _execution(cast(CliOutput, raw))
-        payload = _parsed_object(cursor_execution.text)
+        parse_diagnostic = {} if advisory_reported_tokens else None
+        payload = _parsed_object(cursor_execution.text, diagnostic=parse_diagnostic)
         schema_matches = payload is not None and (
             not (fallback_permitted or advisory_reported_tokens)
             or _payload_matches_response_schema(payload, schema)
@@ -1693,6 +1727,7 @@ async def run_cli_chain(
                 "json_parse": "OBJECT" if payload is not None else "NOT_OBJECT",
                 "schema_status": ("NOT_CHECKED" if payload is None else "NOT_REQUIRED" if schema is None
                                   else "VALID" if schema_matches else "INVALID"),
+                **parse_diagnostic,
             }
         if (
             payload is not None
