@@ -13,6 +13,7 @@ from .model_usage import (
     InvocationAllocation, InvocationEfficiencyPolicy, ModelUsageAdmissionError,
     ModelUsageService, UsageStatus, WorkEnvelope, WorkloadClass, _policy_from_record,
     _envelope_from_record, _retained_terminal_allocation,
+    _allocation_from_record,
 )
 from .writer import (
     CONT_DISABLED_CAPABILITIES, _grok_command_flags, _run_grok_json,
@@ -183,15 +184,48 @@ class NativeStoryModel:
         self._require_terminal(terminal)
         return json.loads(execution.text)
 
+    def _draft_system(self, package_digest, *, candidate_id, hypothesis_digest, admission_decision_id):
+        """Replay the original known prompt for allocated intent; never new spend."""
+        from .native_story_writer import DRAFT_SYSTEM, LEGACY_DRAFT_SYSTEM
+        from .native_assessor import _retained_context
+        key = digest_canonical({"version": VERSION, "package": package_digest, "phase": "DRAFT"})
+        envelope = WorkEnvelope.create(
+            cycle_id=key, workload_class=WorkloadClass.NATIVE_STORY_WRITER,
+            admitted_at=self.clock().astimezone(UTC), admission_decision_id=admission_decision_id,
+            candidate_id=candidate_id, hypothesis_digest=hypothesis_digest,
+            evidence_package_digest=package_digest, ingest_id=None, graphiti_attempt_id=None,
+        )
+        with self.service._connection() as connection:
+            rows = connection.execute("SELECT invocation_id,record_json FROM model_invocation_allocations "
+                "WHERE envelope_id=? ORDER BY leaf_ordinal LIMIT 2", (envelope.envelope_id,)).fetchall()
+            if not rows:
+                return DRAFT_SYSTEM
+            if len(rows) != 1:
+                raise ModelUsageAdmissionError("retained draft prompt allocation differs", reason_code="NATIVE_STORY_PROMPT_DIFFERS")
+            try:
+                allocation = _allocation_from_record(json.loads(rows[0][1]))
+                if (allocation.invocation_id != rows[0][0] or allocation.envelope_id != envelope.envelope_id
+                        or allocation.cycle_id != key or allocation.route != ROUTES["DRAFT"]
+                        or allocation.workload_class is not WorkloadClass.NATIVE_STORY_WRITER):
+                    raise ModelUsageAdmissionError("retained draft prompt identity differs", reason_code="NATIVE_STORY_PROMPT_DIFFERS")
+                context = _retained_context(connection, allocation)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ModelUsageAdmissionError("retained draft prompt binding differs", reason_code="NATIVE_STORY_PROMPT_DIFFERS") from exc
+            for system in (LEGACY_DRAFT_SYSTEM, DRAFT_SYSTEM):
+                if context.get("system_digest") == digest_bytes(system.encode()):
+                    return system
+        raise ModelUsageAdmissionError("retained draft prompt is unknown", reason_code="NATIVE_STORY_PROMPT_UNKNOWN")
+
     def write(self, package, *, require_current=lambda: None, source_currentness=(), **identities):
         from dataclasses import replace
         from .native_story_writer import (
-            DRAFT_SCHEMA, REVIEW_SCHEMA, DRAFT_SYSTEM, REVIEW_SYSTEM,
+            DRAFT_SCHEMA, REVIEW_SCHEMA, REVIEW_SYSTEM,
             SourceSupportReview, write_native_story,
         )
         def generate(request):
             require_current()
-            return self.call(request, phase="DRAFT", schema=DRAFT_SCHEMA, system=DRAFT_SYSTEM, **identities)
+            system = self._draft_system(package.digest, **identities)
+            return self.call(request, phase="DRAFT", schema=DRAFT_SCHEMA, system=system, **identities)
         def review(request):
             require_current()
             return self.call(request, phase="REVIEW", schema=REVIEW_SCHEMA, system=REVIEW_SYSTEM, **identities)
