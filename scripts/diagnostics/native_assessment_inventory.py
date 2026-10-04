@@ -176,10 +176,11 @@ def inventory(path:Path,*,limit=1000,seconds=10):
                     contract=str(facts.get('assessment_contract_version')or 'UNKNOWN')
                     availability['candidate']='CURRENT_BOUND'if facts.get('candidate_id')and facts.get('candidate_version_id')else 'MISSING'
                 except (ValueError,KeyError,TypeError):pass
+                not_assessor=stage in ('ACKNOWLEDGED','SAME_STATE_ASSOCIATED')
+                if not_assessor:reason=stage  # Retained historical facts are not the current disposition.
                 reason,reason_truncated,reason_digest=_label(reason,512)
                 kind,kind_truncated,kind_digest=_label(kind,128)
                 contract,contract_truncated,contract_digest=_label(contract,128)
-                not_assessor=stage in ('ACKNOWLEDGED','SAME_STATE_ASSOCIATED')and not facts.get('candidate_id')
                 key=(reason_digest,kind_digest,contract_digest,not_assessor)
                 if key not in groups:groups[key]={'reason':reason,'source_kind':kind,'consumer_contract':contract,
                     'disposition':'NOT_ASSESSOR_WORK'if not_assessor else 'UNKNOWN_OR_NO_RETRY','reason_digest':reason_digest,'reason_truncated':reason_truncated,
