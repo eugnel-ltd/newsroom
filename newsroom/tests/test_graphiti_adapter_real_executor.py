@@ -1323,9 +1323,12 @@ def test_only_proven_pipeline_rollback_is_classified_complete(
             return None
 
     async def created_episode(**_values: object) -> tuple[SimpleNamespace, str]:
+        if _values.get("create") is False:
+            return None
         return SimpleNamespace(uuid="episode-id"), "CREATED"
 
     async def rolled_back_extract(*_args: object, **_values: object) -> object:
+        await _values["pipeline"].prepare_execution()
         raise real.CombinedTemporalPipelineError(
             "combined-temporal pipeline failed",
             graph_effect_attempted=True,
@@ -1428,6 +1431,8 @@ def test_cancelled_episode_cleanup_is_ordered_and_bounded(
                 await asyncio.Event().wait()
 
     async def created_episode(**_values: object) -> tuple[SimpleNamespace, str]:
+        if _values.get("create") is False:
+            return None
         return SimpleNamespace(uuid="episode-id"), "CREATED"
 
     async def close_embedding() -> None:

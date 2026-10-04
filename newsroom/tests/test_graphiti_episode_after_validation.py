@@ -5,10 +5,12 @@ import asyncio
 import copy
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import BaseModel, ConfigDict
 
 from newsroom.extraction.types import ExtractionContractError
 from newsroom.authority.types import UtcTimestamp
@@ -17,6 +19,28 @@ from newsroom.graphiti_adapter.combined_temporal_contract import build_compact_p
 from newsroom.graphiti_adapter.combined_temporal_fixtures import fixture
 from newsroom.graphiti_adapter.evaluation_attempt import evaluation_attempt_for
 from newsroom.graphiti_adapter.neo4j_guard import GuardError, GuardState
+
+
+class _RuntimeObject(BaseModel):
+    """SDK protocol fields only; real extraction and pipeline logic stay in use."""
+
+    model_config = ConfigDict(extra="allow")
+    uuid: str
+    group_id: str
+    created_at: datetime
+    name: str = ""
+    name_embedding: list[float] | None = None
+
+    @classmethod
+    async def get_by_uuid(cls, _driver, _uuid):
+        raise LookupError("fixture episode absent")
+
+    @classmethod
+    async def get_by_group_ids(cls, _driver, _groups, **_values):
+        return ()
+
+    async def save(self, _driver):
+        raise AssertionError("fixture must observe the business write")
 
 
 def _run(monkeypatch, *, case_name="pair-current", invalid=False, empty=False,
@@ -31,8 +55,18 @@ def _run(monkeypatch, *, case_name="pair-current", invalid=False, empty=False,
         payload = {"entities": [], "facts": []}
     observed = SimpleNamespace(events=[], business={}, prompts=[], contexts=[],
                                snapshots=[], rollback=0, model_calls=0)
-    actual = real._load_graphiti()
-    runtime = SimpleNamespace(**vars(actual))
+    def resolve_pointers(edges, uuid_map):
+        for edge in edges:
+            edge.source_node_uuid = uuid_map[edge.source_node_uuid]
+            edge.target_node_uuid = uuid_map[edge.target_node_uuid]
+        return edges
+
+    runtime = SimpleNamespace(
+        EntityNode=_RuntimeObject, EntityEdge=_RuntimeObject,
+        EpisodicNode=_RuntimeObject, NodeNotFoundError=LookupError,
+        EpisodeType=SimpleNamespace(text="text"),
+        IdentityCrossEncoder=lambda: object(), resolve_edge_pointers=resolve_pointers,
+    )
     accepted = runtime.EntityNode(
         uuid="00000000-0000-4000-8000-000000009815", name="Retained context",
         group_id=revision.group_id, labels=["Entity"], summary="previously accepted",
