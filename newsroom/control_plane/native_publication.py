@@ -1187,7 +1187,9 @@ class NativePublicationContinuation:
         retained_semantic_consumer = (
             type(semantic_intent) is dict
             and semantic_intent.get('contract') == self._semantic_intent_contract
-            and progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
+            and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
+                 or progress.get('stage') == 'EVIDENCE_HOLD'
+                 and facts.get('reason') == 'SEMANTIC_INTENT_INPUT_CHANGED_HOLD')
             and facts.get('failure_class') == 'EvidencePackageError'
             and same_assessment_producer(facts.get('assessment_contract_version'), self._assessment_contract_version)
             and facts.get('assessment_contract_version') != self._assessment_contract_version
@@ -1271,7 +1273,7 @@ class NativePublicationContinuation:
                 }:
                     old_provider_failure = retained
         if old_provider_failure is not None or (
-            progress.get("stage") == "EVIDENCE_HOLD"
+            not retained_semantic_consumer and progress.get("stage") == "EVIDENCE_HOLD"
             and assessment_revalidation_due(facts, self._assessment_contract_version)
         ):
             facts = current_facts()
@@ -1414,7 +1416,7 @@ class NativePublicationContinuation:
                 return NativePublicationContinuationResult(
                     "ASSESSMENT_INTERRUPTED", facts["reason"], None
                 )
-            if progress.get("stage") == "EVIDENCE_HOLD":
+            if progress.get("stage") == "EVIDENCE_HOLD" and not retained_semantic_consumer:
                 reason = facts.get("reason")
                 retryable_acquisition = (
                     facts.get("acquisition_retryable") is True

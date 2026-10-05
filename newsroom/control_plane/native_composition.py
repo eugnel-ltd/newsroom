@@ -829,8 +829,9 @@ def open_native_pipeline(
                 assessor._qualification = qualify_source
                 def read_qualified_source(candidate, base, sources, acquired):
                     from .native_source_qualification import QualificationHold
+                    from .native_source_qualification_replay import read_current_result
                     try:
-                        return qualifier.read_current_result(candidate, base, sources, acquired,
+                        return read_current_result(qualifier, candidate, base, sources, acquired,
                             scope=judgment_scope(candidate, base, sources, acquired), proof=proof)
                     except QualificationHold as exc:
                         raise NativeEvidenceHold(str(exc), sources[0].unit.source_id) from exc
