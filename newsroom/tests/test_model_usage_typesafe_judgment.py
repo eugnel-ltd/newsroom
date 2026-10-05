@@ -236,3 +236,20 @@ def test_unqualified_newest_never_qualifies_stale_current_implementation(tmp_pat
             api_key=lambda:calls.append('key'),source_fence=lambda *_:None,
             implementation_worktree_clean=True)
     assert not calls
+
+
+@pytest.mark.parametrize('workload,provider,route,allowed',[
+    (WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,'grok-build-cli','NATIVE_SOURCE_QUALIFICATION',True),
+    (WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,'typesafe','NATIVE_SOURCE_QUALIFICATION',False),
+    (WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,'grok-build-cli','NATIVE_SOURCE_QUALIFICATION_OTHER',False),
+    (WorkloadClass.NATIVE_STORY_WRITER,'grok-build-cli','NATIVE_SOURCE_QUALIFICATION',False),
+])
+def test_source_qualification_nullable_output_is_exact_purpose(workload,provider,route,allowed):
+    values=asdict(judgment_policy(evidence_digest=digest_bytes(b'purpose fixture'),qualified=True))
+    values.update(workload_class=workload,provider=provider,route=route,
+        model='grok-4.7',reasoning='high',max_output_tokens=None)
+    if allowed:
+        assert InvocationEfficiencyPolicy.create(**values).max_output_tokens is None
+    else:
+        with pytest.raises(ModelUsageIntegrityError,match='unbounded output'):
+            InvocationEfficiencyPolicy.create(**values)

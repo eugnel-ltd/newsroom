@@ -2097,6 +2097,7 @@ class AutonomousNativeEvidenceAssessor:
         usage: NativeAssessmentUsage | None = None,
         dispatch_fence: Callable[[], AbstractContextManager] | None = None,
         judgments=None,
+        qualification=None,
     ) -> None:
         default_dispatch = dispatch is None
         dispatch = dispatch or _dispatch_grok
@@ -2111,6 +2112,9 @@ class AutonomousNativeEvidenceAssessor:
             raise NativeEvidenceError("native assessment dispatch fence differs")
         self._usage = usage
         self._judgments = judgments
+        if qualification is not None and not callable(qualification):
+            raise NativeEvidenceError('native qualification exception differs')
+        self._qualification = qualification
         self._dispatch_fence = dispatch_fence or nullcontext
 
     def __call__(self, candidate, base, sources, acquired):
@@ -2158,6 +2162,26 @@ class AutonomousNativeEvidenceAssessor:
                 raise NativeEvidenceHold(
                     "SOURCE_POLICY_FACTS_HOLD", source.unit.source_id
                 )
+        def qualification_exception(fallback):
+            from .native_assessor_judgments import JudgedAssessment
+            if cached_only or self._qualification is None or not fallback.details.get('source_binding'):
+                return None
+            with self._dispatch_fence():
+                result = self._qualification(candidate, base, sources, acquired, fallback)
+            if type(result) is not JudgedAssessment:
+                raise NativeEvidenceError('native qualification exception result differs')
+            return self._validated_execution(result.execution, candidate, base, sources, acquired)
+
+        def validate_judged(result):
+            try:
+                return self._validated_execution(result.execution, candidate, base, sources, acquired)
+            except EvidencePackageError:
+                if cached_only or self._qualification is None:
+                    raise
+                fallback = self._judgments.validation_failure(result, candidate, base, sources, acquired,
+                    'TYPED_OUTPUT_CONTRACT_UNPROVEN')
+                return qualification_exception(fallback)
+
         if self._judgments is not None:
             decision_ref = self._judgments.get_decision_ref(candidate, base, sources, acquired)
             if decision_ref is not None:
@@ -2166,7 +2190,7 @@ class AutonomousNativeEvidenceAssessor:
                 result = self._judgments.read(decision_ref, candidate, base, sources, acquired)
                 if type(result) is not JudgedAssessment:
                     raise NativeEvidenceError("native judgment retained result differs")
-                return self._validated_execution(result.execution, candidate, base, sources, acquired)
+                return validate_judged(result)
         def new_judgment_intent():
             nonlocal before_dispatch
             from .native_assessor_judgments import JudgedAssessment, JudgmentFallback
@@ -2179,10 +2203,10 @@ class AutonomousNativeEvidenceAssessor:
                 result = self._judgments.read(result.decision_admission_id, candidate, base, sources, acquired)
                 if type(result) is not JudgedAssessment:
                     raise NativeEvidenceError("native judgment retained result differs")
-                return self._validated_execution(result.execution, candidate, base, sources, acquired)
+                return validate_judged(result)
             if type(result) is not JudgmentFallback:
                 raise NativeEvidenceError("native judgment result differs")
-            return None
+            return qualification_exception(result)
         if semantic_only:
             if self._judgments is None:
                 raise NativeEvidenceHold('SEMANTIC_INTENT_UNAVAILABLE', source_id)

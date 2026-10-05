@@ -442,6 +442,20 @@ def deployed_native_service(args):
                     return value
                 semantic_kwargs = dict(judgment_api_key=semantic_key,
                     judgment_policy=semantic_policy, localisation_policy=rendering_policy)
+                from . import native_source_qualification
+                try:
+                    exception_policy = usage.qualified_policy(
+                        workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+                        provider='grok-build-cli', route=native_source_qualification.ROUTE,
+                        model=native_source_qualification.MODEL, reasoning='high',
+                        output_schema_digest=native_source_qualification.SCHEMA_DIGEST)
+                    if exception_policy.implementation_revision != digest_bytes(
+                            Path(native_source_qualification.__file__).read_bytes()):
+                        raise ModelUsageAdmissionError('source qualification implementation is stale')
+                except ModelUsageAdmissionError:
+                    pass  # Typed decisions remain qualified; exceptions hold.
+                else:
+                    semantic_kwargs['source_qualification_policy'] = exception_policy
         tree = subprocess.check_output(
             ("/usr/bin/git", "rev-parse", f"{revision}^{{tree}}"),
             cwd=Path(__file__).resolve().parents[2], text=True, timeout=10,
@@ -460,7 +474,7 @@ def deployed_native_service(args):
                 revision=revision, tree=tree, paths=paths,
                 embedding_policy=embedding, assessment_policy=assessment,
                 semantic_policy_digests=tuple(semantic_kwargs[key].canonical_digest
-                    for key in ('judgment_policy', 'localisation_policy') if key in semantic_kwargs),
+                    for key in ('judgment_policy', 'localisation_policy', 'source_qualification_policy') if key in semantic_kwargs),
             )
 
         opening_paths = {
@@ -531,6 +545,7 @@ def open_native_pipeline(
     judgment_api_key: Callable[[], str] | None = None,
     judgment_policy: InvocationEfficiencyPolicy | None = None,
     localisation_policy: InvocationEfficiencyPolicy | None = None,
+    source_qualification_policy: InvocationEfficiencyPolicy | None = None,
 ):
     """Open one real runtime after its invocation policies are qualified.
 
@@ -800,6 +815,17 @@ def open_native_pipeline(
             assessor._judgments = NativeAssessorJudgments(judgments=judgments, proof=proof,
                 scope_for=judgment_scope, localise=localise_claims, read_localisation=read_claim_localisation,
                 require_current=stop_check)
+            if source_qualification_policy is not None:
+                from .native_source_qualification import NativeSourceQualifier
+                qualifier = NativeSourceQualifier(usage=usage, objects=runtime.authority.objects,
+                    policy=source_qualification_policy, source_fence=judgment_fence, judgments=judgments,
+                    implementation_worktree_clean=implementation_worktree_clean, clock=clock)
+
+                def qualify_source(candidate, base, sources, acquired, fallback):
+                    return qualifier.assess(candidate, base, sources, acquired, fallback,
+                        scope=judgment_scope(candidate, base, sources, acquired), proof=proof)
+
+                assessor._qualification = qualify_source
 
             from .native_graphiti_judgments import NativeGraphitiJudgments
             graph_judgments = NativeGraphitiJudgments(judgments=judgments)

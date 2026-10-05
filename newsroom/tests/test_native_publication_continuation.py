@@ -1437,7 +1437,7 @@ def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, 
     connection.close()
 
 
-@pytest.mark.parametrize('scenario', ['eligible', 'missing-origin', 'missing-graph', 'pending-publication', 'wrong-origin', 'changed-input', 'same-input'])
+@pytest.mark.parametrize('scenario', ['eligible', 'missing-origin', 'missing-graph', 'pending-publication', 'wrong-origin', 'changed-input', 'same-input', 'question-upgrade'])
 def test_separate_semantic_continuation_retains_original_interruption_and_never_retries_legacy(tmp_path, monkeypatch, scenario):
     from datetime import UTC, datetime
     from newsroom.authority.canonical import digest_bytes
@@ -1459,6 +1459,13 @@ def test_separate_semantic_continuation_retains_original_interruption_and_never_
     origin=RetainedAssessorResult(RetainedAssessorContractFailure('original-envelope','original-invocation',_DIGEST,_DIGEST,_DIGEST),
         'newsroom.native-evidence-assessor.v21' if scenario=='wrong-origin' else 'newsroom.native-evidence-assessor.v23',
         _DIGEST,'ASSESSOR_PROVIDER_FAILED',datetime(2026,9,8,tzinfo=UTC),None)
+    if scenario=='question-upgrade':
+        old_intent={'contract':'newsroom.native-assessor-judgments.v1','candidate_version_id':'candidate-version',
+            'origin_envelope_id':origin.proof.envelope_id,'origin_invocation_id':origin.proof.invocation_id,
+            'origin_allocation_digest':origin.proof.allocation_digest,'origin_terminal_digest':origin.proof.terminal_digest,
+            'origin_context_manifest_digest':origin.proof.context_manifest_digest,
+            'origin_journal':dict(old),'input_digest':_DIGEST}
+        journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED',facts={**old,'semantic_assessment_intent':old_intent})
     calls=[]
     paid_calls=[]
     def acquire(_self, **request):
@@ -1487,7 +1494,7 @@ def test_separate_semantic_continuation_retains_original_interruption_and_never_
                 proof=proof(),policies=SimpleNamespace(publication=object())),
             evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
             semantic_origin_failure=lambda _:None if scenario=='missing-origin' else origin,
-            semantic_intent_contract='newsroom.native-assessor-judgments.v1',
+            semantic_intent_contract='newsroom.native-assessor-judgments.v2' if scenario=='question-upgrade' else 'newsroom.native-assessor-judgments.v1',
             assessment_contract_version=old['assessment_contract_version'],
             clock=lambda:UtcTimestamp.parse('2026-09-08T12:30:00Z'))
     result=continuation().advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
@@ -1503,13 +1510,17 @@ def test_separate_semantic_continuation_retains_original_interruption_and_never_
             assert len(calls)==1
         else:
             assert result.state=='ASSESSMENT_INTERRUPTED' and len(calls)==2
-    elif scenario != 'eligible':
+    elif scenario not in {'eligible','question-upgrade'}:
         assert result.state=='ASSESSMENT_INTERRUPTED' and calls==[]
         assert journal.current(unit.revision_id)['facts']==old
     else:
         assert result.reason=='SEMANTIC_INTENT_FALLBACK_HOLD' and len(calls)==1
         assert journal.current(unit.revision_id)['facts']['acquisition_attempt_count']==3
         assert journal.current(unit.revision_id)['facts']['semantic_acquisition_attempt_count']==1
+        if scenario=='question-upgrade':
+            current=journal.current(unit.revision_id)['facts']
+            assert current['semantic_assessment_intent_history']==[old_intent]
+            assert current['semantic_assessment_intent']['contract']=='newsroom.native-assessor-judgments.v2'
         connection.close()
         connection=connect(path)
         journal=NativeRevisionJournal(connection)
