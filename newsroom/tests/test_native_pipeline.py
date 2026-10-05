@@ -2057,3 +2057,30 @@ def test_reopened_quiescent_ticks_never_select_cold_source_bodies(tmp_path, monk
         assert pipeline._journal._bodies == {}
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('case',['eligible','already-current','no-graph','pending-effect','unconfigured'])
+def test_distinct_semantic_contract_upgrade_is_scheduled_without_generic_hold_retry(tmp_path,monkeypatch,case):
+    from newsroom.control_plane.native_publication import NativePublicationContinuation
+    pipeline,journal,connection,units,calls,dispositions=_open(tmp_path,monkeypatch)
+    unit=units[0];journal.land((unit,));dispositions[0]=()
+    facts={'candidate_version_id':'candidate:one','intake_receipt_id':'retained-intake',
+        'graphiti_receipts':[{'ingest_id':unit.ingest_id,'state':'GRAPHITI_COMPLETE','receipt_digest':unit.digest}],
+        'reason':'SEMANTIC_INTENT_FALLBACK_HOLD','acquisition_retryable':False,
+        'semantic_assessment_intent':{'contract':'newsroom.native-assessor-judgments.v1'}}
+    if case=='already-current':facts['semantic_assessment_intent']['contract']='newsroom.native-assessor-judgments.v2'
+    if case=='no-graph':
+        facts['graphiti_receipts']=[]
+        pipeline._graphiti.advance=lambda selected,**_:tuple(NativeGraphitiOutcome(
+            item.ingest_id,'GRAPHITI_HOLD',None,'REQUIRED_GRAPH_UNPROVEN')for item in selected)
+    if case=='pending-effect':facts['publication_started_at']='pending'
+    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+    if case!='unconfigured':
+        pipeline._publish.semantic_intent_revalidation_due=lambda value:NativePublicationContinuation.semantic_intent_revalidation_due(
+            value,'newsroom.native-assessor-judgments.v2')
+    try:
+        pipeline.tick(cycle_id='distinct-question-contract')
+        published=[item for item in calls if item[0]=='publish']
+        assert published==([('publish',unit.revision_id)]if case=='eligible'else[])
+        if case!='eligible':assert journal.summary(unit.revision_id)['stage']==('GRAPHITI_HOLD'if case=='no-graph'else'EVIDENCE_HOLD')
+    finally:connection.close()

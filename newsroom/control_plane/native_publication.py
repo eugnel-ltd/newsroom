@@ -944,6 +944,16 @@ class NativePublicationContinuation:
         )
 
     @staticmethod
+    def semantic_intent_revalidation_due(facts: dict, contract_version: str | None) -> bool:
+        """Schedule a distinct qualified question contract, never an old retry."""
+        intent = facts.get('semantic_assessment_intent')
+        return (type(intent) is dict and (intent.get('contract'), contract_version) == (
+            'newsroom.native-assessor-judgments.v1', 'newsroom.native-assessor-judgments.v2')
+            and bool(facts.get('graphiti_receipts')) and bool(facts.get('intake_receipt_id'))
+            and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
+                'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id')))
+
+    @staticmethod
     def source_binding_recovery_due(facts: dict, contract_version: str | None) -> bool:
         """Schedule an exact pre-assessment source-binding repair, never authorise it."""
         prior = facts.get("assessment_superseded")
