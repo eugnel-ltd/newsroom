@@ -448,6 +448,7 @@ def deployed_native_service(args):
                         workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
                         provider='grok-build-cli', route=native_source_qualification.ROUTE,
                         model=native_source_qualification.MODEL, reasoning='high',
+                        config_identity=native_source_qualification.VERSION,
                         output_schema_digest=native_source_qualification.SCHEMA_DIGEST)
                     if exception_policy.implementation_revision != digest_bytes(
                             Path(native_source_qualification.__file__).read_bytes()):
@@ -816,7 +817,7 @@ def open_native_pipeline(
                 scope_for=judgment_scope, localise=localise_claims, read_localisation=read_claim_localisation,
                 require_current=stop_check)
             if source_qualification_policy is not None:
-                from .native_source_qualification import NativeSourceQualifier
+                from .native_source_qualification import NativeSourceQualifier, VERSION as QUALIFICATION_CONTRACT
                 qualifier = NativeSourceQualifier(usage=usage, objects=runtime.authority.objects,
                     policy=source_qualification_policy, source_fence=judgment_fence, judgments=judgments,
                     implementation_worktree_clean=implementation_worktree_clean, clock=clock)
@@ -1092,7 +1093,7 @@ def open_native_pipeline(
 
             def semantic_intent_revalidation_due(self, facts):
                 return judgment_api_key is not None and NativePublicationContinuation.semantic_intent_revalidation_due(
-                    facts, JUDGMENT_CONTRACT)
+                    facts, JUDGMENT_CONTRACT + ('+' + QUALIFICATION_CONTRACT if source_qualification_policy is not None else ''))
 
             def restore_current_output(self):
                 return runtime.publication.restore_current_publisher_output(journal,proof=proof)
@@ -1117,7 +1118,7 @@ def open_native_pipeline(
                     assessment_old_provider_failure=assessment_usage.retained_old_provider_failure,
                     semantic_origin_failure=(assessment_usage.retained_semantic_origin_failure
                         if judgment_api_key is not None else None),
-                    semantic_intent_contract=(JUDGMENT_CONTRACT
+                    semantic_intent_contract=(JUDGMENT_CONTRACT + ('+' + QUALIFICATION_CONTRACT if source_qualification_policy is not None else '')
                         if judgment_api_key is not None else None),
                     evidence_sources_for=self.sources_for,
                     assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,

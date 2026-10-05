@@ -1527,3 +1527,17 @@ def test_separate_semantic_continuation_retains_original_interruption_and_never_
         assert continuation().advance(revision_id=unit.revision_id,candidate_version_id='candidate-version').reason=='SEMANTIC_INTENT_FALLBACK_HOLD'
         assert len(calls)==1
     connection.close()
+
+
+@pytest.mark.parametrize('previous,current,due',[
+    ('newsroom.native-assessor-judgments.v1','newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2',True),
+    ('newsroom.native-assessor-judgments.v2','newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2',True),
+    ('newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2','newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2',False),
+    ('newsroom.native-assessor-judgments.v2','unqualified-or-arbitrary-contract',False),
+])
+def test_public_context_compound_upgrade_is_exact_and_stable(previous,current,due):
+    facts={'semantic_assessment_intent':{'contract':previous},'graphiti_receipts':[{}],
+           'intake_receipt_id':'original-intake','reason':'NO_QUALIFYING_NEW_INFORMATION'}
+    assert NativePublicationContinuation.semantic_intent_revalidation_due(facts,current)is due
+    facts['publication_started_at']='pending'
+    assert not NativePublicationContinuation.semantic_intent_revalidation_due(facts,current)
