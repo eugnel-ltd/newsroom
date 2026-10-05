@@ -362,6 +362,48 @@ class NativePublicationController:
     def _restore_publisher_group(self,journal,members,references,proof):
         if len(members) < 2:
             return
+        # Restoring current copy needs the current complete ACK, not every
+        # historical package. Pending repair still uses the full path below.
+        if not any(facts.get('factual_correction_intent') and not facts.get('factual_correction_result')
+                   for _, facts in members):
+            headers = {}
+            story_id = None
+            for revision, facts in members:
+                for candidate in (facts, facts.get('factual_correction_result')):
+                    if candidate is None:
+                        continue
+                    event = self._events.provenance(candidate['story_event_id'], proof=proof).event
+                    expected = str(_aggregate('story', facts['candidate_id']))
+                    if (event.aggregate_type != 'story' or event.aggregate_id != expected
+                            or event.event_type != STORY_EVENT or event.aggregate_version < 1
+                            or story_id not in (None, expected)):
+                        raise NativePublicationError('restore current Story header differs')
+                    story_id = expected
+                    prior = headers.get(event.aggregate_version)
+                    if prior is not None and prior[2].event_id != event.event_id:
+                        raise NativePublicationError('restore current Story version is ambiguous')
+                    headers[event.aggregate_version] = (revision, candidate, event, facts)
+            if headers:
+                _, latest_facts, _, original_facts = headers[max(headers)]
+                result, story = self.read_acknowledged({key: latest_facts[key] for key in references}, proof=proof)
+                if latest_facts is not original_facts:
+                    original, original_story = self.read_acknowledged(
+                        {key: original_facts[key] for key in references}, proof=proof)
+                    if (story.story_id != original_story.story_id
+                            or result.attempt_receipt.publication_id != original.attempt_receipt.publication_id
+                            or result.story_receipt.aggregate_version <= original.story_receipt.aggregate_version):
+                        raise NativePublicationError('derived factual correction belongs to another acknowledged chain')
+                if story.copy.writer_id == 'newsroom.native-story-writer.v1':
+                    package = self._evidence.read(story.package_admission_id, candidate_port=self._candidate_port, proof=proof)
+                    policy = self._editorial._read_policy_decision(
+                        DecisionReference(story.policy_decision_event_id, story.policy_decision_admission_id),
+                        retained=package, proof=proof)
+                    try:
+                        self._source_currentness_fence(package.package, policy.currentness)
+                    except EditorialHold:
+                        pass  # Unproved currentness is not shortcut success.
+                    else:
+                        return
         selected = []
         for revision, facts in members:
             result, story = self.read_acknowledged({key:facts[key]for key in references}, proof=proof)

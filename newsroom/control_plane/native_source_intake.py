@@ -717,13 +717,21 @@ class NativeSourceIntake:
         except GovUkPdfHold as exc:
             encoded = pdf_parse_receipt(binding, exc.reason_code)
             if existing is None and encoded is not None:
-                admission = self._objects.admit(request, encoded, proof=self._proof).admission
-                self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, encoded)
+                try:
+                    admission = self._objects.admit(request, encoded, proof=self._proof).admission
+                    self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, encoded)
+                except DiagnosticHistoryExpired:
+                    # Optional cache expiry must not replace the fresh parser HOLD.
+                    pass
             raise
         encoded = pdf_parse_receipt(binding, document)
         if existing is None and encoded is not None:
-            admission = self._objects.admit(request, encoded, proof=self._proof).admission
-            self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, encoded)
+            try:
+                admission = self._objects.admit(request, encoded, proof=self._proof).admission
+                self._hydrate(admission, NATIVE_SOURCE_OBSERVATION_PURPOSE, encoded)
+            except DiagnosticHistoryExpired:
+                # The parsed document remains bound to the freshly acquired bytes.
+                pass
         return document
 
     def _admit_observation(self, source_id: str, raw: bytes, *, url: str | None = None, pdf=False):

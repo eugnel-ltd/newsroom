@@ -803,3 +803,55 @@ def test_current_output_restoration_never_selects_unacknowledged_source_bodies()
         ('pending', {'stage': 'PUBLICATION_STARTED', 'facts': {}}),
     )))
     controller.restore_current_publisher_output(journal, proof=None)
+
+
+@pytest.mark.parametrize('case', ['current', 'superseded', 'pending', 'corrupt-header', 'ambiguous'])
+def test_current_first_restore_verifies_only_latest_ack_without_caching(case):
+    from types import SimpleNamespace
+    from newsroom.authority import ObjectAdmissionId
+    from newsroom.control_plane.native_publication import _aggregate, STORY_EVENT
+    controller=object.__new__(NativePublicationController)
+    refs=('story_event_id','publication_event_id','delivery_attempt_event_id','delivery_evidence_event_id')
+    def facts(n):
+        return {'candidate_id':'candidate', **{key:f'{key}-{n}'for key in refs}}
+    members=[('old',facts(1)),('current',facts(2))]
+    if case=='pending':members[0][1]['factual_correction_intent']={'pending':True}
+    events={f'story_event_id-{n}':SimpleNamespace(event_id=f'story_event_id-{n}',aggregate_id=str(_aggregate('story','candidate')),
+        aggregate_type='story',aggregate_version=n,event_type=STORY_EVENT)for n in (1,2)}
+    if case=='corrupt-header':events['story_event_id-1'].aggregate_type='other'
+    if case=='ambiguous':events['story_event_id-1'].aggregate_version=2
+    reads=[]
+    controller._events=SimpleNamespace(provenance=lambda event_id,**_:SimpleNamespace(event=events[event_id]))
+    def read_ack(values,**_):
+        reads.append(values['story_event_id'])
+        n=int(values['story_event_id'].rsplit('-',1)[1])
+        return SimpleNamespace(story_receipt=SimpleNamespace(aggregate_version=n)),SimpleNamespace(
+            copy=SimpleNamespace(writer_id='newsroom.native-story-writer.v1'), package_admission_id=f'package-{n}',
+            policy_decision_event_id=f'00000000-0000-4000-8000-{n:012d}',
+            policy_decision_admission_id=ObjectAdmissionId.parse(f'00000000-0000-4000-8000-{n+10:012d}'))
+    controller.read_acknowledged=read_ack
+    controller._candidate_port=object()
+    controller._evidence=SimpleNamespace(read=lambda identity,**_:SimpleNamespace(package=identity))
+    policy_reads=[]
+    def policy(reference,**_):
+        assert reference is not None
+        policy_reads.append(reference)
+        if case=='pending' or case=='superseded' and len(policy_reads)>1:
+            raise RuntimeError('full-history-path')
+        return SimpleNamespace(currentness=('current',))
+    controller._editorial=SimpleNamespace(_read_policy_decision=policy)
+    def source_fence(*_):
+        if case=='superseded':raise EditorialHold(reason='NATIVE_STORY_SOURCE_SUPERSEDED')
+    controller._source_currentness_fence=source_fence
+    # The existing full repair path needs complete publication receipts. Reaching
+    # this sentinel proves that unproved/pending cases did not use the shortcut.
+    if case in {'superseded','pending'}:
+        with pytest.raises(RuntimeError,match='full-history-path'):
+            controller._restore_publisher_group(object(),members,refs,proof())
+    elif case in {'corrupt-header','ambiguous'}:
+        with pytest.raises(NativePublicationError,match='header differs|version is ambiguous'):
+            controller._restore_publisher_group(object(),members,refs,proof())
+        assert reads==[]
+    else:
+        for _ in range(2):controller._restore_publisher_group(object(),members,refs,proof())
+        assert reads==['story_event_id-2','story_event_id-2']

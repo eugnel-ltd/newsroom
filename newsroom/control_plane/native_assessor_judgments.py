@@ -192,15 +192,21 @@ class NativeAssessorJudgments:
                 continue
             for test,fields in rules.items():
                 prefix=identity+':'+test;choice=answers[prefix].get('choice')
-                if choice=='UNCERTAIN':return JudgmentFallback('UNCERTAIN_QUALIFICATION',(first,second))
+                if choice=='UNCERTAIN':
+                    if index==0:return JudgmentFallback('UNCERTAIN_QUALIFICATION',(first,second))
+                    continue
                 if choice!='YES':continue
                 witnesses={}
                 for field,schema in fields.items():
                     if 'const'in schema:witnesses[field]=schema['const'];continue
                     value=answers[prefix+':'+field].get('choice')
-                    if value=='NONE':return JudgmentFallback('QUALIFICATION_WITNESS_MISSING',(first,second))
+                    if value=='NONE':
+                        if index==0:return JudgmentFallback('QUALIFICATION_WITNESS_MISSING',(first,second))
+                        witnesses=None
+                        break
                     witnesses[field]=candidates[identity]['text'].strip()if field.endswith('_source_lookup_key')and value==identity else value
-                qualification.append({'claim_index':index,'test':test,'test_evidence':witnesses})
+                if witnesses is not None:
+                    qualification.append({'claim_index':index,'test':test,'test_evidence':witnesses})
         if not any(q['claim_index']==0 for q in qualification):return JudgmentFallback('HEADLINE_QUALIFICATION_UNPROVEN',(first,second))
         if self.localise and self.read_localisation:
             request={'source_binding':binding,'claims':{identity:candidates[identity]for identity in ordered}}
