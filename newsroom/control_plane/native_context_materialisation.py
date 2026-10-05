@@ -105,7 +105,7 @@ def compose_context_execution(original, context_wire, localisation_receipt, *, b
         raise ContextCompositionError('CONTEXT_SOURCE_VIEW')
     validate_sha256_digest(binding.get('content_digest'))
     receipt, document = _original_receipt(original, view)
-    if (binding.get('context_purpose') != 'newsroom.native-context-package.v1'
+    if (binding.get('context_purpose') not in {'newsroom.native-context-package.v1', 'newsroom.native-context-package.v2'}
             or binding.get('context_original_receipt_digest') != digest_canonical(receipt)
             or binding.get('source_reference_binding') != _reference_binding(view)):
         raise ContextCompositionError('CONTEXT_PURPOSE_OR_SOURCE_BINDING')

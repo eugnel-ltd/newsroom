@@ -9,7 +9,7 @@ from newsroom.authority.canonical import canonical_json_bytes, digest_canonical
 from .native_assessor_judgments import JudgedAssessment, NativeAssessorJudgments
 from .native_assessor_spans import build_lossless_source_view
 
-VERSION = 'newsroom.native-context-package.v1'
+VERSION = 'newsroom.native-context-package.v2'
 
 
 class ContextEnrichmentHold(ValueError):
@@ -33,13 +33,9 @@ def _reference(reference):
 def _candidates(view, original):
     package=json.loads(original.execution.text)['package']
     covered={claim['claim']for claim in package['governed_claims']}
-    return {segment.span_id:{'source_id':segment.source_id,
-        'text':segment.text.encode()[:segment.content_end_byte-segment.start_byte].decode(),
-        'entities':[list(entity)for entity in segment.entities],
-        'rendering_fragment_count':len(segment.entities)+1,
-        'source_range':{'first_span_id':segment.span_id,'last_span_id':segment.span_id}}
-        for segment in view.segments if segment.text.strip()
-        and not any(segment.text.strip() in claim for claim in covered)}
+    from .native_source_context_ranges import context_candidates
+    return {identity: candidate for identity, candidate in context_candidates(view).items()
+            if not any(candidate['text'].strip() in claim for claim in covered)}
 
 
 class NativeContextEnricher:
@@ -114,7 +110,7 @@ class NativeContextEnricher:
                 for source in binding.get('current_scope',{}).get('sources',[])]}
         questions={identity:{'type':'choice',
             'instructions':f'For exact candidate {identity}, select useful context for the supplied qualified headline. '
-                'Require an affirmed source assertion, full parent support, exact attribution and preserved '
+                'Omit any candidate marked speaker_parent_hold. Require an affirmed source assertion, full parent support, exact attribution and preserved '
                 'proposal/future/conditional/quoted status. A proposal is not in force. Exclude administration and filler.',
             'criteria':{'INCLUDE':'Useful, source-supported topic, detail or attribution with exact modality.',
                 'OMIT':'Irrelevant, duplicated, administrative or unsupported context.',
@@ -127,6 +123,8 @@ class NativeContextEnricher:
             if selection['answers'][identity].get('choice')=='INCLUDE'}
         if not selected:
             raise ContextEnrichmentHold('CONTEXT_NOT_ESTABLISHED_HOLD')
+        if any(item.get('speaker_parent_hold') for item in selected.values()):
+            raise ContextEnrichmentHold('CONTEXT_SOURCE_SPEAKER_UNRESOLVED_HOLD')
         context_binding={**binding,'context_purpose':VERSION,
             'context_original_receipt_digest':digest_canonical(original_record['materialisation_receipt']),
             'context_ranges':{identity:item['source_range']for identity,item in selected.items()}}
@@ -139,7 +137,7 @@ class NativeContextEnricher:
         verification_state={**public,'selected':selected,'renderings':rendering['renderings']}
         criteria={'support':'The exact complete Source supports the asserted context, not an inferred fact.',
             'modality':'Rendering preserves negation, proposal, future, conditional and provisional meaning.',
-            'attribution':'Quoted or attributed assertions preserve their speaker and do not become confirmed outcomes.',
+            'attribution':'Quoted or first-person assertions preserve the exact Source speaker and parent, never replace it with the publisher or become confirmed outcomes.',
             'entities':'All rendered entities are exactly the supplied Source identities; no translated or added alias.'}
         checks={identity+':'+kind:{'type':'choice','instructions':f'Verify {kind} for {identity}: {instruction}',
             'criteria':{('SUPPORTED'if kind=='support'else'YES'):'Established in exact full Source and rendering.',

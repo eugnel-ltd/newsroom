@@ -1437,7 +1437,7 @@ def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, 
     connection.close()
 
 
-@pytest.mark.parametrize('resumed', [False, True])
+@pytest.mark.parametrize('resumed', [False, True, 'completed-v1'])
 def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_path,monkeypatch,resumed):
     unit=_native();connection=connect(str(tmp_path/'context-purpose.sqlite3'))
     journal=NativeRevisionJournal(connection);journal.land((unit,))
@@ -1448,14 +1448,18 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
         'editorial_decision':json.loads(_decision(old_package).canonical_bytes()),
         'semantic_assessment_intent':semantic,'reason':'NATIVE_STORY_FACTUAL_ENTITIES',
         'publication_started_at':'original-writer-purpose','acquisition_attempt_count':2}
-    if resumed:
-        old.update(context_enrichment_intent={'contract':'newsroom.native-context-package.v1',
+    if resumed is True:
+        old.update(context_enrichment_intent={'contract':'newsroom.native-context-package.v2',
             'original_package_admission_id':str(old_package),
             'original_journal':{'publication_started_at':old.pop('publication_started_at')}},
             reason='ACQUISITION_RESULT_NOT_RETAINED', failure_class='EvidencePackageError',
             assessment_contract_version='newsroom.native-evidence-assessor.v23+previous-consumer')
         old.pop('package_admission_id');old.pop('editorial_decision')
-    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED' if resumed else 'EVIDENCE_HOLD',facts=old)
+    if resumed == 'completed-v1':
+        old.update(context_enrichment_intent={'contract':'newsroom.native-context-package.v1',
+            'original_package_admission_id':'original-before-context'},
+            context_enrichment_completed=True)
+    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED' if resumed is True else 'EVIDENCE_HOLD',facts=old)
     requests=[]
     def acquire(_self,**request):
         requests.append(request)
@@ -1477,7 +1481,7 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
             context_enrichment_contract='newsroom.native-context-package.v99')
     continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
         evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
-        context_enrichment_contract='newsroom.native-context-package.v1',
+        context_enrichment_contract='newsroom.native-context-package.v2',
         semantic_origin_failure=lambda _:None, semantic_intent_contract='old-semantic',
         assessment_contract_version='newsroom.native-evidence-assessor.v23+new-consumer')
     continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
@@ -1486,6 +1490,12 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
     assert facts['context_enrichment_intent']['original_journal']['publication_started_at']=='original-writer-purpose'
     assert facts['semantic_assessment_intent']==semantic and facts['acquisition_attempt_count']==2
     assert facts['context_enrichment_completed']is True and facts['package_admission_id']==str(new_package)
+    if resumed == 'completed-v1':
+        prior = facts['context_enrichment_intent_history'][0]
+        assert prior['intent']['contract'] == 'newsroom.native-context-package.v1'
+        assert prior['intent']['original_package_admission_id'] == 'original-before-context'
+        assert prior['completed'] is True and prior['package_admission_id'] == str(old_package)
+        assert facts['context_enrichment_intent']['contract'] == 'newsroom.native-context-package.v2'
     assert journal.current(unit.revision_id)['stage']=='ACKNOWLEDGED'
     assert len(requests)==publication.calls==1
     assert runtime.authority.receives==0
@@ -1689,3 +1699,14 @@ def test_public_context_compound_upgrade_is_exact_and_stable(previous,current,du
     assert NativePublicationContinuation.semantic_intent_revalidation_due(facts,current)is due
     facts['publication_started_at']='pending'
     assert not NativePublicationContinuation.semantic_intent_revalidation_due(facts,current)
+
+
+@pytest.mark.parametrize('stage_reason', ['ACQUISITION_RESULT_NOT_RETAINED', 'CONTEXT_PROVIDER_UNKNOWN_HOLD'])
+def test_old_unresolved_context_does_not_receive_a_new_purpose(stage_reason):
+    facts = {'context_enrichment_intent': {'contract': 'newsroom.native-context-package.v1',
+             'original_package_admission_id': 'old'}, 'reason': stage_reason,
+             'graphiti_receipts': [{}], 'intake_receipt_id': 'receipt',
+             'semantic_assessment_intent': {'origin_invocation_id': 'unknown'}}
+    before = json.loads(json.dumps(facts))
+    assert not NativePublicationContinuation.context_enrichment_due(facts)
+    assert facts == before
