@@ -120,6 +120,8 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
     """Validate retained bindings without calling either model again."""
     if 'date_derivation' in review_record:
         from .native_story_dates import derive_and_verify
+        if copy.writer_id!=WRITER_ID or copy.evidence_package_digest!=package.digest:
+            return (WriterValidatorResult('NATIVE_STORY_PACKAGE_BINDING','FAIL','SOURCE_BINDING_DIFFERS'),)
         try:
             proof=review_record['date_derivation']
             original=_object(proof['original_draft'],DRAFT_SCHEMA)

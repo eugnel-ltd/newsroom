@@ -122,6 +122,11 @@ def test_source_dated_copy_retains_original_review_and_revalidates_derivation():
     tampered=deepcopy(record);tampered['date_derivation']['anchor']['resolved_date']='2026-10-04'
     assert any(item.result=='FAIL'for item in validate_retained_story(result.copy,package,tampered,result.format,
         source_currentness=currentness))
+    from dataclasses import replace
+    for changed in (replace(result.copy,writer_id='different-writer'),
+                    replace(result.copy,evidence_package_digest='sha256:'+'f'*64)):
+        checks=validate_retained_story(changed,package,record,result.format,source_currentness=currentness)
+        assert any(item.validator=='NATIVE_STORY_PACKAGE_BINDING'and item.result=='FAIL'for item in checks)
     assert result.review.as_record()["verdict"] == "PASS"
     assert all(check.result == "PASS" for check in result.validators)
 
