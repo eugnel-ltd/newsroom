@@ -29,11 +29,14 @@ _FACTUAL_EXPRESSION_TOKEN = re.compile(
     r"eighth|ninth|tenth|half|quarter|percent|percentage|"
     r"january|february|march|april|may|june|july|august|september|october|"
     r"november|december|yesterday|today|tomorrow|seconds?|minutes?|hours?|"
-    r"days?|weeks?|months?|years?|pounds?|dollars?|euros?|kilograms?|"
-    r"kilometres?|metres?|centimetres?|millimetres?|tonnes?|litres?|degrees?|"
+    r"days?|weeks?|months?|years?|pounds?|dollars?|euros?|grams?|"
+    r"kilograms?|milligrams?|micrograms?|centigrams?|decigrams?|hectograms?|"
+    r"kilometres?|metres?|centimetres?|millimetres?|micrometres?|nanometres?|"
+    r"tonnes?|litres?|millilitres?|microlitres?|centilitres?|degrees?|"
     r"miles?|feet|foot|inches?|ounces?|gallons?|acres?|yards?)\b|"
     r"昨日|今日|明日|百分|季度|星期|週|周|英鎊|英镑|美元|港元|"
-    r"公里|公斤|千米|公噸|噸|吨|英里|英尺|英寸|盎司|加侖|加仑|升|米|[%％£$€]",
+    r"公里|公斤|千米|公噸|噸|吨|英里|英尺|英寸|盎司|加侖|加仑|"
+    r"毫克|微克|克|毫升|微升|升|毫米|微米|納米|纳米|米|[%％£$€]",
     re.IGNORECASE,
 )
 

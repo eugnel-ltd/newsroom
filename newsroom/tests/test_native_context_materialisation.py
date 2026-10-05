@@ -242,7 +242,7 @@ def test_supported_context_discards_prose_advice_without_mutating_paid_receipt(s
     ['thirteen schools', '十四所學校'], ['fourth', '第五'],
     ['five percent', '六百分比'], ['a week', '一日'],
     ['ninety minutes', '一小時'], ['one hundred pounds', '二百英鎊'],
-    ['kilograms', '公噸'], ['mile', '公里'], ['May', '六月'], ['changed', '三'],
+    ['kilograms', '公噸'], ['mile', '公里'], ['grams', '毫克'], ['May', '六月'], ['changed', '三'],
     ['5 years', '5年'], ['HK$100', '一百港元'],
 ])
 def test_potentially_factual_context_pairs_are_never_discarded(pair):
@@ -260,7 +260,8 @@ def test_unbound_prose_source_key_still_rejects_before_normalisation():
         _compose(case)
 
 
-def test_retained_unit_advice_still_fails_exact_fact_validator():
+@pytest.mark.parametrize('pair', [('mile', '公里'), ('grams', '毫克')])
+def test_retained_unit_advice_still_fails_exact_fact_validator(pair):
     from dataclasses import replace
     case = _case()
     execution, _ = _compose(case)
@@ -269,4 +270,4 @@ def test_retained_unit_advice_still_fails_exact_fact_validator():
     )
     # Unproved unit-only correspondence must not acquire publication meaning.
     with pytest.raises(ValueError, match='equivalent exact claim facts'):
-        replace(package.governed_claims[1], localised_factual_expressions=(('mile', '公里'),))
+        replace(package.governed_claims[1], localised_factual_expressions=(pair,))
