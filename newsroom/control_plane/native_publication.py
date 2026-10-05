@@ -959,7 +959,8 @@ class NativePublicationContinuation:
     @staticmethod
     def writer_revalidation_due(facts: dict) -> bool:
         from .native_story_writer import CONSUMER_VERSION
-        return ('NATIVE_STORY_SENTENCE_SUPPORT' in (facts.get('reason'),*facts.get('editorial_hold_reason_codes',()))
+        return (bool({'NATIVE_STORY_SENTENCE_SUPPORT', 'NATIVE_STORY_FACTUAL_ENTITIES'} &
+                     {facts.get('reason'), *facts.get('editorial_hold_reason_codes',())})
             and facts.get('writer_support_checked_version')!=CONSUMER_VERSION
             and type(facts.get('package_admission_id'))is str
             and type(facts.get('editorial_decision'))is dict
@@ -1196,7 +1197,17 @@ class NativePublicationContinuation:
         context_only=self._context_enrichment_contract is not None and self.context_enrichment_due(facts)
         if context_only:
             from .native_context_enrichment import VERSION
-            if facts.get('context_enrichment_intent')is None:
+            prior_context = facts.get('context_enrichment_intent')
+            if prior_context is None or prior_context.get('contract') != self._context_enrichment_contract:
+                if prior_context is not None:
+                    facts.setdefault('context_enrichment_intent_history', []).append({
+                        'intent': prior_context,
+                        'completed': facts.get('context_enrichment_completed'),
+                        'package_admission_id': facts.get('package_admission_id'),
+                        'editorial_decision': facts.get('editorial_decision'),
+                    })
+                    facts.pop('context_enrichment_completed', None)
+                    facts.pop('context_enrichment_settled', None)
                 facts['context_enrichment_intent']={'contract':self._context_enrichment_contract,
                     'candidate_version_id':candidate_version_id,
                     'original_package_admission_id':facts['package_admission_id'],
@@ -1590,7 +1601,8 @@ class NativePublicationContinuation:
                     return retain_acquisition_failure(type(exc).__name__)
                 facts = current_facts()
                 if context_only and exc.reason_code in {'CONTEXT_SELECTION_UNCERTAIN_HOLD',
-                        'CONTEXT_NOT_ESTABLISHED_HOLD','CONTEXT_SUPPORT_UNPROVEN_HOLD'}:
+                        'CONTEXT_NOT_ESTABLISHED_HOLD','CONTEXT_SUPPORT_UNPROVEN_HOLD',
+                        'CONTEXT_SOURCE_SPEAKER_UNRESOLVED_HOLD'}:
                     from .native_context_enrichment import VERSION
                     facts['context_enrichment_settled']=VERSION
                 facts["reason"] = exc.reason_code

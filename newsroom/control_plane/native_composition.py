@@ -1155,7 +1155,7 @@ def open_native_pipeline(
                         if judgment_api_key is not None else None),
                     semantic_intent_contract=(JUDGMENT_CONTRACT + ('+' + QUALIFICATION_CONTRACT if source_qualification_policy is not None else '')
                         if judgment_api_key is not None else None),
-                    context_enrichment_contract=('newsroom.native-context-package.v1'
+                    context_enrichment_contract=('newsroom.native-context-package.v2'
                         if judgment_api_key is not None and source_qualification_policy is not None else None),
                     evidence_sources_for=self.sources_for,
                     assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,
