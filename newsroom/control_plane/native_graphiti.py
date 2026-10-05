@@ -101,6 +101,7 @@ class NativeGraphitiProcessor:
         stop_check: Callable[[], None],
         dispatch_fence: Callable[[], ContextManager[None]],
         operator_drain_requested: Callable[[], bool] = lambda: False,
+        typed_proposal_verifier: Callable[..., Mapping[str, object]] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
     ) -> None:
         self._system, self._connection, self._usage = system, connection, usage
@@ -131,6 +132,7 @@ class NativeGraphitiProcessor:
             call_shape_policy=load_checked_native_graphiti_call_shape_policy(),
             fallback_policy=load_checked_native_graphiti_fallback_circuit_policy(),
             inherited_empty_for=self._inherited_empty_for,
+            typed_proposal_verifier=typed_proposal_verifier,
         )
         self._admission = compose_existing_graphiti_admission_consumer(
             connection, adapter=system.graphiti, extraction=system.extraction,

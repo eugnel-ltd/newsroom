@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -259,6 +260,7 @@ class GraphitiModelUsageObserver:
         fallback_policy: GraphitiFallbackCircuitPolicy | None = None,
         recovered_ambiguous_progression: object | None = None,
         inherited_empty_for: Callable | None = None,
+        typed_proposal_verifier: Callable | None = None,
     ) -> None:
         self._service = service
         self._envelope = envelope
@@ -322,6 +324,22 @@ class GraphitiModelUsageObserver:
         )
         self._owner_stop_check = owner_stop_check
         self.inherited_empty_for = inherited_empty_for
+        self._typed_proposal_verifier = typed_proposal_verifier
+
+    def verify_typed_proposals(self, *, source_revision, proposal_receipt):
+        """Verify proposals under the captured authoritative attempt, not SDK IDs."""
+        if self._typed_proposal_verifier is None:
+            return None
+        self._owner_stop_check()
+        verified = self._typed_proposal_verifier(
+            source_revision=source_revision,
+            proposal_receipt=deepcopy(proposal_receipt),
+        )
+        if not isinstance(verified, Mapping) or not verified:
+            raise ValueError("Graphiti typed verification evidence is absent")
+        retained = deepcopy(dict(verified))
+        digest_canonical(retained)
+        return retained
 
     def allows_fresh_zero_dispatch_retry(
         self, *, episode_uuid: str, attempt_number: int
@@ -1103,6 +1121,7 @@ class EvaluationGraphitiRunner:
         call_shape_policy: GraphitiCallShapePolicy | None = None,
         fallback_policy: GraphitiFallbackCircuitPolicy | None = None,
         inherited_empty_for: Callable | None = None,
+        typed_proposal_verifier: Callable | None = None,
     ) -> None:
         if not isinstance(fallback_permitted, bool):
             raise TypeError("Graphiti fallback permission must be boolean")
@@ -1111,6 +1130,7 @@ class EvaluationGraphitiRunner:
         if governed_fallback_permitted and not fallback_permitted:
             raise ValueError("governed Graphiti fallback requires fallback permission")
         self._clock = clock
+        self._typed_proposal_verifier = typed_proposal_verifier
         self._fallback_permitted = fallback_permitted
         self._governed_fallback_permitted = governed_fallback_permitted
         governed_dependencies = (proposal_adapter, extraction_records, proof)
@@ -1592,6 +1612,12 @@ class EvaluationGraphitiRunner:
             inherited_empty_for=(
                 None if self._inherited_empty_for is None else
                 lambda attempt: self._inherited_empty_for(unit, attempt)
+            ),
+            typed_proposal_verifier=(
+                None if self._typed_proposal_verifier is None else
+                lambda **values: self._typed_proposal_verifier(
+                    unit=deepcopy(unit), envelope=envelope, **values
+                )
             ),
         )
         self._pending_usage[(unit.ingest_id, unit.attempt_number)] = (

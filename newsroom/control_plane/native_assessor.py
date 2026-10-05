@@ -2088,6 +2088,7 @@ class AutonomousNativeEvidenceAssessor:
         *,
         usage: NativeAssessmentUsage | None = None,
         dispatch_fence: Callable[[], AbstractContextManager] | None = None,
+        judgments=None,
     ) -> None:
         default_dispatch = dispatch is None
         dispatch = dispatch or _dispatch_grok
@@ -2101,6 +2102,7 @@ class AutonomousNativeEvidenceAssessor:
         if dispatch_fence is not None and not callable(dispatch_fence):
             raise NativeEvidenceError("native assessment dispatch fence differs")
         self._usage = usage
+        self._judgments = judgments
         self._dispatch_fence = dispatch_fence or nullcontext
 
     def __call__(self, candidate, base, sources, acquired):
@@ -2147,9 +2149,42 @@ class AutonomousNativeEvidenceAssessor:
                 raise NativeEvidenceHold(
                     "SOURCE_POLICY_FACTS_HOLD", source.unit.source_id
                 )
+        if self._judgments is not None:
+            decision_ref = self._judgments.get_decision_ref(candidate, base, sources, acquired)
+            if decision_ref is not None:
+                # Replaying a separately accounted decision is not an old model retry.
+                from .native_assessor_judgments import JudgedAssessment
+                result = self._judgments.read(decision_ref, candidate, base, sources, acquired)
+                if type(result) is not JudgedAssessment:
+                    raise NativeEvidenceError("native judgment retained result differs")
+                return self._validated_execution(result.execution, candidate, base, sources, acquired)
+        def new_judgment_intent():
+            nonlocal before_dispatch
+            from .native_assessor_judgments import JudgedAssessment, JudgmentFallback
+            with self._dispatch_fence():
+                if before_dispatch is not None:
+                    before_dispatch()
+                    before_dispatch = None
+                result = self._judgments.assess(candidate, base, sources, acquired)
+            if type(result) is JudgedAssessment:
+                result = self._judgments.read(result.decision_admission_id, candidate, base, sources, acquired)
+                if type(result) is not JudgedAssessment:
+                    raise NativeEvidenceError("native judgment retained result differs")
+                return self._validated_execution(result.execution, candidate, base, sources, acquired)
+            if type(result) is not JudgmentFallback:
+                raise NativeEvidenceError("native judgment result differs")
+            return None
+        judgment_fresh = self._usage is None
         if self._usage is not None:
             retained = self._usage.retained_assessments(candidate, base)
+            judgment_fresh = retained == ()
             if retained is None:
+                if self._judgments is not None and not cached_only:
+                    # A qualified Source judgment is a separate accounted purpose;
+                    # the original unknown allocation remains unknown and reserved.
+                    judged = new_judgment_intent()
+                    if judged is not None:
+                        return judged
                 raise NativeEvidenceHold("ASSESSOR_REVALIDATION_UNRESOLVED_HOLD", source_id)
             mismatched = tuple(item for item in retained if item.base_digest != base.digest)
             if mismatched:
@@ -2209,6 +2244,10 @@ class AutonomousNativeEvidenceAssessor:
                 raise NativeEvidenceHold(
                     "ASSESSOR_REVALIDATION_CACHE_MISSING_HOLD", source_id
                 )
+        if self._judgments is not None and judgment_fresh and not cached_only:
+            judged = new_judgment_intent()
+            if judged is not None:
+                return judged
         reference_view = None
         provider_base = evidence_package_value(base)
         if VERSION in _REFERENCE_PRODUCERS:

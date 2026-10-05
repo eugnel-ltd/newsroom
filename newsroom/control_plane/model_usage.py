@@ -110,6 +110,7 @@ class ModelUsageAdmissionError(RuntimeError):
 
 
 class WorkloadClass(StrEnum):
+    TYPESAFE_JUDGMENT = "TYPESAFE_JUDGMENT"
     NATIVE_EVIDENCE_ASSESSOR = "NATIVE_EVIDENCE_ASSESSOR"
     NATIVE_STORY_WRITER = "NATIVE_STORY_WRITER"
     NATIVE_RETRIEVAL_EMBEDDING = "NATIVE_RETRIEVAL_EMBEDDING"
@@ -128,7 +129,7 @@ def _nullable_native_output(
         provider == "grok-build-cli"
         and (
             (workload is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
-             and route == "NATIVE_EVIDENCE_ASSESSOR")
+             and route in {"NATIVE_EVIDENCE_ASSESSOR", "NATIVE_CLAIM_LOCALISATION"})
             or (workload is WorkloadClass.NATIVE_STORY_WRITER
                 and route in {"NATIVE_STORY_DRAFT", "NATIVE_STORY_REVIEW"})
         )
@@ -2606,6 +2607,17 @@ class WorkEnvelope:
 
     def _validate(self) -> None:
         _token(self.cycle_id, field="cycle_id")
+        if self.workload_class is WorkloadClass.TYPESAFE_JUDGMENT:
+            if not self.evidence_package_digest:
+                raise ModelUsageIntegrityError("Typesafe envelope lacks its source snapshot")
+            if self.candidate_id:
+                if not self.hypothesis_digest or self.graphiti_attempt_id is not None:
+                    raise ModelUsageIntegrityError("Typesafe candidate identity differs")
+            else:
+                prefix, separator, number = str(self.graphiti_attempt_id or "").rpartition(":")
+                if (not self.ingest_id or prefix != self.ingest_id or not separator
+                        or not number.isdigit() or int(number) <= 0):
+                    raise ModelUsageIntegrityError("Typesafe graphiti identity differs")
         native_assessor = (
             self.workload_class is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
         )
@@ -3608,6 +3620,12 @@ class ModelUsageService:
             envelope, workload=WorkloadClass.NATIVE_STORY_WRITER, label="story writer",
         )
 
+    def resume_or_open_typesafe_envelope(self, envelope: WorkEnvelope) -> WorkEnvelope:
+        """Reuse exact pre-allocation semantic intent without authorising a retry."""
+        return self._resume_or_open_native_envelope(
+            envelope, workload=WorkloadClass.TYPESAFE_JUDGMENT, label="Typesafe judgment",
+        )
+
     def _resume_or_open_native_envelope(
         self, envelope: WorkEnvelope, *, workload: WorkloadClass, label: str,
     ) -> WorkEnvelope:
@@ -4235,7 +4253,7 @@ class ModelUsageService:
                     ingest_id=ingest_id, graphiti_attempt_id=f"{ingest_id}:{number}",
                 )
                 native_attempts[envelope.envelope_id] = (ingest_id, number)
-        return {
+        result = {
             ingest_id: evidence
             for ingest_id, (evidence, _) in self._graphiti_ingest_retry_evidence_batch(
                 ingest_ids=tuple(failed_attempts), native_attempts=native_attempts,
@@ -4258,6 +4276,99 @@ class ModelUsageService:
                 ),
             ).items()
         }
+        # A separately accounted semantic verifier is not one of the original
+        # primary envelopes. Its paid dispatch must never become zero-call credit.
+        selected = [
+            {"ingest": ingest, "attempt": number,
+             "cycle": native_graphiti_usage_cycle_id(ingest_id=ingest, attempt_number=number)}
+            for ingest in failed_attempts for number in range(1, max_attempts + 1)
+        ]
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                "SELECT json_extract(w.value,'$.ingest'),json_extract(w.value,'$.attempt'),"
+                "a.invocation_id,e.envelope_id,e.cycle_id,e.workload_class,e.admitted_at,"
+                "e.canonical_digest,e.record_json,m.context_manifest_digest,m.provider,"
+                "m.route,m.evidence_package_digest,m.record_json "
+                "FROM json_each(?) w JOIN model_invocation_allocations a "
+                "ON a.cycle_id=json_extract(w.value,'$.cycle') "
+                "LEFT JOIN model_work_envelopes e USING(envelope_id) "
+                "LEFT JOIN model_invocation_context_manifests m "
+                "ON m.context_manifest_digest=json_extract(a.record_json,'$.context_manifest_digest') "
+                "WHERE a.workload_class=?",
+                (json.dumps(selected), WorkloadClass.TYPESAFE_JUDGMENT.value),
+            ).fetchall()
+            reported_verifiers: dict[tuple[str, int], bool] = {}
+            for row in rows:
+                ingest, number, invocation_id = row[:3]
+                expected_attempt = f"{ingest}:{number}"
+                envelope_record = _object(row[8]) if row[8] is not None else {}
+                manifest = _object(row[13]) if row[13] is not None else {}
+                # The independent caller/envelope bindings select corrupt records
+                # too: an edited role must not hide a paid Graphiti leaf.
+                if (envelope_record.get("graphiti_attempt_id") != expected_attempt
+                        and manifest.get("caller_graphiti_attempt_id") != expected_attempt
+                        and manifest.get("caller_identity") != "GRAPHITI_VERIFIER"):
+                    continue
+                proved_reported = False
+                if connection.execute(
+                    "SELECT 1 FROM model_invocation_terminals WHERE invocation_id=?",
+                    (invocation_id,),
+                ).fetchone() is not None:
+                    allocation, terminal = _retained_terminal_allocation(connection, invocation_id)
+                    policy = _policy_for_allocation(connection, allocation)
+                    self._validate_terminal(terminal, allocation.workload_class, policy,
+                        requested_max_output_tokens=allocation.max_output_tokens)
+                    envelope = _envelope_from_record(envelope_record)
+                    unsigned = dict(manifest)
+                    manifest_digest = unsigned.pop("context_manifest_digest", None)
+                    if (tuple(row[3:8]) != (envelope.envelope_id, envelope.cycle_id,
+                            envelope.workload_class.value, _utc_text(envelope.admitted_at),
+                            envelope.canonical_digest)
+                            or row[8] != _json(envelope.as_record())
+                            or envelope.envelope_id != allocation.envelope_id
+                            or envelope.cycle_id != allocation.cycle_id
+                            or envelope.workload_class is not WorkloadClass.TYPESAFE_JUDGMENT
+                            or envelope.ingest_id != ingest
+                            or envelope.graphiti_attempt_id != expected_attempt
+                            or envelope.candidate_id is not None
+                            or tuple(row[9:13]) != (allocation.context_manifest_digest,
+                                allocation.provider, allocation.route, envelope.evidence_package_digest)
+                            or row[13] != _json(manifest)
+                            or manifest_digest != allocation.context_manifest_digest
+                            or digest_canonical(unsigned) != manifest_digest
+                            or manifest.get("caller_identity") != "GRAPHITI_VERIFIER"
+                            or manifest.get("caller_ingest_id") != ingest
+                            or manifest.get("caller_graphiti_attempt_id") != expected_attempt
+                            or any(manifest.get(key) != getattr(allocation, key) for key in (
+                                "provider", "route", "model", "reasoning", "prompt_bytes",
+                                "prompt_digest", "request_digest", "output_schema_digest",
+                                "prompt_contract_version", "context_identity", "config_identity"))):
+                        raise ModelUsageIntegrityError("retained Graphiti verifier binding differs")
+                    if _is_exact_pre_dispatch_zero(terminal):
+                        proved_reported = not _has_exact_dispatch(connection, terminal)
+                    elif terminal.usage_status is UsageStatus.REPORTED and terminal.dispatch_at is not None:
+                        _require_reported_telemetry(connection, terminal)
+                        proved_reported = _has_exact_dispatch(connection, terminal)
+                key = (ingest, number)
+                reported_verifiers[key] = reported_verifiers.get(key, True) and proved_reported
+        finally:
+            connection.close()
+        for (ingest, number), proved_reported in reported_verifiers.items():
+            evidence = result[ingest]
+            if proved_reported and number in evidence.settled_provider_attempts:
+                # Known paid usage preserves a whole attempt already settled by
+                # the original Graphiti protocol; it never grants graph settlement.
+                continue
+            result[ingest] = GraphitiIngestRetryEvidence(
+                attempt_numbers=tuple(sorted(set(evidence.attempt_numbers) | {number})),
+                zero_dispatch_attempts=tuple(n for n in evidence.zero_dispatch_attempts if n != number),
+                settled_provider_attempts=tuple(n for n in evidence.settled_provider_attempts if n != number),
+                latest_settled_provider_attempt=max((n for n in evidence.settled_provider_attempts if n != number), default=None),
+                unresolved_attempts=tuple(sorted(set(evidence.unresolved_attempts) | {number})),
+            )
+        return result
 
     def native_recovered_ambiguous_usage_evidence_digest(
         self,
@@ -4887,6 +4998,16 @@ class ModelUsageService:
         if envelope_row is None:
             raise ModelUsageAdmissionError("work envelope is absent")
         envelope = _object(envelope_row[0])
+        if allocation.workload_class is WorkloadClass.TYPESAFE_JUDGMENT:
+            role = manifest.get("caller_identity")
+            if (role == "NATIVE_ASSESSOR" and (not envelope.get("candidate_id")
+                    or envelope.get("graphiti_attempt_id") is not None)
+                    or role == "GRAPHITI_VERIFIER" and (envelope.get("candidate_id") is not None
+                        or not envelope.get("graphiti_attempt_id"))
+                    or role not in {"NATIVE_ASSESSOR", "GRAPHITI_VERIFIER"}
+                    or manifest.get("caller_ingest_id") != envelope.get("ingest_id")
+                    or manifest.get("caller_graphiti_attempt_id") != envelope.get("graphiti_attempt_id")):
+                raise ModelUsageAdmissionError("Typesafe caller context differs from envelope")
         if (
             allocation.workload_class != policy.workload_class
             or allocation.provider != policy.provider
@@ -5068,7 +5189,10 @@ class ModelUsageService:
         finally:
             connection.close()
 
-    def has_committed_provider_dispatch(self, *, cycle_id: str) -> bool:
+    def has_committed_provider_dispatch(
+        self, *, cycle_id: str, ingest_id: str | None = None,
+        graphiti_attempt_id: str | None = None,
+    ) -> bool:
         """Return event dispatch truth from a committed provider-leaf marker."""
 
         cycle_id = _token(cycle_id, field="cycle id")
@@ -5088,6 +5212,28 @@ class ModelUsageService:
                     WorkloadClass.GRAPHITI_CHAT_FALLBACK.value,
                     WorkloadClass.GRAPHITI_EMBEDDING.value,
                 ),
+            ).fetchone()
+            if row and row[0]:
+                return True
+            if ingest_id is None or graphiti_attempt_id is None:
+                return False
+            prefix, separator, number = graphiti_attempt_id.rpartition(":")
+            if prefix != ingest_id or not separator or not number.isdigit() or int(number) <= 0:
+                raise ModelUsageIntegrityError("Typesafe graphiti trace identity differs")
+            row = connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM model_invocation_allocations a "
+                "JOIN model_transport_observations o USING(invocation_id) "
+                "JOIN model_work_envelopes e USING(envelope_id) "
+                "JOIN model_invocation_context_manifests m "
+                "ON m.context_manifest_digest=json_extract(a.record_json,'$.context_manifest_digest') "
+                "WHERE a.cycle_id=? AND a.workload_class=? AND o.state='DISPATCH_STARTED' "
+                "AND json_extract(e.record_json,'$.ingest_id')=? "
+                "AND json_extract(e.record_json,'$.graphiti_attempt_id')=? "
+                "AND json_extract(m.record_json,'$.caller_identity')='GRAPHITI_VERIFIER' "
+                "AND json_extract(m.record_json,'$.caller_ingest_id')=? "
+                "AND json_extract(m.record_json,'$.caller_graphiti_attempt_id')=?)",
+                (cycle_id, WorkloadClass.TYPESAFE_JUDGMENT.value, ingest_id,
+                 graphiti_attempt_id, ingest_id, graphiti_attempt_id),
             ).fetchone()
             return bool(row and row[0])
         finally:
@@ -5383,7 +5529,12 @@ class ModelUsageService:
             and total is not None
         ):
             raise ModelUsageIntegrityError("unresolved usage must not invent a total")
-        if workload in {
+        if workload is WorkloadClass.TYPESAFE_JUDGMENT:
+            if (policy.provider != "typesafe" or policy.route != "TYPESAFE_JUDGMENT"
+                    or terminal.od_011_reference != "OD-011:TYPESAFE_JUDGMENT"
+                    or terminal.subscription_cli_chat_not_cash_debited):
+                raise ModelUsageIntegrityError("Typesafe paid usage linkage differs")
+        elif workload in {
             WorkloadClass.GRAPHITI_EMBEDDING,
             WorkloadClass.NATIVE_RETRIEVAL_EMBEDDING,
         }:

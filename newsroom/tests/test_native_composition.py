@@ -192,11 +192,17 @@ def test_deployed_continuous_runtime_runs_without_history_qualification_gate(
         WorkloadClass.NATIVE_RETRIEVAL_EMBEDDING: _embedding_policy(),
         WorkloadClass.NATIVE_EVIDENCE_ASSESSOR: _assessment_policy(),
     }
+    def fixture_qualified_policy(**request):
+        from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+        if request['workload_class'] not in policies:
+            raise ModelUsageAdmissionError('fixture semantic policy is not registered')
+        return policies[request['workload_class']]
+
     monkeypatch.setattr(
         native_composition,
         "ModelUsageService",
         lambda _: SimpleNamespace(
-            qualified_policy=lambda **request: policies[request["workload_class"]]
+            qualified_policy=fixture_qualified_policy
         ),
     )
     monkeypatch.setattr(
