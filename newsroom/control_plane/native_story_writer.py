@@ -97,6 +97,23 @@ def _sentences(copy):
     return [copy.title, *(part.strip() for part in re.findall(r"[^。！？!?\n]+(?:[。！？!?][」』”’\"]*)?", copy.body) if part.strip())]
 
 
+def _sentence_claim_links(copy):
+    """Intersect verbatim draft evidence spans with each body sentence."""
+    spans=[]
+    for link in copy.evidence_links:
+        start=0
+        while (start:=copy.body.find(link.rendered_assertion,start))>=0:
+            spans.append((start,start+len(link.rendered_assertion),link.governed_claim_id))
+            start+=1
+    return [
+        {identity for start,end,identity in spans
+         if start<match.end() and end>match.start()
+         and re.search(r'[\w\u3400-\u9fff]',copy.body[max(start,match.start()):min(end,match.end())])}
+        for match in re.finditer(r"[^。！？!?\n]+(?:[。！？!?][」』”’\"]*)?",copy.body)
+        if match.group().strip()
+    ]
+
+
 def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_record: Mapping, format: str):
     """Validate retained bindings without calling either model again."""
     checks = []
@@ -112,6 +129,7 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
         return tuple(checks)
     claims = {claim.claim_id: claim for claim in package.governed_claims}
     sentences, text = _sentences(copy), copy.title + "\n" + copy.body
+    sentence_links=_sentence_claim_links(copy)
     links = copy.evidence_links
     support = review["sentence_support"]
     headline_ids = {identity for identity, claim in claims.items() if claim.claim_role == "HEADLINE"}
@@ -132,8 +150,8 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
     check("NATIVE_STORY_SENTENCE_SUPPORT", [item["sentence_index"] for item in support] == list(range(len(sentences)))
           and all(item["verdict"] == "SUPPORTED" and set(item["claim_ids"]) <= set(claims) for item in support)
           and all(headline_supported if item["sentence_index"] == 0 else
-                  any(link.governed_claim_id in item["claim_ids"] and link.rendered_assertion in
-                      sentences[item["sentence_index"]] for link in links) for item in support))
+                  bool(set(item["claim_ids"]) & sentence_links[item["sentence_index"]-1])
+                  for item in support))
     check("NATIVE_STORY_SEPARATE_REVIEW", review["verdict"] == "PASS" and all(review["factual_checks"][key] == "PASS" for key in _FACTS))
     number = re.compile(r"\d+(?:[.,]\d+)*|[零〇一二三四五六七八九十百千萬億兆兩廿卅]+(?:年|月|日|時|分|秒|人|名|個|間|所|座|公里|元|英鎊|%|％)")
     approved = "\n".join(value for claim in claims.values() for value in

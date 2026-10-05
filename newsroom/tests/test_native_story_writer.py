@@ -80,6 +80,25 @@ def test_natural_multi_paragraph_report_is_separately_reviewed_against_compact_s
     assert result.copy.body == DRAFT["body"]
     assert result.copy.evidence_package_digest == package.digest
     assert result.format == "ARTICLE"
+
+
+def test_one_verbatim_evidence_span_can_support_multiple_reviewed_sentences():
+    draft=deepcopy(DRAFT)
+    paragraph='政府計劃開設兩個社區中心。每個中心提供100個名額。'
+    draft['body']=paragraph+'\n\n'+DRAFT['body'].split('\n\n')[1]
+    draft['evidence_links'][1]['rendered_assertion']=paragraph
+    def review(request):
+        result=_review(request)
+        result['sentence_support']=[
+            {'sentence_index':0,'claim_ids':['headline','capacity'],'verdict':'SUPPORTED'},
+            {'sentence_index':1,'claim_ids':['headline','capacity'],'verdict':'SUPPORTED'},
+            {'sentence_index':2,'claim_ids':['capacity'],'verdict':'SUPPORTED'},
+            {'sentence_index':3,'claim_ids':['replacement','estimate'],'verdict':'SUPPORTED'},
+        ]
+        return result
+    result=write_native_story(_package(),generate=lambda _:draft,review=review)
+    assert result.copy.body==draft['body']
+    assert all(item.result=='PASS'for item in result.validators)
     assert result.review.as_record()["verdict"] == "PASS"
     assert all(check.result == "PASS" for check in result.validators)
 
