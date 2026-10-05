@@ -257,8 +257,9 @@ def test_completion_denies_unbound_ambiguous_quoted_or_changed_evidence(tmp_path
 
 def test_consumer_suffix_routes_cached_revalidation_without_changing_producer():
     from newsroom.control_plane.native_composition import ASSESSMENT_CONTRACT_VERSION
-    previous, suffix = ASSESSMENT_CONTRACT_VERSION.rsplit("+", 1)
-    assert suffix == module.QUALIFICATION_CLAUSE_CONSUMER_VERSION
+    parts = ASSESSMENT_CONTRACT_VERSION.split("+")
+    assert parts.count(module.QUALIFICATION_CLAUSE_CONSUMER_VERSION) == 1
+    previous = "+".join(part for part in parts if part != module.QUALIFICATION_CLAUSE_CONSUMER_VERSION)
     assert module.VERSION == "newsroom.native-evidence-assessor.v23"
     assert module.same_assessment_producer(previous, ASSESSMENT_CONTRACT_VERSION)
     assert module.assessment_revalidation_due(

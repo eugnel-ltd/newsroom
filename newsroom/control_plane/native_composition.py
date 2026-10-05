@@ -50,6 +50,7 @@ from .native_assessor import (
     QUALIFICATION_CLAUSE_CONSUMER_VERSION,
     VERSION as ASSESSOR_CONTRACT_VERSION,
 )
+from .native_context_materialisation import VERSION as CONTEXT_MATERIALISATION_VERSION
 from .native_collision import NativeCollisionAuthority, NativeCollisionIdentity
 from .native_cycle import _uuid4_for
 from .native_discovery import NativeDiscovery
@@ -86,6 +87,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"{ZH_HANT_HK_SHAPE_POLICY_VERSION}+{FACTUAL_LOCALISATION_POLICY_VERSION}+"
     f"{QUALIFICATION_RELATION_POLICY_VERSION}+{RETAINED_ASSESSMENT_POLICY_VERSION}+{PARTITION_VERSION}"
     f"+{QUALIFICATION_CLAUSE_CONSUMER_VERSION}"
+    f"+{CONTEXT_MATERIALISATION_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
