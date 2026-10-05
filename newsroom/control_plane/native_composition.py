@@ -629,7 +629,9 @@ def open_native_pipeline(
                 require_story_sources()
                 return result
             except (ModelUsageAdmissionError, NativeStoryWriterHold) as exc:
-                raise EditorialHold(reason=getattr(exc, "reason_code", str(exc))) from exc
+                held=EditorialHold(reason=getattr(exc, "reason_code", str(exc)))
+                held.stable_reason_codes=getattr(exc,'stable_reason_codes',(str(held),))
+                raise held from exc
             except (WriterDispatchError, CliProcessError, CliTimeoutError, json.JSONDecodeError) as exc:
                 raise EditorialHold(reason="NATIVE_STORY_PROVIDER_RESULT_HOLD") from exc
         RetrievalContextJournal(retrieval_path)

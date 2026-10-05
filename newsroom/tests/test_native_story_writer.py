@@ -152,6 +152,16 @@ def test_fabricated_or_unmapped_copy_is_held_even_if_a_review_asserts_pass(mutat
         write_native_story(_package(), generate=lambda _: draft, review=_review)
 
 
+def test_story_hold_reports_all_proven_validator_failures_together():
+    draft=deepcopy(DRAFT)
+    draft['body']=draft['body'].replace('100','999').replace('政府計劃','李小明公布政府計劃')
+    with pytest.raises(NativeStoryWriterHold)as held:
+        write_native_story(_package(),generate=lambda _:draft,review=_review)
+    assert 'NATIVE_STORY_FACTUAL_NUMBERS'in held.value.stable_reason_codes
+    assert 'NATIVE_STORY_FACTUAL_ENTITIES'in held.value.stable_reason_codes
+    assert str(held.value)==held.value.stable_reason_codes[0]
+
+
 @pytest.mark.parametrize("mutation", ["unknown", "hold", "empty", "truncated", "package", "draft", "coverage", "sentence", "fact", "mapping"])
 def test_partial_unknown_or_unbound_review_never_admits_copy(mutation):
     def review(request):

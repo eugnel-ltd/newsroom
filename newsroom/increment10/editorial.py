@@ -887,7 +887,9 @@ class NativeEditorial:
                         **({'cached_only': True} if story_cached_only else {}),
                     )
                 except NativeStoryWriterHold as exc:
-                    raise EditorialHold(reason=str(exc)) from exc
+                    held=EditorialHold(reason=str(exc))
+                    held.stable_reason_codes=exc.stable_reason_codes
+                    raise held from exc
                 copy, writer_review, story_format = result.copy, result.review.as_record(), result.format
                 require_current_sources()
             else:

@@ -954,7 +954,7 @@ class NativePublicationContinuation:
     @staticmethod
     def writer_revalidation_due(facts: dict) -> bool:
         from .native_story_writer import CONSUMER_VERSION
-        return (facts.get('reason')=='NATIVE_STORY_SENTENCE_SUPPORT'
+        return ('NATIVE_STORY_SENTENCE_SUPPORT' in (facts.get('reason'),*facts.get('editorial_hold_reason_codes',()))
             and facts.get('writer_support_checked_version')!=CONSUMER_VERSION
             and type(facts.get('package_admission_id'))is str
             and type(facts.get('editorial_decision'))is dict
@@ -1697,7 +1697,7 @@ class NativePublicationContinuation:
             reason_codes = (
                 tuple(exc.decision.stable_reason_codes)
                 if exc.decision is not None
-                else (str(exc),)
+                else tuple(getattr(exc,'stable_reason_codes',(str(exc),)))
             )
             if (
                 not reason_codes

@@ -64,6 +64,9 @@ REVIEW_SCHEMA = {
 
 class NativeStoryWriterHold(ValueError):
     """Unproved copy is held; transport usage remains the caller's responsibility."""
+    def __init__(self, reason, *, failures=()):
+        super().__init__(reason)
+        self.stable_reason_codes=tuple(failures)or(reason,)
 
 
 @dataclass(frozen=True)
@@ -219,8 +222,9 @@ def write_native_story(package: EvidencePackage, *, generate: Callable, review: 
     except (ValueError, TypeError, ValidationError) as exc:
         raise NativeStoryWriterHold("NATIVE_STORY_OUTPUT_CONTRACT_HOLD") from exc
     validators = validate_retained_story(copy, package, record, draft["format"])
-    if any(check.result != "PASS" for check in validators):
-        raise NativeStoryWriterHold(next(check.validator for check in validators if check.result != "PASS"))
+    failures=tuple(check.validator for check in validators if check.result!='PASS')
+    if failures:
+        raise NativeStoryWriterHold(failures[0],failures=failures)
     from .native_story_dates import derive_and_verify
     final,proof=derive_and_verify(draft,record,package,source_currentness)
     if proof is not None:
