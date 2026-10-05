@@ -129,7 +129,8 @@ def _nullable_native_output(
         provider == "grok-build-cli"
         and (
             (workload is WorkloadClass.NATIVE_EVIDENCE_ASSESSOR
-             and route in {"NATIVE_EVIDENCE_ASSESSOR", "NATIVE_CLAIM_LOCALISATION"})
+             and route in {"NATIVE_EVIDENCE_ASSESSOR", "NATIVE_CLAIM_LOCALISATION",
+                           "NATIVE_SOURCE_QUALIFICATION"})
             or (workload is WorkloadClass.NATIVE_STORY_WRITER
                 and route in {"NATIVE_STORY_DRAFT", "NATIVE_STORY_REVIEW"})
         )

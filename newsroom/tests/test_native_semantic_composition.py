@@ -183,7 +183,7 @@ def test_deployed_factory_requires_registered_profiles_and_defers_credential_rea
     # will reject the unsafe file before a provider call.
     with pytest.raises(ValueError, match='credential'):
         captured[0]['judgment_api_key']()
-    assert [r['route'] for r in requests][-2:] == [semantic.route, rendering.route]
+    assert [r['route'] for r in requests if r['route'] in {semantic.route, rendering.route}] == [semantic.route, rendering.route]
 
 
 @pytest.mark.parametrize('changed, permitted', [(False, True), (True, True), (False, False)])
@@ -246,3 +246,51 @@ def test_first_publication_is_publisher_provenance_not_observation_or_change(mon
             'first_published_at': current.unit.published_at}
     else:
         assert 'first_publication' not in scope
+
+
+def test_real_qualification_composition_opens_without_any_provider_dispatch(tmp_path, monkeypatch):
+    from newsroom.control_plane import native_composition
+    original_arguments = existing._arguments
+    from newsroom.control_plane import native_assessor
+    from newsroom.control_plane.native_source_qualification import qualification_policy
+    original_assessor = native_assessor.AutonomousNativeEvidenceAssessor
+    original_consumer = native_assessor_judgments.NativeAssessorJudgments
+    original_graphiti = native_composition.NativeGraphitiProcessor
+    consumers = []
+    processors = []
+    assessors = []
+
+    def arguments(path):
+        return {**original_arguments(path),
+            'judgment_api_key': lambda: pytest.fail('opening must not read credentials'),
+            'judgment_policy': judgment_policy(evidence_digest=digest_bytes(b'qualified semantic fixture'), qualified=True),
+            'localisation_policy': localisation_policy(evidence_digest=digest_bytes(b'qualified rendering fixture'), qualified=True),
+            'source_qualification_policy': qualification_policy(evidence_digest=digest_bytes(b'qualified exception fixture'), qualified=True)}
+
+    def consumer(**values):
+        result = original_consumer(**values)
+        consumers.append(result)
+        return result
+
+    def graphiti(**values):
+        result = original_graphiti(**values)
+        processors.append(result)
+        return result
+
+    def assessor(**values):
+        result = original_assessor(**values)
+        assessors.append(result)
+        return result
+
+    monkeypatch.setattr(native_composition, 'AutonomousNativeEvidenceAssessor', assessor)
+    monkeypatch.setattr(existing, '_arguments', arguments)
+    monkeypatch.setattr(native_assessor_judgments, 'NativeAssessorJudgments', consumer)
+    monkeypatch.setattr(native_composition, 'NativeGraphitiProcessor', graphiti)
+    existing.test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(tmp_path, monkeypatch)
+    assert len(consumers) == 2
+    assert consumers[0].judgments.policy.route == 'TYPESAFE_JUDGMENT'
+    assert consumers[0].localise is not None and consumers[0].read_localisation is not None
+    assert len(processors) == 2
+    assert all(callable(processor._runner._typed_proposal_verifier) for processor in processors)
+
+    assert len(assessors) == 2 and all(callable(item._qualification) for item in assessors)

@@ -121,8 +121,16 @@ _PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS = frozenset(
     "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
     "newsroom.qualification-relation.v3"
 }
-QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v3"
+QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v4"
 # Known historical identity; later consumer subpolicy changes must not relabel it.
+_PRIOR_V10_WRITE_ADMISSION_POLICY_VERSION = (
+    "newsroom.write-admission.v10+newsroom.evid-012.v7+"
+    "newsroom.evidence-approval.v8+newsroom.evidence-gates.v2+"
+    "newsroom.governed-claim.v7+newsroom.governed-input.v10+"
+    "newsroom.named-entity.v16+newsroom.cont-originality.v3+"
+    "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
+    "newsroom.qualification-relation.v3"
+)
 _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION = (
     "newsroom.write-admission.v9+newsroom.evid-012.v7+"
     "newsroom.evidence-approval.v8+newsroom.evidence-gates.v2+"
@@ -437,6 +445,75 @@ def _elapsed_official_deadline_is_proven(
     return True
 
 
+def _confirmed_public_process_launch_is_proven(
+    span: str, claim: GovernedClaimEvidence, *, source_context: str, reader_action: str,
+) -> bool:
+    """A completed public consultation launch is not enactment of its proposals."""
+    if (not span or source_context.count(span) != 1
+            or span not in claim.claim or span not in claim.supporting_excerpt
+            or reader_action != span):
+        return False
+    witness = span.strip().rstrip(".!?。！？")
+    sentences = [part.strip() for part in re.split(r"[.!?。！？]+", source_context) if part.strip()]
+    selected = [index for index, sentence in enumerate(sentences) if witness in sentence]
+    if len(selected) != 1:
+        return False
+    index = selected[0]
+    parent = sentences[index]
+    event = re.search(
+        r"(?:(?:the\s+)?(?:government|authority|department|agency|Home Office)\s+"
+        r"(?:(?:has|have)\s+)?(?:now\s+|formally\s+)?(?:launched|opened|started)\s+"
+        r"(?:a\s+|the\s+)?(?:public\s+)?consultation|"
+        r"(?:a\s+|the\s+)?(?:public\s+)?consultation\s+(?:(?:which|that)\s+)?(?:has been|was)\s+"
+        r"(?:formally\s+)?(?:launched|opened|started)|"
+        r"(?:政府|當局|[\u3400-\u9fff]{1,16}(?:政府|署|局|部門))"
+        r"已(?:正式)?(?:啟動|展開|開始)(?:公眾)?諮詢|"
+        r"(?:公眾)?諮詢已由(?:政府|當局|[\u3400-\u9fff]{1,16}(?:署|局|部門))"
+        r"(?:正式)?(?:啟動|展開|開始))", witness, flags=re.IGNORECASE,
+    )
+    if event is None:
+        return False
+    start = parent.index(witness) + event.start()
+    end = parent.index(witness) + event.end()
+    prefix = parent[:start]
+    # The dependency belongs to the proposed policy target; the consultation's
+    # explicit past relative clause is independently closed, not a future launch.
+    target_dependency = bool(
+        re.search(r"\b(?:which|that)\b", event.group(), flags=re.IGNORECASE)
+        and re.fullmatch(
+            r"(?:the\s+)?(?:(?:new|proposed)\s+)?(?:changes|controls|rules|proposals|policy)"
+            r"\s+(?:will be|are|is)\s+subject to\s+", prefix, flags=re.IGNORECASE,
+        )
+    )
+    conditional_context = parent[start:] if target_dependency else parent
+    if (re.search(r'["“”「」『』]', parent)
+            or not target_dependency and _qualification_text_is_negative(prefix)
+            or re.search(r"\b(?:if|unless|subject to|conditional|pending approval)\b|"
+                         r"假如|如果|倘若|須經批准|有待批准", conditional_context, flags=re.IGNORECASE)):
+        return False
+    # Keep the full parent. Only a separately closed topic clause may describe
+    # proposed/future controls; it cannot qualify or negate the launch itself.
+    for clause in re.split(r"[,，;；]+", parent[end:]):
+        if _qualification_text_is_negative(clause):
+            proposal_topic = re.match(r"\s*(?:on\b|about\b|regarding\b|就|關於|有關)", clause, flags=re.IGNORECASE)
+            if (proposal_topic is None or not re.search(r"propos\w*|擬議|建議", clause, flags=re.IGNORECASE)
+                    or re.search(r"consultation|launch|statement|claim|諮詢|啟動|展開|說法", clause, flags=re.IGNORECASE)):
+                return False
+    neighbours = sentences[max(0, index-1):index] + sentences[index+1:index+2]
+    for neighbour in neighbours:
+        if (re.search(r"consultation|statement|claim|assertion|諮詢|說法|聲明", neighbour, flags=re.IGNORECASE)
+                and _qualification_text_is_negative(neighbour)):
+            return False
+    if re.search(r"public\s+consultation|公眾諮詢", parent, flags=re.IGNORECASE):
+        return True
+    return any(
+        re.match(r"(?:the|this) consultation\b|是次諮詢|該諮詢", neighbour, flags=re.IGNORECASE)
+        and re.search(r"public|stakeholders|citizens|公眾|市民|業界", neighbour, flags=re.IGNORECASE)
+        and re.search(r"submit|respond|views|comments|參與|提交|意見|回應", neighbour, flags=re.IGNORECASE)
+        for neighbour in sentences[index+1:index+2]
+    )
+
+
 def _qualification_relation_is_proven(
     qualification: QualificationEvidence, claim: GovernedClaimEvidence, *, source_context: str
 ) -> bool:
@@ -465,6 +542,16 @@ def _qualification_relation_is_proven(
         ].search(span)
     )
     qualification_fields = dict(qualification.test_evidence)
+    if (len(spans) == 1
+            and qualification.test is Evid012QualificationTest.OFFICIAL_ACTION_OR_DEADLINE
+            and qualification_fields.get("action_class") == "PROCESS"
+            and re.search(r"\bconsultation\b|諮詢|咨询", span, flags=re.IGNORECASE)):
+        # A context-denied consultation must not fall back to generic process
+        # keywords and thereby excise the same parent qualification.
+        return _confirmed_public_process_launch_is_proven(
+            span, claim, source_context=source_context,
+            reader_action=qualification_fields["reader_action"],
+        )
     deadline_state = (
         qualification.test is Evid012QualificationTest.LAW_RIGHT_STATUS_POLICY
         and qualification_fields.get("change_kind") == "OFFICIAL_DEADLINE"
@@ -731,6 +818,7 @@ class WriteAdmissionDecision:
             _OLDEST_WRITE_ADMISSION_POLICY_VERSION,
             *_PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS,
             _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION,
+            _PRIOR_V10_WRITE_ADMISSION_POLICY_VERSION,
         }:
             raise ValueError("unsupported write-admission policy version")
         expected = _decision_id(

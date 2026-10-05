@@ -1187,7 +1187,23 @@ class NativePublicationContinuation:
                     'origin_terminal_digest': original.terminal_digest,
                     'origin_context_manifest_digest': original.context_manifest_digest}
                 if semantic_intent is not None:
-                    if type(semantic_intent) is not dict or any(semantic_intent.get(key) != value for key, value in binding.items()):
+                    if type(semantic_intent) is not dict:
+                        raise NativePublicationError('semantic continuation origin differs')
+                    changed = {key for key, value in binding.items() if semantic_intent.get(key) != value}
+                    if changed == {'contract'} and (semantic_intent['contract'], binding['contract']) == (
+                            'newsroom.native-assessor-judgments.v1', 'newsroom.native-assessor-judgments.v2'):
+                        # The qualified question meaning changed. Preserve the
+                        # complete original compound intent and unknown liability;
+                        # this is not another call under its old request key.
+                        facts = current_facts()
+                        facts['semantic_assessment_intent_history'] = [*facts.get('semantic_assessment_intent_history', ()), semantic_intent]
+                        semantic_intent = {**binding, 'origin_journal': semantic_intent['origin_journal']}
+                        facts['semantic_assessment_intent'] = semantic_intent
+                        facts['semantic_acquisition_attempt_count'] = 0
+                        facts.pop('reason', None)
+                        facts.pop('acquisition_retryable', None)
+                        progress = self._journal.advance(revision_id, stage='SEMANTIC_ASSESSMENT_PENDING', facts=facts)
+                    elif changed:
                         raise NativePublicationError('semantic continuation origin differs')
                 else:
                     semantic_intent = {**binding, 'origin_journal': {key: facts.get(key) for key in (

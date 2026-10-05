@@ -38,12 +38,12 @@ def _source(body, admission, source_id="HK-fixture"):
 
 
 @contextmanager
-def _case(tmp_path, monkeypatch, *, answer_change=None, source_id="HK-fixture", max_prompt_bytes=None):
+def _case(tmp_path, monkeypatch, *, answer_change=None, source_id="HK-fixture", max_prompt_bytes=None, body=BODY):
     args=_args(tmp_path,monkeypatch);usage=ModelUsageService(str(tmp_path/'usage.sqlite3'));calls=[]
     with open_native_runtime(**args) as runtime:
-        admission=runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.source','chinese-source'),BODY.encode(),proof=runtime.proof).admission
-        source,acquired=_source(BODY.encode(),admission.admission_id,source_id)
-        base=EvidencePackage(candidate_id='candidate-fixture',hypothesis_id='hypothesis-fixture',signal_ids=('signal-fixture',),lead_ids=('lead-fixture',),source_ids=(source_id,),observation_digests=(digest_bytes(BODY.encode()),),passages=(BODY,))
+        admission=runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.source','chinese-source'),body.encode(),proof=runtime.proof).admission
+        source,acquired=_source(body.encode(),admission.admission_id,source_id)
+        base=EvidencePackage(candidate_id='candidate-fixture',hypothesis_id='hypothesis-fixture',signal_ids=('signal-fixture',),lead_ids=('lead-fixture',),source_ids=(source_id,),observation_digests=(digest_bytes(body.encode()),),passages=(body,))
         candidate=SimpleNamespace(candidate_id=base.candidate_id,version_id='candidate-version',canonical_bytes=canonical_json_bytes({'candidate':'fixture'}),governing_manifest=SimpleNamespace(canonical_digest=digest_bytes(b'hypothesis'),canonical_bytes=canonical_json_bytes({'hypothesis':'fixture'})))
         def transport(request,**_kw):
             value=json.loads(request.data);calls.append(value);answers={}
@@ -531,3 +531,157 @@ def test_auxiliary_witness_gap_retains_every_claim_and_only_omits_unproven_quali
         assert assessment.qualification_evidence[0].governed_claim_id==assessment.governed_claims[0].claim_id
         assert consumer.read(result.decision_admission_id,candidate,base,(source,),(acquired,))==result
         assert len(calls)==2 and len(local_calls)==1
+
+
+def test_v2_qualification_questions_supply_all_six_rubrics_and_complete_parent_witnesses(tmp_path,monkeypatch):
+    from newsroom.control_plane.native_assessor_judgments import VERSION
+    from newsroom.control_plane.qualification_rubrics import RUBRICS
+    assert VERSION=='newsroom.native-assessor-judgments.v2'
+    with _case(tmp_path,monkeypatch) as (consumer,_service,candidate,base,source,acquired,_usage,calls):
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert result.reason=='QUALIFIED_LOCALISATION_REQUIRED'
+        for test,rubric in RUBRICS.items():
+            actual=calls[1]['questions']['S1L1:'+test]['instructions']
+            assert actual['definition']==rubric['definition']
+            assert actual['requires']==rubric['requires'] and actual['excludes']==rubric['excludes']
+            assert 'already-effective' in actual['temporal_and_source_rules']
+        assert calls[1]['state']['witness_inventory']['S1L1']['parent_text']==BODY.splitlines()[0]
+
+
+def test_witness_inventory_is_utf8_exact_and_never_clips_parent_negation_or_dates():
+    from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
+    from newsroom.control_plane.qualification_rubrics import witness_inventory
+    body='政府宣布新政策，但該政策並未生效。\nThe authority announced a deadline, but the report was not confirmed.'
+    view=build_lossless_source_view((body,),('fixture',));inventory=witness_inventory(view)
+    for parent in inventory.values():
+        for value in parent['candidates'].values():
+            assert body.encode()[value['start_byte']:value['end_byte']].decode()==value['text']
+        assert parent['parent_text']
+    assert '並未生效' in inventory['S1L1']['parent_text']
+    assert 'not confirmed' in inventory['S1L2']['parent_text']
+
+
+def test_complete_no_material_source_has_valid_negative_codec_without_renderer(tmp_path,monkeypatch):
+    def change(answers):
+        for key,value in answers.items():
+            if key.startswith('S1L') and ':'not in key:
+                value['choice']='BACKGROUND'
+                value['probabilities']={option:int(option=='BACKGROUND')for option in value['probabilities']}
+    with _case(tmp_path,monkeypatch,answer_change=change) as (consumer,_service,candidate,base,source,acquired,_usage,calls):
+        consumer.localise=lambda _:pytest.fail('no renderer needed for zero selected news')
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert type(result)is JudgedAssessment
+        assessment=AutonomousNativeEvidenceAssessor._validated_execution(result.execution,candidate,base,(source,),(acquired,))
+        assert not assessment.substantive_new_information and not assessment.qualification_evidence
+        assert len(calls)==1
+        assert json.loads(result.decision_record)['render_provenance']['mode']=='NO_MATERIAL_CLAIMS'
+
+
+def test_v2_fallback_carries_exact_authenticated_inputs_and_no_proof_or_private_state(tmp_path,monkeypatch):
+    with _case(tmp_path,monkeypatch) as (consumer,service,candidate,base,source,acquired,_usage,_calls):
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert len(result.details['judgment_inputs'])==len(result.references)==2
+        for reference,inputs in zip(result.references,result.details['judgment_inputs'],strict=True):
+            assert 'proof'not in inputs and inputs['source_binding']==result.details['source_binding']
+            assert service.read(reference,**inputs,proof=consumer.proof)['answers']
+        assert result.details['failed_questions']
+        assert result.details['witness_inventory']
+
+
+def test_v2_validation_mapper_reauthenticates_prior_decision_without_new_dispatch(tmp_path,monkeypatch):
+    with _case(tmp_path,monkeypatch) as (consumer,service,candidate,base,source,acquired,usage,calls):
+        local_calls=[]
+        _localiser(consumer,service,usage,candidate,base,local_calls)
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        fallback=consumer.validation_failure(result,candidate,base,(source,),(acquired,),'qualification relation failed')
+        assert fallback.reason=='MATERIALISATION_VALIDATION_FAILED'
+        assert len(fallback.references)==2 and len(fallback.details['judgment_inputs'])==2
+        assert fallback.details['prior_decision_admission_id']==str(result.decision_admission_id)
+        assert len(calls)==2 and len(local_calls)==1
+        assert 'judgment_inputs'not in json.loads(result.decision_record)
+        with pytest.raises(Exception):
+            consumer.validation_failure(replace(result,decision_admission_id=result.judgment_inputs[0]['candidate_id']),candidate,base,(source,),(acquired,),'forged ref')
+
+
+def test_overbound_complete_witness_clause_is_visible_and_escalates_without_clipping():
+    from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
+    from newsroom.control_plane.qualification_rubrics import witness_inventory
+    text='The authority introduced a new policy '+('x'*300)+'.'
+    view=build_lossless_source_view((text,),('fixture',));inventory=witness_inventory(view)
+    assert inventory['S1L1']['parent_text']==text
+    assert inventory['S1L1']['uncovered_clause_ids']
+    assert not inventory['S1L1']['candidates']
+
+
+@pytest.mark.parametrize('name,test,expected,context',[
+    ('policy-versus-safety','LAW_RIGHT_STATUS_POLICY',True,'new licensing policy'),
+    ('conditional-risk','SAFETY_OR_PUBLIC_HEALTH',False,'conditional possible harm'),
+    ('consultation','OFFICIAL_ACTION_OR_DEADLINE',True,'proposed rule is not thereby enacted'),
+    ('announced-future','LAW_RIGHT_STATUS_POLICY',None,'not proof the rule is already in force'),
+    ('auxiliary','LAW_RIGHT_STATUS_POLICY',True,'standing guidance'),
+])
+def test_promoted_rubrics_state_distinct_positive_negative_and_temporal_contrasts(name,test,expected,context):
+    from newsroom.control_plane.qualification_rubrics import question,RUBRICS
+    q=question('S1L1',test,{'material_relation_span':{}})
+    assert context in (str(q['instructions'])+' '+str(q['criteria'])) or name in {'policy-versus-safety','auxiliary'}
+    assert q['instructions']['definition']==RUBRICS[test]['definition']
+    assert set(q['criteria'])=={'YES','NO','UNCERTAIN'}
+    assert 'first-observation' in q['instructions']['temporal_and_source_rules']
+    # Labels are fixture expectations, not a fabricated provider judgement.
+    assert expected in (True,False,None)
+
+
+def test_clause_selector_resolves_only_exact_inventory_keys_with_parent_context(tmp_path,monkeypatch):
+    def change(answers):
+        for key,value in answers.items():
+            if key.startswith('S1L1:LAW_RIGHT_STATUS_POLICY:')and key.endswith('_source_lookup_key'):
+                selected=next(option for option in value['probabilities']if option.endswith('C1'))
+                value['choice']=selected
+                value['probabilities']={option:int(option==selected)for option in value['probabilities']}
+    with _case(tmp_path,monkeypatch,answer_change=change) as (consumer,service,candidate,base,source,acquired,usage,calls):
+        local_calls=[];_localiser(consumer,service,usage,candidate,base,local_calls)
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assessment=AutonomousNativeEvidenceAssessor._validated_execution(result.execution,candidate,base,(source,),(acquired,))
+        witness=dict(assessment.qualification_evidence[0].test_evidence)['material_relation_span']
+        assert witness==BODY.splitlines()[0].removesuffix('。')
+        assert witness in assessment.governed_claims[0].claim
+        assert len(calls)==2 and len(local_calls)==1
+        assert all('proof'not in row for row in result.judgment_inputs)
+
+
+def test_v2_old_v1_decision_key_is_not_relabelled_as_new_purpose(tmp_path,monkeypatch):
+    from newsroom.authority.canonical import digest_canonical
+    with _case(tmp_path,monkeypatch) as (consumer,service,candidate,base,source,acquired,usage,_calls):
+        local_calls=[];_localiser(consumer,service,usage,candidate,base,local_calls)
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        binding=json.loads(result.decision_record)['source_binding']
+        old_key='judgment-decision:'+digest_canonical(['newsroom.native-assessor-judgments.v1',binding])
+        assert consumer._decision_key(binding)!=old_key
+        assert service.objects.committed_admission(ObjectAdmissionRequest('evidence.record',old_key),proof=consumer.proof) is None
+        assert consumer.get_decision_ref(candidate,base,(source,),(acquired,))==result.decision_admission_id
+
+
+def test_unknown_complete_source_fallback_retains_source_bound_exception_context_without_paid_judgment(tmp_path,monkeypatch):
+    with _case(tmp_path,monkeypatch) as (consumer,_service,candidate,base,source,acquired,_usage,calls):
+        consumer.scope_for=lambda *_:{'coverage':'COMPLETE','newness':'UNKNOWN','prior_scope':None,'current_scope':{}}
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert result.reason=='NEWNESS_BASELINE_UNKNOWN' and not calls
+        assert result.details['source_binding']['content_digest']==base.digest
+        assert result.details['state']['sources']==[{'source_id':base.source_ids[0],'text':BODY}]
+        assert result.details['judgment_inputs']==[] and result.references==()
+
+
+def test_selected_fragment_cannot_erase_negative_parent_context(tmp_path,monkeypatch):
+    body='The authority introduced a new policy, but it was not confirmed.\nReaders may enquire.'
+    def change(answers):
+        for key,value in answers.items():
+            if key.startswith('S1L1:LAW_RIGHT_STATUS_POLICY:')and key.endswith('_source_lookup_key'):
+                value['choice']='S1L1C1'
+                value['probabilities']={option:int(option=='S1L1C1')for option in value['probabilities']}
+    with _case(tmp_path,monkeypatch,body=body,answer_change=change) as (consumer,_service,candidate,base,source,acquired,_usage,calls):
+        consumer.localise=lambda _:pytest.fail('parent contradiction must escalate before rendering')
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert result.reason=='PARENT_MODALITY_REQUIRES_REASONING'
+        assert 'not confirmed' in result.details['state']['witness_inventory']['S1L1']['parent_text']
+        assert result.details['failed_questions'][0]['reason']=='PARENT_NEGATION_OR_MODALITY'
+        assert len(calls)==2
