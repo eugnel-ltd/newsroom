@@ -2100,6 +2100,7 @@ class AutonomousNativeEvidenceAssessor:
         judgments=None,
         qualification=None,
         retained_qualification=None,
+        context_enrichment=None,
     ) -> None:
         default_dispatch = dispatch is None
         dispatch = dispatch or _dispatch_grok
@@ -2120,6 +2121,9 @@ class AutonomousNativeEvidenceAssessor:
         if retained_qualification is not None and not callable(retained_qualification):
             raise NativeEvidenceError('native retained qualification reader differs')
         self._retained_qualification = retained_qualification
+        if context_enrichment is not None and not callable(context_enrichment):
+            raise NativeEvidenceError('native context enrichment differs')
+        self._context_enrichment=context_enrichment
         self._dispatch_fence = dispatch_fence or nullcontext
 
     def __call__(self, candidate, base, sources, acquired):
@@ -2133,9 +2137,11 @@ class AutonomousNativeEvidenceAssessor:
         cached_only: bool = False,
         semantic_only: bool = False,
         qualification_cached_only: bool = False,
+        context_only: bool = False,
     ):
         if (type(cached_only) is not bool or type(semantic_only) is not bool
                 or type(qualification_cached_only) is not bool or cached_only and semantic_only
+                or type(context_only)is not bool or context_only and (cached_only or semantic_only or qualification_cached_only)
                 or qualification_cached_only and (not cached_only or semantic_only)):
             raise NativeEvidenceError("native assessment cache mode differs")
         source_id = sources[0].unit.source_id if sources else candidate.candidate_id
@@ -2170,6 +2176,20 @@ class AutonomousNativeEvidenceAssessor:
                 raise NativeEvidenceHold(
                     "SOURCE_POLICY_FACTS_HOLD", source.unit.source_id
                 )
+        if context_only:
+            from .native_assessor_judgments import JudgedAssessment
+            if self._retained_qualification is None or self._context_enrichment is None:
+                raise NativeEvidenceHold('CONTEXT_ENRICHMENT_UNAVAILABLE',source_id)
+            if before_dispatch is not None:
+                before_dispatch()
+            original=self._retained_qualification(candidate,base,sources,acquired)
+            if type(original)is not JudgedAssessment:
+                raise NativeEvidenceHold('CONTEXT_ORIGINAL_QUALIFICATION_HOLD',source_id)
+            self._validated_execution(original.execution,candidate,base,sources,acquired)
+            enriched=self._context_enrichment(original,candidate,base,sources,acquired)
+            if type(enriched)is not JudgedAssessment:
+                raise NativeEvidenceHold('CONTEXT_PACKAGE_RESULT_HOLD',source_id)
+            return self._validated_execution(enriched.execution,candidate,base,sources,acquired)
         if qualification_cached_only:
             from .native_assessor_judgments import JudgedAssessment
             if self._retained_qualification is None:
