@@ -159,6 +159,7 @@ def test_spreadsheet_acquisition_refetches_parent_and_asset_with_exact_binding(
         assert result.canonical_url == source.unit.canonical_url
         assert result.canonical_url.startswith("https://www.gov.uk/")
         assert result.text_only is True
+        assert result.body_origin=='GOVUK_DECLARED_ASSET_TEXT'
         if csv_bytes is not None:
             assert 'B="“exact”"' in source.unit.body
             assert 'B="“exact”"' in result.body.decode()

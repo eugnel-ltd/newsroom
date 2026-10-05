@@ -57,7 +57,7 @@ def _anchor(currentness):
 
 
 def derive_and_verify(original_draft, original_review, package, source_currentness, *,
-                      final_draft=None, date_derivation=None):
+                      source_records=(), final_draft=None, date_derivation=None):
     """Return a detached (final draft, proof), or (unchanged draft, None).
 
     Supplying a final draft and proof verifies their exact recomputation. Both
@@ -82,6 +82,19 @@ def derive_and_verify(original_draft, original_review, package, source_currentne
     currentness = source_currentness[0]
     _require(currentness.source_id == package.source_ids[0] and currentness.result == 'PASS'
              and currentness.currency_family == 'CURRENT_VERSION', 'CURRENTNESS')
+    from .evidence import _source_body_provenance_is_bound
+    _require(type(source_records)is tuple and len(source_records)==1
+        and type(source_records[0])is dict,'BODY_PROVENANCE')
+    record=source_records[0];origin=record.get('body_provenance')
+    _require(_source_body_provenance_is_bound(record) and type(origin)is dict
+        and origin['kind']=='GOVUK_CONTENT_API_PAGE_TEXT'
+        and record.get('source_id')==currentness.source_id
+        and record.get('publication_time')==currentness.publication_time
+        and record.get('language')=='en-GB'
+        and origin['transport_evidence_digest']==currentness.evidence_digest
+        and origin['body_digest']==digest_bytes(package.passages[0].encode())
+        and dict(package.resolved_evidence_records).get(record['record_id'])==digest_canonical(record),
+        'BODY_PROVENANCE')
     source = package.passages[0]
     occurrences = list(_YESTERDAY.finditer(source))
     _require(len(occurrences) == 1, 'SOURCE_TOKEN_AMBIGUOUS')
@@ -146,6 +159,7 @@ def derive_and_verify(original_draft, original_review, package, source_currentne
              'source_package_digest': package.digest, 'source_id': currentness.source_id, 'claim_id': claim.claim_id,
              'source_body_digest': digest_bytes(source.encode()), 'source_claim_digest': digest_bytes(claim.claim.encode()),
              'source_currentness_digest': digest_canonical(currentness.value()), 'anchor': anchor,
+             'source_record_digest':digest_canonical(record),
              'source_relative_range': {'token': occurrence.group(), 'start_byte': len(source[:occurrence.start()].encode()),
                                        'end_byte': len(source[:occurrence.end()].encode())},
              'substitutions': substitutions}

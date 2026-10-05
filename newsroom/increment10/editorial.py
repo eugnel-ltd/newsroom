@@ -884,6 +884,7 @@ class NativeEditorial:
                         admission_decision_id=decision.decision_id,
                         require_current=require_current_sources,
                         source_currentness=policy.currentness,
+                        source_records=retained.source_records,
                         **({'cached_only': True} if story_cached_only else {}),
                     )
                 except NativeStoryWriterHold as exc:
@@ -897,7 +898,7 @@ class NativeEditorial:
                 if check_reused_source_currency:
                     require_current_sources()
             validators = validate_retained_story(copy, evaluated, writer_review, story_format,
-                source_currentness=policy.currentness)
+                source_currentness=policy.currentness,source_records=retained.source_records)
             if not validators or any(item.result != "PASS" for item in validators):
                 raise EditorialHold(reason="NATIVE_STORY_SOURCE_SUPPORT_HOLD")
             return StoryVersion(

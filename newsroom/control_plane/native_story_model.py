@@ -222,7 +222,7 @@ class NativeStoryModel:
                     return system
         raise ModelUsageAdmissionError("retained draft prompt is unknown", reason_code="NATIVE_STORY_PROMPT_UNKNOWN")
 
-    def write(self, package, *, require_current=lambda: None, source_currentness=(), **identities):
+    def write(self, package, *, require_current=lambda: None, source_currentness=(), source_records=(), **identities):
         from dataclasses import replace
         from .native_story_writer import (
             DRAFT_SCHEMA, REVIEW_SCHEMA, REVIEW_SYSTEM,
@@ -236,7 +236,7 @@ class NativeStoryModel:
             require_current()
             return self.call(request, phase="REVIEW", schema=REVIEW_SCHEMA, system=REVIEW_SYSTEM, **identities)
         result = write_native_story(package, generate=generate, review=review,
-            source_currentness=source_currentness)
+            source_currentness=source_currentness,source_records=source_records)
         require_current()
         record = result.review.as_record()
         record["model_receipts"] = self.receipts

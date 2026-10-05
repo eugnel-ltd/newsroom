@@ -6,10 +6,28 @@ import pytest
 
 from newsroom.authority.canonical import digest_bytes, digest_canonical
 from newsroom.control_plane.evidence import EvidencePackage, GovernedClaimStatus
-from newsroom.control_plane.native_story_dates import derive_and_verify
+from newsroom.control_plane.native_story_dates import derive_and_verify as _derive
 from newsroom.control_plane.native_story_writer import NativeStoryWriterHold
 from newsroom.increment10.editorial import SourceCurrentness
 from newsroom.tests.test_factual_localisation import _claim
+
+
+def _source_record(text):
+    from newsroom.control_plane.evidence import _SOURCE_RECORD_FIELDS
+    record={key:'fixture'for key in _SOURCE_RECORD_FIELDS}
+    record.update(record_id=digest_bytes(b'acquisition'),source_id='UK-01',
+        originating_artefact_digest=digest_bytes(text.encode()),language='en-GB',
+        publication_time='2026-10-02T15:08:14.000000Z',
+        body_provenance={'version':'newsroom.acquisition-body-provenance.v1',
+            'kind':'GOVUK_CONTENT_API_PAGE_TEXT','body_digest':digest_bytes(text.encode()),
+            'acquisition_receipt_digest':digest_bytes(b'acquisition'),
+            'transport_evidence_digest':digest_bytes(b'transport')})
+    return record
+
+
+def derive_and_verify(draft,review,package,currentness,**kwargs):
+    return _derive(draft,review,package,currentness,
+        source_records=kwargs.pop('source_records',(_source_record(package.passages[0]),)),**kwargs)
 
 
 def _fixture():
@@ -23,6 +41,8 @@ def _fixture():
     package = EvidencePackage('candidate', 'hypothesis', ('signal',), ('lead',),
                               ('UK-01',), (digest_bytes(text.encode()),), (text,),
                               governed_claims=(claim,))
+    record=_source_record(text)
+    package=replace(package,resolved_evidence_records=((record['record_id'],digest_canonical(record)),))
     draft = {'title': '英國內政部：改動須經昨日已展開的諮詢',
              'body': '英國內政部表示，'+rendered, 'format': 'BRIEF',
              'evidence_links': [{'governed_claim_id': 'launch', 'rendered_assertion': rendered}]}
@@ -139,7 +159,10 @@ def test_retained_derivation_is_recomputed_not_trusted(case):
 def test_calendar_boundary_arithmetic_keeps_day_precision(instant, expected):
     draft, review, package, currentness = _fixture()
     currentness = (replace(currentness[0], publication_time=instant, version_reference=instant),)
-    _, proof = derive_and_verify(draft, review, package, currentness)
+    record=_source_record(package.passages[0]);record['publication_time']=instant
+    package=replace(package,resolved_evidence_records=((record['record_id'],digest_canonical(record)),))
+    review['source_package_digest']=package.digest
+    _, proof = derive_and_verify(draft, review, package, currentness,source_records=(record,))
     assert proof['anchor']['resolved_date'] == expected
 
 
@@ -172,3 +195,25 @@ def test_byte_ranges_reject_boolean_equality_in_a_retained_proof():
     proof['substitutions'][0]['start_byte'] = False
     with pytest.raises(NativeStoryWriterHold, match='QUALITY_HOLD'):
         derive_and_verify(draft, review, package, currentness, final_draft=final, date_derivation=proof)
+
+
+@pytest.mark.parametrize('case',['missing','asset','body','receipt','transport','record-digest','unknown-field','kind-type'])
+def test_publisher_clock_requires_authenticated_page_text_body_origin(case):
+    draft,review,package,currentness=_fixture()
+    record=_source_record(package.passages[0])
+    if case=='missing':records=()
+    else:
+        if case=='asset':record['body_provenance']['kind']='GOVUK_DECLARED_ASSET_TEXT'
+        elif case=='body':record['body_provenance']['body_digest']=digest_bytes(b'other')
+        elif case=='receipt':record['body_provenance']['acquisition_receipt_digest']=digest_bytes(b'other')
+        elif case=='transport':record['body_provenance']['transport_evidence_digest']=digest_bytes(b'other')
+        elif case=='unknown-field':record['body_provenance']['trust_me']=True
+        elif case=='kind-type':record['body_provenance']['kind']=[]
+        records=(record,)
+        if case!='record-digest':
+            package=replace(package,resolved_evidence_records=((record['record_id'],digest_canonical(record)),))
+            review['source_package_digest']=package.digest
+        else:
+            record['publisher']='changed'
+    with pytest.raises(NativeStoryWriterHold,match='BODY_PROVENANCE'):
+        _derive(draft,review,package,currentness,source_records=records)

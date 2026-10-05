@@ -614,6 +614,7 @@ def open_native_pipeline(
             from .native_story_writer import NativeStoryWriterHold
             from .writer import WriterDispatchError, CliProcessError, CliTimeoutError
             currentness = identities.pop("source_currentness")
+            source_records = identities.pop('source_records',())
             cached_only = identities.pop('cached_only',False)
             def require_story_sources():
                 require_current_story_sources(package, currentness)
@@ -625,7 +626,7 @@ def open_native_pipeline(
             try:
                 model = NativeStoryModel(usage, load_story_model_policies(usage),
                     fence=writer_fence, stop_check=require_story_sources, clock=clock,cached_only=cached_only)
-                result = model.write(package, **identities)
+                result = model.write(package,source_currentness=currentness,source_records=source_records, **identities)
                 require_story_sources()
                 return result
             except (ModelUsageAdmissionError, NativeStoryWriterHold) as exc:
