@@ -267,8 +267,9 @@ class NativeClaimLocaliser:
                     "WHERE invocation_id=? AND state='DISPATCH_STARTED'", (allocation.invocation_id,)).fetchall()
                 if len(dispatches) != 1 or tuple(dispatches[0]) != (_utc_text(terminal.dispatch_at), allocation.request_digest):
                     raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
-            ModelUsageService._validate_terminal(terminal, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR, policy,
-                requested_max_output_tokens=allocation.max_output_tokens)
+            if ModelUsageService._validate_terminal(terminal, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR, policy,
+                    requested_max_output_tokens=allocation.max_output_tokens) is not None:
+                raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
             repair_of = legacy.invocation_id
         prompt, snapshot, envelope, manifest = self._input(state, repair_of=repair_of, **scope)
         prior = _retained_allocation(self.usage, envelope=envelope,

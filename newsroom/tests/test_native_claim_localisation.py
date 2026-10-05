@@ -361,3 +361,14 @@ def test_pre_dispatch_validation_error_is_not_output_wire_repair_credit(tmp_path
         with pytest.raises(LocalisationHold):
             _localiser(usage, runtime, fence, runner).localise(state, **scope)
         assert calls == []
+
+
+def test_recomputed_legacy_policy_breach_cannot_grant_repair_credit(tmp_path, monkeypatch):
+    args, usage, state, runner, fence, calls = case(tmp_path, monkeypatch)
+    with open_native_runtime(**args) as runtime:
+        scope = _scope(runtime)
+        _legacy_result(usage, runtime, state, scope, outcome='LOCALISATION_FAILED', failure_class='ValidationError')
+        monkeypatch.setattr(ModelUsageService, '_validate_terminal', staticmethod(lambda *_a, **_k: 'MAX_TOTAL_TOKENS_EXCEEDED'))
+        with pytest.raises(LocalisationHold):
+            _localiser(usage, runtime, fence, runner).localise(state, **scope)
+        assert calls == []
