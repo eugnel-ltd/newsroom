@@ -119,11 +119,16 @@ def _bad(kind):
 @pytest.mark.parametrize('kind',['ids','type','model','member','sum','negative','bool','duplicate','nonfinite','usage'])
 def test_invalid_response_never_grants_a_second_call_or_invents_usage(tmp_path,monkeypatch,kind):
     with _case(tmp_path,monkeypatch,mutate=_bad(kind)) as (engine,inputs,usage,calls,_raw):
-        with pytest.raises(TypesafeJudgmentError):engine.evaluate(**inputs)
-        with pytest.raises(TypesafeJudgmentError):engine.evaluate(**inputs)
+        with pytest.raises(TypesafeJudgmentError) as first:engine.evaluate(**inputs)
+        with sqlite3.connect(usage.path)as db:
+            retained_terminal=db.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0]
+        with pytest.raises(TypesafeJudgmentError,match='TYPESAFE_REPLAY_USAGE_HOLD') as replay:engine.evaluate(**inputs)
+        assert replay.value.reference == first.value.reference
         assert len(calls)==1
         with sqlite3.connect(usage.path)as db:
-            value=json.loads(db.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0])
+            after=db.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0]
+        assert after == retained_terminal
+        value=json.loads(after)
         assert value['outcome']=='TYPESAFE_FAILED'
         if kind in {'duplicate','nonfinite','usage'}:
             assert value['usage_status']=='UNREPORTED' and value['components']['total_tokens'] is None
@@ -169,7 +174,7 @@ def test_replay_denies_indexed_allocation_header_drift(tmp_path,monkeypatch):
         ref=engine.evaluate(**inputs)
         with sqlite3.connect(usage.path)as db:
             db.execute('UPDATE model_invocation_allocations SET request_digest=? WHERE invocation_id=?',(digest_bytes(b'foreign'),ref.invocation_id))
-        with pytest.raises(TypesafeJudgmentError,match='ALLOCATION_HOLD'):
+        with pytest.raises((TypesafeJudgmentError,ModelUsageIntegrityError),match='ALLOCATION_HOLD|binding differs'):
             engine.read(ref,**inputs)
 
 

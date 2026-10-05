@@ -311,6 +311,9 @@ class TypesafeJudgment:
             connection.execute('PRAGMA query_only=ON')
             connection.execute('BEGIN')
             allocation, terminal = _retained_terminal_allocation(connection, reference.invocation_id)
+            if (terminal.usage_status is not UsageStatus.REPORTED
+                    or terminal.outcome != 'TYPESAFE_COMPLETE' or terminal.policy_breach):
+                raise TypesafeJudgmentError('TYPESAFE_REPLAY_USAGE_HOLD', reference=reference)
             original_policy = _policy_for_allocation(connection, allocation)
             _require_reported_telemetry(connection, terminal)
             old, current = asdict(original_policy), asdict(self.policy)
