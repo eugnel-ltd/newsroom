@@ -101,4 +101,3 @@ def read_current_result(qualifier, candidate, base, sources, acquired, *, scope,
         raise QualificationHold('QUALIFICATION_PRIOR_DECISION_CHANGED')
     with qualifier.fence(current,proof):
         return JudgedAssessment(NativeAssessmentExecution(checked['materialisation']['materialised_text'],{}),raw,decision.admission.admission_id)
-
