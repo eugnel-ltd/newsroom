@@ -1475,7 +1475,7 @@ def test_admission_policy_identity_binds_all_admission_subpolicies() -> None:
         f"{GOVERNED_CLAIM_POLICY_VERSION}+{GOVERNED_INPUT_SCHEMA_VERSION}+"
         f"{NAMED_ENTITY_POLICY_VERSION}+{ORIGINALITY_POLICY_VERSION}+"
         f"{ZH_HANT_HK_SHAPE_POLICY_VERSION}+{FACTUAL_LOCALISATION_POLICY_VERSION}+"
-        "newsroom.qualification-relation.v4"
+        "newsroom.qualification-relation.v5"
     )
 
 

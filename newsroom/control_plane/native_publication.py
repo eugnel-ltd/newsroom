@@ -1184,7 +1184,22 @@ class NativePublicationContinuation:
 
         semantic_only = False
         semantic_intent = facts.get('semantic_assessment_intent')
+        retained_semantic_consumer = (
+            type(semantic_intent) is dict
+            and semantic_intent.get('contract') == self._semantic_intent_contract
+            and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
+                 or progress.get('stage') == 'EVIDENCE_HOLD'
+                 and facts.get('reason') == 'SEMANTIC_INTENT_INPUT_CHANGED_HOLD')
+            and facts.get('failure_class') == 'EvidencePackageError'
+            and same_assessment_producer(facts.get('assessment_contract_version'), self._assessment_contract_version)
+            and facts.get('assessment_contract_version') != self._assessment_contract_version
+            and facts.get('retained_qualification_checked_contract') != self._assessment_contract_version
+            and bool(facts.get('graphiti_receipts')) and bool(facts.get('intake_receipt_id'))
+            and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
+                'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id'))
+        )
         if (self._semantic_origin_failure is not None
+                and not retained_semantic_consumer
                 and facts.get('graphiti_receipts') and facts.get('intake_receipt_id')
                 and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
                     'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id'))
@@ -1258,7 +1273,7 @@ class NativePublicationContinuation:
                 }:
                     old_provider_failure = retained
         if old_provider_failure is not None or (
-            progress.get("stage") == "EVIDENCE_HOLD"
+            not retained_semantic_consumer and progress.get("stage") == "EVIDENCE_HOLD"
             and assessment_revalidation_due(facts, self._assessment_contract_version)
         ):
             facts = current_facts()
@@ -1299,7 +1314,7 @@ class NativePublicationContinuation:
                 revision_id, stage="ASSESSMENT_CONTRACT_REVALIDATION", facts=facts
             )
 
-        if (progress.get("stage") == "ASSESSMENT_INTERRUPTED" or admission_recovery) and not semantic_only:
+        if (progress.get("stage") == "ASSESSMENT_INTERRUPTED" or admission_recovery) and not semantic_only and not retained_semantic_consumer:
             retained_failure = None
             if (
                 facts.get("failure_class") == "EvidencePackageError"
@@ -1389,7 +1404,7 @@ class NativePublicationContinuation:
                 "EVIDENCE_HOLD", str(facts.get("reason")), None
             )
         if decision_value is None or package_id is None:
-            if not semantic_only and progress.get("stage") in {
+            if not semantic_only and not retained_semantic_consumer and progress.get("stage") in {
                 "ASSESSMENT_STARTED",
                 "ASSESSMENT_INTERRUPTED",
             }:
@@ -1401,7 +1416,7 @@ class NativePublicationContinuation:
                 return NativePublicationContinuationResult(
                     "ASSESSMENT_INTERRUPTED", facts["reason"], None
                 )
-            if progress.get("stage") == "EVIDENCE_HOLD":
+            if progress.get("stage") == "EVIDENCE_HOLD" and not retained_semantic_consumer:
                 reason = facts.get("reason")
                 retryable_acquisition = (
                     facts.get("acquisition_retryable") is True
@@ -1448,7 +1463,11 @@ class NativePublicationContinuation:
                 nonlocal assessment_started, facts
                 facts = current_facts()
                 assessment_started = True
-                facts["assessment_started_at"] = acquisition_started_at
+                if retained_semantic_consumer:
+                    facts['retained_qualification_checked_contract'] = self._assessment_contract_version
+                    facts['retained_qualification_checked_at'] = acquisition_started_at
+                else:
+                    facts["assessment_started_at"] = acquisition_started_at
                 if self._assessment_contract_version is not None:
                     facts["assessment_contract_version"] = self._assessment_contract_version
                 self._journal.advance(
@@ -1486,7 +1505,7 @@ class NativePublicationContinuation:
                 )
                 consumer_only_revalidation = same_assessment_producer(
                     prior_contract, self._assessment_contract_version,
-                )
+                ) or retained_semantic_consumer
                 if revision_id not in self._sources and self._evidence_sources_for is not None:
                     selected_sources = self._evidence_sources_for(revision_id)
                     if (type(selected_sources) is not tuple or not selected_sources
@@ -1500,6 +1519,7 @@ class NativePublicationContinuation:
                     before_assessment=before_assessment,
                     assessment_cached_only=consumer_only_revalidation and not semantic_only,
                     **({'assessment_semantic_only': True} if semantic_only else {}),
+                    **({'assessment_qualification_cached_only': True} if retained_semantic_consumer else {}),
                     **({'before_semantic_assessment': bind_semantic_input} if semantic_only else {}),
                     proof=self._runtime.proof,
                 )

@@ -827,6 +827,16 @@ def open_native_pipeline(
                         scope=judgment_scope(candidate, base, sources, acquired), proof=proof)
 
                 assessor._qualification = qualify_source
+                def read_qualified_source(candidate, base, sources, acquired):
+                    from .native_source_qualification import QualificationHold
+                    from .native_source_qualification_replay import read_current_result
+                    try:
+                        return read_current_result(qualifier, candidate, base, sources, acquired,
+                            scope=judgment_scope(candidate, base, sources, acquired), proof=proof)
+                    except QualificationHold as exc:
+                        raise NativeEvidenceHold(str(exc), sources[0].unit.source_id) from exc
+
+                assessor._retained_qualification = read_qualified_source
 
             from .native_graphiti_judgments import NativeGraphitiJudgments
             graph_judgments = NativeGraphitiJudgments(judgments=judgments)

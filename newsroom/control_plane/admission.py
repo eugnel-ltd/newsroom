@@ -121,7 +121,7 @@ _PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS = frozenset(
     "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
     "newsroom.qualification-relation.v3"
 }
-QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v4"
+QUALIFICATION_RELATION_POLICY_VERSION = "newsroom.qualification-relation.v5"
 # Known historical identity; later consumer subpolicy changes must not relabel it.
 _PRIOR_V10_WRITE_ADMISSION_POLICY_VERSION = (
     "newsroom.write-admission.v10+newsroom.evid-012.v7+"
@@ -130,6 +130,10 @@ _PRIOR_V10_WRITE_ADMISSION_POLICY_VERSION = (
     "newsroom.named-entity.v16+newsroom.cont-originality.v3+"
     "newsroom.zh-hant-hk-shape.v14+newsroom.factual-localisation.v2+"
     "newsroom.qualification-relation.v3"
+)
+_PRIOR_V10_PROCESS_WRITE_ADMISSION_POLICY_VERSION = (
+    _PRIOR_V10_WRITE_ADMISSION_POLICY_VERSION.rsplit('+', 1)[0]
+    + "+newsroom.qualification-relation.v4"
 )
 _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION = (
     "newsroom.write-admission.v9+newsroom.evid-012.v7+"
@@ -451,7 +455,8 @@ def _confirmed_public_process_launch_is_proven(
     """A completed public consultation launch is not enactment of its proposals."""
     if (not span or source_context.count(span) != 1
             or span not in claim.claim or span not in claim.supporting_excerpt
-            or reader_action != span):
+            or not reader_action or reader_action not in claim.claim
+            or reader_action not in claim.supporting_excerpt):
         return False
     witness = span.strip().rstrip(".!?。！？")
     sentences = [part.strip() for part in re.split(r"[.!?。！？]+", source_context) if part.strip()]
@@ -504,10 +509,17 @@ def _confirmed_public_process_launch_is_proven(
         if (re.search(r"consultation|statement|claim|assertion|諮詢|說法|聲明", neighbour, flags=re.IGNORECASE)
                 and _qualification_text_is_negative(neighbour)):
             return False
-    if re.search(r"public\s+consultation|公眾諮詢", parent, flags=re.IGNORECASE):
+    if reader_action == span and re.search(r"public\s+consultation|公眾諮詢", parent, flags=re.IGNORECASE):
         return True
     return any(
-        re.match(r"(?:the|this) consultation\b|是次諮詢|該諮詢", neighbour, flags=re.IGNORECASE)
+        re.match(r"(?:the|this) consultation\b|it\b|是次諮詢|該諮詢", neighbour, flags=re.IGNORECASE)
+        and (not re.match(r"it\b", neighbour, flags=re.IGNORECASE)
+             or len(re.findall(r"\bconsultation\b", parent, flags=re.IGNORECASE)) == 1
+             and not re.search(r"\b(?:programme|scheme|campaign|survey|project)\b", parent, flags=re.IGNORECASE))
+        and (reader_action == span or reader_action in neighbour)
+        and not _qualification_text_is_negative(neighbour)
+        and not re.search(r"\b(?:if|unless|subject to|conditional|different|another|separate)\b|"
+                         r"假如|如果|倘若|另一|其他", neighbour, flags=re.IGNORECASE)
         and re.search(r"public|stakeholders|citizens|公眾|市民|業界", neighbour, flags=re.IGNORECASE)
         and re.search(r"submit|respond|views|comments|參與|提交|意見|回應", neighbour, flags=re.IGNORECASE)
         for neighbour in sentences[index+1:index+2]
@@ -819,6 +831,7 @@ class WriteAdmissionDecision:
             *_PRIOR_V9_WRITE_ADMISSION_POLICY_VERSIONS,
             _PRIOR_CURRENT_WRITE_ADMISSION_POLICY_VERSION,
             _PRIOR_V10_WRITE_ADMISSION_POLICY_VERSION,
+            _PRIOR_V10_PROCESS_WRITE_ADMISSION_POLICY_VERSION,
         }:
             raise ValueError("unsupported write-admission policy version")
         expected = _decision_id(

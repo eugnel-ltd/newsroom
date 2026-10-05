@@ -126,6 +126,7 @@ REASSESSABLE_HOLDS = frozenset({
     "WEATHER_EVIDENCE_METADATA_HOLD",
     "EVIDENCE_VALIDATION_HOLD",
     "ASSESSOR_REVALIDATION_INPUT_CHANGED_HOLD",
+    "SEMANTIC_INTENT_INPUT_CHANGED_HOLD",
 })
 
 
@@ -2098,6 +2099,7 @@ class AutonomousNativeEvidenceAssessor:
         dispatch_fence: Callable[[], AbstractContextManager] | None = None,
         judgments=None,
         qualification=None,
+        retained_qualification=None,
     ) -> None:
         default_dispatch = dispatch is None
         dispatch = dispatch or _dispatch_grok
@@ -2115,6 +2117,9 @@ class AutonomousNativeEvidenceAssessor:
         if qualification is not None and not callable(qualification):
             raise NativeEvidenceError('native qualification exception differs')
         self._qualification = qualification
+        if retained_qualification is not None and not callable(retained_qualification):
+            raise NativeEvidenceError('native retained qualification reader differs')
+        self._retained_qualification = retained_qualification
         self._dispatch_fence = dispatch_fence or nullcontext
 
     def __call__(self, candidate, base, sources, acquired):
@@ -2127,8 +2132,11 @@ class AutonomousNativeEvidenceAssessor:
         self, candidate, base, sources, acquired, *, before_dispatch,
         cached_only: bool = False,
         semantic_only: bool = False,
+        qualification_cached_only: bool = False,
     ):
-        if type(cached_only) is not bool or type(semantic_only) is not bool or cached_only and semantic_only:
+        if (type(cached_only) is not bool or type(semantic_only) is not bool
+                or type(qualification_cached_only) is not bool or cached_only and semantic_only
+                or qualification_cached_only and (not cached_only or semantic_only)):
             raise NativeEvidenceError("native assessment cache mode differs")
         source_id = sources[0].unit.source_id if sources else candidate.candidate_id
         validation_feedback = None
@@ -2162,6 +2170,20 @@ class AutonomousNativeEvidenceAssessor:
                 raise NativeEvidenceHold(
                     "SOURCE_POLICY_FACTS_HOLD", source.unit.source_id
                 )
+        if qualification_cached_only:
+            from .native_assessor_judgments import JudgedAssessment
+            if self._retained_qualification is None:
+                raise NativeEvidenceHold('QUALIFICATION_RETAINED_RESULT_UNAVAILABLE', source_id)
+            with self._dispatch_fence():
+                if before_dispatch is not None:
+                    before_dispatch()
+                result = self._retained_qualification(candidate, base, sources, acquired)
+            if type(result) is not JudgedAssessment:
+                raise NativeEvidenceHold('QUALIFICATION_RETAINED_RESULT_UNAVAILABLE', source_id)
+            try:
+                return self._validated_execution(result.execution, candidate, base, sources, acquired)
+            except EvidencePackageError as exc:
+                raise NativeEvidenceHold(_contract_hold_reason(exc), source_id) from exc
         def qualification_exception(fallback):
             from .native_assessor_judgments import JudgedAssessment
             if cached_only or self._qualification is None or not fallback.details.get('source_binding'):
