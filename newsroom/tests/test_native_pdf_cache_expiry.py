@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from newsroom.authority import ObjectAdmissionRequest
+from newsroom.authority import ObjectAdmissionRequest, DiagnosticHistoryExpired
 from newsroom.authority._graphiti_increment4_system import _AUTHORITY_COMPOSITION_TOKEN
 from newsroom.authority.canonical import digest_canonical
 from newsroom.authority.native_current_checkpoint_migrations import initialise_empty_checkpoint_store
@@ -56,7 +56,8 @@ def _expired_cache(tmp_path, monkeypatch, *, negative=False):
         args = {**args,'authority_path':selected}
     with open_native_runtime(**args) as runtime:
         # Exactly the live gap: original reservation, no activation/admission.
-        assert runtime.authority.objects.committed_admission(request,proof=runtime.proof) is None
+        with pytest.raises(DiagnosticHistoryExpired):
+            runtime.authority.objects.committed_admission(request,proof=runtime.proof)
         with sqlite3.connect(selected) as db:
             assert not db.execute('SELECT 1 FROM object_admissions WHERE admission_id=?',(str(retained.admission.admission_id),)).fetchone()
             tombstone = db.execute('SELECT * FROM native_expired_command_keys WHERE key=?',('lifecycle-activate:'+request.idempotency_key,)).fetchone()
@@ -82,10 +83,39 @@ def test_expired_pdf_cache_returns_exact_fresh_document_or_original_hold(tmp_pat
             assert document == original
             assert 'Complete first page.' in document.body_text and 'Complete second page.' in document.body_text
         assert calls == [1]
-        assert runtime.authority.objects.committed_admission(request,proof=runtime.proof) is None
+        with pytest.raises(DiagnosticHistoryExpired):
+            runtime.authority.objects.committed_admission(request,proof=runtime.proof)
         with sqlite3.connect(args['authority_path']) as db:
             assert db.execute('SELECT * FROM native_expired_command_keys WHERE key=?',('lifecycle-activate:'+request.idempotency_key,)).fetchone()==tombstone
             assert not db.execute('SELECT 1 FROM object_lifecycle_operations WHERE idempotency_key=?',(request.idempotency_key,)).fetchone()
+
+
+@pytest.mark.parametrize('negative',[False,True])
+def test_expired_optional_cache_reparse_has_no_staging_or_security_regrowth(tmp_path,monkeypatch,negative):
+    with _expired_cache(tmp_path,monkeypatch,negative=negative) as (_runtime,intake,kwargs,_request,args,_tombstone,reason,original):
+        def counts():
+            with sqlite3.connect(args['authority_path']) as db:
+                tables=('object_staging_records','object_admission_preflights','authentication_contexts',
+                        'authorization_requests','authorization_decisions')
+                return {name:db.execute('SELECT count(*) FROM "'+name+'"').fetchone()[0]
+                        for name in tables}
+        before=counts()
+        for _ in range(2):
+            if negative:
+                with pytest.raises(GovUkPdfHold) as held:intake._parse_pdf(**kwargs)
+                assert held.value.reason_code==reason
+            else:
+                assert intake._parse_pdf(**kwargs)==original
+        assert counts()==before
+
+
+def test_expired_admission_denies_before_consuming_source_bytes(tmp_path,monkeypatch):
+    with _expired_cache(tmp_path,monkeypatch) as (runtime,_intake,_kwargs,request,_args,_tombstone,_reason,_original):
+        def source():
+            pytest.fail('expired admission consumed source bytes')
+            yield b'not read'
+        with pytest.raises(DiagnosticHistoryExpired):
+            runtime.authority.objects.admit(request,source(),proof=runtime.proof)
 
 
 def test_expired_cache_does_not_waive_current_raw_pdf_identity(tmp_path,monkeypatch):
@@ -100,7 +130,7 @@ def test_owner_stop_at_optional_cache_write_still_propagates(tmp_path,monkeypatc
     with _expired_cache(tmp_path,monkeypatch) as (runtime,intake,kwargs,_request,_args,_tombstone,_reason,_original):
         def stopped(*_values,**_named):
             raise VetoError('fixture signed owner stop')
-        intake._objects=SimpleNamespace(committed_admission=runtime.authority.objects.committed_admission,
+        intake._objects=SimpleNamespace(committed_admission=lambda *_args,**_kwargs:None,
             rehydrate=runtime.authority.objects.rehydrate,admit=stopped)
         with pytest.raises(VetoError,match='signed owner stop'):
             intake._parse_pdf(**kwargs)
