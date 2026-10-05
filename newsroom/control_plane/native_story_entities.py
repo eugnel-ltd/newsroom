@@ -24,15 +24,13 @@ def story_entity_names_are_bound(text, claims):
 
 def declared_source_speakers_are_retained(claims, links):
     """A publisher must not replace an explicitly named quoted Source speaker."""
-    import re
+    from .native_source_context_ranges import declared_speakers
 
     for claim in claims:
         linked = '\n'.join(link.rendered_assertion for link in links
                            if link.governed_claim_id == claim.claim_id)
-        for name, kind, _ in claim.named_entity_evidence:
-            if kind in {'PERSON', 'ORGANISATION'} and re.search(
-                re.escape(name) + r'\s+(?:said|says|stated|announced|warned|told)\s*:',
-                claim.claim, re.IGNORECASE,
-            ) and name not in linked:
-                return False
+        speakers = declared_speakers(claim.claim, tuple((name, kind)
+            for name, kind, _ in claim.named_entity_evidence))
+        if any(name not in linked for name in speakers):
+            return False
     return True

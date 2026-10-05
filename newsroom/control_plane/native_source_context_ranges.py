@@ -9,17 +9,21 @@ _FIRST_PERSON = re.compile(r'\b(?:we|our|us|I)\b', re.IGNORECASE)
 _SPEAKER = re.compile(r'''^\s*["“‘']?(?P<subject>[^:\n.!?;]{1,256}?)\s+(?:said|says|stated|announced)\s*:\s*\S''', re.IGNORECASE)
 
 
-def _has_speaker(segment) -> bool:
-    match = _SPEAKER.match(segment.text)
+def declared_speakers(text, entities):
+    """Use one Source-bound speaker grammar in grouping and copy validation."""
+    match = _SPEAKER.match(text)
     if match is None:
-        return False
+        return ()
     subject = match['subject'].strip()
     if any(character in subject for character in '{}[]<>'):
-        return False
-    # Names come only from this exact Source span, never publisher inference.
-    return any(kind in {'PERSON', 'ORGANISATION'} and (
+        return ()
+    return tuple(name for name, kind in entities if kind in {'PERSON', 'ORGANISATION'} and (
         subject == name or subject.endswith(' ' + name) or subject.startswith(name + ', ')
-    ) for name, kind in segment.entities)
+    ))
+
+
+def _has_speaker(segment) -> bool:
+    return bool(declared_speakers(segment.text, segment.entities))
 
 
 def context_candidates(view: SourceView) -> dict[str, dict]:
