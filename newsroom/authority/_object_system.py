@@ -6,7 +6,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from ._capability import _AuthorizedCommandGrant, _CapabilityIssuer
+from ._capability import _AuthorizedCommandGrant, _CapabilityIssuer, _derive_idempotency_namespace
 from ._event_system import _ReadBoundary
 from ._object_capability import (
     _AdmissionCommitGrant,
@@ -541,6 +541,14 @@ class _ObjectBoundary:
         # the input source is touched.
         if not rights_policy.preflight_allowed:
             raise ObjectAdmissionDenied(rights_policy.reason_code)
+        if replay_contract is None:
+            # An expired activation is not a fresh admission. Detect the exact
+            # existing reservation before staging bytes or retaining preflight.
+            self._store.find(
+                idempotency_namespace=_derive_idempotency_namespace(
+                    authentication, self._command_registry.resolve('object.admission.activate')),
+                idempotency_key='lifecycle-activate:' + request.idempotency_key,
+            )
         preflight = self._object_issuer.issue_preflight(
             preflight_id=preflight_id,
             request=request,
