@@ -2716,6 +2716,36 @@ def test_source_declared_acronym_revalidates_retained_output_without_dispatch(
     assert retained_rows() == before
 
 
+def test_retained_process_with_separate_public_invitation_passes_static_validation(
+    retained_22589_assessment,
+):
+    candidate, base, source, acquired, raw = _qualification_assessor_inputs(
+        retained_22589_assessment, kind="deadline",
+    )
+    launch = "The changes will be subject to a consultation which was launched yesterday."
+    invitation = "It seeks views from the public, industry and business to gauge how these changes would affect them."
+    text = launch + " " + invitation
+    claim = raw["package"]["governed_claims"][0]
+    claim.update(claim=text, supporting_excerpt=text,
+                 rendered_assertion_zh_hant_hk="諮詢已於昨日展開，向公眾、業界及企業徵求意見，以了解這些改動對他們的影響。")
+    qualification = raw["package"]["qualification_evidence"][0]
+    qualification["test_evidence"].update(
+        action_class="PROCESS", material_relation_span=launch,
+        reader_action="seeks views from the public, industry and business",
+    )
+    raw["package"]["substantive_new_information"] = [text]
+    body = text.encode()
+    base = replace(base, passages=(text,), observation_digests=(digest_bytes(body),))
+    acquired = SimpleNamespace(**{**vars(acquired), "body": body, "body_digest": digest_bytes(body)})
+    execution = NativeAssessmentExecution(canonical_json_bytes(raw).decode(), {})
+    result = AutonomousNativeEvidenceAssessor._validated_execution(
+        execution, candidate, base, (source,), (acquired,),
+    )
+    assert len(result.qualification_evidence) == 1
+    assert dict(result.qualification_evidence[0].test_evidence)["reader_action"] == qualification["test_evidence"]["reader_action"]
+    assert execution.text == canonical_json_bytes(raw).decode()
+
+
 def test_weather_record_metadata_failure_revalidates_once_per_consumer_contract():
     from newsroom.control_plane.native_assessor import assessment_revalidation_due
     from newsroom.control_plane.native_composition import ASSESSMENT_CONTRACT_VERSION

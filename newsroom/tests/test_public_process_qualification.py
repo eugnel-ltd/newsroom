@@ -79,6 +79,46 @@ def test_reader_action_and_public_antecedent_must_bind_exact_current_source():
     assert not proven(span,parent,source='The authority is considering a different process.')
 
 
+@pytest.mark.parametrize('invitation', [
+    'It seeks views from the public, industry and business to gauge how these changes would affect them.',
+    'This consultation seeks views from the public, industry and business.',
+])
+def test_separate_reader_action_binds_the_confirmed_process_and_public_invitation(invitation):
+    launch='The changes will be subject to a consultation which was launched yesterday.'
+    parent=launch+' '+invitation
+    assert proven(launch,parent,reader_action='seeks views from the public, industry and business')
+
+
+@pytest.mark.parametrize('suffix', [
+    'It will seek views from the public next year.',
+    'It does not seek views from the public.',
+    'If funding is granted, it seeks views from the public.',
+    'It seeks views from the public on a different consultation.',
+    'A separate programme was launched. It seeks views from the public.',
+])
+def test_reader_action_cannot_excise_invitation_modality_or_change_antecedent(suffix):
+    launch='The changes will be subject to a consultation which was launched yesterday.'
+    parent=launch+' '+suffix
+    assert not proven(launch,parent,reader_action='seeks views from the public')
+
+
+def test_reader_action_phrase_must_be_in_the_same_claim_and_source():
+    launch='The changes will be subject to a consultation which was launched yesterday.'
+    invitation='It seeks views from the public, industry and business.'
+    assert not proven(launch,launch,source=launch+' '+invitation,
+        reader_action='seeks views from the public, industry and business')
+
+
+@pytest.mark.parametrize('parent', [
+    'The government has launched a consultation alongside a survey.',
+    'The government has launched a consultation and another consultation.',
+])
+def test_pronoun_invitation_requires_one_unambiguous_process_in_parent(parent):
+    span='The government has launched a consultation'
+    text=parent+' It seeks views from the public.'
+    assert not proven(span,text,reader_action='seeks views from the public')
+
+
 def test_process_truth_does_not_supply_missing_substantive_newness():
     parent='The government has launched a public consultation on proposed controls.'
     assert proven('The government has launched a public consultation',parent)
@@ -88,16 +128,17 @@ def test_process_truth_does_not_supply_missing_substantive_newness():
     assert decision.decision=='REJECT' and decision.stable_reason_codes==('NO_SUBSTANTIVE_NEW_INFORMATION',)
 
 
-def test_prior_v10_relation_v3_decision_reads_without_becoming_current(tmp_path):
+@pytest.mark.parametrize('previous_relation', ['v3', 'v4'])
+def test_prior_v10_relation_decision_reads_without_becoming_current(tmp_path, previous_relation):
     from newsroom.control_plane import admission
     candidate,package=_candidate_package()
     current=DeterministicWriteAdmission().decide(candidate,package,decided_at='2026-10-05T00:00:00Z')
     record=current.as_record()
-    record['policy_version']=current.policy_version.rsplit('+',1)[0]+'+newsroom.qualification-relation.v3'
+    record['policy_version']=current.policy_version.rsplit('+',1)[0]+'+newsroom.qualification-relation.'+previous_relation
     values={key:getattr(current,key)for key in record if key not in {'decision_id','decided_at'}}
     values['policy_version']=record['policy_version'];record['decision_id']=_decision_id(**values)
     assert WriteAdmissionDecision.from_record(record).as_record()==record
-    assert current.policy_version.endswith('newsroom.qualification-relation.v4')
+    assert current.policy_version.endswith('newsroom.qualification-relation.v5')
     assert record['policy_version']!=admission.WRITE_ADMISSION_POLICY_VERSION
     from newsroom.control_plane.store import connect, retain_write_admission_decision
     old=WriteAdmissionDecision.from_record(record)
@@ -115,7 +156,7 @@ def test_prior_v10_relation_v3_decision_reads_without_becoming_current(tmp_path)
     assert connection.execute('SELECT count(*) FROM unpublished_write_admission_decisions').fetchone()[0]==2
     connection.close()
     with pytest.raises(ValueError,match='unsupported write-admission'):
-        WriteAdmissionDecision.from_record({**record,'policy_version':record['policy_version'].replace('relation.v3','relation.v99')})
+        WriteAdmissionDecision.from_record({**record,'policy_version':record['policy_version'].replace('relation.'+previous_relation,'relation.v99')})
 
 
 def test_context_denial_cannot_fall_back_to_generic_process_keywords():
@@ -164,3 +205,22 @@ def test_current_package_admits_confirmed_process_but_not_clipped_denial():
     denied=replace(package,passages=(package.passages[0].replace(parent,'Officials deny that '+parent),))
     result=DeterministicWriteAdmission().decide(candidate,denied,decided_at='2026-10-05T00:00:00Z')
     assert result.decision=='HOLD' and result.stable_reason_codes==('QUALIFICATION_EVIDENCE_NOT_EXACT',)
+
+
+def test_current_package_admits_exact_separate_public_reader_action():
+    from newsroom.tests.test_zero_quota_write_loop import _bind_fixture_entities
+    launch='The changes will be subject to a consultation which was launched yesterday.'
+    text=launch+' It seeks views from the public, industry and business.'
+    candidate,package=_candidate_package()
+    claim=_bind_fixture_entities(replace(package.governed_claims[1],claim=text,supporting_excerpt=text,
+        rendered_assertion_zh_hant_hk='諮詢已於昨日展開，向公眾、業界及企業徵求意見。'))
+    q=replace(qualification(launch,reader_action='seeks views from the public, industry and business'),
+        governed_claim_id=claim.claim_id,qualification_record_id=package.qualification_evidence[1].qualification_record_id)
+    package=replace(package,passages=(package.passages[0]+'\n'+text,),
+        governed_claims=(package.governed_claims[0],claim),
+        substantive_new_information=(package.governed_claims[0].claim,text),
+        qualification_evidence=(package.qualification_evidence[0],q),
+        resolved_evidence_records=(*package.resolved_evidence_records,
+            *((record,'fixture-entity-digest')for _,_,record in claim.named_entity_evidence)))
+    result=DeterministicWriteAdmission().decide(candidate,package,decided_at='2026-10-05T00:00:00Z')
+    assert result.decision=='WRITE_READY',result.stable_reason_codes
