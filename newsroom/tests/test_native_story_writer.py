@@ -80,6 +80,55 @@ def test_natural_multi_paragraph_report_is_separately_reviewed_against_compact_s
     assert result.copy.body == DRAFT["body"]
     assert result.copy.evidence_package_digest == package.digest
     assert result.format == "ARTICLE"
+
+
+def test_one_verbatim_evidence_span_can_support_multiple_reviewed_sentences():
+    draft=deepcopy(DRAFT)
+    paragraph='政府計劃開設兩個社區中心。每個中心提供100個名額。'
+    draft['body']=paragraph+'\n\n'+DRAFT['body'].split('\n\n')[1]
+    draft['evidence_links'][1]['rendered_assertion']=paragraph
+    def review(request):
+        result=_review(request)
+        result['sentence_support']=[
+            {'sentence_index':0,'claim_ids':['headline','capacity'],'verdict':'SUPPORTED'},
+            {'sentence_index':1,'claim_ids':['headline','capacity'],'verdict':'SUPPORTED'},
+            {'sentence_index':2,'claim_ids':['capacity'],'verdict':'SUPPORTED'},
+            {'sentence_index':3,'claim_ids':['replacement','estimate'],'verdict':'SUPPORTED'},
+        ]
+        return result
+    result=write_native_story(_package(),generate=lambda _:draft,review=review)
+    assert result.copy.body==draft['body']
+    assert all(item.result=='PASS'for item in result.validators)
+
+
+def test_source_dated_copy_retains_original_review_and_revalidates_derivation():
+    from newsroom.authority.canonical import digest_canonical
+    from newsroom.tests.test_native_story_dates import _fixture,_source_record
+    from newsroom.control_plane.native_story_writer import validate_retained_story
+    draft,review,package,currentness=_fixture()
+    # Date mechanics alone: publisher-name localisation requires its own
+    # governed entity evidence and is not supplied by this disposable fixture.
+    draft['title']=draft['title'].removeprefix('英國內政部：')
+    draft['body']=draft['body'].removeprefix('英國內政部表示，')
+    review['draft_digest']=digest_canonical(draft)
+    sources=(_source_record(package.passages[0]),)
+    result=write_native_story(package,generate=lambda _:deepcopy(draft),review=lambda _:deepcopy(review),
+        source_currentness=currentness,source_records=sources)
+    record=result.review.as_record()
+    assert record['draft_digest']==review['draft_digest']
+    assert record['date_derivation']['original_draft']==draft
+    assert '2026年10月1日'in result.copy.body
+    assert all(item.result=='PASS'for item in validate_retained_story(result.copy,package,record,result.format,
+        source_currentness=currentness,source_records=sources))
+    tampered=deepcopy(record);tampered['date_derivation']['anchor']['resolved_date']='2026-10-04'
+    assert any(item.result=='FAIL'for item in validate_retained_story(result.copy,package,tampered,result.format,
+        source_currentness=currentness,source_records=sources))
+    from dataclasses import replace
+    for changed in (replace(result.copy,writer_id='different-writer'),
+                    replace(result.copy,evidence_package_digest='sha256:'+'f'*64)):
+        checks=validate_retained_story(changed,package,record,result.format,
+            source_currentness=currentness,source_records=sources)
+        assert any(item.validator=='NATIVE_STORY_PACKAGE_BINDING'and item.result=='FAIL'for item in checks)
     assert result.review.as_record()["verdict"] == "PASS"
     assert all(check.result == "PASS" for check in result.validators)
 
@@ -103,6 +152,16 @@ def test_fabricated_or_unmapped_copy_is_held_even_if_a_review_asserts_pass(mutat
         draft["evidence_links"].pop()
     with pytest.raises(NativeStoryWriterHold):
         write_native_story(_package(), generate=lambda _: draft, review=_review)
+
+
+def test_story_hold_reports_all_proven_validator_failures_together():
+    draft=deepcopy(DRAFT)
+    draft['body']=draft['body'].replace('100','999').replace('政府計劃','李小明公布政府計劃')
+    with pytest.raises(NativeStoryWriterHold)as held:
+        write_native_story(_package(),generate=lambda _:draft,review=_review)
+    assert 'NATIVE_STORY_FACTUAL_NUMBERS'in held.value.stable_reason_codes
+    assert 'NATIVE_STORY_FACTUAL_ENTITIES'in held.value.stable_reason_codes
+    assert str(held.value)==held.value.stable_reason_codes[0]
 
 
 @pytest.mark.parametrize("mutation", ["unknown", "hold", "empty", "truncated", "package", "draft", "coverage", "sentence", "fact", "mapping"])

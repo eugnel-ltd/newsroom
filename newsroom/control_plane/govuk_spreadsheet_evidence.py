@@ -236,6 +236,7 @@ class GovUkSpreadsheetEvidenceAcquisition:
             language="en-GB",
             transport_evidence_digest=transport_digest,
             currentness_basis="AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT",
+            body_origin='GOVUK_DECLARED_ASSET_TEXT',
             rights_eligibility_digest=rights_digest,
             licence_attribution=ATTRIBUTION,
             exclusion_signals=document.exclusion_signals,

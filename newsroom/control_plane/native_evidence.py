@@ -97,10 +97,13 @@ class AcquiredEvidence:
     exclusion_signals: tuple[str, ...] = ()
     text_only: bool = False
     source_observed_time: str = ""
+    body_origin: str = ""
 
     def __post_init__(self) -> None:
         if (
             type(self.text_only) is not bool
+            or type(self.body_origin)is not str
+            or self.body_origin not in {'','GOVUK_CONTENT_API_PAGE_TEXT','GOVUK_DECLARED_ASSET_TEXT'}
             or self.currentness_basis not in {
                 "", "AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT",
                 "RETAINED_AUTHORITATIVE_COMPLETED_EVENT",
@@ -133,6 +136,7 @@ class AcquiredEvidence:
                 for name in self.__dataclass_fields__
                 if name not in {"body", "receipt_digest"}
                 and not (name == "source_observed_time" and not self.source_observed_time)
+                and not (name == 'body_origin' and not self.body_origin)
             }
         )
 
@@ -144,7 +148,7 @@ class AcquiredEvidence:
             **values,
         }
         value = {name: item for name, item in values.items() if name != "body"
-                 and not (name == "source_observed_time" and not item)}
+                 and not (name in {'source_observed_time','body_origin'} and not item)}
         return cls(
             **values,
             receipt_digest=digest_bytes(canonical_json_bytes(value)),
@@ -778,6 +782,12 @@ class NativeEvidenceController:
                         "originating_report_id": source.dependency.originating_report_id,
                         "originating_artefact_digest": result.body_digest,
                         "dependency_evidence_ids": [source.dependency.record_id],
+                        **({'body_provenance': {
+                            'version':'newsroom.acquisition-body-provenance.v1',
+                            'kind':result.body_origin,'body_digest':result.body_digest,
+                            'acquisition_receipt_digest':result.receipt_digest,
+                            'transport_evidence_digest':result.transport_evidence_digest,
+                        }} if result.body_origin else {}),
                     },
                     {
                         **common,

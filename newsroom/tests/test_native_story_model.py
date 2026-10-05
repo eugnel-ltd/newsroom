@@ -54,6 +54,20 @@ def test_accounted_draft_and_review_replay_without_second_dispatch(tmp_path, mon
         assert connection.execute("SELECT count(*) FROM model_usage_current WHERE active=1").fetchone()[0] == 0
 
 
+def test_cached_only_story_reader_never_allocates_missing_phase(tmp_path,monkeypatch):
+    model,service,calls=_model(tmp_path,monkeypatch)
+    _call(model)
+    model.cached_only=True
+    assert _call(model)=={'text':'supported copy'}
+    with service._connection()as db:
+        before=db.execute('SELECT * FROM model_invocation_allocations').fetchall()
+    with pytest.raises(ModelUsageAdmissionError,match='retained story response unavailable'):
+        _call(model,'REVIEW')
+    assert len(calls)==1
+    with service._connection()as db:
+        assert db.execute('SELECT * FROM model_invocation_allocations').fetchall()==before
+
+
 def test_changed_input_or_cached_response_never_dispatches_again(tmp_path, monkeypatch):
     model, service, calls = _model(tmp_path, monkeypatch)
     _call(model)

@@ -235,6 +235,7 @@ class GovUkEvidenceAcquisition:
             rights_eligibility_digest=rights_digest,
             licence_attribution=attribution,
             exclusion_signals=signals, text_only=True,
+            body_origin='GOVUK_CONTENT_API_PAGE_TEXT',
         )
 
 

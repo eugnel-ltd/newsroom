@@ -585,6 +585,7 @@ def test_exact_native_source_fetches_bounded_independent_content(tmp_path, monke
         assert result.body == b"Official update\n\nExact independent source text."
         assert result.request_digest == request.digest
         assert result.publisher == "Home Office"
+        assert result.body_origin=='GOVUK_CONTENT_API_PAGE_TEXT'
         assert result.publication_time == "2026-09-01T10:00:00.000000Z"
         assert result.source_updated_time == "2026-09-02T10:00:00.000000Z"
         assert result.retrieval_time == "2026-09-02T12:02:00.000000Z"

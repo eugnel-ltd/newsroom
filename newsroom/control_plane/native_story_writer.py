@@ -14,6 +14,7 @@ from .writer import WriterCopy, WriterEvidenceLink, WriterValidatorResult, _writ
 from .zh_hant import contains_discourse_filler, contains_non_han_letter, contains_simplified_variant
 
 WRITER_ID = "newsroom.native-story-writer.v1"
+CONSUMER_VERSION = "newsroom.native-story-support.v2"
 LEGACY_DRAFT_SYSTEM = (
     "Write original Hong Kong Traditional Chinese news, not claim declarations. Use only approved facts "
     "and supporting source windows: a natural headline, attributed lead, detail and available context. "
@@ -63,6 +64,9 @@ REVIEW_SCHEMA = {
 
 class NativeStoryWriterHold(ValueError):
     """Unproved copy is held; transport usage remains the caller's responsibility."""
+    def __init__(self, reason, *, failures=()):
+        super().__init__(reason)
+        self.stable_reason_codes=tuple(failures)or(reason,)
 
 
 @dataclass(frozen=True)
@@ -97,8 +101,45 @@ def _sentences(copy):
     return [copy.title, *(part.strip() for part in re.findall(r"[^。！？!?\n]+(?:[。！？!?][」』”’\"]*)?", copy.body) if part.strip())]
 
 
-def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_record: Mapping, format: str):
+def _sentence_claim_links(copy):
+    """Intersect verbatim draft evidence spans with each body sentence."""
+    spans=[]
+    for link in copy.evidence_links:
+        start=0
+        while (start:=copy.body.find(link.rendered_assertion,start))>=0:
+            spans.append((start,start+len(link.rendered_assertion),link.governed_claim_id))
+            start+=1
+    return [
+        {identity for start,end,identity in spans
+         if start<match.end() and end>match.start()
+         and re.search(r'[\w\u3400-\u9fff]',copy.body[max(start,match.start()):min(end,match.end())])}
+        for match in re.finditer(r"[^。！？!?\n]+(?:[。！？!?][」』”’\"]*)?",copy.body)
+        if match.group().strip()
+    ]
+
+
+def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_record: Mapping, format: str,
+                            *, source_currentness=(), source_records=()):
     """Validate retained bindings without calling either model again."""
+    if 'date_derivation' in review_record:
+        from .native_story_dates import derive_and_verify
+        if copy.writer_id!=WRITER_ID or copy.evidence_package_digest!=package.digest:
+            return (WriterValidatorResult('NATIVE_STORY_PACKAGE_BINDING','FAIL','SOURCE_BINDING_DIFFERS'),)
+        try:
+            proof=review_record['date_derivation']
+            original=_object(proof['original_draft'],DRAFT_SCHEMA)
+            original_copy=WriterCopy(original['title'],original['body'],WRITER_ID,package.digest,
+                tuple(WriterEvidenceLink(**link)for link in original['evidence_links']))
+            review={key:review_record[key]for key in REVIEW_SCHEMA['required']}
+            checks=validate_retained_story(original_copy,package,review,original['format'])
+            if any(check.result!='PASS'for check in checks):
+                return checks
+            derive_and_verify(original,review,package,source_currentness,
+                source_records=source_records,
+                final_draft=_draft(copy,format),date_derivation=proof)
+        except (KeyError,TypeError,ValueError,ValidationError):
+            return (WriterValidatorResult('NATIVE_STORY_DATE_DERIVATION','FAIL','UNPROVEN_SOURCE_DATE'),)
+        return (*checks,WriterValidatorResult('NATIVE_STORY_DATE_DERIVATION','PASS','SOURCE_BOUND_DATE'))
     checks = []
 
     def check(name, passed):
@@ -112,6 +153,7 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
         return tuple(checks)
     claims = {claim.claim_id: claim for claim in package.governed_claims}
     sentences, text = _sentences(copy), copy.title + "\n" + copy.body
+    sentence_links=_sentence_claim_links(copy)
     links = copy.evidence_links
     support = review["sentence_support"]
     headline_ids = {identity for identity, claim in claims.items() if claim.claim_role == "HEADLINE"}
@@ -132,8 +174,8 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
     check("NATIVE_STORY_SENTENCE_SUPPORT", [item["sentence_index"] for item in support] == list(range(len(sentences)))
           and all(item["verdict"] == "SUPPORTED" and set(item["claim_ids"]) <= set(claims) for item in support)
           and all(headline_supported if item["sentence_index"] == 0 else
-                  any(link.governed_claim_id in item["claim_ids"] and link.rendered_assertion in
-                      sentences[item["sentence_index"]] for link in links) for item in support))
+                  bool(set(item["claim_ids"]) & sentence_links[item["sentence_index"]-1])
+                  for item in support))
     check("NATIVE_STORY_SEPARATE_REVIEW", review["verdict"] == "PASS" and all(review["factual_checks"][key] == "PASS" for key in _FACTS))
     number = re.compile(r"\d+(?:[.,]\d+)*|[零〇一二三四五六七八九十百千萬億兆兩廿卅]+(?:年|月|日|時|分|秒|人|名|個|間|所|座|公里|元|英鎊|%|％)")
     approved = "\n".join(value for claim in claims.values() for value in
@@ -156,7 +198,8 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
     return tuple(checks)
 
 
-def write_native_story(package: EvidencePackage, *, generate: Callable, review: Callable) -> NativeStoryResult:
+def write_native_story(package: EvidencePackage, *, generate: Callable, review: Callable,
+                       source_currentness=(), source_records=()) -> NativeStoryResult:
     if generate is review:
         raise NativeStoryWriterHold("NATIVE_STORY_SEPARATE_REVIEW_REQUIRED")
     evidence = _writer_evidence_value(package)
@@ -180,6 +223,17 @@ def write_native_story(package: EvidencePackage, *, generate: Callable, review: 
     except (ValueError, TypeError, ValidationError) as exc:
         raise NativeStoryWriterHold("NATIVE_STORY_OUTPUT_CONTRACT_HOLD") from exc
     validators = validate_retained_story(copy, package, record, draft["format"])
-    if any(check.result != "PASS" for check in validators):
-        raise NativeStoryWriterHold(next(check.validator for check in validators if check.result != "PASS"))
+    failures=tuple(check.validator for check in validators if check.result!='PASS')
+    if failures:
+        raise NativeStoryWriterHold(failures[0],failures=failures)
+    from .native_story_dates import derive_and_verify
+    final,proof=derive_and_verify(draft,record,package,source_currentness,source_records=source_records)
+    if proof is not None:
+        copy=WriterCopy(final['title'],final['body'],WRITER_ID,package.digest,
+            tuple(WriterEvidenceLink(**link)for link in final['evidence_links']))
+        record={**record,'date_derivation':proof}
+        validators=validate_retained_story(copy,package,record,final['format'],
+            source_currentness=source_currentness,source_records=source_records)
+        if any(check.result!='PASS'for check in validators):
+            raise NativeStoryWriterHold('NATIVE_STORY_DATE_DERIVATION')
     return NativeStoryResult(copy, SourceSupportReview(canonical_json_bytes(record)), validators, draft["format"])

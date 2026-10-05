@@ -687,6 +687,10 @@ def test_historical_observation_receipt_is_explicit_and_legacy_bytes_stay_exact(
         currentness_basis='AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT',
     )
     legacy = AcquiredEvidence.create(**values)
+    assert 'body_origin' not in json.loads(legacy.receipt_bytes)
+    sourced = AcquiredEvidence.create(**{**values,'body_origin':'GOVUK_CONTENT_API_PAGE_TEXT'})
+    assert json.loads(sourced.receipt_bytes)['body_origin']=='GOVUK_CONTENT_API_PAGE_TEXT'
+    assert sourced.receipt_digest!=legacy.receipt_digest
     assert 'source_observed_time' not in json.loads(legacy.receipt_bytes)
     assert AcquiredEvidence(**{**json.loads(legacy.receipt_bytes), 'exclusion_signals': (),
                                'body': body, 'receipt_digest': legacy.receipt_digest}) == legacy
@@ -733,3 +737,117 @@ def test_completed_observation_cannot_be_promoted_to_current_warning():
             NativeEvidenceController._validated_source_assessments(
                 (source,), (acquired,), (replace(assessment, currentness=changed),),
             )
+
+
+@pytest.fixture
+def retained_page_text_source_package(tmp_path):
+    """One real disposable controller/package path, with no transport effects."""
+    from types import SimpleNamespace
+    candidate_connection, candidate_port, version = _candidate(tmp_path)
+    ingress = open_evidence_intake_ingress(tmp_path / 'body-intake.sqlite3')
+    acknowledgement = _receive(ingress, candidate_connection, candidate_port, version,
+        request_id='page-body-provenance')
+    def current(version_id):
+        candidate_connection.execute('BEGIN')
+        try:
+            return candidate_port.require_retained_version_in_transaction(version_id)
+        finally:
+            candidate_connection.rollback()
+    port = candidate_port._with_bounded_version(current)
+    path = tmp_path / 'body-objects.sqlite3'
+    system, registries, *_ = _open(path)
+    packages = _evidence_facade(system, ingress, registries)
+    passage, ready, records = _ready_package(version)
+    source_record = next(r for r in records if r['record_type'] == 'SOURCE_RECORD')
+    unit = replace(_unit(), headline='', body=passage, canonical_url=source_record['canonical_url'])
+    unit = replace(unit, effective_revision=replace(unit.effective_revision, revision_digest=unit.revision_digest))
+    request = _source_requests(unit, _rights())[1]
+    source_version = SourceDefinitionVersion(request, EventId.new(), 1, NOW, request.digest)
+    rights = PublicationRightsAssessment.create(decision='PERMITTED', permitted_use='PUBLICATION_EVIDENCE',
+        policy_digest='sha256:' + '1' * 64, evidence_digest='sha256:' + '2' * 64)
+    dependency = DependencyAssessment.create(dependency_status='RESOLVED', evidential_origin_id='origin-1',
+        originating_report_id='origin-1', evidence_digest='sha256:' + '3' * 64)
+    source = NativeEvidenceSource(unit, source_version, rights, dependency)
+    wire = _model_package_value(replace(ready, source_ids=(unit.source_id,),
+        governed_claims=tuple(replace(c, source_ids=(unit.source_id,)) for c in ready.governed_claims)))
+    acquisitions = []
+    def acquire(request):
+        result = AcquiredEvidence.create(request_digest=request.digest, outcome='COMPLETE',
+            canonical_url=unit.canonical_url, body=passage.encode(), body_digest=digest_bytes(passage.encode()),
+            **{name: source_record[name] for name in ('publisher', 'responsible_body', 'source_type',
+                'publication_time', 'retrieval_time', 'geography', 'language')},
+            source_updated_time=source_record['publication_time'],
+            transport_evidence_digest='sha256:' + 'c' * 64,
+            currentness_basis='AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT', body_origin='GOVUK_CONTENT_API_PAGE_TEXT')
+        acquisitions.append(result)
+        return result
+    def assess(candidate, base, sources, acquired):
+        return AutonomousNativeEvidenceAssessor._validated_execution(
+            NativeAssessmentExecution(canonical_json_bytes({'package': wire}).decode(), {}),
+            candidate, base, sources, acquired)
+    controller = NativeEvidenceController(objects=system.objects, candidate_port=port,
+        evidence_packages=packages, transport=EvidenceTransport(acquire), assessor=EvidenceAssessor(assess),
+        policy_bundle_digest='sha256:' + 'a' * 64, transport_policy_digest='sha256:' + '7' * 64,
+        clock=lambda: UtcTimestamp.parse('2026-09-08T12:02:00Z'))
+    candidate_connection.commit()
+    try:
+        result = controller.acquire_and_retain(candidate_version_id=version.version_id,
+            intake_receipt_id=acknowledgement.receipt_id, sources=(source,), proof=proof())
+        yield SimpleNamespace(system=system, path=path, packages=packages, candidate_port=port,
+            registries=registries, ingress=ingress, retained=result.retained, acquisitions=acquisitions)
+    finally:
+        system.close()
+        ingress.close()
+        candidate_connection.close()
+
+
+def test_page_text_source_provenance_survives_package_read_and_reopen(retained_page_text_source_package):
+    from newsroom.authority import HydrationRequest
+    from newsroom.increment10.evidence import _PACKAGE_PURPOSE
+    case = retained_page_text_source_package
+    retained = case.retained
+    assert len(case.acquisitions) == 1
+    acquired = case.acquisitions[0]
+    expected = {'version': 'newsroom.acquisition-body-provenance.v1', 'kind': 'GOVUK_CONTENT_API_PAGE_TEXT',
+        'body_digest': acquired.body_digest, 'acquisition_receipt_digest': acquired.receipt_digest,
+        'transport_evidence_digest': acquired.transport_evidence_digest}
+    assert retained.source_records[0]['body_provenance'] == expected
+    assert retained.source_records[0]['record_id'] == acquired.receipt_digest
+    raw = case.system.objects.rehydrate(HydrationRequest(retained.package_admission_id, _PACKAGE_PURPOSE), proof=proof()).data
+    envelope = json.loads(raw)
+    assert 'source_records' not in envelope and 'body_provenance' not in envelope['package']
+    reread = case.packages.read(retained.package_admission_id, candidate_port=case.candidate_port, proof=proof())
+    assert reread == retained
+    case.system.close()
+    reopened, registries, *_ = _open(case.path)
+    try:
+        packages = _evidence_facade(reopened, case.ingress, registries)
+        assert packages.read(retained.package_admission_id, candidate_port=case.candidate_port, proof=proof()) == retained
+        assert reopened.objects.rehydrate(HydrationRequest(retained.package_admission_id, _PACKAGE_PURPOSE), proof=proof()).data == raw
+        assert len(case.acquisitions) == 1
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize('tamper', ('body_digest', 'acquisition_receipt_digest', 'unknown_field'))
+def test_page_text_source_provenance_tamper_denies_retained_package(retained_page_text_source_package, tamper):
+    from newsroom.authority import HydrationRequest
+    case = retained_page_text_source_package
+    retained = case.retained
+    original = deepcopy(retained.source_records[0])
+    malformed = deepcopy(original)
+    if tamper == 'unknown_field':
+        malformed['body_provenance']['unsupported_schema_extension'] = True
+    else:
+        malformed['body_provenance'][tamper] = 'sha256:' + 'f' * 64
+    forged_id = _admit_record(case.system.objects, canonical_json_bytes(malformed), proof())
+    ids = []
+    for admission_id in retained.record_admission_ids:
+        record = json.loads(case.system.objects.rehydrate(HydrationRequest(admission_id, 'evidence.record'), proof=proof()).data)
+        ids.append(forged_id if record['record_type'] == 'SOURCE_RECORD' else admission_id)
+    with pytest.raises(EvidencePackageError, match='governed evidence records differ'):
+        case.packages.retain(retained.package, receipt_id=retained.receipt_id,
+            candidate_port=case.candidate_port, source_admission_ids=retained.source_admission_ids,
+            record_admission_ids=tuple(ids), proof=proof())
+    assert case.packages.read(retained.package_admission_id, candidate_port=case.candidate_port, proof=proof()) == retained
+    assert retained.source_records[0] == original

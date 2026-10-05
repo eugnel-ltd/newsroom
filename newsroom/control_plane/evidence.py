@@ -53,6 +53,23 @@ _SOURCE_RECORD_FIELDS = frozenset(
         "dependency_evidence_ids",
     }
 )
+
+
+def _source_body_provenance_is_bound(record):
+    if set(record)==_SOURCE_RECORD_FIELDS:
+        return True
+    if set(record)!=_SOURCE_RECORD_FIELDS|{'body_provenance'}:
+        return False
+    proof=record.get('body_provenance')
+    return (type(proof)is dict and set(proof)=={'version','kind','body_digest',
+        'acquisition_receipt_digest','transport_evidence_digest'}
+        and proof['version']=='newsroom.acquisition-body-provenance.v1'
+        and type(proof['kind'])is str
+        and proof['kind']in {'GOVUK_CONTENT_API_PAGE_TEXT','GOVUK_DECLARED_ASSET_TEXT'}
+        and proof['body_digest']==record.get('originating_artefact_digest')
+        and proof['acquisition_receipt_digest']==record.get('record_id')
+        and all(type(proof[key])is str and re.fullmatch(r'sha256:[0-9a-f]{64}',proof[key])
+            for key in ('body_digest','acquisition_receipt_digest','transport_evidence_digest')))
 _SOURCE_AUTHORITY_RECORD_FIELDS = frozenset(
     {
         "record_id",
@@ -2235,7 +2252,8 @@ def validate_governed_evidence_records(
             or record.get("candidate_id") != candidate_id
             or record.get("base_package_digest") != base_package_digest
             or record.get("status") != "CURRENT"
-            or set(record) != _RECORD_FIELDS_BY_TYPE.get(record_type)
+            or (not _source_body_provenance_is_bound(record) if record_type=='SOURCE_RECORD'
+                else set(record) != _RECORD_FIELDS_BY_TYPE.get(record_type))
         ):
             return None
         records[record_id] = record
@@ -2281,7 +2299,7 @@ def validate_governed_evidence_records(
                 or not str(records[record_id][field]).strip()
                 for field in required_source_record_string_fields
             )
-            or set(records[record_id]) != _SOURCE_RECORD_FIELDS
+            or not _source_body_provenance_is_bound(records[record_id])
             or records[record_id].get("source_type")
             not in _PUBLICATION_EVIDENCE_SOURCE_TYPES
             or records[record_id].get("authority_class") != claim.authority_class.value
