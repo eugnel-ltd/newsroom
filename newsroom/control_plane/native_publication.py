@@ -95,6 +95,11 @@ class NativePublicationError(ValueError):
 
 
 _MAX_ACQUISITION_ATTEMPTS = 3
+_SEMANTIC_TRANSITIONS = frozenset({
+    ('newsroom.native-assessor-judgments.v1', 'newsroom.native-assessor-judgments.v2'),
+    ('newsroom.native-assessor-judgments.v1', 'newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2'),
+    ('newsroom.native-assessor-judgments.v2', 'newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2'),
+})
 _RETRYABLE_ACQUISITION_HOLDS = frozenset({
     "GOVUK_ACQUISITION_UNAVAILABLE",
     "WEATHER_ACQUISITION_UNAVAILABLE",
@@ -947,8 +952,7 @@ class NativePublicationContinuation:
     def semantic_intent_revalidation_due(facts: dict, contract_version: str | None) -> bool:
         """Schedule a distinct qualified question contract, never an old retry."""
         intent = facts.get('semantic_assessment_intent')
-        return (type(intent) is dict and (intent.get('contract'), contract_version) == (
-            'newsroom.native-assessor-judgments.v1', 'newsroom.native-assessor-judgments.v2')
+        return (type(intent) is dict and (intent.get('contract'), contract_version) in _SEMANTIC_TRANSITIONS
             and bool(facts.get('graphiti_receipts')) and bool(facts.get('intake_receipt_id'))
             and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
                 'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id')))
@@ -1200,8 +1204,7 @@ class NativePublicationContinuation:
                     if type(semantic_intent) is not dict:
                         raise NativePublicationError('semantic continuation origin differs')
                     changed = {key for key, value in binding.items() if semantic_intent.get(key) != value}
-                    if changed == {'contract'} and (semantic_intent['contract'], binding['contract']) == (
-                            'newsroom.native-assessor-judgments.v1', 'newsroom.native-assessor-judgments.v2'):
+                    if changed == {'contract'} and (semantic_intent['contract'], binding['contract']) in _SEMANTIC_TRANSITIONS:
                         # The qualified question meaning changed. Preserve the
                         # complete original compound intent and unknown liability;
                         # this is not another call under its old request key.
