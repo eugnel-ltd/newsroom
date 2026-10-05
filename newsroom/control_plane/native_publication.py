@@ -1238,7 +1238,8 @@ class NativePublicationContinuation:
         semantic_only = False
         semantic_intent = facts.get('semantic_assessment_intent')
         retained_semantic_consumer = (
-            type(semantic_intent) is dict
+            not context_only
+            and type(semantic_intent) is dict
             and semantic_intent.get('contract') == self._semantic_intent_contract
             and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
                  or progress.get('stage') == 'EVIDENCE_HOLD'
