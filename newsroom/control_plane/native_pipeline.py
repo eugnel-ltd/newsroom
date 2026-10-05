@@ -123,7 +123,9 @@ class NativePipeline:
         self._drain_between_work()
         restore = getattr(self._publish, 'restore_current_output', None)
         if callable(restore):
-            restore()
+            with _native_phase('RESTORE_CURRENT_OUTPUT', cycle_id=cycle_id,
+                               cohort_count=len(self._journal.units)):
+                restore()
             self._drain_between_work()
 
         with _native_phase("CLASSIFY", cycle_id=cycle_id, cohort_count=len(self._journal.units)):

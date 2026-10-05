@@ -262,3 +262,86 @@ def test_unclean_implementation_denies_constructor_without_model(tmp_path,monkey
                 api_key=engine.key, source_fence=engine.fence, transport=engine.transport,
                 clock=engine.clock, implementation_worktree_clean=False)
         assert calls==[]
+
+
+_ROUNDED_ROLES={'BACKGROUND':0.16,'MATERIAL':0.02,'UNCERTAIN':0.0,'SUPPORTING':0.81}
+
+
+def _rounded_role_response(value):
+    value['answers']={'support':{'type':'choice','choice':'SUPPORTING','confidence':0.75,'probabilities':dict(_ROUNDED_ROLES)}}
+    return json.dumps(value).encode()
+
+
+@contextmanager
+def _reported_old_decoder_failure(tmp_path,monkeypatch,*,failure=ValueError):
+    from newsroom.control_plane import typesafe_judgment as module
+    with _case(tmp_path,monkeypatch,mutate=_rounded_role_response) as (engine,inputs,usage,calls,raw):
+        inputs['questions']={'support':{'type':'choice','instructions':'Classify source role.',
+            'criteria':{key:key for key in _ROUNDED_ROLES}}}
+        # Reproduce the old strict decoder failure without forging durable SQL.
+        with monkeypatch.context() as old:
+            def strict(_answers,_questions):
+                raise failure('probabilities do not sum to one')
+            old.setattr(module,'_answers',strict)
+            with pytest.raises(TypesafeJudgmentError) as held:
+                engine.evaluate(**inputs)
+        reference=held.value.reference
+        assert reference is not None and len(calls)==1
+        yield engine,inputs,usage,calls,raw,reference
+
+
+def test_rounded_reported_failure_is_locally_revalidated_without_rewriting_original_receipts(tmp_path,monkeypatch):
+    from newsroom.authority import HydrationRequest
+    with _reported_old_decoder_failure(tmp_path,monkeypatch) as (engine,inputs,usage,calls,raw,reference):
+        original_receipt=engine.objects.rehydrate(HydrationRequest(reference.receipt_admission_id,'evidence.record'),proof=inputs['proof']).data
+        with sqlite3.connect(usage.path) as db:
+            before={table:db.execute(f'SELECT record_json FROM {table} ORDER BY record_json').fetchall()
+                for table in ('model_invocation_allocations','model_invocation_terminals','model_transport_observations','model_provider_telemetry')}
+        record=engine.read(reference,**inputs)
+        assert record['answers']['support']['probabilities_ppm']=={key:int(value*1000000)for key,value in _ROUNDED_ROLES.items()}
+        assert record['answers']['support']['choice']=='SUPPORTING'
+        assert record['outcome']=='TYPESAFE_FAILED' and usage.terminal(reference.invocation_id).outcome=='TYPESAFE_FAILED'
+        assert record['consumer_revalidation']=={'consumer_contract':'newsroom.typesafe-judgment.answers-consumer.v2','original_outcome':'TYPESAFE_FAILED',
+            'original_terminal_digest':usage.terminal(reference.invocation_id).terminal_digest,'raw_response_digest':digest_bytes(raw)}
+        assert engine.evaluate(**inputs)==reference
+        reopened=TypesafeJudgment(usage=ModelUsageService(usage.path),objects=engine.objects,policy=engine.policy,
+            api_key=lambda:pytest.fail('replay must not read credential'),source_fence=engine.fence,
+            transport=lambda *_args,**_kw:pytest.fail('replay must not call provider'),clock=engine.clock,implementation_worktree_clean=True)
+        assert reopened.evaluate(**inputs)==reference
+        assert len(calls)==1
+        assert engine.objects.rehydrate(HydrationRequest(reference.receipt_admission_id,'evidence.record'),proof=inputs['proof']).data==original_receipt
+        assert json.loads(original_receipt)['answers'] is None
+        with sqlite3.connect(usage.path) as db:
+            after={table:db.execute(f'SELECT record_json FROM {table} ORDER BY record_json').fetchall()for table in before}
+        assert after==before
+        with pytest.raises(TypesafeJudgmentError):
+            engine.read(replace(reference,raw_admission_id=reference.receipt_admission_id),**inputs)
+
+
+@pytest.mark.parametrize('probabilities',[
+    {'BACKGROUND':0.16,'MATERIAL':0.02,'UNCERTAIN':0.0,'SUPPORTING':0.81},
+    {'BACKGROUND':0.17,'MATERIAL':0.02,'UNCERTAIN':0.01,'SUPPORTING':0.81},
+])
+def test_choice_supports_inclusive_one_percent_provider_rounding_without_normalising(probabilities):
+    from newsroom.control_plane.typesafe_judgment import _answers,_decode
+    value=_decode(json.dumps({'support':{'type':'choice','choice':'SUPPORTING','confidence':0.75,'probabilities':probabilities}}).encode())
+    result=_answers(value,{'support':{'type':'choice','criteria':{key:key for key in probabilities}}})
+    assert result['support']['probabilities_ppm']=={key:int(value*1000000)for key,value in probabilities.items()}
+    assert sum(result['support']['probabilities_ppm'].values())!=1000000
+
+
+def test_score_and_gross_nonunit_choice_distributions_remain_rejected():
+    from newsroom.control_plane.typesafe_judgment import _answers,_decode
+    value=_decode(b'{"support":{"type":"choice","choice":"yes","confidence":1,"probabilities":{"yes":0.2,"no":0.2}}}')
+    with pytest.raises(ValueError,match='probabilities do not sum'):
+        _answers(value,{'support':{'type':'choice','criteria':{'yes':'Yes','no':'No'}}})
+    value=_decode(b'{"score":{"type":"score","score":0.5,"confidence":0.5,"probabilities":{"0":0.49,"1":0.5},"legend":{"0":"Low","1":"High"}}}')
+    with pytest.raises(ValueError,match='probabilities do not sum'):
+        _answers(value,{'score':{'type':'score','criteria':['Low','High']}})
+
+
+def test_non_valueerror_failed_terminal_is_never_revalidated_even_with_valid_rounded_raw(tmp_path,monkeypatch):
+    with _reported_old_decoder_failure(tmp_path,monkeypatch,failure=RuntimeError) as (engine,inputs,usage,calls,_raw,reference):
+        with pytest.raises(TypesafeJudgmentError,match='TYPESAFE_REPLAY_USAGE_HOLD'):
+            engine.evaluate(**inputs)
+        assert len(calls)==1 and usage.terminal(reference.invocation_id).failure_class=='RuntimeError'

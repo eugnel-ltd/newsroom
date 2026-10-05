@@ -1435,3 +1435,84 @@ def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, 
     assert publication.reconciliations == 2 and publication.calls == 1
     assert journal.current(first.revision_id)['facts'] == sibling
     connection.close()
+
+
+@pytest.mark.parametrize('scenario', ['eligible', 'missing-origin', 'missing-graph', 'pending-publication', 'wrong-origin', 'changed-input', 'same-input'])
+def test_separate_semantic_continuation_retains_original_interruption_and_never_retries_legacy(tmp_path, monkeypatch, scenario):
+    from datetime import UTC, datetime
+    from newsroom.authority.canonical import digest_bytes
+    from newsroom.control_plane.native_assessor import RetainedAssessorResult
+    unit = _native()
+    path = str(tmp_path / 'separate-intent.sqlite3')
+    connection = connect(path)
+    journal = NativeRevisionJournal(connection)
+    journal.land((unit,))
+    old = {'candidate_id':'candidate','candidate_version_id':'candidate-version',
+           'graphiti_receipts':[{}], 'intake_receipt_id':'already-acknowledged',
+           'assessment_contract_version':'newsroom.native-evidence-assessor.v23+consumer.v1',
+           'assessment_started_at':'2026-09-08T12:00:00Z',
+           'acquisition_started_at':'2026-09-08T11:59:00Z', 'acquisition_attempt_count':3,
+           'reason':'ACQUISITION_RESULT_NOT_RETAINED','failure_class':'CliTimeoutError'}
+    if scenario == 'missing-graph': old['graphiti_receipts'] = []
+    if scenario == 'pending-publication': old['publication_started_at']='pending-effect'
+    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED',facts=old)
+    origin=RetainedAssessorResult(RetainedAssessorContractFailure('original-envelope','original-invocation',_DIGEST,_DIGEST,_DIGEST),
+        'newsroom.native-evidence-assessor.v21' if scenario=='wrong-origin' else 'newsroom.native-evidence-assessor.v23',
+        _DIGEST,'ASSESSOR_PROVIDER_FAILED',datetime(2026,9,8,tzinfo=UTC),None)
+    calls=[]
+    paid_calls=[]
+    def acquire(_self, **request):
+        assert request['assessment_semantic_only'] is True
+        assert request['assessment_cached_only'] is False
+        assert request['intake_receipt_id'] == old['intake_receipt_id']
+        retained=journal.current(unit.revision_id)['facts']['semantic_assessment_intent']
+        assert retained['origin_invocation_id'] == 'original-invocation'
+        assert retained['origin_journal']['assessment_started_at'] == old['assessment_started_at']
+        changed = scenario == 'changed-input' and bool(calls)
+        request['before_semantic_assessment'](SimpleNamespace(digest=_DIGEST),
+            (SimpleNamespace(receipt_digest=digest_bytes(b'changed' if changed else b'original'), body_digest=_DIGEST),))
+        request['before_assessment']()
+        calls.append(request)
+        if scenario in {'changed-input','same-input'}:
+            if not paid_calls:
+                paid_calls.append('one stable compound intent')
+            raise RuntimeError('new semantic allocation remains unknown; no dispatch on replay')
+        # The real semantic assessor's negative path is tested with actual
+        # ModelUsage+CAS; this seam proves it never falls back to legacy dispatch.
+        raise NativeEvidenceHold('SEMANTIC_INTENT_FALLBACK_HOLD',unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+    def continuation():
+        return NativePublicationContinuation(journal=journal,
+            runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),
+                proof=proof(),policies=SimpleNamespace(publication=object())),
+            evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
+            semantic_origin_failure=lambda _:None if scenario=='missing-origin' else origin,
+            semantic_intent_contract='newsroom.native-assessor-judgments.v1',
+            assessment_contract_version=old['assessment_contract_version'],
+            clock=lambda:UtcTimestamp.parse('2026-09-08T12:30:00Z'))
+    result=continuation().advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+    if scenario in {'changed-input','same-input'}:
+        assert result.state == 'ASSESSMENT_INTERRUPTED' and len(paid_calls)==1
+        connection.close()
+        connection=connect(path)
+        journal=NativeRevisionJournal(connection)
+        result=continuation().advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+        assert len(paid_calls)==1
+        if scenario=='changed-input':
+            assert result.reason=='SEMANTIC_INTENT_INPUT_CHANGED_HOLD'
+            assert len(calls)==1
+        else:
+            assert result.state=='ASSESSMENT_INTERRUPTED' and len(calls)==2
+    elif scenario != 'eligible':
+        assert result.state=='ASSESSMENT_INTERRUPTED' and calls==[]
+        assert journal.current(unit.revision_id)['facts']==old
+    else:
+        assert result.reason=='SEMANTIC_INTENT_FALLBACK_HOLD' and len(calls)==1
+        assert journal.current(unit.revision_id)['facts']['acquisition_attempt_count']==3
+        assert journal.current(unit.revision_id)['facts']['semantic_acquisition_attempt_count']==1
+        connection.close()
+        connection=connect(path)
+        journal=NativeRevisionJournal(connection)
+        assert continuation().advance(revision_id=unit.revision_id,candidate_version_id='candidate-version').reason=='SEMANTIC_INTENT_FALLBACK_HOLD'
+        assert len(calls)==1
+    connection.close()

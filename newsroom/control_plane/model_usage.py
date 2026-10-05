@@ -3567,9 +3567,21 @@ class ModelUsageService:
         ]
         general_policies = [policy for policy in policies if not policy.calibration_only]
         if general_policies:
+            compatible_typesafe = False
+            if (workload_class is WorkloadClass.TYPESAFE_JUDGMENT
+                    and (provider, route, model, reasoning)
+                    == ("typesafe", "TYPESAFE_JUDGMENT", "jev-latest", "none")
+                    and output_schema_digest is not None):
+                # Match the retained-reader compatibility boundary: an audited
+                # software upgrade does not change the semantic invocation grant.
+                contracts = [{key: value for key, value in asdict(policy).items()
+                              if key not in {"canonical_digest", "implementation_revision", "evidence_digest"}}
+                             for policy in general_policies]
+                compatible_typesafe = all(contract == contracts[0] for contract in contracts)
             policies = (
                 general_policies[:1]
                 if all(_is_hermetic_cont_policy(policy) for policy in general_policies)
+                or compatible_typesafe
                 or (
                     workload_class is WorkloadClass.NATIVE_RETRIEVAL_EMBEDDING
                     and output_schema_digest is not None

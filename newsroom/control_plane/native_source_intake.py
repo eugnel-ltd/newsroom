@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from newsroom.authority import (
     AuthenticationProof, HydrationRequest, ObjectAccessDecisionId, ObjectAdmissionId,
-    ObjectAdmissionRequest, UtcTimestamp, AuthorityPersistenceError,
+    ObjectAdmissionRequest, UtcTimestamp, AuthorityPersistenceError, DiagnosticHistoryExpired,
 )
 from newsroom.authority.canonical import (
     digest_bytes, digest_canonical, validate_sha256_digest,
@@ -183,6 +183,7 @@ class NativeSourceIntake:
         other_source_poll: Callable[..., NativeSourceDisposition] | None = None,
         retained_units: Mapping[str, tuple[CorpusIngestUnit, ...]] | None = None,
         observations: Mapping[str, tuple[str, str, str, str]] | None = None,
+        reobservation_epoch: str | None = None,
         fetch: Callable[[str], tuple[int, bytes]] = _fetch_exact,
         clock: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
     ) -> None:
@@ -190,6 +191,9 @@ class NativeSourceIntake:
             raise ValueError("native source bindings exceed the approved portfolio")
         if not callable(dispatch_fence):
             raise ValueError("native observation authority and dispatch fence are required")
+        if reobservation_epoch is not None:
+            validate_sha256_digest(reobservation_epoch)
+        self._reobservation_epoch = reobservation_epoch
         self._sources, self._objects, self._proof = sources, objects, proof
         self._definitions, self._licence = {}, licence
         self.bind_definitions(definition_ids)
@@ -888,10 +892,28 @@ class NativeSourceIntake:
         for ordinal, chunk in enumerate(chunks, 1):
             provisional = replace(base, chunk_ordinal=ordinal, chunk_count=len(chunks), predecessor_ingest_id=predecessor)
             data = " ".join(provisional.episode_body.split()).encode()
-            admission = self._objects.admit(ObjectAdmissionRequest(
-                OPERATIONAL_ADMISSION_TYPE, f"native-source-passage:{provisional.ingest_id}:{rights_id}"
-            ), data, proof=self._proof).admission
-            access = self._hydrate(admission, GRAPHITI_EVALUATION_HYDRATION_POLICY.purpose, data)
+            try:
+                admission = self._objects.admit(ObjectAdmissionRequest(
+                    OPERATIONAL_ADMISSION_TYPE, f"native-source-passage:{provisional.ingest_id}:{rights_id}"
+                ), data, proof=self._proof).admission
+            except DiagnosticHistoryExpired:
+                if self._reobservation_epoch is None:
+                    raise
+                # A fresh retention intent, never a replay of the reserved old
+                # command. Canonical Source and provider-attempt IDs stay exact.
+                with self._fence(source_id, version.locator):
+                    admission = self._objects.admit(ObjectAdmissionRequest(
+                        OPERATIONAL_ADMISSION_TYPE,
+                        f"native-source-passage-reobserve:{self._reobservation_epoch}:{provisional.ingest_id}:{rights_id}",
+                    ), data, proof=self._proof).admission
+                    access = self._hydrate(admission, GRAPHITI_EVALUATION_HYDRATION_POLICY.purpose, data)
+                    checked = self._objects.rehydrate(HydrationRequest(
+                        admission.admission_id, GRAPHITI_EVALUATION_HYDRATION_POLICY.purpose, 0, len(data),
+                    ), proof=self._proof)
+                    if checked.data != data:
+                        raise ValueError("current source reobservation passage differs")
+            else:
+                access = self._hydrate(admission, GRAPHITI_EVALUATION_HYDRATION_POLICY.purpose, data)
             binding = CorpusAuthorityBinding(
                 str(admission.admission_id), str(access.access_decision_id), str(definition_id),
                 str(version_id), str(item_id), str(revision_id), str(representation_id),

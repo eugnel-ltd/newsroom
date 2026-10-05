@@ -761,7 +761,7 @@ def open_native_pipeline(
         )
         typed_proposal_verifier = None
         if judgment_api_key is not None:
-            from .native_assessor_judgments import NativeAssessorJudgments
+            from .native_assessor_judgments import NativeAssessorJudgments, VERSION as JUDGMENT_CONTRACT
             from .native_claim_localisation import NativeClaimLocaliser
             from .typesafe_judgment import TypesafeJudgment
             if judgment_policy is None or localisation_policy is None:
@@ -1085,6 +1085,10 @@ def open_native_pipeline(
                         assessment_usage.retained_pre_dispatch_failure
                     ),
                     assessment_old_provider_failure=assessment_usage.retained_old_provider_failure,
+                    semantic_origin_failure=(assessment_usage.retained_semantic_origin_failure
+                        if judgment_api_key is not None else None),
+                    semantic_intent_contract=(JUDGMENT_CONTRACT
+                        if judgment_api_key is not None else None),
                     evidence_sources_for=self.sources_for,
                     assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,
                     clock=now,
@@ -1121,6 +1125,7 @@ def open_native_pipeline(
             proof=proof, definition_ids=definitions, licence=licence,
             dispatch_fence=source_fence, clock=clock,
             retained_units=journal.units, observations=journal.observations,
+            reobservation_epoch=rights_reobservation_epoch,
             other_source_poll=lambda **request: poll_other_source(intake, **request),
         )
 

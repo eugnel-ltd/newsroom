@@ -1337,8 +1337,16 @@ class NativeAssessmentUsage:
         latest = max(results, key=lambda item: (item.completed_at, item.contract_version == VERSION))
         return latest if latest.outcome == "ASSESSOR_PROVIDER_FAILED" else None
 
+    def retained_semantic_origin_failure(self, candidate: object) -> RetainedAssessorResult | None:
+        """Authenticate an unknown origin without settling or retrying that purpose."""
+        results = self.retained_assessments(candidate, _semantic_origin=True)
+        if not results:
+            return None
+        latest = max(results, key=lambda item: item.completed_at)
+        return latest if latest.outcome == 'ASSESSOR_PROVIDER_FAILED' and latest.execution is None else None
+
     def retained_assessments(
-        self, candidate: object, base: EvidencePackage | None = None,
+        self, candidate: object, base: EvidencePackage | None = None, *, _semantic_origin: bool = False,
     ) -> tuple[RetainedAssessorResult, ...] | None:
         """Read exact settled results; ambiguity never grants a new provider call."""
 
@@ -1501,7 +1509,7 @@ class NativeAssessmentUsage:
                     and allocation.prompt_contract_version in (
                         _V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION, *_REFERENCE_PRODUCERS,
                     )
-                    and allocation.prompt_contract_version != VERSION
+                    and (allocation.prompt_contract_version != VERSION or _semantic_origin)
                     and terminal.outcome == "ASSESSOR_PROVIDER_FAILED"
                     and terminal.failure_class == "UNKNOWN_PROVIDER_FAILURE"
                     and terminal.usage_status is UsageStatus.ESTIMATED
@@ -2114,8 +2122,9 @@ class AutonomousNativeEvidenceAssessor:
     def assess_with_boundary(
         self, candidate, base, sources, acquired, *, before_dispatch,
         cached_only: bool = False,
+        semantic_only: bool = False,
     ):
-        if type(cached_only) is not bool:
+        if type(cached_only) is not bool or type(semantic_only) is not bool or cached_only and semantic_only:
             raise NativeEvidenceError("native assessment cache mode differs")
         source_id = sources[0].unit.source_id if sources else candidate.candidate_id
         validation_feedback = None
@@ -2174,6 +2183,15 @@ class AutonomousNativeEvidenceAssessor:
             if type(result) is not JudgmentFallback:
                 raise NativeEvidenceError("native judgment result differs")
             return None
+        if semantic_only:
+            if self._judgments is None:
+                raise NativeEvidenceHold('SEMANTIC_INTENT_UNAVAILABLE', source_id)
+            judged = new_judgment_intent()
+            if judged is None:
+                # This separate purpose never grants an old Grok retry when its
+                # typed questions require the ordinary reasoning fallback.
+                raise NativeEvidenceHold('SEMANTIC_INTENT_FALLBACK_HOLD', source_id)
+            return judged
         judgment_fresh = self._usage is None
         if self._usage is not None:
             retained = self._usage.retained_assessments(candidate, base)

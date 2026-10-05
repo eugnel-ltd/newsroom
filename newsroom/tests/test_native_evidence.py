@@ -368,6 +368,20 @@ def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) ->
         )
 
     candidate_connection.commit()
+    bound_inputs = []
+
+    def deny_changed_semantic_input(base, acquired):
+        bound_inputs.append((base.digest, tuple(item.receipt_digest for item in acquired)))
+        raise NativeEvidenceHold('SEMANTIC_INTENT_INPUT_CHANGED_HOLD', source_id)
+
+    with pytest.raises(NativeEvidenceHold, match='SEMANTIC_INTENT_INPUT_CHANGED_HOLD'):
+        evidence_controller(lambda *_: pytest.fail('input must bind before assessment')).acquire_and_retain(
+            candidate_version_id=version.version_id,
+            intake_receipt_id=acknowledgement.receipt_id, sources=(source,),
+            assessment_semantic_only=True, before_semantic_assessment=deny_changed_semantic_input,
+            proof=proof(),
+        )
+    assert len(bound_inputs) == 1 and bound_inputs[0][1] == (acquisition.receipt_digest,)
     negative_value = _model_package_value(assessed_package)
     # Semantic relation is a controller constant in v18; exercise a
     # remaining provider choice rather than pretending it can be emitted.

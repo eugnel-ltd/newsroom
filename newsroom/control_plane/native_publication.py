@@ -23,6 +23,7 @@ from newsroom.authority import (
 from newsroom.authority.canonical import (
     canonical_json_bytes,
     digest_bytes,
+    digest_canonical,
     validate_sha256_digest,
 )
 from newsroom.authority.types import UtcTimestamp
@@ -840,6 +841,8 @@ class NativePublicationContinuation:
         assessment_old_provider_failure: (
             Callable[[object], RetainedAssessorResult | None] | None
         ) = None,
+        semantic_origin_failure: Callable[[object], RetainedAssessorResult | None] | None = None,
+        semantic_intent_contract: str | None = None,
         evidence_sources_for: Callable[[str], tuple[NativeEvidenceSource, ...]] | None = None,
         assessment_contract_version: str | None = None,
         clock=UtcTimestamp.now,
@@ -861,6 +864,9 @@ class NativePublicationContinuation:
                 and not callable(assessment_pre_dispatch_failure)
             )
             or (assessment_old_provider_failure is not None and not callable(assessment_old_provider_failure))
+            or (semantic_origin_failure is not None and not callable(semantic_origin_failure))
+            or ((semantic_origin_failure is None) != (semantic_intent_contract is None))
+            or (semantic_intent_contract is not None and (type(semantic_intent_contract) is not str or not semantic_intent_contract))
             or (evidence_sources_for is not None and not callable(evidence_sources_for))
             or not isinstance(sources, Mapping)
             or not all(
@@ -882,6 +888,8 @@ class NativePublicationContinuation:
         self._assessment_contract_failure = assessment_contract_failure
         self._assessment_pre_dispatch_failure = assessment_pre_dispatch_failure
         self._assessment_old_provider_failure = assessment_old_provider_failure
+        self._semantic_origin_failure = semantic_origin_failure
+        self._semantic_intent_contract = semantic_intent_contract
         self._evidence_sources_for = evidence_sources_for
         self._assessment_contract_version = assessment_contract_version
         self._clock = clock
@@ -1118,6 +1126,36 @@ class NativePublicationContinuation:
         def current_facts() -> dict:
             return self._current_candidate_facts(revision_id, candidate_version_id, candidate_id)
 
+        semantic_only = False
+        semantic_intent = facts.get('semantic_assessment_intent')
+        if (self._semantic_origin_failure is not None
+                and facts.get('graphiti_receipts') and facts.get('intake_receipt_id')
+                and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
+                    'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id'))
+                and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED' or semantic_intent is not None)):
+            origin = self._semantic_origin_failure(version)
+            if (type(origin) is RetainedAssessorResult and origin.outcome == 'ASSESSOR_PROVIDER_FAILED'
+                    and origin.execution is None and (semantic_intent is not None or same_assessment_producer(
+                        facts.get('assessment_contract_version'), origin.contract_version))):
+                original = origin.proof
+                binding = {'contract': self._semantic_intent_contract,
+                    'candidate_version_id': candidate_version_id, 'origin_envelope_id': original.envelope_id,
+                    'origin_invocation_id': original.invocation_id,
+                    'origin_allocation_digest': original.allocation_digest,
+                    'origin_terminal_digest': original.terminal_digest,
+                    'origin_context_manifest_digest': original.context_manifest_digest}
+                if semantic_intent is not None:
+                    if type(semantic_intent) is not dict or any(semantic_intent.get(key) != value for key, value in binding.items()):
+                        raise NativePublicationError('semantic continuation origin differs')
+                else:
+                    semantic_intent = {**binding, 'origin_journal': {key: facts.get(key) for key in (
+                        'reason', 'failure_class', 'assessment_started_at', 'acquisition_started_at',
+                        'assessment_contract_version', 'acquisition_attempt_count')}}
+                    facts = current_facts()
+                    facts['semantic_assessment_intent'] = semantic_intent
+                    progress = self._journal.advance(revision_id, stage='SEMANTIC_ASSESSMENT_PENDING', facts=facts)
+                semantic_only = True
+
         if progress.get("stage") == "COPY_CORRECTION_PREPARED" or (
             progress.get("stage") == "ACKNOWLEDGED"
             and (self.copy_correction_due(facts, getattr(self._runtime.publication, "writer_contract_version", "newsroom.offline-exact-copy.v3")) or facts.get("copy_correction_of"))
@@ -1190,7 +1228,7 @@ class NativePublicationContinuation:
                 revision_id, stage="ASSESSMENT_CONTRACT_REVALIDATION", facts=facts
             )
 
-        if progress.get("stage") == "ASSESSMENT_INTERRUPTED" or admission_recovery:
+        if (progress.get("stage") == "ASSESSMENT_INTERRUPTED" or admission_recovery) and not semantic_only:
             retained_failure = None
             if (
                 facts.get("failure_class") == "EvidencePackageError"
@@ -1280,7 +1318,7 @@ class NativePublicationContinuation:
                 "EVIDENCE_HOLD", str(facts.get("reason")), None
             )
         if decision_value is None or package_id is None:
-            if progress.get("stage") in {
+            if not semantic_only and progress.get("stage") in {
                 "ASSESSMENT_STARTED",
                 "ASSESSMENT_INTERRUPTED",
             }:
@@ -1303,21 +1341,37 @@ class NativePublicationContinuation:
                     return NativePublicationContinuationResult(
                         "EVIDENCE_HOLD", str(reason), None
                     )
-            attempt_count = facts.get("acquisition_attempt_count", 0)
+            acquisition_counter = 'semantic_acquisition_attempt_count' if semantic_only else 'acquisition_attempt_count'
+            attempt_count = facts.get(acquisition_counter, 0)
             if type(attempt_count) is not int or attempt_count < 0:
                 raise NativePublicationError("native acquisition attempt differs")
             attempt_count += 1
             acquisition_started_at = self._clock().to_text()
             facts = current_facts()
             facts.update(
-                acquisition_attempt_count=attempt_count,
                 acquisition_started_at=acquisition_started_at,
             )
+            facts[acquisition_counter] = attempt_count
             facts.pop("acquisition_retryable", None)
             self._journal.advance(
                 revision_id, stage="ACQUISITION_STARTED", facts=facts
             )
             assessment_started = False
+
+            def bind_semantic_input(base, acquired):
+                nonlocal facts
+                current = current_facts()
+                intent = dict(current['semantic_assessment_intent'])
+                digest = digest_canonical({'base_digest': base.digest,
+                    'acquired': [(item.receipt_digest, item.body_digest) for item in acquired]})
+                retained_digest = intent.get('input_digest')
+                if retained_digest is not None and retained_digest != digest:
+                    raise NativeEvidenceHold('SEMANTIC_INTENT_INPUT_CHANGED_HOLD', revision_id)
+                if retained_digest is None:
+                    intent['input_digest'] = digest
+                    current['semantic_assessment_intent'] = intent
+                    facts = current
+                    self._journal.advance(revision_id, stage='ACQUISITION_STARTED', facts=current)
 
             def before_assessment() -> None:
                 nonlocal assessment_started, facts
@@ -1373,7 +1427,9 @@ class NativePublicationContinuation:
                     intake_receipt_id=str(facts["intake_receipt_id"]),
                     sources=self._sources[revision_id],
                     before_assessment=before_assessment,
-                    assessment_cached_only=consumer_only_revalidation,
+                    assessment_cached_only=consumer_only_revalidation and not semantic_only,
+                    **({'assessment_semantic_only': True} if semantic_only else {}),
+                    **({'before_semantic_assessment': bind_semantic_input} if semantic_only else {}),
                     proof=self._runtime.proof,
                 )
             except VetoError:
