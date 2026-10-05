@@ -7,6 +7,7 @@ import re
 import sqlite3
 import ssl
 import urllib.request
+import urllib.error
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -253,6 +254,7 @@ class TypesafeJudgment:
             prior_message_count=0, allocated_at=self.clock(), recovery_deadline_at=self.clock()+timedelta(seconds=TIMEOUT+5), parent_invocation_id=None)
         self.usage.allocate(allocation, owner_emergency_stop=False)
         dispatch, usage, raw, value, answers, error = None, None, None, None, None, None
+        transport_failure = None
         try:
             with self.fence(inputs['source_binding'], proof):
                 key = self.key()
@@ -275,6 +277,14 @@ class TypesafeJudgment:
                 raise ValueError('reported usage is absent')
         except Exception as exc:
             error = type(exc).__name__
+            if isinstance(exc, urllib.error.HTTPError):
+                # Preserve the actual response for diagnosis, not a zero-cost or
+                # provider-completion inference. No Authorization headers/logs.
+                transport_failure = {'status': exc.code, 'endpoint_matches': exc.geturl() == URL}
+                try:
+                    raw = exc.read(MAX_RESPONSE_BYTES + 1)
+                except Exception as read_error:
+                    transport_failure['response_read_failure'] = type(read_error).__name__
         known, zero = usage is not None, dispatch is None
         telemetry = None if not known else {'provider':'typesafe','model_alias':MODEL, 'model_returned':value.get('model'), **usage}
         components = UsageComponents(input_tokens=usage['input_tokens'], output_tokens=usage['output_tokens'],
@@ -286,6 +296,13 @@ class TypesafeJudgment:
             provider_telemetry_digest=None if telemetry is None else digest_canonical(telemetry),
             raw_telemetry_pointer=None if telemetry is None else digest_bytes(raw),
             od_011_reference='OD-011:TYPESAFE_JUDGMENT', subscription_cli_chat_not_cash_debited=False), provider_telemetry=telemetry)
+        if transport_failure is not None:
+            failure_record = {'schema_version': VERSION, 'invocation_id': allocation.invocation_id,
+                'allocation_digest': allocation.canonical_digest, 'terminal_digest': terminal.terminal_digest,
+                'request_digest': manifest['request_digest'], 'snapshot': snapshot,
+                'transport_failure': transport_failure, 'outcome': terminal.outcome}
+            self.objects.admit(ObjectAdmissionRequest('evidence.record', 'typesafe-transport-failure:'+allocation.invocation_id),
+                canonical_json_bytes(failure_record), proof=proof)
         if raw is None or type(raw) is not bytes or len(raw)>MAX_RESPONSE_BYTES:
             raise TypesafeJudgmentError('TYPESAFE_UNSETTLED_OR_INVALID_TRANSPORT')
         raw_admission = self.objects.admit(ObjectAdmissionRequest('evidence.record','typesafe-raw:'+allocation.invocation_id), raw, proof=proof).admission
@@ -295,6 +312,8 @@ class TypesafeJudgment:
             'raw_response_digest':digest_bytes(raw),'terminal_digest':terminal.terminal_digest,'outcome':terminal.outcome,
             'answers':answers,'usage':usage,'tariff':{'input_microUSD_per_1000_tokens':42,'output_microUSD_per_1000_tokens':0,
             'basis':'CALCULATED_FROM_QUALIFIED_TARIFF','calculated_usd_microunits':None if not known else (usage['input_tokens']*42+999)//1000}}
+        if transport_failure is not None:
+            receipt['transport_failure'] = transport_failure
         admitted = self.objects.admit(ObjectAdmissionRequest('evidence.record','typesafe-receipt:'+allocation.invocation_id), canonical_json_bytes(receipt), proof=proof).admission
         reference = JudgmentReference(allocation.invocation_id, raw_admission.admission_id, admitted.admission_id)
         if error is not None or terminal.policy_breach:

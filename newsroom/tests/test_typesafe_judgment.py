@@ -487,3 +487,59 @@ def test_unknown_verifier_never_retries_its_ingest_under_a_new_attempt(tmp_path,
         with pytest.raises(ModelUsageAdmissionError):
             engine.evaluate(**{**verifier, 'cycle_id': 'changed', 'graphiti_attempt_id': 'ingest-1:2'})
         assert len(calls) == 1
+
+
+@pytest.mark.parametrize('status', [400, 401, 402, 429, 503])
+def test_http_failure_retains_bounded_response_status_without_inventing_usage(tmp_path, monkeypatch, status):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from newsroom.authority import HydrationRequest
+    from newsroom.control_plane.typesafe_judgment import URL
+    body = json.dumps({'error': {'code': 'fixture-error', 'message': 'fixture response'}}).encode()
+    with _case(tmp_path, monkeypatch,
+               transport_error=HTTPError(URL, status, 'fixture status', {}, BytesIO(body))) as (engine, inputs, usage, calls, _):
+        with pytest.raises(TypesafeJudgmentError) as held:
+            engine.evaluate(**inputs)
+        reference = held.value.reference
+        assert reference is not None
+        receipt = json.loads(engine.objects.rehydrate(
+            HydrationRequest(reference.receipt_admission_id, 'evidence.record'), proof=inputs['proof']).data)
+        assert receipt['transport_failure'] == {'status': status, 'endpoint_matches': True}
+        assert engine.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'),
+                                        proof=inputs['proof']).data == body
+        terminal = usage.terminal(reference.invocation_id)
+        assert terminal.usage_status.value == 'UNREPORTED'
+        assert terminal.components.total_tokens is None and not terminal.pre_dispatch_zero_proved
+        assert terminal.failure_class == 'HTTPError'
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize('response', ['unreadable', 'oversized'])
+def test_http_failure_diagnostic_survives_without_a_retainable_body(tmp_path, monkeypatch, response):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from newsroom.authority import HydrationRequest, ObjectAdmissionRequest
+    from newsroom.control_plane.typesafe_judgment import URL, MAX_RESPONSE_BYTES
+    class Unreadable:
+        def read(self, *_):
+            raise OSError('fixture unreadable body')
+        def close(self):
+            pass
+    stream = Unreadable() if response == 'unreadable' else BytesIO(b'x' * (MAX_RESPONSE_BYTES + 1))
+    with _case(tmp_path, monkeypatch, transport_error=HTTPError(URL, 503, 'fixture', {}, stream)) as (engine, inputs, usage, calls, _):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        with sqlite3.connect(usage.path) as db:
+            invocation = db.execute('SELECT invocation_id FROM model_invocation_allocations').fetchone()[0]
+        admission = engine.objects.committed_admission(ObjectAdmissionRequest('evidence.record',
+            'typesafe-transport-failure:' + invocation), proof=inputs['proof']).admission
+        diagnostic = json.loads(engine.objects.rehydrate(HydrationRequest(admission.admission_id, 'evidence.record'),
+                                                        proof=inputs['proof']).data)
+        assert diagnostic['transport_failure']['status'] == 503
+        if response == 'unreadable':
+            assert diagnostic['transport_failure']['response_read_failure'] == 'OSError'
+        terminal = usage.terminal(invocation)
+        assert terminal.usage_status.value == 'UNREPORTED' and terminal.components.total_tokens is None
+        assert len(calls) == 1

@@ -47,7 +47,7 @@ def _services(tmp_path,monkeypatch,*,uncertain=False,failed_support=False,timeou
         return 200,request.full_url,raw
     def runner(prompt):
         local_calls.append(json.loads(prompt))
-        return NativeAssessmentExecution(canonical_json_bytes({'renderings':rendering['renderings']}).decode(),
+        return NativeAssessmentExecution(canonical_json_bytes({'renderings':[{'span_id':identity,**item} for identity,item in rendering['renderings'].items()]}).decode(),
             {'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':20,'total_tokens':60})
     with open_native_runtime(**_args(tmp_path,monkeypatch))as runtime:
         admitted=runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.record','original-source-qualification'),
