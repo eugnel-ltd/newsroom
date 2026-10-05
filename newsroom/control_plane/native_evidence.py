@@ -351,6 +351,7 @@ class EvidenceAssessor:
         cached_only: bool = False,
         semantic_only: bool = False,
         qualification_cached_only: bool = False,
+        context_only: bool = False,
     ) -> IndependentEvidenceAssessment:
         bounded = getattr(self._assess, "assess_with_boundary", None)
         if callable(bounded):
@@ -360,9 +361,10 @@ class EvidenceAssessor:
                 cached_only=cached_only,
                 **({'semantic_only': True} if semantic_only else {}),
                 **({'qualification_cached_only': True} if qualification_cached_only else {}),
+                **({'context_only': True} if context_only else {}),
             )
         else:
-            if cached_only or semantic_only or qualification_cached_only:
+            if cached_only or semantic_only or qualification_cached_only or context_only:
                 source_id = (
                     sources[0].unit.source_id if sources else candidate.candidate_id
                 )
@@ -446,6 +448,7 @@ class NativeEvidenceController:
         assessment_cached_only: bool = False,
         assessment_semantic_only: bool = False,
         assessment_qualification_cached_only: bool = False,
+        assessment_context_only: bool = False,
         before_semantic_assessment: Callable[[EvidencePackage, tuple[AcquiredEvidence, ...]], None] | None = None,
         proof: AuthenticationProof,
     ) -> NativeEvidenceResult:
@@ -453,6 +456,8 @@ class NativeEvidenceController:
             type(assessment_cached_only) is not bool
             or type(assessment_semantic_only) is not bool
             or type(assessment_qualification_cached_only) is not bool
+            or type(assessment_context_only)is not bool
+            or (assessment_context_only and (assessment_cached_only or assessment_semantic_only or assessment_qualification_cached_only))
             or (assessment_qualification_cached_only and (not assessment_cached_only or assessment_semantic_only))
             or (before_semantic_assessment is not None and not callable(before_semantic_assessment))
             or type(sources) is not tuple
@@ -492,6 +497,7 @@ class NativeEvidenceController:
             cached_only=assessment_cached_only,
             **({'semantic_only': True} if assessment_semantic_only else {}),
             **({'qualification_cached_only': True} if assessment_qualification_cached_only else {}),
+            **({'context_only': True} if assessment_context_only else {}),
         )
         source_assessments = self._validated_source_assessments(
             sources, acquired, assessment.source_assessments

@@ -841,6 +841,25 @@ def open_native_pipeline(
                         raise NativeEvidenceHold(str(exc), sources[0].unit.source_id) from exc
 
                 assessor._retained_qualification = read_qualified_source
+                from .native_context_enrichment import NativeContextEnricher, ContextEnrichmentHold
+
+                def enrich_source_context(original,candidate,base,sources,acquired):
+                    from .native_assessor_spans import build_lossless_source_view
+                    scope=judgment_scope(candidate,base,sources,acquired)
+                    view=build_lossless_source_view(base.passages,base.source_ids)
+                    binding=NativeAssessorJudgments._binding(candidate,base,scope,view)
+                    def require_context_current():
+                        stop_check()
+                        _require_semantic_current_sources(runtime.authority.sources,binding,
+                            proof=proof,rights_for=source_rights)
+                    consumer=NativeContextEnricher(judgments=judgments,localiser=localiser,
+                        objects=runtime.authority.objects,proof=proof,require_current=require_context_current)
+                    try:
+                        return consumer.enrich(original,candidate,base,sources,acquired,scope=scope)
+                    except ContextEnrichmentHold as exc:
+                        raise NativeEvidenceHold(str(exc),sources[0].unit.source_id)from exc
+
+                assessor._context_enrichment=enrich_source_context
 
             from .native_graphiti_judgments import NativeGraphitiJudgments
             graph_judgments = NativeGraphitiJudgments(judgments=judgments)
@@ -1134,6 +1153,8 @@ def open_native_pipeline(
                         if judgment_api_key is not None else None),
                     semantic_intent_contract=(JUDGMENT_CONTRACT + ('+' + QUALIFICATION_CONTRACT if source_qualification_policy is not None else '')
                         if judgment_api_key is not None else None),
+                    context_enrichment_contract=('newsroom.native-context-package.v1'
+                        if judgment_api_key is not None and source_qualification_policy is not None else None),
                     evidence_sources_for=self.sources_for,
                     assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,
                     clock=now,
@@ -1168,6 +1189,10 @@ def open_native_pipeline(
             @staticmethod
             def writer_revalidation_due(facts):
                 return NativePublicationContinuation.writer_revalidation_due(facts)
+
+            def context_enrichment_due(self,facts):
+                return (judgment_api_key is not None and source_qualification_policy is not None
+                    and NativePublicationContinuation.context_enrichment_due(facts))
 
         intake = NativeSourceIntake(
             sources=runtime.authority.sources, objects=runtime.authority.objects,

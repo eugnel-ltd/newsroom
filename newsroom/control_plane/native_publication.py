@@ -893,6 +893,7 @@ class NativePublicationContinuation:
         ) = None,
         semantic_origin_failure: Callable[[object], RetainedAssessorResult | None] | None = None,
         semantic_intent_contract: str | None = None,
+        context_enrichment_contract: str | None = None,
         evidence_sources_for: Callable[[str], tuple[NativeEvidenceSource, ...]] | None = None,
         assessment_contract_version: str | None = None,
         clock=UtcTimestamp.now,
@@ -917,6 +918,7 @@ class NativePublicationContinuation:
             or (semantic_origin_failure is not None and not callable(semantic_origin_failure))
             or ((semantic_origin_failure is None) != (semantic_intent_contract is None))
             or (semantic_intent_contract is not None and (type(semantic_intent_contract) is not str or not semantic_intent_contract))
+            or (context_enrichment_contract is not None and (type(context_enrichment_contract)is not str or not context_enrichment_contract))
             or (evidence_sources_for is not None and not callable(evidence_sources_for))
             or not isinstance(sources, Mapping)
             or not all(
@@ -940,6 +942,7 @@ class NativePublicationContinuation:
         self._assessment_old_provider_failure = assessment_old_provider_failure
         self._semantic_origin_failure = semantic_origin_failure
         self._semantic_intent_contract = semantic_intent_contract
+        self._context_enrichment_contract=context_enrichment_contract
         self._evidence_sources_for = evidence_sources_for
         self._assessment_contract_version = assessment_contract_version
         self._clock = clock
@@ -958,6 +961,24 @@ class NativePublicationContinuation:
             and facts.get('writer_support_checked_version')!=CONSUMER_VERSION
             and type(facts.get('package_admission_id'))is str
             and type(facts.get('editorial_decision'))is dict
+            and not any(facts.get(key)for key in ('story_event_id','publication_event_id',
+                'delivery_attempt_event_id','delivery_evidence_event_id')))
+
+    @staticmethod
+    def context_enrichment_due(facts: dict) -> bool:
+        from .native_context_enrichment import VERSION
+        if any(facts.get(key)for key in ('story_event_id','publication_event_id',
+                'delivery_attempt_event_id','delivery_evidence_event_id')):
+            return False
+        if facts.get('context_enrichment_settled')==VERSION:
+            return False
+        intent=facts.get('context_enrichment_intent')
+        if type(intent)is dict and intent.get('contract')==VERSION:
+            return bool(intent.get('original_package_admission_id'))and not facts.get('context_enrichment_completed')
+        return (facts.get('reason')in {'NATIVE_STORY_FACTUAL_ENTITIES','NATIVE_STORY_SENTENCE_SUPPORT'}
+            and type(facts.get('package_admission_id'))is str
+            and type(facts.get('editorial_decision'))is dict
+            and bool(facts.get('graphiti_receipts'))and bool(facts.get('intake_receipt_id'))
             and not any(facts.get(key)for key in ('story_event_id','publication_event_id',
                 'delivery_attempt_event_id','delivery_evidence_event_id')))
 
@@ -1170,6 +1191,22 @@ class NativePublicationContinuation:
         progress = self._journal.current(revision_id)
         facts = dict(progress.get("facts", {}))
         writer_cached_revalidation = self.writer_revalidation_due(facts)
+        context_only=self._context_enrichment_contract is not None and self.context_enrichment_due(facts)
+        if context_only:
+            from .native_context_enrichment import VERSION
+            if facts.get('context_enrichment_intent')is None:
+                facts['context_enrichment_intent']={'contract':VERSION,
+                    'candidate_version_id':candidate_version_id,
+                    'original_package_admission_id':facts['package_admission_id'],
+                    'original_journal':{key:facts.get(key)for key in (
+                        'editorial_decision','expected_story_version','expected_publication_version',
+                        'expected_delivery_evidence_version','publication_started_at','reason',
+                        'editorial_hold_reason_codes','writer_support_checked_version')}}
+                for key in ('package_admission_id','editorial_decision','expected_story_version',
+                        'expected_publication_version','expected_delivery_evidence_version','publication_started_at'):
+                    facts.pop(key,None)
+                progress=self._journal.advance(revision_id,stage='CONTEXT_ASSESSMENT_PENDING',facts=facts)
+            writer_cached_revalidation=False
         admission_recovery = (
             progress.get("stage") == "EVIDENCE_HOLD"
             and assessor_admission_recovery_due(facts)
@@ -1212,7 +1249,7 @@ class NativePublicationContinuation:
             and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
                 'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id'))
         )
-        if (self._semantic_origin_failure is not None
+        if (self._semantic_origin_failure is not None and not context_only
                 and not retained_semantic_consumer
                 and facts.get('graphiti_receipts') and facts.get('intake_receipt_id')
                 and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
@@ -1286,10 +1323,10 @@ class NativePublicationContinuation:
                     "context_manifest_digest": old.context_manifest_digest,
                 }:
                     old_provider_failure = retained
-        if old_provider_failure is not None or (
+        if not context_only and (old_provider_failure is not None or (
             not retained_semantic_consumer and progress.get("stage") == "EVIDENCE_HOLD"
             and assessment_revalidation_due(facts, self._assessment_contract_version)
-        ):
+        )):
             facts = current_facts()
             # Retain the superseded references before clearing continuation-only
             # fields. Intake identity and all original ledger/accounting remain.
@@ -1328,7 +1365,7 @@ class NativePublicationContinuation:
                 revision_id, stage="ASSESSMENT_CONTRACT_REVALIDATION", facts=facts
             )
 
-        if (progress.get("stage") == "ASSESSMENT_INTERRUPTED" or admission_recovery) and not semantic_only and not retained_semantic_consumer:
+        if (progress.get("stage") == "ASSESSMENT_INTERRUPTED" or admission_recovery) and not semantic_only and not retained_semantic_consumer and not context_only:
             retained_failure = None
             if (
                 facts.get("failure_class") == "EvidencePackageError"
@@ -1419,7 +1456,7 @@ class NativePublicationContinuation:
                 "EVIDENCE_HOLD", str(facts.get("reason")), None
             )
         if decision_value is None or package_id is None:
-            if not semantic_only and not retained_semantic_consumer and progress.get("stage") in {
+            if not semantic_only and not retained_semantic_consumer and not context_only and progress.get("stage") in {
                 "ASSESSMENT_STARTED",
                 "ASSESSMENT_INTERRUPTED",
             }:
@@ -1431,7 +1468,7 @@ class NativePublicationContinuation:
                 return NativePublicationContinuationResult(
                     "ASSESSMENT_INTERRUPTED", facts["reason"], None
                 )
-            if progress.get("stage") == "EVIDENCE_HOLD" and not retained_semantic_consumer:
+            if progress.get("stage") == "EVIDENCE_HOLD" and not retained_semantic_consumer and not context_only:
                 reason = facts.get("reason")
                 retryable_acquisition = (
                     facts.get("acquisition_retryable") is True
@@ -1442,7 +1479,8 @@ class NativePublicationContinuation:
                     return NativePublicationContinuationResult(
                         "EVIDENCE_HOLD", str(reason), None
                     )
-            acquisition_counter = 'semantic_acquisition_attempt_count' if semantic_only else 'acquisition_attempt_count'
+            acquisition_counter = ('context_acquisition_attempt_count' if context_only else
+                'semantic_acquisition_attempt_count' if semantic_only else 'acquisition_attempt_count')
             attempt_count = facts.get(acquisition_counter, 0)
             if type(attempt_count) is not int or attempt_count < 0:
                 raise NativePublicationError("native acquisition attempt differs")
@@ -1532,9 +1570,10 @@ class NativePublicationContinuation:
                     intake_receipt_id=str(facts["intake_receipt_id"]),
                     sources=self._sources[revision_id],
                     before_assessment=before_assessment,
-                    assessment_cached_only=consumer_only_revalidation and not semantic_only,
+                    assessment_cached_only=consumer_only_revalidation and not semantic_only and not context_only,
                     **({'assessment_semantic_only': True} if semantic_only else {}),
                     **({'assessment_qualification_cached_only': True} if retained_semantic_consumer else {}),
+                    **({'assessment_context_only': True} if context_only else {}),
                     **({'before_semantic_assessment': bind_semantic_input} if semantic_only else {}),
                     proof=self._runtime.proof,
                 )
@@ -1547,6 +1586,10 @@ class NativePublicationContinuation:
                 ):
                     return retain_acquisition_failure(type(exc).__name__)
                 facts = current_facts()
+                if context_only and exc.reason_code in {'CONTEXT_SELECTION_UNCERTAIN_HOLD',
+                        'CONTEXT_NOT_ESTABLISHED_HOLD','CONTEXT_SUPPORT_UNPROVEN_HOLD'}:
+                    from .native_context_enrichment import VERSION
+                    facts['context_enrichment_settled']=VERSION
                 facts["reason"] = exc.reason_code
                 facts["acquisition_retryable"] = False
                 self._journal.advance(
@@ -1599,6 +1642,10 @@ class NativePublicationContinuation:
                     evidence.acquisition_receipt_digests
                 ),
             )
+            if context_only:
+                if package_id==facts['context_enrichment_intent']['original_package_admission_id']:
+                    raise NativePublicationError('context enrichment did not create a new package')
+                facts['context_enrichment_completed']=True
             self._journal.advance(
                 revision_id, stage="EVIDENCE_RETAINED", facts=facts
             )
