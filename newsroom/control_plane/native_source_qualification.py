@@ -98,7 +98,8 @@ def _prompt(state):
             'current': current, 'prior': prior,
             'first_publication': publication},
         'qualification_rubrics': RUBRICS, 'temporal_rules': TEMPORAL_RULES,
-        'unresolved': state['issue'], 'judgments': state['judgments']}).decode()
+        'unresolved': {key: value for key, value in state['issue'].items() if key != 'prior_scope'},
+        'judgments': state['judgments']}).decode()
 
 
 def _materialisation(raw, state):

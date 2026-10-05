@@ -280,3 +280,15 @@ def test_public_qualification_v2_prompt_preserves_rubrics_time_and_prior_without
     assert value['judgments']==state['judgments']
     assert all(secret not in raw for secret in ('private-definition','private-receipt','private-candidate-id'))
     assert 'not the retrieval clock' in SYSTEM and 'mandatory obligation' in SYSTEM
+
+
+def test_prior_public_body_occurs_once_in_qualification_prompt():
+    from newsroom.control_plane.native_source_qualification import _prompt
+    state=_state();old='An earlier uniquely identifiable public fact.'
+    prior={'sources':[{'source_id':'UK-03','body':old,'published_at':'2026-10-01T00:00:00Z'}]}
+    state['source_binding'].update(coverage='COMPLETE',newness='KNOWN_CHANGE',prior_scope=prior)
+    state['issue']['prior_scope']=prior
+    raw=_prompt(state);value=json.loads(raw)
+    assert raw.count(old)==1
+    assert value['scope']['prior']==prior and 'prior_scope'not in value['unresolved']
+    assert state['issue']['prior_scope']==prior  # Local provenance is unchanged.
