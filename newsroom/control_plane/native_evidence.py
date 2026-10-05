@@ -346,6 +346,7 @@ class EvidenceAssessor:
         before_assessment: Callable[[], None] | None = None,
         cached_only: bool = False,
         semantic_only: bool = False,
+        qualification_cached_only: bool = False,
     ) -> IndependentEvidenceAssessment:
         bounded = getattr(self._assess, "assess_with_boundary", None)
         if callable(bounded):
@@ -354,9 +355,10 @@ class EvidenceAssessor:
                 before_dispatch=before_assessment,
                 cached_only=cached_only,
                 **({'semantic_only': True} if semantic_only else {}),
+                **({'qualification_cached_only': True} if qualification_cached_only else {}),
             )
         else:
-            if cached_only or semantic_only:
+            if cached_only or semantic_only or qualification_cached_only:
                 source_id = (
                     sources[0].unit.source_id if sources else candidate.candidate_id
                 )
@@ -439,12 +441,15 @@ class NativeEvidenceController:
         before_assessment: Callable[[], None] | None = None,
         assessment_cached_only: bool = False,
         assessment_semantic_only: bool = False,
+        assessment_qualification_cached_only: bool = False,
         before_semantic_assessment: Callable[[EvidencePackage, tuple[AcquiredEvidence, ...]], None] | None = None,
         proof: AuthenticationProof,
     ) -> NativeEvidenceResult:
         if (
             type(assessment_cached_only) is not bool
             or type(assessment_semantic_only) is not bool
+            or type(assessment_qualification_cached_only) is not bool
+            or (assessment_qualification_cached_only and (not assessment_cached_only or assessment_semantic_only))
             or (before_semantic_assessment is not None and not callable(before_semantic_assessment))
             or type(sources) is not tuple
             or not sources
@@ -482,6 +487,7 @@ class NativeEvidenceController:
             before_assessment=before_assessment,
             cached_only=assessment_cached_only,
             **({'semantic_only': True} if assessment_semantic_only else {}),
+            **({'qualification_cached_only': True} if assessment_qualification_cached_only else {}),
         )
         source_assessments = self._validated_source_assessments(
             sources, acquired, assessment.source_assessments

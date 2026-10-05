@@ -2746,6 +2746,37 @@ def test_retained_process_with_separate_public_invitation_passes_static_validati
     assert execution.text == canonical_json_bytes(raw).decode()
 
 
+@pytest.mark.parametrize('available', [False, True])
+def test_qualification_cached_only_has_no_judgment_or_provider_fallback(
+    tmp_path, monkeypatch, retained_22589_assessment, available,
+):
+    from newsroom.control_plane.native_assessor_judgments import JudgedAssessment
+    candidate, base, source, acquired, raw = _qualification_assessor_inputs(
+        retained_22589_assessment, kind='policy',
+    )
+    raw['package'].update(substantive_new_information=[], governed_claims=[], qualification_evidence=[])
+    execution=NativeAssessmentExecution(canonical_json_bytes(raw).decode(), {})
+    _,usage=_usage(tmp_path,monkeypatch)
+    calls=[]
+    def read(*_):
+        calls.append('retained')
+        return JudgedAssessment(execution,b'fixture',None)
+    def forbidden(*_,**__):
+        pytest.fail('cached qualification dispatched or entered fresh judgment')
+    assessor=AutonomousNativeEvidenceAssessor(forbidden,usage=usage,dispatch_fence=nullcontext,
+        judgments=SimpleNamespace(get_decision_ref=forbidden),qualification=forbidden,
+        retained_qualification=read if available else None)
+    if available:
+        result=assessor.assess_with_boundary(candidate,base,(source,),(acquired,),
+            before_dispatch=lambda:calls.append('consumer'),cached_only=True,qualification_cached_only=True)
+        assert not result.governed_claims and calls==['consumer','retained']
+    else:
+        with pytest.raises(NativeEvidenceHold,match='QUALIFICATION_RETAINED_RESULT_UNAVAILABLE'):
+            assessor.assess_with_boundary(candidate,base,(source,),(acquired,),
+                before_dispatch=forbidden,cached_only=True,qualification_cached_only=True)
+        assert calls==[]
+
+
 def test_weather_record_metadata_failure_revalidates_once_per_consumer_contract():
     from newsroom.control_plane.native_assessor import assessment_revalidation_due
     from newsroom.control_plane.native_composition import ASSESSMENT_CONTRACT_VERSION

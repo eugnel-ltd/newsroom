@@ -1437,6 +1437,56 @@ def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, 
     connection.close()
 
 
+@pytest.mark.parametrize('fault', [None, 'unknown', 'same-consumer', 'already-checked', 'pending-effect'])
+def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_path, monkeypatch, fault):
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    unit = _native()
+    connection = connect(str(tmp_path / 'known-qualification.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    journal.land((unit,))
+    contract='newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2'
+    current='newsroom.native-evidence-assessor.v23+consumer.v2'
+    intent={'contract':contract,'input_digest':_DIGEST,'origin_invocation_id':'original-unknown',
+            'origin_journal':{'reason':'ACQUISITION_RESULT_NOT_RETAINED'}}
+    facts={'candidate_id':'candidate','candidate_version_id':'candidate-version',
+        'graphiti_receipts':[{}],'intake_receipt_id':'existing-intake',
+        'semantic_assessment_intent':intent,'assessment_contract_version':current.replace('consumer.v2','consumer.v1'),
+        'reason':'ACQUISITION_RESULT_NOT_RETAINED','failure_class':'EvidencePackageError',
+        'assessment_started_at':'2026-10-05T07:33:07Z',
+        'semantic_acquisition_attempt_count':2,'acquisition_attempt_count':3}
+    if fault=='unknown':facts['failure_class']='CliTimeoutError'
+    if fault=='same-consumer':facts['assessment_contract_version']=current
+    if fault=='already-checked':facts['retained_qualification_checked_contract']=current
+    if fault=='pending-effect':facts['publication_started_at']='pending'
+    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED',facts=facts)
+    calls=[]
+    def acquire(_self, **request):
+        calls.append(request)
+        assert request['assessment_cached_only'] is True
+        assert request['assessment_qualification_cached_only'] is True
+        assert 'assessment_semantic_only' not in request
+        assert 'before_semantic_assessment' not in request
+        request['before_assessment']()
+        raise NativeEvidenceHold('QUALIFICATION_RETAINED_RESULT_HOLD',unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+    runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),policies=object(),proof=proof())
+    continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
+        evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
+        semantic_origin_failure=lambda _:None,semantic_intent_contract=contract,assessment_contract_version=current)
+    continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+    after=journal.current(unit.revision_id)['facts']
+    assert len(calls)==(1 if fault is None else 0), after
+    assert after['semantic_assessment_intent']==intent
+    assert after['semantic_acquisition_attempt_count']==2
+    assert after['assessment_started_at']==facts['assessment_started_at']
+    if fault is None:
+        assert after['retained_qualification_checked_contract']==current
+        continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+        assert len(calls)==1
+    assert runtime.authority.receives==0 and runtime.publication.calls==0
+    connection.close()
+
+
 @pytest.mark.parametrize('scenario', ['eligible', 'missing-origin', 'missing-graph', 'pending-publication', 'wrong-origin', 'changed-input', 'same-input', 'question-upgrade'])
 def test_separate_semantic_continuation_retains_original_interruption_and_never_retries_legacy(tmp_path, monkeypatch, scenario):
     from datetime import UTC, datetime
