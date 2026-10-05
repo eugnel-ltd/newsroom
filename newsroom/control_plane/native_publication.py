@@ -898,6 +898,7 @@ class NativePublicationContinuation:
         assessment_contract_version: str | None = None,
         clock=UtcTimestamp.now,
     ) -> None:
+        from .native_context_enrichment import VERSION as CONTEXT_CONTRACT
         if (
             type(journal) is not NativeRevisionJournal
             or type(evidence_controller) is not NativeEvidenceController
@@ -918,7 +919,8 @@ class NativePublicationContinuation:
             or (semantic_origin_failure is not None and not callable(semantic_origin_failure))
             or ((semantic_origin_failure is None) != (semantic_intent_contract is None))
             or (semantic_intent_contract is not None and (type(semantic_intent_contract) is not str or not semantic_intent_contract))
-            or (context_enrichment_contract is not None and (type(context_enrichment_contract)is not str or not context_enrichment_contract))
+            or (context_enrichment_contract is not None and (type(context_enrichment_contract)is not str
+                or context_enrichment_contract!=CONTEXT_CONTRACT))
             or (evidence_sources_for is not None and not callable(evidence_sources_for))
             or not isinstance(sources, Mapping)
             or not all(
@@ -1195,7 +1197,7 @@ class NativePublicationContinuation:
         if context_only:
             from .native_context_enrichment import VERSION
             if facts.get('context_enrichment_intent')is None:
-                facts['context_enrichment_intent']={'contract':VERSION,
+                facts['context_enrichment_intent']={'contract':self._context_enrichment_contract,
                     'candidate_version_id':candidate_version_id,
                     'original_package_admission_id':facts['package_admission_id'],
                     'original_journal':{key:facts.get(key)for key in (

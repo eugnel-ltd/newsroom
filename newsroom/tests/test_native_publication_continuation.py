@@ -1462,6 +1462,10 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
     publication=_Publication();runtime=SimpleNamespace(authority=_Authority(),ingress=object(),
         publication=publication,proof=proof(),policies=SimpleNamespace(publication=SimpleNamespace(
             target_path=tmp_path/'serving.sqlite3',target_id='private',target_context_digest=_DIGEST)))
+    with pytest.raises(ValueError,match='composition differs'):
+        NativePublicationContinuation(journal=journal,runtime=runtime,
+            evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
+            context_enrichment_contract='newsroom.native-context-package.v99')
     continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
         evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
         context_enrichment_contract='newsroom.native-context-package.v1')
