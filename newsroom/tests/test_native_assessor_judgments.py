@@ -479,3 +479,25 @@ def test_second_stage_geometry_fallback_retains_exact_first_reference_without_se
         with sqlite3.connect(usage.path) as db:
             assert db.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0]==1
             assert db.execute('SELECT count(*) FROM model_invocation_terminals').fetchone()[0]==1
+
+
+@pytest.mark.parametrize('fallback', [False, True])
+def test_semantic_only_intent_never_dispatches_legacy_reasoning(tmp_path, monkeypatch, fallback):
+    from contextlib import nullcontext
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    with _case(tmp_path,monkeypatch) as (consumer,service,candidate,base,source,acquired,usage,calls):
+        local_calls=[]
+        _localiser(consumer,service,usage,candidate,base,local_calls)
+        if fallback:
+            consumer.scope_for=lambda *_:{'coverage':'COMPLETE','newness':'UNKNOWN','current_scope':{},'prior_scope':None}
+        assessor=AutonomousNativeEvidenceAssessor(lambda _:pytest.fail('separate semantic purpose may not dispatch legacy'),
+            dispatch_fence=nullcontext,judgments=consumer)
+        for _ in range(2):
+            if fallback:
+                with pytest.raises(NativeEvidenceHold,match='SEMANTIC_INTENT_FALLBACK_HOLD'):
+                    assessor.assess_with_boundary(candidate,base,(source,),(acquired,),before_dispatch=None,semantic_only=True)
+            else:
+                result=assessor.assess_with_boundary(candidate,base,(source,),(acquired,),before_dispatch=None,semantic_only=True)
+                assert len(result.governed_claims)==2
+        assert len(calls)==(0 if fallback else 2)
+        assert len(local_calls)==(0 if fallback else 1)

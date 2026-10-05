@@ -3061,3 +3061,23 @@ def test_old_provider_failure_continuation_keeps_current_source_and_stop_boundar
                 (json.loads(_terminal)['invocation_id'],)).fetchone() == (_terminal,)
     finally:
         connection.close()
+
+
+def test_unknown_current_producer_can_be_read_as_separate_semantic_origin_not_retry(tmp_path, monkeypatch):
+    # Existing failure fixture deliberately uses v21 prompt bytes. A current
+    # origin must instead bind the actual current system contract.
+    monkeypatch.setattr(native_assessor_module, '_V21_SYSTEM', native_assessor_module.SYSTEM)
+    connection, candidate, base, service, current, old_allocation, old_terminal = _old_provider_failure(
+        tmp_path, monkeypatch, contract=native_assessor_module._REFERENCE_PRODUCER_VERSION)
+    try:
+        assert current.retained_assessments(candidate, base) is None
+        origin = current.retained_semantic_origin_failure(candidate)
+        assert origin is not None and origin.execution is None
+        assert origin.contract_version == native_assessor_module.VERSION
+        assert origin.proof.invocation_id == json.loads(old_allocation)['invocation_id']
+        assert current.retained_assessments(candidate, base) is None
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT record_json FROM model_invocation_allocations').fetchone()[0] == old_allocation
+            assert retained.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0] == old_terminal
+    finally:
+        connection.close()

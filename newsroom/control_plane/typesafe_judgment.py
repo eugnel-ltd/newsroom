@@ -24,6 +24,7 @@ from .model_usage import (InvocationAllocation, InvocationEfficiencyPolicy, Invo
     _require_reported_telemetry, ModelUsageIntegrityError)
 
 VERSION = 'newsroom.typesafe-judgment.v1'
+CONSUMER_VERSION = 'newsroom.typesafe-judgment.answers-consumer.v2'
 ROUTE = 'TYPESAFE_JUDGMENT'
 MODEL = 'jev-latest'
 URL = 'https://api.typesafe.ai/v1/systemone'
@@ -123,7 +124,8 @@ def _answers(value, questions):
         if set(answer) != expected or type(probabilities) is not dict or set(probabilities) != keys:
             raise ValueError('answer fields/distribution differ')
         projected = {k: _ppm(v) for k, v in probabilities.items()}
-        if abs(sum(Decimal(v) for v in probabilities.values()) - 1) > Decimal('0.000001'):
+        tolerance = Decimal('0.01') if kind == 'choice' else Decimal('0.000001')
+        if abs(sum(Decimal(v) for v in probabilities.values()) - 1) > tolerance:
             raise ValueError('probabilities do not sum to one')
         result[key] = {'type': kind, 'confidence_ppm': _ppm(answer['confidence']), 'probabilities_ppm': projected}
         if kind == 'choice':
@@ -311,8 +313,9 @@ class TypesafeJudgment:
             connection.execute('PRAGMA query_only=ON')
             connection.execute('BEGIN')
             allocation, terminal = _retained_terminal_allocation(connection, reference.invocation_id)
+            revalidate = terminal.outcome == 'TYPESAFE_FAILED' and terminal.failure_class == 'ValueError'
             if (terminal.usage_status is not UsageStatus.REPORTED
-                    or terminal.outcome != 'TYPESAFE_COMPLETE' or terminal.policy_breach):
+                    or (terminal.outcome != 'TYPESAFE_COMPLETE' and not revalidate) or terminal.policy_breach):
                 raise TypesafeJudgmentError('TYPESAFE_REPLAY_USAGE_HOLD', reference=reference)
             original_policy = _policy_for_allocation(connection, allocation)
             _require_reported_telemetry(connection, terminal)
@@ -348,16 +351,34 @@ class TypesafeJudgment:
             receipt.get('request_digest')!=original_manifest['request_digest'] or receipt.get('raw_admission_id')!=str(reference.raw_admission_id) or
             receipt.get('allocation_digest')!=allocation.canonical_digest or
             receipt.get('raw_response_digest')!=digest_bytes(raw) or terminal is None or
-            receipt.get('terminal_digest')!=terminal.terminal_digest or terminal.outcome!='TYPESAFE_COMPLETE' or terminal.usage_status is not UsageStatus.REPORTED or terminal.policy_breach):
+            receipt.get('terminal_digest')!=terminal.terminal_digest or receipt.get('outcome')!=terminal.outcome
+            or terminal.usage_status is not UsageStatus.REPORTED or terminal.policy_breach):
             raise TypesafeJudgmentError('TYPESAFE_REPLAY_BINDING_HOLD')
-        decoded = _decode(raw)
-        if receipt.get('answers')!=_answers(decoded['answers'], inputs['questions']) or receipt.get('usage')!=decoded['usage'] or receipt.get('model_returned')!=decoded['model']:
-            raise TypesafeJudgmentError('TYPESAFE_REPLAY_VALUE_HOLD')
+        try:
+            decoded = _decode(raw)
+            usage = decoded.get('usage') if type(decoded) is dict else None
+            if (type(decoded) is not dict or set(decoded)!={'model','answers','usage'}
+                    or type(decoded['model']) is not str or not re.fullmatch(r'jev-\d+\.\d+(?:\.\d+)?',decoded['model'])
+                    or type(usage) is not dict or set(usage)!={'input_tokens','output_tokens'}
+                    or any(type(value)is not int or value<0 for value in usage.values())):
+                raise ValueError('retained response envelope differs')
+            answers = _answers(decoded['answers'], inputs['questions'])
+        except (ValueError,TypeError,KeyError,UnicodeError) as exc:
+            raise TypesafeJudgmentError('TYPESAFE_REPLAY_USAGE_HOLD' if revalidate else 'TYPESAFE_REPLAY_VALUE_HOLD',reference=reference) from exc
+        expected_answers = None if revalidate else answers
+        if (receipt.get('answers')!=expected_answers or receipt.get('usage')!=usage
+                or receipt.get('model_returned')!=decoded['model']):
+            raise TypesafeJudgmentError('TYPESAFE_REPLAY_VALUE_HOLD',reference=reference)
         if (receipt.get('model_alias') != MODEL or receipt.get('tariff') != {
                 'input_microUSD_per_1000_tokens':42, 'output_microUSD_per_1000_tokens':0,
                 'basis':'CALCULATED_FROM_QUALIFIED_TARIFF',
                 'calculated_usd_microunits':(decoded['usage']['input_tokens']*42+999)//1000}
                 or terminal.components.input_tokens != decoded['usage']['input_tokens']
-                or terminal.components.output_tokens != decoded['usage']['output_tokens']):
+                or terminal.components.output_tokens != decoded['usage']['output_tokens']
+                or terminal.components.total_tokens != sum(decoded['usage'].values())):
             raise TypesafeJudgmentError('TYPESAFE_REPLAY_USAGE_HOLD')
+        if revalidate:
+            return {**receipt,'answers':answers,'consumer_revalidation':{
+                'consumer_contract':CONSUMER_VERSION,'original_outcome':terminal.outcome,
+                'original_terminal_digest':terminal.terminal_digest,'raw_response_digest':digest_bytes(raw)}}
         return receipt

@@ -172,3 +172,67 @@ def test_verified_predispatch_zero_preserves_only_already_settled_graphiti(tmp_p
         after = usage.native_graphiti_ingest_retry_evidence_many(failed_attempts={'ingest-1':1}, max_attempts=1)['ingest-1']
         assert after == before and after.zero_dispatch_attempts == ()
         assert not calls
+
+
+def _typesafe_profile_pair(tmp_path, **changes):
+    service = ModelUsageService(str(tmp_path/'profiles.sqlite3'))
+    old = judgment_policy(evidence_digest=digest_bytes(b'original qualification'), qualified=True)
+    values = asdict(old)
+    values.update(implementation_revision=digest_bytes(b'new qualified implementation'),
+        evidence_digest=digest_bytes(b'new qualification'), **changes)
+    new = InvocationEfficiencyPolicy.create(**values)
+    service.register_policy(old);service.register_policy(new)
+    return service,old,new
+
+
+def _selected_typesafe(service, *, schema=True):
+    from newsroom.control_plane.typesafe_judgment import SCHEMA_DIGEST
+    return service.qualified_policy(workload_class=WorkloadClass.TYPESAFE_JUDGMENT,
+        provider='typesafe',route='TYPESAFE_JUDGMENT',model='jev-latest',reasoning='none',
+        output_schema_digest=SCHEMA_DIGEST if schema else None)
+
+
+def test_latest_typesafe_profile_only_supersedes_compatible_software_audit_facts(tmp_path):
+    import sqlite3
+    service, old, new = _typesafe_profile_pair(tmp_path)
+    assert _selected_typesafe(service) == new
+    with sqlite3.connect(service.path) as db:
+        assert db.execute('SELECT count(*) FROM model_invocation_policies').fetchone()[0] == 2
+        original = db.execute('SELECT record_json FROM model_invocation_policies WHERE canonical_digest=?', (old.canonical_digest,)).fetchone()[0]
+    import json
+    assert json.loads(original) == old.as_record()
+
+
+@pytest.mark.parametrize('changes', [
+    {'max_prompt_bytes': 131071},
+    {'command_flags': ('POST=/v1/systemone','RETRIES=1')},
+    {'prompt_contract_version': 'different-purpose'},
+    {'allowed_config_identities': ('different-config',)},
+])
+def test_incompatible_typesafe_profiles_remain_ambiguous(tmp_path, changes):
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    service, _old, _new = _typesafe_profile_pair(tmp_path, **changes)
+    with pytest.raises(ModelUsageAdmissionError, match='absent or ambiguous'):
+        _selected_typesafe(service)
+
+
+def test_typesafe_latest_selection_requires_explicit_schema(tmp_path):
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    service, _old, _new = _typesafe_profile_pair(tmp_path)
+    with pytest.raises(ModelUsageAdmissionError, match='absent or ambiguous'):
+        _selected_typesafe(service, schema=False)
+
+
+def test_unqualified_newest_never_qualifies_stale_current_implementation(tmp_path):
+    from newsroom.control_plane.typesafe_judgment import TypesafeJudgment, TypesafeJudgmentError
+    service, old, _new = _typesafe_profile_pair(tmp_path, qualified=False)
+    assert _selected_typesafe(service) == old
+    stale = InvocationEfficiencyPolicy.create(**{**asdict(old), 'implementation_revision':digest_bytes(b'stale software')})
+    service.register_policy(stale)
+    assert _selected_typesafe(service) == stale
+    calls = []
+    with pytest.raises(TypesafeJudgmentError, match='TYPESAFE_IMPLEMENTATION_HOLD'):
+        TypesafeJudgment(usage=service,objects=None,policy=stale,
+            api_key=lambda:calls.append('key'),source_fence=lambda *_:None,
+            implementation_worktree_clean=True)
+    assert not calls
