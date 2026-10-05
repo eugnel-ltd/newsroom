@@ -292,3 +292,96 @@ def test_prior_public_body_occurs_once_in_qualification_prompt():
     assert raw.count(old)==1
     assert value['scope']['prior']==prior and 'prior_scope'not in value['unresolved']
     assert state['issue']['prior_scope']==prior  # Local provenance is unchanged.
+
+
+@contextmanager
+def _retained_role_bound_recipe(tmp_path,monkeypatch,*,failure=None,first_publication=False):
+    from copy import deepcopy
+    from newsroom.tests.test_native_assessor_judgments import _case as typed_case, _first_publication
+    from newsroom.control_plane.native_assessor_judgments import JudgmentFallback
+    with typed_case(tmp_path,monkeypatch,max_prompt_bytes=6000,source_id='UK-03') as (consumer,service,candidate,base,source,acquired,usage,jev_calls):
+        scope={'coverage':'COMPLETE','newness':'KNOWN_CHANGE','prior_scope':{'revision_digest':digest_bytes(b'prior')},
+            'current_scope':{'sources':[{'source_id':source.unit.source_id,'body':base.passages[0],
+                'published_at':acquired.publication_time,'updated_at':acquired.source_updated_time,'retrieved_at':acquired.retrieval_time}]}}
+        if first_publication:
+            _first_publication(consumer,source,acquired)
+            first=consumer.scope_for(candidate,base,(source,),(acquired,))
+            scope.update(newness=first['newness'],prior_scope=first['prior_scope'],first_publication=first['first_publication'])
+        consumer.scope_for=lambda *_:scope
+        fallback=consumer.assess(candidate,base,(source,),(acquired,))
+        assert isinstance(fallback,JudgmentFallback) and fallback.reason=='JUDGMENT_INPUT_BOUND',fallback
+        assert fallback.details['failed_questions']==[{'stage':'SELECTED_QUALIFICATION','reason':'INPUT_BOUND'}]
+        calls=[]
+        def runner(prompt):
+            calls.append(prompt)
+            if failure=='timeout':raise TimeoutError('fixture')
+            return NativeAssessmentExecution(canonical_json_bytes(WIRE).decode(),
+                {'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':10,'total_tokens':50})
+        qualifier=NativeSourceQualifier(usage=usage,objects=service.objects,
+            policy=qualification_policy(evidence_digest=digest_bytes(b'retained-consumer fixture'),qualified=True),
+            source_fence=service.fence,judgments=service,runner=runner,implementation_worktree_clean=True,clock=lambda:NOW)
+        if failure=='timeout':
+            with pytest.raises(TimeoutError):qualifier.assess(candidate,base,(source,),(acquired,),fallback,scope=scope,proof=consumer.proof)
+            original=None
+        else:
+            original=qualifier.assess(candidate,base,(source,),(acquired,),fallback,scope=scope,proof=consumer.proof)
+        fresh=SimpleNamespace(**{**vars(acquired),'retrieval_time':'2026-10-05T12:00:00Z','receipt_digest':digest_bytes(b'fresh observation')})
+        current=deepcopy(scope);current['current_scope']['sources'][0]['retrieved_at']=fresh.retrieval_time
+        if first_publication:current['first_publication'][0]['acquisition_receipt_digest']=fresh.receipt_digest
+        yield qualifier,consumer,candidate,base,source,fresh,current,original,usage,calls,jev_calls
+
+
+def test_known_role_bound_qualification_replays_two_observations_without_model(tmp_path,monkeypatch):
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    with _retained_role_bound_recipe(tmp_path,monkeypatch,first_publication=True) as (qualifier,consumer,candidate,base,source,fresh,scope,original,usage,calls,jev_calls):
+        with sqlite3.connect(usage.path)as db:
+            before=db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()
+        result=read_current_result(qualifier,candidate,base,(source,),(fresh,),scope=scope,proof=consumer.proof)
+        assert result==original
+        assert len(calls)==len(jev_calls)==1
+        with sqlite3.connect(usage.path)as db:
+            assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==before
+
+
+@pytest.mark.parametrize('mutation',['body','definition','prior','newness','first-publication','missing'])
+def test_known_qualification_reader_denies_current_binding_drift(tmp_path,monkeypatch,mutation):
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    with _retained_role_bound_recipe(tmp_path,monkeypatch,first_publication=True) as (qualifier,consumer,candidate,base,source,fresh,scope,_original,_usage,calls,jev_calls):
+        if mutation=='body':fresh.body=b'changed current source'
+        elif mutation=='definition':scope['first_publication'][0]['definition_id']='other-definition'
+        elif mutation=='prior':scope['prior_scope']={'body':'unproved prior'}
+        elif mutation=='newness':scope['newness']='KNOWN_CHANGE'
+        elif mutation=='first-publication':scope['first_publication'][0]['first_published_at']='2026-10-02T00:00:00Z'
+        else:candidate=SimpleNamespace(**{**vars(candidate),'candidate_id':'other-candidate'})
+        with pytest.raises((QualificationHold,ValueError)):
+            read_current_result(qualifier,candidate,base,(source,),(fresh,),scope=scope,proof=consumer.proof)
+        assert len(calls)==len(jev_calls)==1
+
+
+def test_unknown_qualification_reader_never_retries_original(tmp_path,monkeypatch):
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    with _retained_role_bound_recipe(tmp_path,monkeypatch,failure='timeout') as (qualifier,consumer,candidate,base,source,fresh,scope,_original,_usage,calls,jev_calls):
+        with pytest.raises(QualificationHold,match='USAGE_HOLD'):
+            read_current_result(qualifier,candidate,base,(source,),(fresh,),scope=scope,proof=consumer.proof)
+        assert len(calls)==len(jev_calls)==1
+
+
+def test_known_qualification_reader_denies_ambiguous_candidate_leaves(tmp_path,monkeypatch):
+    from dataclasses import asdict
+    from newsroom.control_plane.model_usage import WorkEnvelope,WorkloadClass,InvocationAllocation,_allocation_from_record
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    with _retained_role_bound_recipe(tmp_path,monkeypatch) as (qualifier,consumer,candidate,base,source,fresh,scope,_original,usage,calls,jev_calls):
+        with sqlite3.connect(usage.path)as db:
+            record=db.execute("SELECT record_json FROM model_invocation_allocations WHERE route='NATIVE_SOURCE_QUALIFICATION'").fetchone()[0]
+        original=_allocation_from_record(json.loads(record))
+        envelope=WorkEnvelope.create(cycle_id='another-retained-qualified-intent',workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+            admitted_at=NOW,admission_decision_id=None,candidate_id=candidate.candidate_id,
+            hypothesis_digest=candidate.governing_manifest.canonical_digest,evidence_package_digest=base.digest,
+            ingest_id=None,graphiti_attempt_id=None)
+        usage.open_envelope(envelope)
+        values=asdict(original);values.pop('invocation_id');values.pop('canonical_digest')
+        second=InvocationAllocation.create(**{**values,'envelope_id':envelope.envelope_id,'cycle_id':envelope.cycle_id})
+        usage.allocate(second,owner_emergency_stop=False)
+        with pytest.raises(QualificationHold,match='ABSENT_OR_AMBIGUOUS'):
+            read_current_result(qualifier,candidate,base,(source,),(fresh,),scope=scope,proof=consumer.proof)
+        assert len(calls)==len(jev_calls)==1

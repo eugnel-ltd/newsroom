@@ -30,6 +30,13 @@ class JudgmentFallback:
     details: dict=field(default_factory=dict)
 
 
+def source_role_questions(candidates):
+    """Exact current producer role questions, also used for retained proof reads."""
+    return {identity:{'type':'choice','instructions':f'Classify exact span {identity} in full source context; future announced change can be material, but is not already in force. Keep supporting facts and times even if not novel.',
+            'criteria':{'MATERIAL':'Affirmed material event/policy/action claim.', 'SUPPORTING':'Affirmed supported detail, timestamp or explanatory fact; preserve exact modality and negation.',
+                        'BACKGROUND':'Administrative/irrelevant framing or separator.', 'UNCERTAIN':'Unresolved factual role/support, attributed allegation or provisional rather than confirmed fact.'}}for identity in candidates}
+
+
 class NativeAssessorJudgments:
     """Two accounted batches over one exact source view, not a backend router."""
     def __init__(self,*,judgments,scope_for,proof,require_current=lambda:None,
@@ -182,9 +189,7 @@ class NativeAssessorJudgments:
         state={'candidates':candidates,'current_scope':binding['current_scope'],'prior_scope':binding['prior_scope']}
         if scope['newness']=='SOURCE_DECLARED_FIRST_PUBLICATION':
             state['publication_basis']={'mode':scope['newness'],'published_at':{row['source_id']:row['first_published_at']for row in scope['first_publication']}}
-        questions={identity:{'type':'choice','instructions':f'Classify exact span {identity} in full source context; future announced change can be material, but is not already in force. Keep supporting facts and times even if not novel.',
-            'criteria':{'MATERIAL':'Affirmed material event/policy/action claim.', 'SUPPORTING':'Affirmed supported detail, timestamp or explanatory fact; preserve exact modality and negation.',
-                        'BACKGROUND':'Administrative/irrelevant framing or separator.', 'UNCERTAIN':'Unresolved factual role/support, attributed allegation or provisional rather than confirmed fact.'}}for identity in candidates}
+        questions=source_role_questions(candidates)
         result=batch('SOURCE_ROLES',state,questions)
         if type(result)is JudgmentFallback:return result
         first,roles=result
