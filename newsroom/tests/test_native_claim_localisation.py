@@ -320,7 +320,7 @@ def test_v2_inventory_and_utf8_source_key_boundaries_hold(tmp_path, monkeypatch,
         assert len(calls) == 1
 
 
-@pytest.mark.parametrize('corruption', ['context-header', 'context-snapshot', 'missing-dispatch'])
+@pytest.mark.parametrize('corruption', ['context-header', 'context-snapshot', 'missing-dispatch', 'dispatch-binding'])
 def test_legacy_schema_failure_never_repairs_unbound_evidence(tmp_path, monkeypatch, corruption):
     from newsroom.authority.canonical import canonical_json_bytes, digest_canonical
     args, usage, state, runner, fence, calls = case(tmp_path, monkeypatch)
@@ -337,6 +337,13 @@ def test_legacy_schema_failure_never_repairs_unbound_evidence(tmp_path, monkeypa
                 manifest['source_snapshot_digest'] = digest_bytes(b'another source')
                 c.execute('UPDATE model_invocation_context_manifests SET record_json=? WHERE context_manifest_digest=?',
                           (canonical_json_bytes(manifest).decode(), old.context_manifest_digest))
+            elif corruption == 'dispatch-binding':
+                record = json.loads(c.execute('SELECT record_json FROM model_transport_observations WHERE invocation_id=?',
+                                              (old.invocation_id,)).fetchone()[0])
+                record.pop('observation_digest'); record['evidence_digest'] = digest_bytes(b'other request')
+                digest = digest_canonical(record); record['observation_digest'] = digest
+                c.execute('UPDATE model_transport_observations SET observation_digest=?,evidence_digest=?,record_json=? WHERE invocation_id=?',
+                          (digest, record['evidence_digest'], canonical_json_bytes(record).decode(), old.invocation_id))
             else:
                 c.execute('DELETE FROM model_transport_observations WHERE invocation_id=?', (old.invocation_id,))
         with pytest.raises((LocalisationHold, ValueError)):

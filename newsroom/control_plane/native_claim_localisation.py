@@ -16,7 +16,7 @@ from .govuk_evidence import _unique_object
 from .model_usage import (
     InvocationAllocation, InvocationEfficiencyPolicy, ModelUsageIntegrityError, ModelUsageService,
     UsageStatus, WorkEnvelope, WorkloadClass, _policy_for_allocation,
-    _require_reported_telemetry, _retained_terminal_allocation, _has_exact_dispatch, _envelope_from_record,
+    _require_reported_telemetry, _retained_terminal_allocation, _has_exact_dispatch, _envelope_from_record, _utc_text,
 )
 from .native_embeddings import _retained_allocation
 from .writer import _run_grok_json, CONT_DISABLED_CAPABILITIES, _grok_command_flags
@@ -262,6 +262,10 @@ class NativeClaimLocaliser:
                 raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
             with sqlite3.connect(Path(self.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
                 if not _has_exact_dispatch(c, terminal):
+                    raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+                dispatches = c.execute('SELECT observed_at,evidence_digest FROM model_transport_observations '
+                    "WHERE invocation_id=? AND state='DISPATCH_STARTED'", (allocation.invocation_id,)).fetchall()
+                if len(dispatches) != 1 or tuple(dispatches[0]) != (_utc_text(terminal.dispatch_at), allocation.request_digest):
                     raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
             ModelUsageService._validate_terminal(terminal, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR, policy,
                 requested_max_output_tokens=allocation.max_output_tokens)
