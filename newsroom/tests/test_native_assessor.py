@@ -382,6 +382,7 @@ def test_native_assessor_derives_entities_from_constructed_uk03_output(
     body = excerpt.encode()
     acquired = SimpleNamespace(
         currentness_basis="AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT",
+        body_origin="",
         receipt_digest="sha256:" + "b" * 64,
         canonical_url="https://www.gov.uk/example",
         publisher="Home Office",
@@ -1055,6 +1056,7 @@ def retained_22589_assessment():
     )
     acquired = SimpleNamespace(
         currentness_basis="AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT",
+        body_origin="",
         receipt_digest="sha256:" + "b" * 64,
         canonical_url=(
             "https://www.gov.uk/guidance/immigration-rules/"
