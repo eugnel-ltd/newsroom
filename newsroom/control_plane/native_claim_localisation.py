@@ -16,7 +16,7 @@ from .govuk_evidence import _unique_object
 from .model_usage import (
     InvocationAllocation, InvocationEfficiencyPolicy, ModelUsageIntegrityError, ModelUsageService,
     UsageStatus, WorkEnvelope, WorkloadClass, _policy_for_allocation,
-    _require_reported_telemetry, _retained_terminal_allocation,
+    _require_reported_telemetry, _retained_terminal_allocation, _has_exact_dispatch, _envelope_from_record,
 )
 from .native_embeddings import _retained_allocation
 from .writer import _run_grok_json, CONT_DISABLED_CAPABILITIES, _grok_command_flags
@@ -185,7 +185,7 @@ class NativeClaimLocaliser:
         manifest['context_manifest_digest'] = digest_canonical(manifest)
         return prompt, digest, envelope, manifest
 
-    def _terminal(self, invocation_id):
+    def _terminal(self, invocation_id, *, expected_snapshot=None):
         with sqlite3.connect(Path(self.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
             if c.execute('SELECT 1 FROM model_invocation_terminals WHERE invocation_id=?',
                          (invocation_id,)).fetchone() is None:
@@ -195,15 +195,28 @@ class NativeClaimLocaliser:
             if terminal.usage_status is not UsageStatus.REPORTED or terminal.policy_breach:
                 raise LocalisationHold('LOCALISATION_PRIOR_USAGE_HOLD')
             _require_reported_telemetry(c, terminal)
-            row = c.execute('SELECT record_json FROM model_invocation_context_manifests '
+            envelope_row = c.execute('SELECT envelope_id,cycle_id,workload_class,admitted_at,canonical_digest,record_json '
+                'FROM model_work_envelopes WHERE envelope_id=?', (allocation.envelope_id,)).fetchone()
+            if envelope_row is None:
+                raise LocalisationHold('LOCALISATION_REPLAY_SCOPE_HOLD')
+            retained_envelope = _envelope_from_record(json.loads(envelope_row[5]))
+            if (tuple(envelope_row[:5]) != (retained_envelope.envelope_id, retained_envelope.cycle_id,
+                    retained_envelope.workload_class.value, retained_envelope.as_record()['admitted_at'], retained_envelope.canonical_digest)
+                    or any(getattr(retained_envelope, key) != expected_snapshot[key]
+                           for key in ('candidate_id','hypothesis_digest','evidence_package_digest'))):
+                raise LocalisationHold('LOCALISATION_REPLAY_SCOPE_HOLD')
+            row = c.execute('SELECT provider,route,evidence_package_digest,record_json FROM model_invocation_context_manifests '
                 'WHERE context_manifest_digest=?', (allocation.context_manifest_digest,)).fetchone()
             if row is None:
                 raise LocalisationHold('LOCALISATION_REPLAY_MANIFEST_HOLD')
-            manifest = json.loads(row[0])
+            manifest = json.loads(row[3])
             unsigned = {key: value for key, value in manifest.items() if key != 'context_manifest_digest'}
             version = allocation.prompt_contract_version
             system = LEGACY_SYSTEM if version == LEGACY_VERSION else SYSTEM
-            if (version not in {LEGACY_VERSION, VERSION}
+            if (tuple(row[:3]) != (manifest.get('provider'), manifest.get('route'), manifest.get('evidence_package_digest'))
+                    or manifest.get('evidence_package_digest') != expected_snapshot['evidence_package_digest']
+                    or manifest.get('source_snapshot_digest') != digest_canonical(expected_snapshot)
+                    or version not in {LEGACY_VERSION, VERSION}
                     or manifest.get('context_manifest_digest') != allocation.context_manifest_digest
                     or digest_canonical(unsigned) != allocation.context_manifest_digest
                     or manifest.get('system_digest') != digest_bytes(system.encode())
@@ -232,7 +245,8 @@ class NativeClaimLocaliser:
             prompt_digest=digest_bytes(legacy_prompt.encode()), policy=self.policy)
         repair_of = None
         if legacy is not None:
-            allocation, terminal, policy = self._terminal(legacy.invocation_id)
+            allocation, terminal, policy = self._terminal(legacy.invocation_id, expected_snapshot={
+                'state':state, **{key:scope[key] for key in ('candidate_id','hypothesis_digest','evidence_package_digest')}})
             if (not policy.qualified or policy.prompt_contract_version != LEGACY_VERSION
                     or policy.output_schema_digest != LEGACY_SCHEMA_DIGEST
                     or allocation.prompt_contract_version != LEGACY_VERSION
@@ -244,6 +258,13 @@ class NativeClaimLocaliser:
                 return reference
             if terminal.outcome != 'LOCALISATION_FAILED' or terminal.failure_class != 'ValidationError':
                 raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+            if terminal.components.provenance != 'PROVIDER_REPORTED' or terminal.pre_dispatch_zero_proved:
+                raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+            with sqlite3.connect(Path(self.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
+                if not _has_exact_dispatch(c, terminal):
+                    raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+            ModelUsageService._validate_terminal(terminal, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR, policy,
+                requested_max_output_tokens=allocation.max_output_tokens)
             repair_of = legacy.invocation_id
         prompt, snapshot, envelope, manifest = self._input(state, repair_of=repair_of, **scope)
         prior = _retained_allocation(self.usage, envelope=envelope,
@@ -308,7 +329,8 @@ class NativeClaimLocaliser:
 
     def read_localisation(self, reference, state, *, proof, **scope):
         with self.fence(state['source_binding'], proof):
-            allocation, terminal, policy = self._terminal(reference.invocation_id)
+            allocation, terminal, policy = self._terminal(reference.invocation_id, expected_snapshot={
+                'state':state, **{key:scope[key] for key in ('candidate_id','hypothesis_digest','evidence_package_digest')}})
             raw = self.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'), proof=proof).data
             receipt_raw = self.objects.rehydrate(HydrationRequest(reference.receipt_admission_id, 'evidence.record'), proof=proof).data
         receipt = json.loads(receipt_raw)

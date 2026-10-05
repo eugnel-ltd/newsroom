@@ -102,9 +102,9 @@ def test_same_source_digest_does_not_allow_changed_claim_or_scope_replay(tmp_pat
                      evidence_package_digest=digest_bytes(b'package'), proof=runtime.proof)
         ref = localiser.localise(state, **scope)
         changed = {**state, 'claims': {'S1L1': {**state['claims']['S1L1'], 'text': 'An unsupported changed claim.'}}}
-        with pytest.raises(LocalisationHold, match='REPLAY_BINDING'):
+        with pytest.raises(LocalisationHold, match='REPLAY_(?:BINDING|MANIFEST|SCOPE)'):
             localiser.read_localisation(ref, changed, **scope)
-        with pytest.raises(LocalisationHold, match='REPLAY_BINDING'):
+        with pytest.raises(LocalisationHold, match='REPLAY_(?:BINDING|MANIFEST|SCOPE)'):
             localiser.read_localisation(ref, state, **{**scope, 'candidate_id': 'other-candidate'})
         assert len(calls) == 1
 
@@ -167,13 +167,13 @@ def test_bad_v2_schema_retains_actual_raw_and_small_diagnostic_before_raise(tmp_
         assert 's' * 257 not in json.dumps(receipt)
         assert len(canonical_json_bytes(receipt['diagnostic'])) < 2048
         assert usage.terminal(invocation).usage_status.value == 'REPORTED'
-        with pytest.raises(LocalisationHold, match='REPLAY_BINDING'):
+        with pytest.raises(LocalisationHold, match='REPLAY_(?:BINDING|MANIFEST|SCOPE)'):
             localiser.localise(state, **scope)
         assert len(calls) == 1
 
 
 def _legacy_result(usage, runtime, state, scope, *, outcome='LOCALISATION_COMPLETE',
-                   failure_class=None, reported=True, active=False, breach=False):
+                   failure_class=None, reported=True, active=False, breach=False, pre_dispatch=False):
     """Genuine old-policy/allocation/CAS records, independent of the v2 producer."""
     from dataclasses import asdict
     current = localisation_policy(evidence_digest=digest_bytes(b'legacy qualified fixture'), qualified=True)
@@ -224,6 +224,9 @@ def _legacy_result(usage, runtime, state, scope, *, outcome='LOCALISATION_COMPLE
     usage.allocate(allocation, owner_emergency_stop=False)
     if active:
         return allocation, None
+    if not pre_dispatch:
+        usage.observe_transport(invocation_id=allocation.invocation_id, observed_at=NOW,
+                                state='DISPATCH_STARTED', evidence_digest=allocation.request_digest)
     telemetry = {'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 22, 'output_tokens': 34,
         'cached_read_tokens': 0, 'cached_write_tokens': 0, 'reasoning_tokens': 0,
         'context_tokens': 22, 'total_tokens': 56}
@@ -231,8 +234,9 @@ def _legacy_result(usage, runtime, state, scope, *, outcome='LOCALISATION_COMPLE
         telemetry['total_tokens'] = 300001
         telemetry['output_tokens'] = 299979
     _complete_writer_usage(usage, allocation, outcome=outcome, failure_class=failure_class,
-        usage=telemetry if reported else None, dispatch_at=NOW, completed_at=NOW,
-        provider_dispatched=True, policy=policy)
+        usage=None if pre_dispatch else telemetry if reported else None,
+        dispatch_at=None if pre_dispatch else NOW, completed_at=NOW,
+        provider_dispatched=not pre_dispatch, policy=policy)
     if outcome != 'LOCALISATION_COMPLETE':
         return allocation, None  # Old v1 really lost raw; do not fabricate a failure receipt.
     raw = canonical_json_bytes({'renderings': {'S1L1': {
@@ -314,3 +318,39 @@ def test_v2_inventory_and_utf8_source_key_boundaries_hold(tmp_path, monkeypatch,
         with pytest.raises(LocalisationHold):
             localiser.localise(state, **_scope(runtime))
         assert len(calls) == 1
+
+
+@pytest.mark.parametrize('corruption', ['context-header', 'context-snapshot', 'missing-dispatch'])
+def test_legacy_schema_failure_never_repairs_unbound_evidence(tmp_path, monkeypatch, corruption):
+    from newsroom.authority.canonical import canonical_json_bytes, digest_canonical
+    args, usage, state, runner, fence, calls = case(tmp_path, monkeypatch)
+    with open_native_runtime(**args) as runtime:
+        scope = _scope(runtime)
+        old, _ = _legacy_result(usage, runtime, state, scope,
+                               outcome='LOCALISATION_FAILED', failure_class='ValidationError')
+        with sqlite3.connect(usage.path) as c:
+            if corruption == 'context-header':
+                c.execute("UPDATE model_invocation_context_manifests SET route='tampered' WHERE context_manifest_digest=?", (old.context_manifest_digest,))
+            elif corruption == 'context-snapshot':
+                manifest = json.loads(c.execute('SELECT record_json FROM model_invocation_context_manifests WHERE context_manifest_digest=?',
+                                                (old.context_manifest_digest,)).fetchone()[0])
+                manifest['source_snapshot_digest'] = digest_bytes(b'another source')
+                c.execute('UPDATE model_invocation_context_manifests SET record_json=? WHERE context_manifest_digest=?',
+                          (canonical_json_bytes(manifest).decode(), old.context_manifest_digest))
+            else:
+                c.execute('DELETE FROM model_transport_observations WHERE invocation_id=?', (old.invocation_id,))
+        with pytest.raises((LocalisationHold, ValueError)):
+            _localiser(usage, runtime, fence, runner).localise(state, **scope)
+        assert calls == []
+
+
+def test_pre_dispatch_validation_error_is_not_output_wire_repair_credit(tmp_path, monkeypatch):
+    args, usage, state, runner, fence, calls = case(tmp_path, monkeypatch)
+    with open_native_runtime(**args) as runtime:
+        scope = _scope(runtime)
+        old, _ = _legacy_result(usage, runtime, state, scope, outcome='LOCALISATION_FAILED',
+                               failure_class='ValidationError', pre_dispatch=True)
+        assert usage.terminal(old.invocation_id).pre_dispatch_zero_proved
+        with pytest.raises(LocalisationHold):
+            _localiser(usage, runtime, fence, runner).localise(state, **scope)
+        assert calls == []
