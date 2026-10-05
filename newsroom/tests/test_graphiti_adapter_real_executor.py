@@ -183,6 +183,8 @@ def test_episode_creation_requires_current_generation_owner_before_provider(
             events.append("prepared")
             return None
 
+    pipeline = Pipeline()
+
     class Graphiti:
         def __init__(self, *_args: object, **_values: object) -> None:
             self.driver = object()
@@ -205,12 +207,15 @@ def test_episode_creation_requires_current_generation_owner_before_provider(
 
     async def save_episode(**_values: object):
         assert fenced, "episode write must hold the current generation fence"
+        if _values.get("create") is False:
+            return None
         events.append("save")
         return SimpleNamespace(uuid="episode-id"), "CREATED"
 
     async def provider(*_args: object, **_values: object):
         assert not fenced, "provider work must not hold the database lock"
         events.append("provider")
+        await pipeline.prepare_execution()
         return SimpleNamespace(
             outcome=real.CombinedTemporalOutcome.TERMINAL_SUCCESS_ZERO_PROPOSALS,
             nodes=(), edges=(),
@@ -218,7 +223,7 @@ def test_episode_creation_requires_current_generation_owner_before_provider(
 
     monkeypatch.setattr(real, "_load_graphiti", lambda: runtime)
     monkeypatch.setattr(real, "build_cli_llm_client", lambda: SimpleNamespace(invocations=[]))
-    monkeypatch.setattr(real, "combined_temporal_pipeline_for", lambda **_values: Pipeline())
+    monkeypatch.setattr(real, "combined_temporal_pipeline_for", lambda **_values: pipeline)
     monkeypatch.setattr(real, "_ensure_episode", save_episode)
     monkeypatch.setattr(real, "extract_combined_temporal_async", provider)
     configuration, revision = _combined_runtime_inputs("Body", "episode-id")
@@ -235,7 +240,7 @@ def test_episode_creation_requires_current_generation_owner_before_provider(
         assert events == ["prepared", "close"]
     else:
         asyncio.run(call)
-        assert events == ["prepared", "save", "provider", "close"]
+        assert events == ["prepared", "provider", "save", "close"]
 
 
 def _digest(label: str) -> str:
@@ -1318,9 +1323,12 @@ def test_only_proven_pipeline_rollback_is_classified_complete(
             return None
 
     async def created_episode(**_values: object) -> tuple[SimpleNamespace, str]:
+        if _values.get("create") is False:
+            return None
         return SimpleNamespace(uuid="episode-id"), "CREATED"
 
     async def rolled_back_extract(*_args: object, **_values: object) -> object:
+        await _values["pipeline"].prepare_execution()
         raise real.CombinedTemporalPipelineError(
             "combined-temporal pipeline failed",
             graph_effect_attempted=True,
@@ -1423,6 +1431,8 @@ def test_cancelled_episode_cleanup_is_ordered_and_bounded(
                 await asyncio.Event().wait()
 
     async def created_episode(**_values: object) -> tuple[SimpleNamespace, str]:
+        if _values.get("create") is False:
+            return None
         return SimpleNamespace(uuid="episode-id"), "CREATED"
 
     async def close_embedding() -> None:

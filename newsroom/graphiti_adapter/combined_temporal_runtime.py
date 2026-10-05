@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from math import isfinite, sqrt
 from types import SimpleNamespace
 from typing import Any, Protocol
+from uuid import UUID
 
 from newsroom.authority.canonical import (
     CanonicalizationError,
     canonical_json_bytes,
     digest_canonical,
+    validate_sha256_digest,
 )
 from newsroom.authority.types import UtcTimestamp
 from newsroom.graphiti_adapter.combined_temporal_contract import (
@@ -66,6 +69,36 @@ from newsroom.graphiti_adapter.local_entity_resolution import (
 _EMBEDDING_RETRY_BASES = frozenset(
     {LocalEntityResolutionBasis.BELOW_NEW_CANONICAL_ENTITY_CEILING}
 )
+
+_VERIFIER_FAILURE_REASONS = frozenset({
+    "GRAPHITI_JUDGMENT_CALLER_BINDING_INVALID", "GRAPHITI_PROPOSAL_BINDING_INVALID",
+    "GRAPHITI_JUDGMENT_INPUT_BOUND", "GRAPHITI_JUDGMENT_ANSWER_INVENTORY_INVALID",
+    "GRAPHITI_JUDGMENT_ANSWER_INVALID", "GRAPHITI_RELATION_DIRECTION_UNPROVEN",
+    "GRAPHITI_PROPOSAL_UNSUPPORTED",
+})
+
+
+def _verification_failure_evidence(error: Exception) -> dict[str, object] | None:
+    """Retain only the fixed error carrier, never exception/provider text."""
+    reason = getattr(error, "reason_code", None)
+    reference = getattr(error, "reference", None)
+    retained = None
+    if reference is not None:
+        try:
+            invocation_id = reference.invocation_id
+            validate_sha256_digest(invocation_id)
+            raw_id, receipt_id = str(reference.raw_admission_id), str(reference.receipt_admission_id)
+            if str(UUID(raw_id)) != raw_id or str(UUID(receipt_id)) != receipt_id:
+                raise ValueError("noncanonical admission identity")
+            retained = {"invocation_id": invocation_id, "raw_admission_id": raw_id,
+                        "receipt_admission_id": receipt_id}
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if type(reason) is str and reason in _VERIFIER_FAILURE_REASONS:
+        return {"reason_code": reason, "judgment_reference": retained}
+    if retained is not None:
+        return {"reason_code": "GRAPHITI_VERIFIER_FAILED", "judgment_reference": retained}
+    return None
 
 
 class AsyncCombinedTemporalTransport(Protocol):
@@ -356,6 +389,7 @@ async def extract_combined_temporal_async(
     admitted_summary_assertions: tuple[AdmittedSummaryAssertion, ...] = (),
     attempt_prepared: bool = False,
     donor_store: DonorStore | None = None,
+    typed_proposal_verifier: Callable[..., Mapping[str, object] | None] | None = None,
 ) -> CombinedTemporalLeaf:
     """Run one combined-temporal leaf without crossing event loops."""
 
@@ -517,6 +551,27 @@ async def extract_combined_temporal_async(
             receipt,
             failure_code=CombinedTemporalFailureCode.MALFORMED_OBJECT,
         )
+    if typed_proposal_verifier is not None:
+        try:
+            verification = typed_proposal_verifier(
+                source_revision=revision,
+                proposal_receipt=deepcopy(receipt["proposal_receipt"]),
+            )
+            if verification is not None:
+                if not isinstance(verification, Mapping) or not verification:
+                    raise ValueError("Graphiti typed verification evidence is absent")
+                retained_verification = deepcopy(dict(verification))
+                digest_canonical(retained_verification)
+                receipt["typed_proposal_verification"] = retained_verification
+        except Exception as exc:
+            failure_evidence = _verification_failure_evidence(exc)
+            if failure_evidence is not None:
+                receipt["typed_proposal_verification"] = failure_evidence
+            return await _complete_failure(
+                pipeline, prompt, receipt,
+                failure_code=(exc.code if isinstance(exc, CombinedTemporalError)
+                              else CombinedTemporalFailureCode.PIPELINE_FAILED),
+            )
     try:
         pipeline_result = await pipeline._execute(
             nodes=nodes,

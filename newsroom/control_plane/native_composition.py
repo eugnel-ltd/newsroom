@@ -61,7 +61,7 @@ from .native_evidence import (
 from .native_graphiti import NativeGraphitiProcessor
 from .native_pipeline import NativePipeline
 from .native_policies import VERSION, native_policy_components
-from .native_progress import NativeRevisionJournal
+from .native_progress import NativeRevisionJournal, source_header
 from .native_publication import NativePublicationContinuation
 from .native_retrieval import NativeRetrievalContinuation, compose_native_documents
 from .native_runtime import open_native_runtime
@@ -220,7 +220,96 @@ def _native_cursor_credential():
             os.environ[name] = previous
 
 
-def _deployment_identity(*, revision, tree, paths, embedding_policy, assessment_policy):
+def _require_semantic_current_sources(sources, binding, *, proof, rights_for):
+    for source in binding.get('source_currentness', ()):
+        definition = sources.current_summary(
+            SourceDefinitionId.parse(source['definition_id']), proof=proof)
+        if str(definition.version_id) != source['definition_version_id']:
+            raise ValueError('semantic source definition changed')
+        version = sources.version_details(definition.version_id, proof=proof)
+        if rights_for(source['source_id'], version.request.locator) is None:
+            raise ValueError('semantic current rights unavailable')
+
+
+def _judgment_scope(journal, sources, acquired):
+    # A fresh observation is not proof of a new material fact.
+    # A source-declared first publication remains distinct from a proved change.
+    if not sources or len(sources) != len(acquired):
+        return {'coverage': 'PARTIAL', 'newness': 'UNKNOWN', 'prior_scope': None}
+    scope = {'coverage': 'COMPLETE', 'newness': 'UNKNOWN', 'prior_scope': None,
+        'current_scope': {'sources': [{'source_id': source.unit.source_id,
+            'published_at': item.publication_time, 'updated_at': item.source_updated_time,
+            'retrieved_at': item.retrieval_time,
+            'body': item.body.decode('utf-8')} for source, item in zip(sources, acquired, strict=True)]},
+        'source_currentness': [{'source_id': source.unit.source_id,
+            'definition_id': str(source.unit.authority.definition_id),
+            'definition_version_id': str(source.unit.authority.definition_version_id)} for source in sources]}
+    # Source acquisition has already enforced this candidate's
+    # declared sibling closure. An unrelated held item elsewhere
+    # in the same feed is not a new blanket editorial veto.
+    previous = []
+    prior_found = False
+    for source, item in zip(sources, acquired, strict=True):
+        matches = []
+        for revision_id in journal.units:
+            header = source_header(journal.units, revision_id)
+            if (header.source_id, header.item_key, header.canonical_url) != (
+                    source.unit.source_id, source.unit.item_key, source.unit.canonical_url):
+                continue
+            if revision_id == str(source.unit.authority.revision_id):
+                continue
+            if max(header.observed_ats, default='') >= source.unit.observed_at:
+                continue
+            matches.append((max(header.observed_ats, default=''), revision_id))
+        if not matches:
+            break
+        prior_found = True
+        _, prior_id = max(matches)
+        prior = journal.units[prior_id][0]
+        if not prior.body.strip() or prior.authority is None:
+            break
+        previous.append({'source_id': prior.source_id, 'headline': prior.headline,
+            'body': prior.body, 'published_at': prior.published_at, 'updated_at': prior.updated_at})
+    if len(previous) == len(sources) and previous:
+        scope['prior_scope'] = {'sources': previous}
+        scope['newness'] = 'KNOWN_CHANGE' if any(
+            prior['body'].strip() != source.unit.body.strip()
+            or prior['headline'].strip() != source.unit.headline.strip()
+            for prior, source in zip(previous, sources, strict=True)) else 'KNOWN_UNCHANGED'
+    elif not prior_found:
+        first_publication = []
+        for source, item in zip(sources, acquired, strict=True):
+            # This acquisition parser has no date fallback: publication_time
+            # comes from GOV.UK first_published_at, never public_updated_at.
+            # Non-GOV.UK acquisition contracts require their own provenance.
+            if (source.unit.source_id not in {'UK-01', 'UK-02', 'UK-03', 'UK-05'}
+                    or not item.canonical_url.startswith('https://www.gov.uk/')
+                    or item.source_type != 'PRIMARY_OFFICIAL'
+                    or item.currentness_basis != 'AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT'
+                    or not any(assignment.role.value == 'ORIGINATING_AUTHORITY'
+                        for assignment in source.source_version.request.roles)):
+                break
+            try:
+                published = UtcTimestamp.parse(item.publication_time).value
+                retrieved = UtcTimestamp.parse(item.retrieval_time).value
+            except (TypeError, ValueError):
+                break
+            if published > retrieved:
+                break
+            first_publication.append({'source_id': source.unit.source_id,
+                'definition_id': str(source.unit.authority.definition_id),
+                'definition_version_id': str(source.unit.authority.definition_version_id),
+                'source_revision_digest': source.unit.revision_digest,
+                'acquisition_receipt_digest': item.receipt_digest,
+                'first_published_at': item.publication_time})
+        if len(first_publication) == len(sources):
+            scope['newness'] = 'SOURCE_DECLARED_FIRST_PUBLICATION'
+            scope['first_publication'] = first_publication
+    return scope
+
+
+def _deployment_identity(*, revision, tree, paths, embedding_policy, assessment_policy,
+                         semantic_policy_digests=()):
     from . import broker
     from .native_source_rights import POLICY_DIGEST as RIGHTS_POLICY
     identities = {}
@@ -230,7 +319,7 @@ def _deployment_identity(*, revision, tree, paths, embedding_policy, assessment_
             raise ValueError("native deployment store is a symlink")
         stat = path.stat()
         identities[name] = {"path": str(path.resolve()), "device": stat.st_dev, "inode": stat.st_ino}
-    return digest_canonical({
+    value = {
         "version": VERSION, "revision": revision, "tree": tree,
         "stores": identities, "target": "hermes-private-serving", "public_effect": False,
         "embedding_policy": embedding_policy.canonical_digest,
@@ -238,7 +327,10 @@ def _deployment_identity(*, revision, tree, paths, embedding_policy, assessment_
         "rights_policy": RIGHTS_POLICY, "transport_policy": TRANSPORT_POLICY,
         "neo4j": {"host": broker.NEO4J_BOLT_HOST, "port": broker.NEO4J_BOLT_PORT,
                   "database": broker.NEO4J_DATABASE, "principal": broker.NEO4J_PROJECTOR_USERNAME},
-    })
+    }
+    if semantic_policy_digests:
+        value['semantic_policies'] = list(semantic_policy_digests)
+    return digest_canonical(value)
 
 
 def deployed_native_service(args):
@@ -313,6 +405,43 @@ def deployed_native_service(args):
             native_assessor.COMMAND_FLAGS, None,
         ):
             raise ValueError("native assessor profile differs before authority OPEN")
+        from .typesafe_judgment import ROUTE as JUDGMENT_ROUTE, SCHEMA_DIGEST as JUDGMENT_SCHEMA
+        from .native_claim_localisation import ROUTE as LOCALISATION_ROUTE, SCHEMA_DIGEST as LOCALISATION_SCHEMA
+        from . import typesafe_judgment, native_claim_localisation
+        from newsroom.authority.canonical import digest_bytes
+        from .model_usage import ModelUsageAdmissionError
+        semantic_kwargs = {}
+        key_path = Path.home() / '.config/newsroom/credentials/typesafe-jev-evaluation.key'
+        if key_path.exists():
+            try:
+                semantic_policy = usage.qualified_policy(workload_class=WorkloadClass.TYPESAFE_JUDGMENT,
+                    provider='typesafe', route=JUDGMENT_ROUTE, model='jev-latest', reasoning='none',
+                    output_schema_digest=JUDGMENT_SCHEMA,
+                    implementation_revision=digest_bytes(Path(typesafe_judgment.__file__).read_bytes()))
+                rendering_policy = usage.qualified_policy(workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+                    provider='grok-build-cli', route=LOCALISATION_ROUTE, model='grok-4.7', reasoning='high',
+                    output_schema_digest=LOCALISATION_SCHEMA,
+                    implementation_revision=digest_bytes(Path(native_claim_localisation.__file__).read_bytes()))
+                if (semantic_policy.implementation_revision != typesafe_judgment.implementation_digest()
+                        or rendering_policy.implementation_revision != digest_bytes(
+                            Path(native_claim_localisation.__file__).read_bytes())):
+                    raise ModelUsageAdmissionError('semantic implementation qualification is stale')
+            except ModelUsageAdmissionError:
+                from .diagnostic_logging import emit_diagnostic
+                emit_diagnostic('native_semantic_configuration', {'state': 'CONFIG_HOLD'})
+                # The independently qualified existing assessor remains usable;
+                # missing semantic qualification is not a NOQUAL decision.
+            else:
+                def semantic_key():
+                    metadata = key_path.lstat()
+                    if key_path.is_symlink() or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+                        raise ValueError('native semantic credential ownership differs')
+                    value = key_path.read_text().strip()
+                    if not value.startswith('apikey_') or len(value) < 32:
+                        raise ValueError('native semantic credential shape differs')
+                    return value
+                semantic_kwargs = dict(judgment_api_key=semantic_key,
+                    judgment_policy=semantic_policy, localisation_policy=rendering_policy)
         tree = subprocess.check_output(
             ("/usr/bin/git", "rev-parse", f"{revision}^{{tree}}"),
             cwd=Path(__file__).resolve().parents[2], text=True, timeout=10,
@@ -330,6 +459,8 @@ def deployed_native_service(args):
             return _deployment_identity(
                 revision=revision, tree=tree, paths=paths,
                 embedding_policy=embedding, assessment_policy=assessment,
+                semantic_policy_digests=tuple(semantic_kwargs[key].canonical_digest
+                    for key in ('judgment_policy', 'localisation_policy') if key in semantic_kwargs),
             )
 
         opening_paths = {
@@ -365,6 +496,7 @@ def deployed_native_service(args):
             neo4j_config=broker.neo4j_projector_config(), embedding_key=broker.openrouter_api_key(),
             embedding_policy=embedding, assessment_policy=assessment, source_definition_ids=bindings,
             licence=None, stop_check=check, stop_fence=fence, implementation_worktree_clean=clean,
+            **semantic_kwargs,
             service_event=service_event,
             reassessment_quantum_seconds=args.interval,
         ) as composed:
@@ -396,6 +528,9 @@ def open_native_pipeline(
     service_event: threading.Event | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
     reassessment_quantum_seconds: float = 300,
+    judgment_api_key: Callable[[], str] | None = None,
+    judgment_policy: InvocationEfficiencyPolicy | None = None,
+    localisation_policy: InvocationEfficiencyPolicy | None = None,
 ):
     """Open one real runtime after its invocation policies are qualified.
 
@@ -624,6 +759,59 @@ def open_native_pipeline(
             usage=assessment_usage,
             dispatch_fence=stop_fence,
         )
+        typed_proposal_verifier = None
+        if judgment_api_key is not None:
+            from .native_assessor_judgments import NativeAssessorJudgments
+            from .native_claim_localisation import NativeClaimLocaliser
+            from .typesafe_judgment import TypesafeJudgment
+            if judgment_policy is None or localisation_policy is None:
+                raise ValueError('qualified semantic and localisation policies are required')
+
+            @contextmanager
+            def judgment_fence(binding, current_proof):
+                with stop_fence():
+                    stop_check()
+                    if current_proof is not proof:
+                        raise ValueError('semantic caller proof differs')
+                    _require_semantic_current_sources(runtime.authority.sources, binding,
+                        proof=proof, rights_for=source_rights)
+                    yield
+
+            def judgment_scope(candidate, base, sources, acquired):
+                return _judgment_scope(journal, sources, acquired)
+
+            judgments = TypesafeJudgment(usage=usage, objects=runtime.authority.objects,
+                policy=judgment_policy, api_key=judgment_api_key, source_fence=judgment_fence,
+                implementation_worktree_clean=implementation_worktree_clean, clock=clock)
+            localiser = NativeClaimLocaliser(usage=usage, objects=runtime.authority.objects,
+                policy=localisation_policy, source_fence=judgment_fence,
+                implementation_worktree_clean=implementation_worktree_clean, clock=clock)
+
+            def localise_claims(request):
+                binding = request['source_binding']
+                return localiser.localise(request, proof=proof, **{key: binding[key]
+                    for key in ('candidate_id', 'hypothesis_digest', 'evidence_package_digest')})
+
+            def read_claim_localisation(reference, request):
+                binding = request['source_binding']
+                return localiser.read_localisation(reference, request, proof=proof, **{key: binding[key]
+                    for key in ('candidate_id', 'hypothesis_digest', 'evidence_package_digest')})
+
+            assessor._judgments = NativeAssessorJudgments(judgments=judgments, proof=proof,
+                scope_for=judgment_scope, localise=localise_claims, read_localisation=read_claim_localisation,
+                require_current=stop_check)
+
+            from .native_graphiti_judgments import NativeGraphitiJudgments
+            graph_judgments = NativeGraphitiJudgments(judgments=judgments)
+
+            def typed_proposal_verifier(*, unit, envelope, source_revision, proposal_receipt):
+                with stop_fence():
+                    stop_check()
+                    if rights_for_unit(unit) is None:
+                        raise NativeEvidenceHold('NATIVE_CURRENT_SOURCE_RIGHTS_HOLD')
+                    return graph_judgments.evaluate(proposal_receipt, source_revision,
+                        envelope=envelope, unit=unit, cycle_id=envelope.cycle_id,
+                        caller_identity='GRAPHITI_VERIFIER', proof=proof)
         definitions = dict(source_definition_ids)
         intake = None
 
@@ -946,6 +1134,7 @@ def open_native_pipeline(
                 system=runtime.authority, connection=private, usage=usage, proof=proof,
                 rights_for=rights_for_unit, stop_check=stop_check, dispatch_fence=stop_fence,
                 operator_drain_requested=operator_drain_requested,
+                typed_proposal_verifier=typed_proposal_verifier,
                 clock=clock,
             ), discovery=NativeDiscovery(
                 sources=runtime.authority.sources, checks=runtime.authority.checks,

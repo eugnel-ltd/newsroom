@@ -185,6 +185,7 @@ class ExistingGraphitiPipeline:
     expected_ingest_id: str | None = None
     complete_receipt: CompleteReceipt | None = None
     complete_failure_receipt: CompleteFailureReceipt | None = None
+    prepare_execution: Callable[[], Awaitable[None]] | None = None
     _attempt_started: bool = field(default=False, init=False)
     recovery_marker: Any | None = field(default=None, init=False)
 
@@ -340,12 +341,17 @@ class ExistingGraphitiPipeline:
                     graph_effect_attempted=False,
                     rollback_completed=False,
                 )
-        if not nodes and not edges:
-            return await self._seal_empty_effect(
-                receipt, embedding_skipped=True
-            )
+        if self.prepare_execution is None and not nodes and not edges:
+            return await self._seal_empty_effect(receipt, embedding_skipped=True)
         mutation_attempted = False
         try:
+            if self.prepare_execution is not None:
+                mutation_attempted = True
+                await self.prepare_execution()
+            if not nodes and not edges:
+                return await self._seal_empty_effect(
+                    receipt, embedding_skipped=True
+                )
             resolved_nodes, uuid_map, _duplicates = await self.resolve_nodes(
                 list(nodes)
             )

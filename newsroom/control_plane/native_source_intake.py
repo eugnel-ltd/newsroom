@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import ssl
 import urllib.error
 import urllib.request
@@ -68,6 +69,7 @@ from .native_evidence import (
 from .native_progress import NativeRevisionJournal, iter_source_headers
 
 from .veto import OperatorDrainRequested, VetoError
+from .diagnostic_logging import emit_diagnostic
 
 VERSION = "hermes-native-source-intake-v1"
 SUPPORTED = frozenset({"UK-01", "UK-02", "UK-03", "UK-05"})
@@ -214,17 +216,68 @@ class NativeSourceIntake:
 
     def poll(self) -> tuple[NativeSourceDisposition, ...]:
         self._pending_units.clear()
+        self._poll_failure_groups, self._poll_failure_overflow = {}, {}
         results = []
-        for source_id in SOURCE_IDS:
+        try:
+            for source_id in SOURCE_IDS:
+                try:
+                    results.append(self._poll_one(source_id))
+                except VetoError:
+                    raise
+                except Exception as exc:
+                    self._observe_poll_failure(source_id, "ROOT_POLL", exc)
+                    results.append(NativeSourceDisposition(
+                        source_id, "HOLD", getattr(exc, "reason_code", "SOURCE_POLL_FAILED")
+                    ))
+            return tuple(results)
+        finally:
             try:
-                results.append(self._poll_one(source_id))
-            except VetoError:
-                raise
-            except Exception as exc:
-                results.append(NativeSourceDisposition(
-                    source_id, "HOLD", getattr(exc, "reason_code", "SOURCE_POLL_FAILED")
-                ))
-        return tuple(results)
+                for source_id in SOURCE_IDS:
+                    groups = [dict(stage=key[1], exception_class=key[2], file=key[3],
+                        function=key[4], line=key[5], cause_class=key[6], count=count)
+                        for key, count in self._poll_failure_groups.items() if key[0] == source_id]
+                    overflow = self._poll_failure_overflow.get(source_id, 0)
+                    if groups or overflow:
+                        emit_diagnostic("native_source_failure_summary", {
+                            "source_id": source_id, "groups": groups, "overflow_count": overflow,
+                            "failure_count": sum(group["count"] for group in groups) + overflow,
+                        })
+            except Exception:
+                pass
+            finally:
+                self._poll_failure_groups = self._poll_failure_overflow = None
+
+    def _observe_poll_failure(self, source_id, stage, error):
+        """Operation-local fixed-key counts; retain neither exceptions nor frames."""
+        try:
+            groups = getattr(self, "_poll_failure_groups", None)
+            if groups is None or source_id not in SOURCE_IDS:
+                return
+            if stage not in {"ROOT_POLL", "ITEM", "DECLARED_CHILD", "DECLARED_ASSET", "MANUAL_SECTION"}:
+                return
+            trace = error.__traceback__
+            while trace is not None and trace.tb_next is not None:
+                trace = trace.tb_next
+            path = "" if trace is None else trace.tb_frame.f_code.co_filename
+            filename = "NONE" if trace is None else path.rsplit("/", 1)[-1]
+            if trace is not None and ("://" in path or re.fullmatch(r"[A-Za-z0-9_.-]{1,93}\.py", filename) is None):
+                filename = "OTHER"
+            function = "NONE" if trace is None else trace.tb_frame.f_code.co_name
+            if re.fullmatch(r"[A-Za-z0-9_]{1,96}", function) is None:
+                function = "OTHER"
+            line = 0 if trace is None else trace.tb_lineno
+            cause = error.__cause__
+            key = (source_id, stage, type(error).__name__[:64], filename, function, line,
+                   "NONE" if cause is None else type(cause).__name__[:64])
+            if key in groups:
+                groups[key] += 1
+            elif len(groups) < 16:
+                groups[key] = 1
+            else:
+                overflow = self._poll_failure_overflow
+                overflow[source_id] = overflow.get(source_id, 0) + 1
+        except Exception:
+            pass
 
     def _poll_one(self, source_id: str) -> NativeSourceDisposition:
         definition_id = self._definitions.get(source_id)
@@ -289,6 +342,7 @@ class NativeSourceIntake:
             except VetoError:
                 raise
             except Exception as exc:
+                self._observe_poll_failure(source_id, "ITEM", exc)
                 item_holds.append((
                     item.canonical_url,
                     getattr(exc, "reason_code", "SOURCE_ITEM_RETAIN_FAILED"),
@@ -360,6 +414,7 @@ class NativeSourceIntake:
                 except VetoError:
                     raise
                 except Exception as child_exc:
+                    self._observe_poll_failure(source_id, "DECLARED_CHILD", child_exc)
                     holds.append((
                         child.canonical_url,
                         getattr(child_exc, "reason_code", "SOURCE_ITEM_RETAIN_FAILED"),
@@ -412,6 +467,7 @@ class NativeSourceIntake:
                 except VetoError:
                     raise
                 except Exception as asset_exc:
+                    self._observe_poll_failure(source_id, "DECLARED_ASSET", asset_exc)
                     holds.append((
                         declaration.asset_url,
                         getattr(
@@ -503,6 +559,7 @@ class NativeSourceIntake:
             except VetoError:
                 raise
             except Exception as exc:
+                self._observe_poll_failure(source_id, "MANUAL_SECTION", exc)
                 item_holds.append((
                     canonical_url,
                     getattr(exc, "reason_code", "SOURCE_ITEM_RETAIN_FAILED"),
