@@ -1090,6 +1090,10 @@ def open_native_pipeline(
             source_binding_recovery_due = staticmethod(lambda facts, decide=NativePublicationContinuation.source_binding_recovery_due:
                 decide(facts, ASSESSMENT_CONTRACT_VERSION))
 
+            def semantic_intent_revalidation_due(self, facts):
+                return judgment_api_key is not None and NativePublicationContinuation.semantic_intent_revalidation_due(
+                    facts, JUDGMENT_CONTRACT)
+
             def restore_current_output(self):
                 return runtime.publication.restore_current_publisher_output(journal,proof=proof)
 

@@ -106,6 +106,10 @@ class NativePipeline:
             "unclassified_revisions": report.unclassified_revisions,
         }
 
+    def _semantic_upgrade_due(self, facts: dict) -> bool:
+        due = getattr(self._publish, 'semantic_intent_revalidation_due', None)
+        return callable(due) and due(facts)
+
     def tick(self, *, cycle_id: str) -> NativePipelineReport:
         self._check()
         self._drain_between_work()
@@ -137,6 +141,8 @@ class NativePipeline:
                 facts = previous.get("facts", {})
                 if not facts.get("graphiti_receipts"):
                     cohort = pending_revisions
+                elif previous.get("stage") == "EVIDENCE_HOLD" and self._semantic_upgrade_due(facts):
+                    cohort = ordinary
                 elif previous.get("stage") == "EVIDENCE_HOLD" and assessment_revalidation_due(
                     facts, self._assessment_contract_version,
                 ):
@@ -353,6 +359,7 @@ class NativePipeline:
                         "GOVUK_LICENCE_REVIEW_HOLD", "NATIVE_SOURCE_RIGHTS_HOLD",
                         "PUBLICATION_RIGHTS_HOLD",
                     }
+                    and not self._semantic_upgrade_due(previous.get("facts", {}))
                     and not write_admission_revalidation_due(previous.get("facts", {}))
                     and not assessment_revalidation_due(
                         previous.get("facts", {}), self._assessment_contract_version,
