@@ -1437,7 +1437,7 @@ def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, 
     connection.close()
 
 
-@pytest.mark.parametrize('fault', [None, 'unknown', 'same-consumer', 'already-checked', 'pending-effect'])
+@pytest.mark.parametrize('fault', [None, 'accepted', 'unknown', 'same-consumer', 'already-checked', 'pending-effect'])
 def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_path, monkeypatch, fault):
     from newsroom.control_plane.native_evidence import NativeEvidenceHold
     unit = _native()
@@ -1460,6 +1460,7 @@ def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_p
     if fault=='pending-effect':facts['publication_started_at']='pending'
     journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED',facts=facts)
     calls=[]
+    package_id=ObjectAdmissionId.new()
     def acquire(_self, **request):
         calls.append(request)
         assert request['assessment_cached_only'] is True
@@ -1467,15 +1468,21 @@ def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_p
         assert 'assessment_semantic_only' not in request
         assert 'before_semantic_assessment' not in request
         request['before_assessment']()
+        if fault=='accepted':
+            return SimpleNamespace(retained=SimpleNamespace(package_admission_id=package_id),
+                editorial_decision=_decision(package_id),acquisition_receipt_digests=(_DIGEST,))
         raise NativeEvidenceHold('QUALIFICATION_RETAINED_RESULT_HOLD',unit.source_id)
     monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
-    runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),policies=object(),proof=proof())
+    monkeypatch.setattr('newsroom.control_plane.native_publication.open_private_serving_read_port',lambda *_args,**_kwargs:_Reader())
+    runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),
+        policies=SimpleNamespace(publication=SimpleNamespace(target_path=tmp_path/'serving.sqlite3',
+            target_id='private',target_context_digest=_DIGEST)),proof=proof())
     continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
         evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
         semantic_origin_failure=lambda _:None,semantic_intent_contract=contract,assessment_contract_version=current)
     continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
     after=journal.current(unit.revision_id)['facts']
-    assert len(calls)==(1 if fault is None else 0), after
+    assert len(calls)==(1 if fault in (None,'accepted') else 0), after
     assert after['semantic_assessment_intent']==intent
     assert after['semantic_acquisition_attempt_count']==2
     assert after['assessment_started_at']==facts['assessment_started_at']
@@ -1483,7 +1490,9 @@ def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_p
         assert after['retained_qualification_checked_contract']==current
         continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
         assert len(calls)==1
-    assert runtime.authority.receives==0 and runtime.publication.calls==0
+    if fault=='accepted':
+        assert journal.current(unit.revision_id)['stage']=='ACKNOWLEDGED'
+    assert runtime.authority.receives==0 and runtime.publication.calls==(1 if fault=='accepted'else 0)
     connection.close()
 
 
