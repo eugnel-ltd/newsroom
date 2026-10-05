@@ -345,3 +345,145 @@ def test_non_valueerror_failed_terminal_is_never_revalidated_even_with_valid_rou
         with pytest.raises(TypesafeJudgmentError,match='TYPESAFE_REPLAY_USAGE_HOLD'):
             engine.evaluate(**inputs)
         assert len(calls)==1 and usage.terminal(reference.invocation_id).failure_class=='RuntimeError'
+
+
+@pytest.mark.parametrize('new_caller', ['native', 'graphiti'])
+def test_timeout_quarantines_its_work_item_not_independent_paid_work(tmp_path, monkeypatch, new_caller):
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    with _case(tmp_path, monkeypatch, transport_error=TimeoutError('fixture')) as (engine, inputs, usage, calls, raw):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        with sqlite3.connect(usage.path) as db:
+            old = db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals').fetchone()
+        def successful(request, **_):
+            calls.append(request.data)
+            return 200, request.full_url, raw
+        engine.transport = successful
+        different = {**inputs, 'cycle_id': 'different-work'}
+        if new_caller == 'native':
+            different['candidate_id'] = 'candidate-2'
+        else:
+            different.update(caller_identity='GRAPHITI_VERIFIER', candidate_id=None, hypothesis_digest=None,
+                             ingest_id='ingest-2', graphiti_attempt_id='ingest-2:1')
+        reference = engine.evaluate(**different)
+        assert engine.read(reference, **different)['answers']['support']['choice'] == 'yes'
+        assert len(calls) == 2
+        with sqlite3.connect(usage.path) as db:
+            assert db.execute('SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?', (old[0],)).fetchone()[0] == old[1]
+            assert db.execute('SELECT unresolved FROM model_usage_current WHERE invocation_id=?', (old[0],)).fetchone() == (1,)
+        assert usage.route_state('TYPESAFE_JUDGMENT')['state'] == 'OPEN'
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**{**inputs, 'cycle_id': 'disguised-retry'})
+        assert len(calls) == 2
+
+
+@pytest.mark.parametrize('fault', ['missing-context', 'context-role', 'missing-dispatch', 'envelope-header',
+                                   'systemic-open', 'circuit-header', 'active', 'unqualified', 'dispatch-binding', 'context-header'])
+def test_timeout_scope_never_relaxes_corrupt_or_unsettled_admission(tmp_path, monkeypatch, fault):
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError, ModelUsageIntegrityError
+    with _case(tmp_path, monkeypatch, transport_error=TimeoutError('fixture')) as (engine, inputs, usage, calls, raw):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        with sqlite3.connect(usage.path) as db:
+            allocation = json.loads(db.execute('SELECT record_json FROM model_invocation_allocations').fetchone()[0])
+            invocation, envelope, manifest = (allocation[key] for key in ('invocation_id', 'envelope_id', 'context_manifest_digest'))
+            if fault == 'missing-context':
+                db.execute('DELETE FROM model_invocation_context_manifests WHERE context_manifest_digest=?', (manifest,))
+            elif fault == 'context-header':
+                db.execute("UPDATE model_invocation_context_manifests SET route='tampered' WHERE context_manifest_digest=?", (manifest,))
+            elif fault == 'context-role':
+                row = json.loads(db.execute('SELECT record_json FROM model_invocation_context_manifests WHERE context_manifest_digest=?', (manifest,)).fetchone()[0])
+                row['caller_identity'] = 'GRAPHITI_VERIFIER'
+                db.execute('UPDATE model_invocation_context_manifests SET record_json=? WHERE context_manifest_digest=?', (json.dumps(row), manifest))
+            elif fault == 'missing-dispatch':
+                db.execute('DELETE FROM model_transport_observations WHERE invocation_id=?', (invocation,))
+            elif fault == 'dispatch-binding':
+                from newsroom.authority.canonical import canonical_json_bytes, digest_canonical
+                row = json.loads(db.execute('SELECT record_json FROM model_transport_observations WHERE invocation_id=?', (invocation,)).fetchone()[0])
+                row.pop('observation_digest'); row['evidence_digest'] = digest_bytes(b'other request')
+                digest = digest_canonical(row); row['observation_digest'] = digest
+                db.execute('UPDATE model_transport_observations SET observation_digest=?,evidence_digest=?,record_json=? WHERE invocation_id=?',
+                           (digest, row['evidence_digest'], canonical_json_bytes(row).decode(), invocation))
+            elif fault == 'unqualified':
+                from newsroom.authority.canonical import canonical_json_bytes
+                policy = engine.policy.as_record(); policy['qualified'] = False
+                db.execute('UPDATE model_invocation_policies SET qualified=0,record_json=? WHERE canonical_digest=?',
+                           (canonical_json_bytes(policy).decode(), engine.policy.canonical_digest))
+
+            elif fault == 'envelope-header':
+                db.execute("UPDATE model_work_envelopes SET cycle_id='tampered' WHERE envelope_id=?", (envelope,))
+            elif fault == 'systemic-open':
+                usage._append_route_state(db, route='TYPESAFE_JUDGMENT', state='OPEN', reason='SYSTEMIC_TRANSPORT',
+                                          invocation_id=None, recorded_at=NOW.replace(year=2027))
+            elif fault == 'circuit-header':
+                usage._append_route_state(db, route='TYPESAFE_JUDGMENT', state='OPEN', reason='SYSTEMIC_TRANSPORT',
+                                          invocation_id=None, recorded_at=NOW.replace(year=2027))
+                db.execute("UPDATE model_usage_route_circuit_events SET reason='TimeoutError',invocation_id=? WHERE reason='SYSTEMIC_TRANSPORT'", (invocation,))
+        if fault == 'active':
+            def interrupted(request, **_):
+                calls.append(request.data)
+                raise KeyboardInterrupt('fixture process interruption')
+            engine.transport = interrupted
+            with pytest.raises(KeyboardInterrupt):
+                engine.evaluate(**{**inputs, 'cycle_id': 'active-work', 'candidate_id': 'candidate-2'})
+        before = len(calls)
+        engine.transport = lambda request, **_: (200, request.full_url, raw)
+        with pytest.raises((ModelUsageAdmissionError, ModelUsageIntegrityError, ValueError)):
+            engine.evaluate(**{**inputs, 'cycle_id': 'unrelated-work', 'candidate_id': 'candidate-3'})
+        assert len(calls) == before
+
+
+@pytest.mark.parametrize('new_role', ['native', 'graphiti'])
+def test_unknown_known_ingest_remains_quarantined_across_roles(tmp_path, monkeypatch, new_role):
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    with _case(tmp_path, monkeypatch, transport_error=TimeoutError('fixture')) as (engine, inputs, usage, calls, raw):
+        original = {**inputs, 'ingest_id': 'shared-ingest'}
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**original)
+        independent = {**inputs, 'cycle_id': 'different-cycle', 'candidate_id': 'candidate-2', 'ingest_id': 'shared-ingest'}
+        if new_role == 'graphiti':
+            independent.update(caller_identity='GRAPHITI_VERIFIER', candidate_id=None, hypothesis_digest=None,
+                               graphiti_attempt_id='shared-ingest:2')
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**independent)
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize('mixed', ['unknown-non-timeout', 'policy-breach'])
+def test_timeout_exception_requires_every_current_blocker_to_be_eligible(tmp_path, monkeypatch, mixed):
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    with _case(tmp_path, monkeypatch, transport_error=TimeoutError('fixture')) as (engine, inputs, usage, calls, raw):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        with sqlite3.connect(usage.path) as db:
+            old = db.execute('SELECT invocation_id FROM model_invocation_terminals').fetchone()[0]
+        def mixed_failure(request, **_):
+            calls.append(request.data)
+            if mixed == 'unknown-non-timeout':
+                raise ValueError('unknown provider failure')
+            value = json.loads(raw); value['usage']['output_tokens'] = 1_000_000
+            return 200, request.full_url, json.dumps(value).encode()
+        engine.transport = mixed_failure
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**{**inputs, 'candidate_id': 'candidate-2', 'cycle_id': 'mixed-work'})
+        # The latest selected circuit may still be the eligible timeout; current
+        # liabilities, not that one event, must establish the scope exception.
+        with sqlite3.connect(usage.path) as db:
+            db.execute('DELETE FROM model_usage_route_circuit_events WHERE invocation_id != ?', (old,))
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**{**inputs, 'candidate_id': 'candidate-3', 'cycle_id': 'third-work'})
+        assert len(calls) == 2
+
+
+def test_unknown_verifier_never_retries_its_ingest_under_a_new_attempt(tmp_path, monkeypatch):
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    with _case(tmp_path, monkeypatch, transport_error=TimeoutError('fixture')) as (engine, inputs, usage, calls, raw):
+        verifier = {**inputs, 'caller_identity': 'GRAPHITI_VERIFIER', 'candidate_id': None,
+                    'hypothesis_digest': None, 'ingest_id': 'ingest-1', 'graphiti_attempt_id': 'ingest-1:1'}
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**verifier)
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**{**verifier, 'cycle_id': 'changed', 'graphiti_attempt_id': 'ingest-1:2'})
+        assert len(calls) == 1

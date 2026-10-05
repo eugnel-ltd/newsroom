@@ -4988,6 +4988,103 @@ class ModelUsageService:
             connection.close()
         return int(row[0]) + 1
 
+    @staticmethod
+    def _independent_typesafe_timeout_work(connection, allocation, envelope, route_state):
+        """Quarantine exact unknown work, never settle cash or reopen the route.
+
+        No Source-wide clearance is inferred: the retained caller IDs are the
+        narrowest available boundary. Same candidate/ingest remains held even
+        when its cycle, questions or attempt are changed.
+        """
+        if (allocation.workload_class is not WorkloadClass.TYPESAFE_JUDGMENT
+                or allocation.provider != "typesafe" or allocation.route != "TYPESAFE_JUDGMENT"
+                or route_state.get("reason") != "TimeoutError"):
+            return False
+        event = connection.execute(
+            "SELECT event_digest,route,state,reason,invocation_id,recorded_at,record_json "
+            "FROM model_usage_route_circuit_events WHERE route='TYPESAFE_JUDGMENT' "
+            "ORDER BY recorded_at DESC,rowid DESC LIMIT 1"
+        ).fetchone()
+        if event is None:
+            return False
+        record = _object(event[6]); unsigned = dict(record); digest = unsigned.pop("event_digest", None)
+        if (digest != event[0] or digest_canonical(unsigned) != digest
+                or _json(record) != event[6] or tuple(event[1:6]) != tuple(record.get(key)
+                    for key in ("route", "state", "reason", "invocation_id", "recorded_at"))
+                or record.get("state") != "OPEN" or record.get("reason") != "TimeoutError"
+                or record.get("invocation_id") != route_state.get("invocation_id")):
+            return False
+        current = connection.execute(
+            "SELECT invocation_id,active,unresolved,policy_breach FROM model_usage_current "
+            "WHERE route='TYPESAFE_JUDGMENT'"
+        ).fetchall()
+        blocked = set()
+        for invocation_id, active, unresolved, breach in current:
+            if active or not unresolved or breach:
+                return False
+            prior, terminal = _retained_terminal_allocation(connection, invocation_id)
+            if (prior.workload_class is not WorkloadClass.TYPESAFE_JUDGMENT
+                    or prior.provider != "typesafe" or prior.route != "TYPESAFE_JUDGMENT"
+                    or terminal is None or terminal.outcome != "TYPESAFE_FAILED"
+                    or terminal.usage_status is not UsageStatus.UNREPORTED
+                    or terminal.failure_class != "TimeoutError" or terminal.policy_breach is not None
+                    or terminal.dispatch_at is None or terminal.pre_dispatch_zero_proved):
+                return False
+            old_policy = _policy_for_allocation(connection, prior)
+            if not old_policy.qualified or not _has_exact_dispatch(connection, terminal):
+                return False
+            ModelUsageService._validate_terminal(terminal, WorkloadClass.TYPESAFE_JUDGMENT, old_policy,
+                                                requested_max_output_tokens=prior.max_output_tokens)
+            dispatches = connection.execute(
+                "SELECT observed_at,evidence_digest FROM model_transport_observations "
+                "WHERE invocation_id=? AND state='DISPATCH_STARTED'", (invocation_id,),
+            ).fetchall()
+            if len(dispatches) != 1 or tuple(dispatches[0]) != (_utc_text(terminal.dispatch_at), prior.request_digest):
+                return False
+            row = connection.execute(
+                "SELECT envelope_id,cycle_id,workload_class,admitted_at,canonical_digest,record_json "
+                "FROM model_work_envelopes WHERE envelope_id=?", (prior.envelope_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            retained = _envelope_from_record(_object(row[5]))
+            if (tuple(row[:5]) != (retained.envelope_id, retained.cycle_id, retained.workload_class.value,
+                                  _utc_text(retained.admitted_at), retained.canonical_digest)
+                    or _json(retained.as_record()) != row[5] or retained.envelope_id != prior.envelope_id
+                    or retained.cycle_id != prior.cycle_id
+                    or retained.workload_class is not WorkloadClass.TYPESAFE_JUDGMENT):
+                return False
+            from .native_assessor import _retained_context
+            context = _retained_context(connection, prior)
+            headers = connection.execute(
+                "SELECT provider,route,evidence_package_digest FROM model_invocation_context_manifests "
+                "WHERE context_manifest_digest=?", (prior.context_manifest_digest,),
+            ).fetchone()
+            if (headers is None or tuple(headers) != (context.get("provider"), context.get("route"),
+                    context.get("evidence_package_digest"))
+                    or context.get("evidence_package_digest") != retained.evidence_package_digest):
+                return False
+            role = context.get("caller_identity")
+            prefix, separator, number = str(retained.graphiti_attempt_id or "").rpartition(":")
+            if (role not in {"NATIVE_ASSESSOR", "GRAPHITI_VERIFIER"}
+                    or context.get("caller_ingest_id") != retained.ingest_id
+                    or context.get("caller_graphiti_attempt_id") != retained.graphiti_attempt_id
+                    or role == "NATIVE_ASSESSOR" and (not retained.candidate_id or retained.graphiti_attempt_id is not None)
+                    or role == "GRAPHITI_VERIFIER" and (retained.candidate_id is not None or not retained.ingest_id
+                        or prefix != retained.ingest_id or separator != ":" or not number.isdigit() or int(number) <= 0)):
+
+                return False
+            scope = retained.as_record()
+            if not (scope.get("candidate_id") or scope.get("ingest_id")):
+                return False
+            if any(scope.get(key) is not None and scope.get(key) == envelope.get(key)
+                   for key in ("candidate_id", "ingest_id")):
+                return False
+            blocked.add(invocation_id)
+            if invocation_id == route_state.get("invocation_id") and record.get("recorded_at") != _utc_text(terminal.observed_at):
+                return False
+        return bool(blocked) and route_state.get("invocation_id") in blocked
+
     def _validate_preflight(
         self,
         connection: sqlite3.Connection,
@@ -5140,13 +5237,15 @@ class ModelUsageService:
                 "config identity is outside qualified policy"
             )
         blocking_routes = _usage_blocking_routes(connection)
-        if _canonical_circuit_route(allocation.route) in blocking_routes:
+        route_state = self._route_state(connection, allocation.route, blocking_routes=blocking_routes)
+        independent_timeout_work = self._independent_typesafe_timeout_work(
+            connection, allocation, envelope, route_state,
+        )
+        if _canonical_circuit_route(allocation.route) in blocking_routes and not independent_timeout_work:
             raise ModelUsageAdmissionError(
                 "affected route has unresolved usage or a policy breach"
             )
-        if self._route_state(
-            connection, allocation.route, blocking_routes=blocking_routes,
-        )["state"] == "OPEN":
+        if route_state["state"] == "OPEN" and not independent_timeout_work:
             raise ModelUsageAdmissionError("affected route circuit is open")
         duplicate = connection.execute(
             "SELECT 1 FROM model_invocation_allocations "
