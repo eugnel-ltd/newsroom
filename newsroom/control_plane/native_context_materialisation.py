@@ -30,8 +30,10 @@ _FACTUAL_EXPRESSION_TOKEN = re.compile(
     r"january|february|march|april|may|june|july|august|september|october|"
     r"november|december|yesterday|today|tomorrow|seconds?|minutes?|hours?|"
     r"days?|weeks?|months?|years?|pounds?|dollars?|euros?|kilograms?|"
-    r"kilometres?|metres?|tonnes?|litres?|degrees?)\b|"
-    r"昨日|今日|明日|百分|季度|星期|週|周|英鎊|英镑|美元|港元|[%％£$€]",
+    r"kilometres?|metres?|centimetres?|millimetres?|tonnes?|litres?|degrees?|"
+    r"miles?|feet|foot|inches?|ounces?|gallons?|acres?|yards?)\b|"
+    r"昨日|今日|明日|百分|季度|星期|週|周|英鎊|英镑|美元|港元|"
+    r"公里|公斤|千米|公噸|噸|吨|英里|英尺|英寸|盎司|加侖|加仑|升|米|[%％£$€]",
     re.IGNORECASE,
 )
 
