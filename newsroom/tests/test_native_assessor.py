@@ -2748,57 +2748,6 @@ def test_retained_process_with_separate_public_invitation_passes_static_validati
     assert execution.text == canonical_json_bytes(raw).decode()
 
 
-@pytest.mark.parametrize("pair, accepted", [
-    (["The policy changed.", "政策已經更改。"], True),
-    (["changed", "更改"], True),
-    (["foreign prose", "更改"], False),
-    (["changed", "未出現詞句"], False),
-    (["30 June 2026", "2026年7月1日"], False),
-    (["ten schools", "11所學校"], False),
-    (["thirteen schools", "十四所學校"], False),
-    (["five percent", "六百分比"], False),
-    (["a week", "一日"], False),
-    (["ninety minutes", "一小時"], False),
-    (["one hundred pounds", "二百英鎊"], False),
-    (["changed"], False),
-    (["changed", ""], False),
-])
-def test_advisory_prose_pairs_do_not_replace_typed_factual_validation(
-    retained_22589_assessment, pair, accepted,
-):
-    candidate, base, source, acquired, raw = _qualification_assessor_inputs(
-        retained_22589_assessment, kind="policy",
-    )
-    # The correction concerns newly composed context, not the original headline.
-    context = {**raw["package"]["governed_claims"][0], "claim_id": "context-prose",
-               "claim_role": "CONTEXT", "localised_factual_expressions": [pair]}
-    raw["package"]["governed_claims"].append(context)
-    execution = NativeAssessmentExecution(canonical_json_bytes(raw).decode(), {})
-    if accepted:
-        result = AutonomousNativeEvidenceAssessor._validated_execution(
-            execution, candidate, base, (source,), (acquired,),
-        )
-        assert result.governed_claims[-1].localised_factual_expressions == ()
-        assert execution.text == canonical_json_bytes(raw).decode()
-    else:
-        with pytest.raises(EvidencePackageError):
-            AutonomousNativeEvidenceAssessor._validated_execution(
-                execution, candidate, base, (source,), (acquired,),
-            )
-
-
-def test_original_headline_advisory_pairs_are_not_reinterpreted(retained_22589_assessment):
-    candidate, base, source, acquired, raw = _qualification_assessor_inputs(
-        retained_22589_assessment, kind="policy",
-    )
-    raw["package"]["governed_claims"][0]["localised_factual_expressions"] = [["changed", "更改"]]
-    execution = NativeAssessmentExecution(canonical_json_bytes(raw).decode(), {})
-    with pytest.raises(EvidencePackageError):
-        AutonomousNativeEvidenceAssessor._validated_execution(
-            execution, candidate, base, (source,), (acquired,),
-        )
-
-
 @pytest.mark.parametrize('available', [False, True])
 def test_qualification_cached_only_has_no_judgment_or_provider_fallback(
     tmp_path, monkeypatch, retained_22589_assessment, available,

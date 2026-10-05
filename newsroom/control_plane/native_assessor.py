@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
@@ -115,47 +114,6 @@ REASONING = "high"
 COMMAND_FLAGS = _grok_command_flags(REASONING, model=MODEL)
 RETAINED_ASSESSMENT_POLICY_VERSION = "newsroom.retained-assessment.v1"
 QUALIFICATION_CLAUSE_CONSUMER_VERSION = "newsroom.native-hko-qualification-clause.v1"
-LOCALISATION_ADVISORY_CONSUMER_VERSION = "newsroom.native-localisation-advisory.v1"
-# Preserve possibly factual or malformed pairs for the existing strict validator.
-_FACTUAL_EXPRESSION_TOKEN = re.compile(
-    r"\d|\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
-    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
-    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|"
-    r"million|billion|trillion|first|second|third|half|quarter|percent|percentage|"
-    r"january|february|march|april|may|june|july|august|september|october|"
-    r"november|december|yesterday|today|tomorrow|seconds?|minutes?|hours?|"
-    r"days?|weeks?|months?|years?)\b|"
-    r"[零〇一二三四五六七八九十百千萬万億亿兩两]+"
-    r"(?:年|月|日|時|时|分|秒|個|个|間|间|所|人|名|部|輛|辆|條|条|港元|元)|"
-    r"昨日|今日|明日|百分|半|季度|星期|週|周|英鎊|英镑|美元|港元|[%£$€]",
-    re.IGNORECASE,
-)
-
-
-def _typed_factual_pairs(claim: dict):
-    """Context prose already has support evidence; it is not typed fact metadata."""
-    from .evidence import _canonical_localised_fact
-
-    pairs = claim.get("localised_factual_expressions")
-    if claim.get("claim_role") != "CONTEXT" or type(pairs) is not list:
-        return pairs
-    retained = []
-    for pair in pairs:
-        if (type(pair) is not list or len(pair) != 2
-                or any(type(value) is not str or not value.strip() for value in pair)):
-            retained.append(pair)
-            continue
-        source, target = pair
-        factual = any(_canonical_localised_fact(value) is not None
-                      or _FACTUAL_EXPRESSION_TOKEN.search(value) for value in pair)
-        bound = (source in claim["claim"] or source in claim["supporting_excerpt"]) and (
-            target in claim["rendered_assertion_zh_hant_hk"]
-        )
-        if factual or not bound:
-            retained.append(pair)
-    return retained
-
-
 REASSESSABLE_HOLDS = frozenset({
     "ASSESSOR_CLAIM_BINDING_HOLD", "ASSESSOR_NAMED_ENTITY_CONTRACT_HOLD",
     "INVALID_GOVERNED_CLAIM_EVIDENCE",
@@ -2665,7 +2623,6 @@ class AutonomousNativeEvidenceAssessor:
                 "source_record_ids": [
                     receipt_by_source[item] for item in claim_source_ids
                 ],
-                "localised_factual_expressions": _typed_factual_pairs(raw_claim),
                 "source_authority_decision_ids": [
                     item.record_id for item in decisions
                 ],

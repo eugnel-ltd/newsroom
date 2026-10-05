@@ -213,3 +213,48 @@ def test_context_multispan_ranges_use_existing_entity_order_and_source_decoder()
     assert result['rendered_assertion_zh_hant_hk'].count('UK') == 1
     assert result['rendered_assertion_zh_hant_hk'].count('Dan Jarvis') == 1
     assert AutonomousNativeEvidenceAssessor._validated_execution(execution, N(), case[6], (case[7],), (case[8],)).governed_claims
+
+
+@pytest.mark.parametrize('source,target', [
+    ('proposing', '提出'),
+    ('proposing', '建議推行'),  # Advisory target need not be a contiguous rendering span.
+])
+def test_supported_context_discards_prose_advice_without_mutating_paid_receipt(source, target):
+    case = list(_case())
+    pair = {'source_lookup_key': source, 'rendered_expression': target}
+    case[1]['package']['governed_claims'][0]['factual_localisations'] = [pair]
+    case[2]['renderings']['S1L2']['factual_localisations'] = [deepcopy(pair)]
+    paid_before = canonical_json_bytes(case[2])
+    original_before = case[0].execution.text
+    execution, proof = _compose(case)
+    result = AutonomousNativeEvidenceAssessor._validated_execution(
+        execution, N(), case[6], (case[7],), (case[8],),
+    )
+    assert result.governed_claims[1].localised_factual_expressions == ()
+    assert canonical_json_bytes(case[2]) == paid_before
+    assert json.loads(execution.text)['package']['governed_claims'][0] == json.loads(original_before)['package']['governed_claims'][0]
+    assert proof['version'] == 'newsroom.native-context-materialisation.v2'
+    assert result.governed_claims[1].rendered_assertion_zh_hant_hk == '政府正提出按UK法律管制2種化學物質。'
+
+
+@pytest.mark.parametrize('pair', [
+    ['30 June 2026', '2026年7月1日'], ['ten schools', '11所學校'],
+    ['thirteen schools', '十四所學校'], ['fourth', '第五'],
+    ['five percent', '六百分比'], ['a week', '一日'],
+    ['ninety minutes', '一小時'], ['one hundred pounds', '二百英鎊'],
+    ['kilograms', '公噸'], ['May', '六月'], ['changed', '三'],
+    ['5 years', '5年'], ['HK$100', '一百港元'],
+])
+def test_potentially_factual_context_pairs_are_never_discarded(pair):
+    from newsroom.control_plane.native_context_materialisation import _typed_context_pairs
+    assert _typed_context_pairs({'localised_factual_expressions': [pair]}) == [pair]
+
+
+def test_unbound_prose_source_key_still_rejects_before_normalisation():
+    from newsroom.control_plane.native_assessor_references import SourceReferenceError
+    case = list(_case())
+    pair = {'source_lookup_key': 'not in the Source', 'rendered_expression': '文本'}
+    case[1]['package']['governed_claims'][0]['factual_localisations'] = [pair]
+    case[2]['renderings']['S1L2']['factual_localisations'] = [deepcopy(pair)]
+    with pytest.raises(SourceReferenceError):
+        _compose(case)

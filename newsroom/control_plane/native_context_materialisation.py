@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import re
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical, validate_sha256_digest
 from .native_assessor import NativeAssessmentExecution, _materialise_reference_result, _reference_binding, VERSION as CODEC
@@ -14,7 +15,37 @@ from .native_assessor_judgments import JudgedAssessment, VERSION as JUDGMENT_VER
 from .native_assessor_references import SourceView, MAX_CLAIMS, VERSION as REFERENCE_VERSION
 from .native_source_qualification import VERSION as QUALIFICATION_VERSION
 
-VERSION = 'newsroom.native-context-materialisation.v1'
+VERSION = 'newsroom.native-context-materialisation.v2'
+
+
+# Advisory prose is not a typed numeric/date/unit substitution. Keep anything
+# possibly factual for the original strict validator, rather than certifying it.
+_FACTUAL_EXPRESSION_TOKEN = re.compile(
+    r"\d|[零〇一二三四五六七八九十百千萬万億亿兆兩两半]|"
+    r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|"
+    r"million|billion|trillion|first|second|third|fourth|fifth|sixth|seventh|"
+    r"eighth|ninth|tenth|half|quarter|percent|percentage|"
+    r"january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|yesterday|today|tomorrow|seconds?|minutes?|hours?|"
+    r"days?|weeks?|months?|years?|pounds?|dollars?|euros?|kilograms?|"
+    r"kilometres?|metres?|tonnes?|litres?|degrees?)\b|"
+    r"昨日|今日|明日|百分|季度|星期|週|周|英鎊|英镑|美元|港元|[%％£$€]",
+    re.IGNORECASE,
+)
+
+
+def _typed_context_pairs(claim):
+    from .evidence import _canonical_localised_fact
+
+    retained = []
+    for pair in claim["localised_factual_expressions"]:
+        source, target = pair
+        if any(_canonical_localised_fact(value) is not None
+               or _FACTUAL_EXPRESSION_TOKEN.search(value) for value in pair):
+            retained.append(pair)
+    return retained
 
 
 class ContextCompositionError(ValueError):
@@ -123,6 +154,10 @@ def compose_context_execution(original, context_wire, localisation_receipt, *, b
         raise ContextCompositionError('CONTEXT_LOCALISATION_INVENTORY')
     context, context_receipt = _materialise_reference_result(canonical_json_bytes(wire), view,
                                                           digest_canonical(binding), CODEC)
+    # Only newly composed, receipt-authenticated context is normalised. The
+    # original headline/qualification, rendering and paid receipts stay intact.
+    for claim in context['package']['governed_claims']:
+        claim['localised_factual_expressions'] = _typed_context_pairs(claim)
     combined = deepcopy(document)
     combined['package']['governed_claims'].extend(context['package']['governed_claims'])
     ids = [c['claim_id'] for c in combined['package']['governed_claims']]
