@@ -151,3 +151,24 @@ def test_unproved_paid_verifier_never_preserves_settlement(tmp_path, monkeypatch
             with pytest.raises(ModelUsageIntegrityError):
                 usage.native_graphiti_ingest_retry_evidence_many(failed_attempts={'ingest-1':1}, max_attempts=1)
         assert len(calls) == 1
+
+
+def test_verified_predispatch_zero_preserves_only_already_settled_graphiti(tmp_path, monkeypatch):
+    from newsroom.control_plane.typesafe_judgment import TypesafeJudgmentError
+    from newsroom.control_plane.model_usage import _is_exact_pre_dispatch_zero
+    with _case(tmp_path, monkeypatch) as (engine, inputs, usage, calls, _):
+        cycle = _settled_native_graphiti(usage, monkeypatch)
+        before = usage.native_graphiti_ingest_retry_evidence_many(failed_attempts={'ingest-1':1}, max_attempts=1)['ingest-1']
+        assert before.settled_provider_attempts == (1,)
+        inputs.update(caller_identity='GRAPHITI_VERIFIER', candidate_id=None, hypothesis_digest=None,
+            ingest_id='ingest-1', graphiti_attempt_id='ingest-1:1', cycle_id=cycle)
+        engine.key = lambda: ''
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        import sqlite3
+        with sqlite3.connect(usage.path) as db:
+            invocation = db.execute('SELECT invocation_id FROM model_invocation_allocations WHERE workload_class=?', (WorkloadClass.TYPESAFE_JUDGMENT.value,)).fetchone()[0]
+        assert _is_exact_pre_dispatch_zero(usage.terminal(invocation))
+        after = usage.native_graphiti_ingest_retry_evidence_many(failed_attempts={'ingest-1':1}, max_attempts=1)['ingest-1']
+        assert after == before and after.zero_dispatch_attempts == ()
+        assert not calls

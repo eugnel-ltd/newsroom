@@ -1,6 +1,6 @@
 """Current codec consumes authenticated closed judgments; no live provider."""
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import replace,asdict
 from datetime import UTC, datetime
 from types import SimpleNamespace
 import json
@@ -9,7 +9,7 @@ import sqlite3
 import pytest
 from newsroom.authority import ObjectAdmissionRequest
 from newsroom.authority.canonical import digest_bytes, canonical_json_bytes
-from newsroom.control_plane.model_usage import ModelUsageService
+from newsroom.control_plane.model_usage import ModelUsageService,InvocationEfficiencyPolicy
 from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
 from newsroom.control_plane.native_assessor_judgments import NativeAssessorJudgments, JudgedAssessment
 from newsroom.control_plane.native_evidence import PublicationRightsAssessment, rights_eligibility_digest
@@ -38,7 +38,7 @@ def _source(body, admission, source_id="HK-fixture"):
 
 
 @contextmanager
-def _case(tmp_path, monkeypatch, *, answer_change=None, source_id="HK-fixture"):
+def _case(tmp_path, monkeypatch, *, answer_change=None, source_id="HK-fixture", max_prompt_bytes=None):
     args=_args(tmp_path,monkeypatch);usage=ModelUsageService(str(tmp_path/'usage.sqlite3'));calls=[]
     with open_native_runtime(**args) as runtime:
         admission=runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.source','chinese-source'),BODY.encode(),proof=runtime.proof).admission
@@ -67,8 +67,11 @@ def _case(tmp_path, monkeypatch, *, answer_change=None, source_id="HK-fixture"):
         def fence(binding,proof):
             assert binding['content_digest']==base.digest
             yield
+        policy=judgment_policy(evidence_digest=digest_bytes(b'qualified fixture'),qualified=True)
+        if max_prompt_bytes is not None:
+            policy=InvocationEfficiencyPolicy.create(**{**asdict(policy),'max_prompt_bytes':max_prompt_bytes})
         service=TypesafeJudgment(usage=usage,objects=runtime.authority.objects,
-            policy=judgment_policy(evidence_digest=digest_bytes(b'qualified fixture'),qualified=True),api_key=lambda:'fixture-not-live',source_fence=fence,transport=transport,implementation_worktree_clean=True,clock=lambda:datetime(2026,10,4,tzinfo=UTC))
+            policy=policy,api_key=lambda:'fixture-not-live',source_fence=fence,transport=transport,implementation_worktree_clean=True,clock=lambda:datetime(2026,10,4,tzinfo=UTC))
         consumer=NativeAssessorJudgments(judgments=service,proof=runtime.proof,scope_for=lambda *_:{'coverage':'COMPLETE','newness':'KNOWN_CHANGE','current_scope':{'revision_digest':source.source_version.canonical_digest},'prior_scope':{'revision_digest':digest_bytes(b'prior')}})
         yield consumer,service,candidate,base,source,acquired,usage,calls
 
@@ -446,3 +449,33 @@ def test_first_publication_provenance_drift_never_uses_updated_or_retrieved_time
         result=consumer.assess(candidate,base,(source,),(acquired,))
         assert result.reason=='FIRST_PUBLICATION_PROVENANCE_UNPROVEN'
         assert not calls
+
+
+def test_large_prior_geometry_returns_zero_call_judgment_fallback(tmp_path,monkeypatch):
+    with _case(tmp_path,monkeypatch) as (consumer,service,candidate,base,source,acquired,usage,calls):
+        consumer.scope_for=lambda *_:{'coverage':'COMPLETE','newness':'KNOWN_CHANGE',
+            'current_scope':{'body':BODY},'prior_scope':{'body':'x'*(service.policy.max_prompt_bytes+1)}}
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert result.reason=='JUDGMENT_INPUT_BOUND' and result.references==()
+        assert not calls
+        with sqlite3.connect(usage.path) as db:
+            assert db.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0]==0
+
+
+def test_second_stage_geometry_fallback_retains_exact_first_reference_without_second_dispatch(tmp_path,monkeypatch):
+    from newsroom.control_plane.typesafe_judgment import MODEL,_json
+    with _case(tmp_path,monkeypatch,max_prompt_bytes=4096) as (consumer,service,candidate,base,source,acquired,usage,calls):
+        evaluate=service.evaluate;references=[]
+        def first_then_bound(**inputs):
+            reference=evaluate(**inputs)
+            references.append(reference)
+            bound=len(_json({'model':MODEL,'state':inputs['state'],'questions':inputs['questions']}))
+            assert bound<=service.policy.max_prompt_bytes
+            return reference
+        monkeypatch.setattr(service,'evaluate',first_then_bound)
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert result.reason=='JUDGMENT_INPUT_BOUND' and result.references==tuple(references)
+        assert len(references)==1 and len(calls)==1
+        with sqlite3.connect(usage.path) as db:
+            assert db.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0]==1
+            assert db.execute('SELECT count(*) FROM model_invocation_terminals').fetchone()[0]==1

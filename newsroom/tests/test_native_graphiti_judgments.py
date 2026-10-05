@@ -139,3 +139,46 @@ def test_empty_proposal_still_requires_current_source_rights_fence():
     with pytest.raises(InterruptedError,match='current source permission or stop changed'):
         NativeGraphitiJudgments(judgments=paid).evaluate(receipt,revision,**scope)
     assert not paid.calls
+
+
+@pytest.mark.parametrize('empty', [False, True])
+def test_real_accounted_service_uses_nonreentrant_source_fence(tmp_path, monkeypatch, empty):
+    import json
+    from newsroom.tests.test_typesafe_judgment import _case
+    receipt, revision, scope = case()
+    if empty:
+        receipt = _proposal_receipt(revision=revision, payload={'entities': [], 'facts': []}, ranges={})
+    with _case(tmp_path, monkeypatch) as (paid, _inputs, _usage, _calls, _raw):
+        scope['proof'] = _inputs['proof']
+        active = False
+        fences, dispatches = [], []
+        @contextmanager
+        def exclusive(binding, proof):
+            nonlocal active
+            assert not active, 'source fence is nonreentrant'
+            assert binding['source_revision_id'] == revision.revision_id
+            assert binding['proposal_payload_digest'] == receipt['payload_digest']
+            active = True
+            fences.append(binding)
+            try:
+                yield
+            finally:
+                active = False
+        def transport(request, **_kwargs):
+            assert active, 'shared service must fence provider dispatch'
+            posted = json.loads(request.data)
+            dispatches.append(posted)
+            answers = {}
+            for identity, question in posted['questions'].items():
+                choice = 'AS_STATED' if identity.endswith(':direction') else 'SUPPORTED'
+                answers[identity] = {'type': 'choice', 'choice': choice, 'confidence': 1,
+                    'probabilities': {key: int(key == choice) for key in question['criteria']}}
+            return 200, request.full_url, json.dumps({'model': 'jev-1.13.0', 'answers': answers,
+                'usage': {'input_tokens': 40, 'output_tokens': 10}}).encode()
+        paid.fence, paid.transport = exclusive, transport
+        consumer = NativeGraphitiJudgments(judgments=paid)
+        result = consumer.evaluate(receipt, revision, **scope)
+        assert result['status'] == ('ZERO_PROPOSALS' if empty else 'VERIFIED')
+        assert len(dispatches) == (0 if empty else 1)
+        assert len(fences) == (1 if empty else 3)
+        assert not active

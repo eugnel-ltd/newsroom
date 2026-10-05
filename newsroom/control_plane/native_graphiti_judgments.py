@@ -32,9 +32,8 @@ class NativeGraphitiJudgments:
             'source_id': unit.source_id, 'unit_revision_id': unit.revision_id,
             'source_currentness': [{'source_id': unit.source_id, 'definition_id': str(unit.authority.definition_id),
                                    'definition_version_id': str(unit.authority.definition_version_id)}]}
-        with self.judgments.fence(binding, proof):
-            return self._evaluate(receipt, revision, envelope=envelope, cycle_id=cycle_id,
-                caller_identity=caller_identity, proof=proof, binding=binding)
+        return self._evaluate(receipt, revision, envelope=envelope, cycle_id=cycle_id,
+            caller_identity=caller_identity, proof=proof, binding=binding)
 
     def _evaluate(self, receipt, revision, *, envelope, cycle_id, caller_identity, proof, binding):
         try:
@@ -49,7 +48,8 @@ class NativeGraphitiJudgments:
         result = {'contract': VERSION, 'payload_digest': expected['payload_digest'],
             'source_binding_digest': digest_canonical(binding), 'proposal_receipt_digest': digest_canonical(expected)}
         if not payload['entities'] and not payload['facts']:
-            return {**result, 'status': 'ZERO_PROPOSALS', 'question_count': 0, 'judgment_reference': None}
+            with self.judgments.fence(binding, proof):
+                return {**result, 'status': 'ZERO_PROPOSALS', 'question_count': 0, 'judgment_reference': None}
         # IDs below are source segment/local proposal ordinals, not authority UUIDs.
         state = {'source_segments': [{'segment_id': s.segment_id, 'text': s.text} for s in segments],
                  'entities': payload['entities'], 'facts': payload['facts']}

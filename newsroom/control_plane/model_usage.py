@@ -4346,7 +4346,9 @@ class ModelUsageService:
                                 "prompt_digest", "request_digest", "output_schema_digest",
                                 "prompt_contract_version", "context_identity", "config_identity"))):
                         raise ModelUsageIntegrityError("retained Graphiti verifier binding differs")
-                    if terminal.usage_status is UsageStatus.REPORTED and terminal.dispatch_at is not None:
+                    if _is_exact_pre_dispatch_zero(terminal):
+                        proved_reported = not _has_exact_dispatch(connection, terminal)
+                    elif terminal.usage_status is UsageStatus.REPORTED and terminal.dispatch_at is not None:
                         _require_reported_telemetry(connection, terminal)
                         proved_reported = _has_exact_dispatch(connection, terminal)
                 key = (ingest, number)

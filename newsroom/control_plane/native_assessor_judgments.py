@@ -125,6 +125,9 @@ class NativeAssessorJudgments:
                 'candidate_id':candidate.candidate_id,'hypothesis_digest':candidate.governing_manifest.canonical_digest,
                 'proof':self.proof}
             if retained is None:
+                from .typesafe_judgment import MODEL,_json
+                if len(_json({'model':MODEL,'state':state,'questions':questions}))>self.judgments.policy.max_prompt_bytes:
+                    return JudgmentFallback('JUDGMENT_INPUT_BOUND',tuple(stages))
                 reference=self.judgments.evaluate(**inputs)
             else:
                 from .typesafe_judgment import JudgmentReference
@@ -140,7 +143,9 @@ class NativeAssessorJudgments:
         questions={identity:{'type':'choice','instructions':f'Classify exact span {identity} in full source context; future announced change can be material, but is not already in force. Keep supporting facts and times even if not novel.',
             'criteria':{'MATERIAL':'Affirmed material event/policy/action claim.', 'SUPPORTING':'Affirmed supported detail, timestamp or explanatory fact; preserve exact modality and negation.',
                         'BACKGROUND':'Administrative/irrelevant framing or separator.', 'UNCERTAIN':'Unresolved factual role/support, attributed allegation or provisional rather than confirmed fact.'}}for identity in candidates}
-        first,roles=batch('SOURCE_ROLES',state,questions)
+        result=batch('SOURCE_ROLES',state,questions)
+        if type(result)is JudgmentFallback:return result
+        first,roles=result
         if any(a.get('choice')not in ROLES for a in roles.values()):raise ValueError('judgment role differs')
         if any(a['choice']=='UNCERTAIN'for a in roles.values()):return JudgmentFallback('UNCERTAIN_SOURCE_ROLE',(first,))
         selected=[identity for identity,a in roles.items()if a['choice']in ('MATERIAL','SUPPORTING')]
@@ -173,7 +178,9 @@ class NativeAssessorJudgments:
                     else:continue
                     questions[prefix+':'+field]={'type':'choice','instructions':f'For {identity}/{test}, select source-supported {field}; NONE if not established.',
                         'criteria':{**choices,'NONE':'No established value.'}}
-        second,answers=batch('SELECTED_QUALIFICATION',state,questions)
+        result=batch('SELECTED_QUALIFICATION',state,questions)
+        if type(result)is JudgmentFallback:return result
+        second,answers=result
         headline=answers['headline'].get('choice')
         if headline not in material:return JudgmentFallback('UNCERTAIN_HEADLINE',(first,second))
         if scope['newness']=='SOURCE_DECLARED_FIRST_PUBLICATION' and any(answers[identity+':announced_event'].get('choice')!='YES' for identity in material):
