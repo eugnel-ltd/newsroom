@@ -501,3 +501,33 @@ def test_semantic_only_intent_never_dispatches_legacy_reasoning(tmp_path, monkey
                 assert len(result.governed_claims)==2
         assert len(calls)==(0 if fallback else 2)
         assert len(local_calls)==(0 if fallback else 1)
+
+
+@pytest.mark.parametrize('kind',['missing','uncertain'])
+def test_auxiliary_witness_gap_retains_every_claim_and_only_omits_unproven_qualification(tmp_path,monkeypatch,kind):
+    def change(answers):
+        if 'S1L2'in answers:
+            answers['S1L2']['choice']='MATERIAL'
+            answers['S1L2']['probabilities']={key:int(key=='MATERIAL')for key in answers['S1L2']['probabilities']}
+        key='S1L2:LAW_RIGHT_STATUS_POLICY'
+        if key not in answers:return
+        choice='UNCERTAIN'if kind=='uncertain'else'YES'
+        answers[key]['choice']=choice
+        answers[key]['probabilities']={value:int(value==choice)for value in answers[key]['probabilities']}
+        if kind=='missing':
+            key+=':new_state_source_lookup_key'
+            answers[key]['choice']='NONE'
+            answers[key]['probabilities']={value:int(value=='NONE')for value in answers[key]['probabilities']}
+    with _case(tmp_path,monkeypatch,answer_change=change) as (consumer,service,candidate,base,source,acquired,usage,calls):
+        local_calls=[]
+        _localiser(consumer,service,usage,candidate,base,local_calls)
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert type(result)is JudgedAssessment
+        assessment=AutonomousNativeEvidenceAssessor._validated_execution(result.execution,candidate,base,(source,),(acquired,))
+        assert [claim.claim for claim in assessment.governed_claims]==BODY.splitlines()
+        assert [claim.claim_role for claim in assessment.governed_claims]==['HEADLINE','SUBSTANTIVE']
+        assert assessment.substantive_new_information==tuple(BODY.splitlines())
+        assert len(assessment.qualification_evidence)==1
+        assert assessment.qualification_evidence[0].governed_claim_id==assessment.governed_claims[0].claim_id
+        assert consumer.read(result.decision_admission_id,candidate,base,(source,),(acquired,))==result
+        assert len(calls)==2 and len(local_calls)==1
