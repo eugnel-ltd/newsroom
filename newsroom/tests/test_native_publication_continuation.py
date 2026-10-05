@@ -1437,7 +1437,8 @@ def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, 
     connection.close()
 
 
-def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_path,monkeypatch):
+@pytest.mark.parametrize('resumed', [False, True])
+def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_path,monkeypatch,resumed):
     unit=_native();connection=connect(str(tmp_path/'context-purpose.sqlite3'))
     journal=NativeRevisionJournal(connection);journal.land((unit,))
     old_package=ObjectAdmissionId.new();new_package=ObjectAdmissionId.new()
@@ -1447,12 +1448,20 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
         'editorial_decision':json.loads(_decision(old_package).canonical_bytes()),
         'semantic_assessment_intent':semantic,'reason':'NATIVE_STORY_FACTUAL_ENTITIES',
         'publication_started_at':'original-writer-purpose','acquisition_attempt_count':2}
-    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=old)
+    if resumed:
+        old.update(context_enrichment_intent={'contract':'newsroom.native-context-package.v1',
+            'original_package_admission_id':str(old_package),
+            'original_journal':{'publication_started_at':old.pop('publication_started_at')}},
+            reason='ACQUISITION_RESULT_NOT_RETAINED', failure_class='EvidencePackageError',
+            assessment_contract_version='newsroom.native-evidence-assessor.v23+previous-consumer')
+        old.pop('package_admission_id');old.pop('editorial_decision')
+    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED' if resumed else 'EVIDENCE_HOLD',facts=old)
     requests=[]
     def acquire(_self,**request):
         requests.append(request)
         assert request['assessment_context_only']is True
         assert request['assessment_cached_only']is False
+        assert not request.get('assessment_qualification_cached_only')
         assert 'assessment_semantic_only'not in request
         request['before_assessment']()
         return SimpleNamespace(retained=SimpleNamespace(package_admission_id=new_package),
@@ -1468,11 +1477,13 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
             context_enrichment_contract='newsroom.native-context-package.v99')
     continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
         evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
-        context_enrichment_contract='newsroom.native-context-package.v1')
+        context_enrichment_contract='newsroom.native-context-package.v1',
+        semantic_origin_failure=lambda _:None, semantic_intent_contract='old-semantic',
+        assessment_contract_version='newsroom.native-evidence-assessor.v23+new-consumer')
     continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
     facts=journal.current(unit.revision_id)['facts']
     assert facts['context_enrichment_intent']['original_package_admission_id']==str(old_package)
-    assert facts['context_enrichment_intent']['original_journal']['publication_started_at']==old['publication_started_at']
+    assert facts['context_enrichment_intent']['original_journal']['publication_started_at']=='original-writer-purpose'
     assert facts['semantic_assessment_intent']==semantic and facts['acquisition_attempt_count']==2
     assert facts['context_enrichment_completed']is True and facts['package_admission_id']==str(new_package)
     assert journal.current(unit.revision_id)['stage']=='ACKNOWLEDGED'
