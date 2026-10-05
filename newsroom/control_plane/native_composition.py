@@ -614,6 +614,7 @@ def open_native_pipeline(
             from .native_story_writer import NativeStoryWriterHold
             from .writer import WriterDispatchError, CliProcessError, CliTimeoutError
             currentness = identities.pop("source_currentness")
+            cached_only = identities.pop('cached_only',False)
             def require_story_sources():
                 require_current_story_sources(package, currentness)
             @contextmanager
@@ -623,7 +624,7 @@ def open_native_pipeline(
                     yield
             try:
                 model = NativeStoryModel(usage, load_story_model_policies(usage),
-                    fence=writer_fence, stop_check=require_story_sources, clock=clock)
+                    fence=writer_fence, stop_check=require_story_sources, clock=clock,cached_only=cached_only)
                 result = model.write(package, **identities)
                 require_story_sources()
                 return result
@@ -1160,6 +1161,10 @@ def open_native_pipeline(
                 return self.continuation(
                     {revision_id: sources} if sources else {},
                 ).advance(revision_id=revision_id, candidate_version_id=candidate_version_id)
+
+            @staticmethod
+            def writer_revalidation_due(facts):
+                return NativePublicationContinuation.writer_revalidation_due(facts)
 
         intake = NativeSourceIntake(
             sources=runtime.authority.sources, objects=runtime.authority.objects,

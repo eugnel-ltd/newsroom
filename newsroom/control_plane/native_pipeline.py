@@ -361,6 +361,8 @@ class NativePipeline:
                     }
                     and not self._semantic_upgrade_due(previous.get("facts", {}))
                     and not write_admission_revalidation_due(previous.get("facts", {}))
+                    and not (callable(getattr(self._publish,'writer_revalidation_due',None))
+                        and self._publish.writer_revalidation_due(previous.get('facts',{})))
                     and not assessment_revalidation_due(
                         previous.get("facts", {}), self._assessment_contract_version,
                     )

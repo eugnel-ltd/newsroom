@@ -14,6 +14,7 @@ from .writer import WriterCopy, WriterEvidenceLink, WriterValidatorResult, _writ
 from .zh_hant import contains_discourse_filler, contains_non_han_letter, contains_simplified_variant
 
 WRITER_ID = "newsroom.native-story-writer.v1"
+CONSUMER_VERSION = "newsroom.native-story-support.v2"
 LEGACY_DRAFT_SYSTEM = (
     "Write original Hong Kong Traditional Chinese news, not claim declarations. Use only approved facts "
     "and supporting source windows: a natural headline, attributed lead, detail and available context. "
@@ -114,8 +115,25 @@ def _sentence_claim_links(copy):
     ]
 
 
-def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_record: Mapping, format: str):
+def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_record: Mapping, format: str,
+                            *, source_currentness=()):
     """Validate retained bindings without calling either model again."""
+    if 'date_derivation' in review_record:
+        from .native_story_dates import derive_and_verify
+        try:
+            proof=review_record['date_derivation']
+            original=_object(proof['original_draft'],DRAFT_SCHEMA)
+            original_copy=WriterCopy(original['title'],original['body'],WRITER_ID,package.digest,
+                tuple(WriterEvidenceLink(**link)for link in original['evidence_links']))
+            review={key:review_record[key]for key in REVIEW_SCHEMA['required']}
+            checks=validate_retained_story(original_copy,package,review,original['format'])
+            if any(check.result!='PASS'for check in checks):
+                return checks
+            derive_and_verify(original,review,package,source_currentness,
+                final_draft=_draft(copy,format),date_derivation=proof)
+        except (KeyError,TypeError,ValueError,ValidationError):
+            return (WriterValidatorResult('NATIVE_STORY_DATE_DERIVATION','FAIL','UNPROVEN_SOURCE_DATE'),)
+        return (*checks,WriterValidatorResult('NATIVE_STORY_DATE_DERIVATION','PASS','SOURCE_BOUND_DATE'))
     checks = []
 
     def check(name, passed):
@@ -174,7 +192,8 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
     return tuple(checks)
 
 
-def write_native_story(package: EvidencePackage, *, generate: Callable, review: Callable) -> NativeStoryResult:
+def write_native_story(package: EvidencePackage, *, generate: Callable, review: Callable,
+                       source_currentness=()) -> NativeStoryResult:
     if generate is review:
         raise NativeStoryWriterHold("NATIVE_STORY_SEPARATE_REVIEW_REQUIRED")
     evidence = _writer_evidence_value(package)
@@ -200,4 +219,13 @@ def write_native_story(package: EvidencePackage, *, generate: Callable, review: 
     validators = validate_retained_story(copy, package, record, draft["format"])
     if any(check.result != "PASS" for check in validators):
         raise NativeStoryWriterHold(next(check.validator for check in validators if check.result != "PASS"))
+    from .native_story_dates import derive_and_verify
+    final,proof=derive_and_verify(draft,record,package,source_currentness)
+    if proof is not None:
+        copy=WriterCopy(final['title'],final['body'],WRITER_ID,package.digest,
+            tuple(WriterEvidenceLink(**link)for link in final['evidence_links']))
+        record={**record,'date_derivation':proof}
+        validators=validate_retained_story(copy,package,record,final['format'],source_currentness=source_currentness)
+        if any(check.result!='PASS'for check in validators):
+            raise NativeStoryWriterHold('NATIVE_STORY_DATE_DERIVATION')
     return NativeStoryResult(copy, SourceSupportReview(canonical_json_bytes(record)), validators, draft["format"])

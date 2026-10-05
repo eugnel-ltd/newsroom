@@ -99,6 +99,29 @@ def test_one_verbatim_evidence_span_can_support_multiple_reviewed_sentences():
     result=write_native_story(_package(),generate=lambda _:draft,review=review)
     assert result.copy.body==draft['body']
     assert all(item.result=='PASS'for item in result.validators)
+
+
+def test_source_dated_copy_retains_original_review_and_revalidates_derivation():
+    from newsroom.authority.canonical import digest_canonical
+    from newsroom.tests.test_native_story_dates import _fixture
+    from newsroom.control_plane.native_story_writer import validate_retained_story
+    draft,review,package,currentness=_fixture()
+    # Date mechanics alone: publisher-name localisation requires its own
+    # governed entity evidence and is not supplied by this disposable fixture.
+    draft['title']=draft['title'].removeprefix('英國內政部：')
+    draft['body']=draft['body'].removeprefix('英國內政部表示，')
+    review['draft_digest']=digest_canonical(draft)
+    result=write_native_story(package,generate=lambda _:deepcopy(draft),review=lambda _:deepcopy(review),
+        source_currentness=currentness)
+    record=result.review.as_record()
+    assert record['draft_digest']==review['draft_digest']
+    assert record['date_derivation']['original_draft']==draft
+    assert '2026年10月1日'in result.copy.body
+    assert all(item.result=='PASS'for item in validate_retained_story(result.copy,package,record,result.format,
+        source_currentness=currentness))
+    tampered=deepcopy(record);tampered['date_derivation']['anchor']['resolved_date']='2026-10-04'
+    assert any(item.result=='FAIL'for item in validate_retained_story(result.copy,package,tampered,result.format,
+        source_currentness=currentness))
     assert result.review.as_record()["verdict"] == "PASS"
     assert all(check.result == "PASS" for check in result.validators)
 

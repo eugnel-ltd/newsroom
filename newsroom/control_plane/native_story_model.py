@@ -50,7 +50,10 @@ def story_model_policy(template, *, phase, schema, revision, evidence_digest):
 class NativeStoryModel:
     def __init__(self, service: ModelUsageService, policies: dict, *, fence,
                  stop_check: Callable[[], None], clock=lambda: datetime.now(UTC),
-                 invoke=_run_grok_json):
+                 invoke=_run_grok_json, cached_only=False):
+        if type(cached_only) is not bool:
+            raise ValueError('native story cache mode differs')
+        self.cached_only = cached_only
         self.service, self.policies = service, policies
         self.fence, self.stop_check, self.clock, self.invoke = fence, stop_check, clock, invoke
         self.receipts = {}
@@ -99,6 +102,9 @@ class NativeStoryModel:
                                     "response_digest": response_digest}
             return json.loads(text)
 
+        if self.cached_only:
+            raise ModelUsageAdmissionError('retained story response unavailable',
+                reason_code='NATIVE_STORY_RESULT_NOT_RETAINED')
         self.stop_check()
         policy = self.policies[phase]
         if (policy.route != ROUTES[phase] or policy.output_schema_digest != digest_canonical(schema)
@@ -229,7 +235,8 @@ class NativeStoryModel:
         def review(request):
             require_current()
             return self.call(request, phase="REVIEW", schema=REVIEW_SCHEMA, system=REVIEW_SYSTEM, **identities)
-        result = write_native_story(package, generate=generate, review=review)
+        result = write_native_story(package, generate=generate, review=review,
+            source_currentness=source_currentness)
         require_current()
         record = result.review.as_record()
         record["model_receipts"] = self.receipts

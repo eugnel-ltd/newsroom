@@ -618,9 +618,12 @@ class NativeEditorial:
         candidate_port: StoryCandidateReadPort,
         proof: AuthenticationProof,
         reviewed_copy_from: StoryVersionReceipt | None = None,
+        story_cached_only: bool = False,
     ) -> tuple[StoryVersionReceipt, StoryVersion]:
         if type(request) is not StoryVersionRequest:
             raise EditorialError("immutable Story Version request is required")
+        if type(story_cached_only) is not bool:
+            raise EditorialError('story cache mode differs')
         if type(decision_reference) is not DecisionReference:
             raise EditorialError("immutable editorial decision reference is required")
         retained = self._evidence.read(
@@ -667,6 +670,7 @@ class NativeEditorial:
             original = StoryVersion.from_bytes(hydrated.data)
             story = self._build_story(
                 request, retained, decision, decision_reference,
+                **({'story_cached_only': True} if story_cached_only else {}),
                 writer_id=original.copy.writer_id,
                 retained_copy=original.copy if original.writer_review is not None else None,
                 writer_review=original.writer_review, story_format=original.story_format,
@@ -686,6 +690,7 @@ class NativeEditorial:
                     raise EditorialError("reviewed correction copy belongs to another package")
             story = self._build_story(
                 request, retained, decision, decision_reference,
+                **({'story_cached_only': True} if story_cached_only else {}),
                 **({"writer_id": reviewed.copy.writer_id,
                     "retained_copy": reviewed.copy if reviewed.writer_review is not None else None,
                     "writer_review": reviewed.writer_review, "story_format": reviewed.story_format,
@@ -804,6 +809,7 @@ class NativeEditorial:
         writer_review: dict | None = None, story_format: str | None = None,
         retained_admission: WriteAdmissionDecision | None = None,
         check_reused_source_currency: bool = False,
+        story_cached_only: bool = False,
     ) -> StoryVersion:
         package = retained.package
         if str(request.story_id) == package.candidate_id:
@@ -878,6 +884,7 @@ class NativeEditorial:
                         admission_decision_id=decision.decision_id,
                         require_current=require_current_sources,
                         source_currentness=policy.currentness,
+                        **({'cached_only': True} if story_cached_only else {}),
                     )
                 except NativeStoryWriterHold as exc:
                     raise EditorialHold(reason=str(exc)) from exc
@@ -887,7 +894,8 @@ class NativeEditorial:
                 copy = retained_copy
                 if check_reused_source_currency:
                     require_current_sources()
-            validators = validate_retained_story(copy, evaluated, writer_review, story_format)
+            validators = validate_retained_story(copy, evaluated, writer_review, story_format,
+                source_currentness=policy.currentness)
             if not validators or any(item.result != "PASS" for item in validators):
                 raise EditorialHold(reason="NATIVE_STORY_SOURCE_SUPPORT_HOLD")
             return StoryVersion(

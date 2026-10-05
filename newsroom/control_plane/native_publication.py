@@ -500,9 +500,11 @@ class NativePublicationController:
         factual_correction_of: NativePublicationResult | None = None,
         reviewed_copy_from: NativePublicationResult | None = None,
         reconciled_predecessor: dict | None = None,
+        story_cached_only: bool = False,
     ) -> NativePublicationResult:
         if (
             type(package_admission_id) is not ObjectAdmissionId
+            or type(story_cached_only) is not bool
             or type(editorial_decision) is not EditorialPolicyDecision
             or (correction_of is not None and type(correction_of) is not NativePublicationResult)
             or any(
@@ -627,6 +629,7 @@ class NativePublicationController:
             candidate_port=self._candidate_port,
             proof=proof,
             reviewed_copy_from=(None if reviewed_copy_from is None else reviewed_copy_from.story_receipt),
+            **({'story_cached_only': True} if story_cached_only else {}),
         )
         if correction_of is not None and _story.copy.writer_id != self.writer_contract_version:
             raise NativePublicationError("copy correction writer differs")
@@ -949,6 +952,16 @@ class NativePublicationContinuation:
         )
 
     @staticmethod
+    def writer_revalidation_due(facts: dict) -> bool:
+        from .native_story_writer import CONSUMER_VERSION
+        return (facts.get('reason')=='NATIVE_STORY_SENTENCE_SUPPORT'
+            and facts.get('writer_support_checked_version')!=CONSUMER_VERSION
+            and type(facts.get('package_admission_id'))is str
+            and type(facts.get('editorial_decision'))is dict
+            and not any(facts.get(key)for key in ('story_event_id','publication_event_id',
+                'delivery_attempt_event_id','delivery_evidence_event_id')))
+
+    @staticmethod
     def semantic_intent_revalidation_due(facts: dict, contract_version: str | None) -> bool:
         """Schedule a distinct qualified question contract, never an old retry."""
         intent = facts.get('semantic_assessment_intent')
@@ -1156,6 +1169,7 @@ class NativePublicationContinuation:
             raise NativePublicationError("native continuation revision differs")
         progress = self._journal.current(revision_id)
         facts = dict(progress.get("facts", {}))
+        writer_cached_revalidation = self.writer_revalidation_due(facts)
         admission_recovery = (
             progress.get("stage") == "EVIDENCE_HOLD"
             and assessor_admission_recovery_due(facts)
@@ -1399,6 +1413,7 @@ class NativePublicationContinuation:
             and progress.get("stage") == "EVIDENCE_HOLD"
             and facts.get("reason") not in _REFRESHABLE_EVIDENCE_HOLDS
             and not write_admission_revalidation_due(facts)
+            and not writer_cached_revalidation
         ):
             return NativePublicationContinuationResult(
                 "EVIDENCE_HOLD", str(facts.get("reason")), None
@@ -1660,6 +1675,11 @@ class NativePublicationContinuation:
             facts["write_admission_policy_version"] = WRITE_ADMISSION_POLICY_VERSION
             self._journal.advance(revision_id, stage="PUBLICATION_STARTED", facts=facts)
         try:
+            if writer_cached_revalidation:
+                from .native_story_writer import CONSUMER_VERSION
+                facts=current_facts()
+                facts['writer_support_checked_version']=CONSUMER_VERSION
+                self._journal.advance(revision_id,stage='PUBLICATION_STARTED',facts=facts)
             published = self._runtime.publication.advance(
                 ObjectAdmissionId.parse(str(package_id)),
                 decision,
@@ -1671,6 +1691,7 @@ class NativePublicationContinuation:
                 proof=self._runtime.proof,
                 **({"reconciled_predecessor": facts["publication_predecessor"]}
                    if "publication_predecessor" in facts else {}),
+                **({'story_cached_only': True} if writer_cached_revalidation else {}),
             )
         except EditorialHold as exc:
             reason_codes = (

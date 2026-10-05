@@ -1437,6 +1437,39 @@ def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, 
     connection.close()
 
 
+@pytest.mark.parametrize('already_checked',[False,True])
+def test_story_consumer_revalidation_only_reads_retained_copy_once(tmp_path,monkeypatch,already_checked):
+    from newsroom.control_plane.native_story_writer import CONSUMER_VERSION
+    unit=_native();connection=connect(str(tmp_path/'writer-consumer.sqlite3'))
+    journal=NativeRevisionJournal(connection);journal.land((unit,))
+    package_id=ObjectAdmissionId.new();decision=_decision(package_id)
+    facts={'candidate_id':'candidate','candidate_version_id':'candidate-version',
+        'graphiti_receipts':[{}],'intake_receipt_id':'old-intake',
+        'package_admission_id':str(package_id),'editorial_decision':json.loads(decision.canonical_bytes()),
+        'reason':'NATIVE_STORY_SENTENCE_SUPPORT','expected_story_version':0,
+        'expected_publication_version':0,'expected_delivery_evidence_version':0}
+    if already_checked:facts['writer_support_checked_version']=CONSUMER_VERSION
+    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+    class CachedPublication(_Publication):
+        def advance(self,*args,**kwargs):
+            assert kwargs['story_cached_only']is True
+            return super().advance(*args,**kwargs)
+    publication=CachedPublication();runtime=SimpleNamespace(authority=_Authority(),ingress=object(),
+        publication=publication,proof=proof(),policies=SimpleNamespace(publication=SimpleNamespace(
+            target_path=tmp_path/'serving.sqlite3',target_id='private',target_context_digest=_DIGEST)))
+    monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',lambda *_args,**_kwargs:pytest.fail('reacquired package'))
+    monkeypatch.setattr('newsroom.control_plane.native_publication.open_private_serving_read_port',lambda *_args,**_kwargs:_Reader())
+    continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
+        evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)})
+    continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+    assert publication.calls==(0 if already_checked else 1)
+    if not already_checked:
+        assert journal.current(unit.revision_id)['stage']=='ACKNOWLEDGED'
+        assert journal.current(unit.revision_id)['facts']['writer_support_checked_version']==CONSUMER_VERSION
+    assert runtime.authority.receives==0
+    connection.close()
+
+
 @pytest.mark.parametrize('fault', [None, 'accepted', 'changed-clock', 'unknown', 'same-consumer', 'already-checked', 'pending-effect'])
 def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_path, monkeypatch, fault):
     from newsroom.control_plane.native_evidence import NativeEvidenceHold
