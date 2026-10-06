@@ -109,6 +109,8 @@ def pdf_parse_receipt(binding, outcome):
         if type(outcome) is not GovUkPdfDocument:
             raise ValueError('PDF parse receipt requires exact document')
         document = asdict(outcome)
+        if not document.get('scope_excluded_assets'):
+            document.pop('scope_excluded_assets', None)
         for field in ('publication', 'updated'):
             document[field] = document[field].isoformat()
         outcome = 'COMPLETE'
@@ -136,6 +138,11 @@ def read_pdf_parse_receipt(raw, binding):
     document['updated'] = datetime.fromisoformat(document['updated'])
     for field in ('organisations', 'exclusion_signals', 'page_inventory'):
         document[field] = tuple(document[field])
+    if 'scope_excluded_assets' in document:
+        from .govuk_evidence import GovUkAssetScopeExclusion
+        document['scope_excluded_assets'] = tuple(GovUkAssetScopeExclusion(**{
+            **row, 'definition_scope': tuple(row['definition_scope']),
+        }) for row in document['scope_excluded_assets'])
     result = GovUkPdfDocument(**document)
     declared = binding['declaration']
     if (result.document_type != 'pdf' or result.raw_digest != binding['raw_digest']

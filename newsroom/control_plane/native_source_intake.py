@@ -10,7 +10,7 @@ import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager, ExitStack
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from itertools import chain
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
@@ -20,7 +20,7 @@ from newsroom.authority import (
     ObjectAdmissionRequest, UtcTimestamp, AuthorityPersistenceError, DiagnosticHistoryExpired,
 )
 from newsroom.authority.canonical import (
-    digest_bytes, digest_canonical, validate_sha256_digest,
+    canonical_json_bytes, digest_bytes, digest_canonical, validate_sha256_digest,
 )
 from newsroom.checks import deterministic_uuid4
 from newsroom.control_plane.corpus import CorpusAuthorityBinding, CorpusIngestUnit, chunk_text
@@ -47,7 +47,7 @@ from newsroom.sources import (
 
 from .govuk_rights import GovUkLicenceEvidence
 from .govuk_evidence import (
-    GovUkContentHold, _api_url, _utc, _require_attachment_inventory, parse_govuk_content_document,
+    GovUkAssetScopeExclusion, GovUkContentHold, _api_url, _utc, _require_attachment_inventory, parse_govuk_content_document,
     parse_govuk_manual_inventory,
 )
 from .govuk_spreadsheet import (
@@ -137,6 +137,7 @@ class NativeSourceDisposition:
     observation_access_decision_id: str | None = None
     observations: tuple[tuple[str, str, str, str], ...] = ()
     item_holds: tuple[tuple[str, str], ...] = ()
+    scope_excluded_assets: tuple[GovUkAssetScopeExclusion, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +237,16 @@ class NativeSourceIntake:
             return tuple(results)
         finally:
             try:
+                for result in results:
+                    if result.scope_excluded_assets:
+                        records = [asdict(row) for row in result.scope_excluded_assets]
+                        preview = records[:2]
+                        if len(canonical_json_bytes(preview)) > 1800:
+                            preview = []
+                        emit_diagnostic("native_source_scope_exclusions", {
+                            "source_id": result.source_id, "count": len(records),
+                            "records_digest": digest_canonical(records), "records": preview,
+                        })
                 for source_id in SOURCE_IDS:
                     groups = [dict(stage=key[1], exception_class=key[2], file=key[3],
                         function=key[4], line=key[5], cause_class=key[6], count=count)
@@ -332,13 +343,14 @@ class NativeSourceIntake:
                 str(raw_admission), str(raw_access.access_decision_id),
                 tuple(observations),
             )
-        units, item_holds = [], []
+        units, item_holds, scope_excluded_assets = [], [], []
         for item, fetched in self._fetch_items(source_id, items):
             try:
                 item_url, item_raw, retrieved = fetched.result()
                 settled_units, settled_observations, settled_holds = self._settle_item(
                     source_id, definition_id, summary.version_id, version, item,
                     item_url, item_raw, retrieved, rights.record_id,
+                    scope_excluded_assets=scope_excluded_assets,
                 )
                 units.extend(settled_units)
                 observations.extend(settled_observations)
@@ -367,12 +379,14 @@ class NativeSourceIntake:
             str(raw_admission), str(raw_access.access_decision_id),
             tuple(observations),
             tuple(item_holds),
+            tuple(scope_excluded_assets),
         )
 
     def _settle_item(
         self, source_id, definition_id, version_id, version, item,
         item_url, raw, observed, rights_id, *, follow_children=True,
         publication_leaves=False, terminal_html_leaf=False,
+        scope_excluded_assets=None,
     ):
         admission, access = self._admit_observation(source_id, raw, url=item_url)
         observation_digest = digest_bytes(raw)
@@ -381,7 +395,8 @@ class NativeSourceIntake:
             str(access.access_decision_id),
         )]
         try:
-            complete = self._parse_complete_item(item, raw, observed)
+            complete = self._parse_complete_item(item, raw, observed,
+                extraction_scope=version.extraction_scope, scope_excluded_assets=scope_excluded_assets)
         except NativeSourceIntakeHold as exc:
             if exc.exclusion_signals:
                 return (), tuple(observations), ((
@@ -410,7 +425,8 @@ class NativeSourceIntake:
                         source_id, definition_id, version_id, version, child,
                         child_url, child_raw, child_observed, rights_id,
                         follow_children=False, publication_leaves=collection_children,
-                        terminal_html_leaf=leaf_handoff,
+                    terminal_html_leaf=leaf_handoff,
+                        scope_excluded_assets=scope_excluded_assets,
                     )
                     units.extend(child_units)
                     observations.extend(child_observations)
@@ -512,6 +528,7 @@ class NativeSourceIntake:
             try:
                 document = parse_govuk_content_document(
                     canonical_root, raw, retrieved_at=retrieved,
+                    extraction_scope=version.extraction_scope,
                 )
                 if document.document_type != "guide":
                     raise ValueError("BN(O) source is not a complete guide")
@@ -534,6 +551,7 @@ class NativeSourceIntake:
                 source_id, "READY", "GOVERNED_REVISIONS_RETAINED", units,
                 str(admission), str(access.access_decision_id),
                 tuple(observations),
+                scope_excluded_assets=document.scope_excluded_assets,
             )
         try:
             inventory = parse_govuk_manual_inventory(
@@ -545,7 +563,7 @@ class NativeSourceIntake:
                 str(admission), str(access.access_decision_id),
                 tuple(observations),
             )
-        units, item_holds = [], []
+        units, item_holds, scope_excluded_assets = [], [], []
         for item, fetched in self._fetch_manual_sections(source_id, root_digest, inventory.sections):
             canonical_url = item.canonical_url
             try:
@@ -555,7 +573,8 @@ class NativeSourceIntake:
                     item_url, digest_bytes(item_raw), str(item_admission),
                     str(item_access.access_decision_id),
                 ))
-                item = self._parse_complete_item(item, item_raw, observed)
+                item = self._parse_complete_item(item, item_raw, observed,
+                    extraction_scope=version.extraction_scope, scope_excluded_assets=scope_excluded_assets)
                 units.extend(self._retain_item(
                     source_id, definition_id, version_id, version, item,
                     digest_bytes(item_raw), _utc(observed), rights.record_id,
@@ -573,6 +592,7 @@ class NativeSourceIntake:
             "SOURCE_ITEMS_HELD" if item_holds else "GOVERNED_REVISIONS_RETAINED",
             tuple(units), str(admission), str(access.access_decision_id),
             tuple(observations), tuple(item_holds),
+            tuple(scope_excluded_assets),
         )
 
     def _fetch_manual_sections(self, source_id, root_digest, sections):
@@ -669,12 +689,15 @@ class NativeSourceIntake:
         return url, raw, self._clock().astimezone(UTC)
 
     @staticmethod
-    def _parse_complete_item(item, raw, observed):
+    def _parse_complete_item(item, raw, observed, *, extraction_scope=(), scope_excluded_assets=None):
         try:
             document = parse_govuk_content_document(
-                item.canonical_url, raw, retrieved_at=observed
+                item.canonical_url, raw, retrieved_at=observed,
+                extraction_scope=extraction_scope,
             )
         except GovUkContentHold as exc:
+            if scope_excluded_assets is not None:
+                scope_excluded_assets.extend(exc.scope_excluded_assets)
             raise NativeSourceIntakeHold(
                 exc.reason_code,
                 child_items=exc.child_items,
@@ -688,6 +711,8 @@ class NativeSourceIntake:
                 "SOURCE_ITEM_RIGHTS_EXCLUSION_HOLD",
                 exclusion_signals=document.exclusion_signals,
             )
+        if scope_excluded_assets is not None:
+            scope_excluded_assets.extend(document.scope_excluded_assets)
         return replace(
             item,
             headline=document.title,
@@ -1008,6 +1033,13 @@ def native_evidence_sources(
         try:
             validate_sha256_digest(unit.observation_digest)
             asset_url = spreadsheet_asset_url(unit) or pdf_asset_url(unit)
+            version = None
+            def definition_scope():
+                nonlocal version
+                version = sources.version_details(
+                    SourceDefinitionVersionId.parse(authority.definition_version_id), proof=proof,
+                )
+                return version.request.extraction_scope
             expected_api_url = (
                 SOURCE_URLS[unit.source_id]
                 if weather
@@ -1028,12 +1060,10 @@ def native_evidence_sources(
             if separator == "|" and root_digest.startswith("sha256:"):
                 parent_inventory = _require_parent_inventory_binding(
                     unit=unit, observations=observations, objects=objects,
-                    proof=proof,
+                    proof=proof, extraction_scope_for=definition_scope,
                 )
-            version = sources.version_details(
-                SourceDefinitionVersionId.parse(authority.definition_version_id),
-                proof=proof,
-            )
+            if version is None:
+                definition_scope()
             revision = sources.revision(
                 SourceRevisionId.parse(authority.revision_id), proof=proof,
             )
@@ -1111,6 +1141,7 @@ def native_evidence_sources(
                 else:
                     document = parse_govuk_content_document(
                         unit.canonical_url, raw, retrieved_at=retrieved,
+                        extraction_scope=request.extraction_scope,
                     )
                 matches = (
                     document.title == unit.headline
@@ -1154,6 +1185,8 @@ def _require_parent_inventory_binding(
     *, unit: CorpusIngestUnit,
     observations: Mapping[str, tuple[str, str, str, str]], objects,
     proof: AuthenticationProof,
+    extraction_scope: tuple[str, ...] = (),
+    extraction_scope_for=None,
 ) -> tuple[str, bytes]:
     root_digest, separator, section_path = unit.item_key.partition("|")
     validate_sha256_digest(root_digest)
@@ -1168,6 +1201,8 @@ def _require_parent_inventory_binding(
     ), proof=proof).data
     if digest_bytes(raw) != root_digest:
         raise ValueError("parent inventory bytes differ")
+    if extraction_scope_for is not None:
+        extraction_scope = extraction_scope_for()
     if unit.source_id == "UK-03":
         if root[0] != unit.source_definition_url:
             raise ValueError("manual root inventory reference differs")
@@ -1219,6 +1254,7 @@ def _require_parent_inventory_binding(
                 unit=unit, parent_url=parent_url, feed_urls=feed_urls,
                 observations=observations, objects=objects, proof=proof,
                 collection_only=spreadsheet_asset_url(unit) is None and pdf_asset_url(unit) is None,
+                extraction_scope=extraction_scope,
             )
         if not parent_found:
             raise ValueError("parent is outside its retained feed inventory")
@@ -1227,6 +1263,7 @@ def _require_parent_inventory_binding(
         parse_govuk_content_document(
             parent_url, raw,
             retrieved_at=datetime.fromisoformat(unit.observed_at.replace("Z", "+00:00")),
+            extraction_scope=extraction_scope,
         )
     except GovUkContentHold as exc:
         child_paths = {path for path, _title in exc.child_items}
@@ -1272,6 +1309,7 @@ def _declared_publication_leaves(raw, parent_url) -> bool:
 def _declared_file_parent_in_feed_child(
     *, unit, parent_url, feed_urls, observations, objects, proof,
     collection_only=False,
+    extraction_scope=(),
 ) -> bool:
     """Prove exactly feed -> direct inventory -> attachment parent; never crawl."""
     for observation in observations.values():
@@ -1292,6 +1330,7 @@ def _declared_file_parent_in_feed_child(
                 parse_govuk_content_document(
                     _canonical_url_from_api(observation[0]), raw,
                     retrieved_at=datetime.fromisoformat(unit.observed_at.replace("Z", "+00:00")),
+                    extraction_scope=extraction_scope,
                 )
             except GovUkContentHold as exc:
                 if (not exc.exclusion_signals

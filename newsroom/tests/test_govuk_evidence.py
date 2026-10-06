@@ -782,3 +782,84 @@ def test_manual_inventory_still_rejects_future_first_publication_timestamp():
             "https://www.gov.uk/government/example", json.dumps(value).encode(),
             retrieved_at=datetime(2026, 9, 11, 10, tzinfo=UTC),
         )
+
+
+TEXT_BODY_SCOPE = ('body', 'canonical_url', 'headline', 'published_at', 'updated_at')
+
+
+def _digital_age_root():
+    from pathlib import Path
+    raw = (Path(__file__).parent / 'fixtures/govuk/digital-age-0be.json').read_bytes()
+    assert __import__('hashlib').sha256(raw).hexdigest() == '72e9e48805c3140acde256535c45f80500bc1db6ed937e625f60722094a6e52c'
+    return raw
+
+
+def test_actual_digital_age_text_scope_retains_visible_image_exclusion():
+    raw = _digital_age_root()
+    url = 'https://www.gov.uk/government/news/new-rules-pave-the-way-for-businesses-to-adopt-digital-proof-of-age-for-alcohol-sales'
+    # Unknown/all-asset scope still reproduces the original exact coverage HOLD.
+    with pytest.raises(GovUkContentHold, match='SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE'):
+        parse_govuk_content_document(url, raw, retrieved_at=datetime(2026, 10, 6, tzinfo=UTC))
+    document = parse_govuk_content_document(url, raw, retrieved_at=datetime(2026, 10, 6, tzinfo=UTC),
+        extraction_scope=TEXT_BODY_SCOPE)
+    assert document.title == 'New rules pave the way for businesses to adopt digital proof of age for alcohol sales'
+    assert 'Licensed premises' in document.body_text
+    assert len(document.scope_excluded_assets) == 1
+    excluded = document.scope_excluded_assets[0]
+    assert excluded.disposition == 'SOURCE_SCOPE_EXCLUDED'
+    assert excluded.asset_url.endswith('/Digital-Proof-of-Age-Image.jpg')
+    assert excluded.mime == 'image/jpeg'
+    assert excluded.raw_root_digest == 'sha256:72e9e48805c3140acde256535c45f80500bc1db6ed937e625f60722094a6e52c'
+    assert excluded.definition_scope == TEXT_BODY_SCOPE
+    assert excluded.policy_version == 'newsroom.govuk-text-body-image-scope.v1'
+
+
+@pytest.mark.parametrize('fault', [
+    'link', 'image', 'filename', 'figure', 'table', 'diagram', 'caption', 'lead-caption',
+    'pdf', 'doc', 'unknown', 'wrong-host', 'mime', 'label', 'unknown-scope', 'missing-scope',
+    'encoded-link', 'role', 'malformed-caption',
+])
+def test_text_scope_never_hides_required_or_ambiguous_image_evidence(fault):
+    value = json.loads(_digital_age_root())
+    attachment = value['details']['attachments'][0]
+    url = 'https://www.gov.uk' + value['base_path']
+    scope = TEXT_BODY_SCOPE
+    if fault == 'link': value['details']['body'] += '<a href="' + attachment['url'] + '">Evidence</a>'
+    elif fault == 'image': value['details']['body'] += '<img src="' + attachment['url'] + '">'
+    elif fault == 'filename': value['details']['body'] += '<p>Refer to Digital-Proof-of-Age-Image.jpg.</p>'
+    elif fault == 'figure': value['details']['body'] += '<figure>Required visual evidence</figure>'
+    elif fault == 'table': value['details']['body'] += '<table><tr><td>Data</td></tr></table>'
+    elif fault == 'diagram': value['details']['body'] += '<p>The diagram establishes the required procedure.</p>'
+    elif fault == 'caption': attachment['caption'] = 'Required age-verification process'
+    elif fault == 'lead-caption': value['details']['images'][0]['caption'] = 'The image shows required data'
+    elif fault == 'encoded-link': value['details']['body'] += '<a href="' + attachment['url'].replace('.jpg', '&#46;jpg') + '">Evidence</a>'
+    elif fault == 'role': attachment['role'] = 'data'
+    elif fault == 'malformed-caption': attachment['caption'] = False
+    elif fault in {'pdf', 'doc', 'unknown'}:
+        extension, mime = {'pdf':('.pdf','application/pdf'), 'doc':('.doc','application/msword'),
+                           'unknown':('.bin','application/octet-stream')}[fault]
+        attachment['filename'] = 'required' + extension
+        attachment['url'] = 'https://assets.publishing.service.gov.uk/media/example/required' + extension
+        attachment['content_type'] = mime
+    elif fault == 'wrong-host': attachment['url'] = attachment['url'].replace('assets.publishing.service.gov.uk','example.invalid')
+    elif fault == 'mime': attachment['content_type'] = 'image/png'
+    elif fault == 'label': attachment['title'] = ''
+    elif fault == 'unknown-scope': scope = (*scope, 'all_assets')
+    else: scope = ()
+    with pytest.raises((GovUkContentHold, ValueError)):
+        parse_govuk_content_document(url, json.dumps(value).encode(), retrieved_at=datetime(2026,10,6,tzinfo=UTC),
+            extraction_scope=scope)
+
+
+def test_text_scope_keeps_required_peers_and_visible_excluded_png():
+    value = json.loads(_digital_age_root())
+    attachment = value['details']['attachments'][0]
+    attachment.update(filename='picture.png', url='https://assets.publishing.service.gov.uk/media/example/picture.png', content_type='image/png')
+    value['details']['attachments'].append({'title':'Required spreadsheet','url':'https://assets.publishing.service.gov.uk/media/example/data.ods',
+        'attachment_type':'file','content_type':'application/vnd.oasis.opendocument.spreadsheet','filename':'data.ods'})
+    with pytest.raises(GovUkContentHold) as caught:
+        parse_govuk_content_document('https://www.gov.uk'+value['base_path'],json.dumps(value).encode(),
+            retrieved_at=datetime(2026,10,6,tzinfo=UTC),extraction_scope=TEXT_BODY_SCOPE)
+    assert caught.value.unsupported_attachments == (('https://assets.publishing.service.gov.uk/media/example/data.ods','Required spreadsheet'),)
+    assert len(caught.value.scope_excluded_assets) == 1
+    assert caught.value.scope_excluded_assets[0].mime == 'image/png'

@@ -2081,3 +2081,55 @@ def test_native_source_binding_propagates_stop_from_parent_proof(monkeypatch, st
         native_evidence_sources(units=(unit,), sources=object(), objects=object(),
             observations={unit.observation_digest: observation}, licence=object(), proof=object())
     assert caught.value is stop
+
+
+def test_digital_age_text_scope_is_shared_by_poll_and_governed_evidence_read(tmp_path, monkeypatch):
+    from pathlib import Path
+    import newsroom.control_plane.native_source_intake as module
+    raw = (Path(__file__).parent / 'fixtures/govuk/digital-age-0be.json').read_bytes()
+    value = json.loads(raw)
+    path = value['base_path']
+    bodies = {SOURCE_URLS['UK-01']:_atom_for(path), 'https://www.gov.uk/api/content'+path:raw}
+    fetched = []
+    diagnostics = []
+    monkeypatch.setattr(module,'emit_diagnostic',lambda event,data:diagnostics.append((event,data)))
+    args = _args(tmp_path,monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID,authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(sources=runtime.authority.sources,objects=runtime.authority.objects,proof=runtime.proof,
+            definition_ids={'UK-01':_seed_uk01(runtime)},licence=_licence(),dispatch_fence=lambda *_:nullcontext(),
+            fetch=lambda url:(fetched.append(url),(200,bodies[url]))[1],clock=lambda:datetime(2026,10,6,tzinfo=UTC))
+        result = next(row for row in intake.poll() if row.source_id=='UK-01')
+        assert result.status=='READY' and result.units and result.item_holds==()
+        assert len(result.scope_excluded_assets)==1
+        excluded=result.scope_excluded_assets[0]
+        assert excluded.disposition=='SOURCE_SCOPE_EXCLUDED' and excluded.mime=='image/jpeg'
+        assert excluded.raw_root_digest==digest_bytes(raw)
+        assert excluded.asset_url not in fetched
+        assert any(event=='native_source_scope_exclusions' and data['count']==1 for event,data in diagnostics)
+        assert native_evidence_sources(units=result.units,sources=runtime.authority.sources,objects=runtime.authority.objects,
+            observations={row[1]:row for row in result.observations},licence=_licence(),proof=runtime.proof)
+
+
+@pytest.mark.parametrize('fault',['pdf-peer','caption','inline','wrong-host'])
+def test_text_scope_intake_keeps_required_asset_peer_holds_visible(tmp_path,monkeypatch,fault):
+    from pathlib import Path
+    raw = (Path(__file__).parent/'fixtures/govuk/digital-age-0be.json').read_bytes()
+    value=json.loads(raw);attachment=value['details']['attachments'][0]
+    if fault=='pdf-peer':
+        value['details']['attachments'].append({'url':'https://assets.publishing.service.gov.uk/media/example/report.bin',
+            'filename':'report.bin','title':'Required report','attachment_type':'file','content_type':'application/octet-stream'})
+    elif fault=='caption':attachment['caption']='Required procedure diagram'
+    elif fault=='inline':value['details']['body']+='<a href="'+attachment['url']+'">Required image</a>'
+    else:attachment['url']=attachment['url'].replace('assets.publishing.service.gov.uk','example.invalid')
+    raw=json.dumps(value).encode();path=value['base_path'];bodies={SOURCE_URLS['UK-01']:_atom_for(path),'https://www.gov.uk/api/content'+path:raw};fetched=[]
+    args=_args(tmp_path,monkeypatch);args.update(principal_id=OPERATOR_PRINCIPAL_ID,authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    with open_native_runtime(**args)as runtime:
+        intake=NativeSourceIntake(sources=runtime.authority.sources,objects=runtime.authority.objects,proof=runtime.proof,
+            definition_ids={'UK-01':_seed_uk01(runtime)},licence=_licence(),dispatch_fence=lambda *_:nullcontext(),
+            fetch=lambda url:(fetched.append(url),(200,bodies[url]))[1],clock=lambda:datetime(2026,10,6,tzinfo=UTC))
+        result=next(row for row in intake.poll()if row.source_id=='UK-01')
+        assert result.status=='HOLD'and result.units==()
+        assert (('https://www.gov.uk'+path,'SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE')if fault!='wrong-host'else('https://www.gov.uk'+path,'SOURCE_ITEM_METADATA_HOLD'))in result.item_holds
+        assert attachment['url']not in fetched
+        assert len(result.scope_excluded_assets)==int(fault=='pdf-peer')
