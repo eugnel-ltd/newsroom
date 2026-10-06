@@ -2084,3 +2084,94 @@ def test_distinct_semantic_contract_upgrade_is_scheduled_without_generic_hold_re
         assert published==([('publish',unit.revision_id)]if case=='eligible'else[])
         if case!='eligible':assert journal.summary(unit.revision_id)['stage']==('GRAPHITI_HOLD'if case=='no-graph'else'EVIDENCE_HOLD')
     finally:connection.close()
+
+
+def test_ordinary_profile_measures_first_real_hold_turn_only(tmp_path, monkeypatch):
+    import json
+    from newsroom.control_plane.diagnostic_logging import MAX_MESSAGE
+    pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    for unit in units:
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts={
+            'graphiti_receipts': [{}], 'reason': 'RETAINED_HOLD', 'acquisition_retryable': False,
+        })
+    events = []
+    monkeypatch.setattr(n, 'emit_diagnostic', lambda event, data: events.append((event, data)), raising=False)
+    try:
+        before = {unit.revision_id: journal.summary(unit.revision_id) for unit in units}
+        for cycle in ('natural-first', 'natural-second'):
+            assert pipeline.tick(cycle_id=cycle).revision_states == {'EVIDENCE_HOLD': 2}
+        assert {unit.revision_id: journal.summary(unit.revision_id) for unit in units} == before
+        assert not any(kind in {'publish', 'graphiti'} for kind, _ in calls)
+        assert len(events) == 1 and events[0][0] == 'native_ordinary_profile'
+        data = events[0][1]
+        assert data['one_shot'] is True and data['profile_overhead_included'] is True
+        assert data['timing_basis'] == 'ELAPSED_CALL_STATS'
+        assert data['wall_ms'] >= 0 and data['cpu_ms'] >= 0
+        assert data['columns'] == ['module', 'function', 'calls', 'total_ms', 'cumulative_ms']
+        assert 0 < len(data['rows']) <= 15
+        assert len(json.dumps(data, ensure_ascii=False, separators=(',', ':'))) <= MAX_MESSAGE
+        assert all('/' not in row[0] and '\\' not in row[0] and len(row) == 5 for row in data['rows'])
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('failure_at', ('create', 'enable', 'disable', 'stats', 'diagnostic'))
+@pytest.mark.parametrize('business_failure', (False, True))
+def test_ordinary_profile_failure_preserves_single_call_identity(tmp_path, monkeypatch, failure_at, business_failure):
+    pipeline, _journal, connection, _units, _calls, _dispositions = _open(tmp_path, monkeypatch)
+    result, failure, calls, lifecycle = [], VetoError('owner stop'), [], []
+    def advance(revisions, **kwargs):
+        calls.append((revisions, kwargs))
+        if business_failure:
+            raise failure
+        return result
+    class Profile:
+        def enable(self):
+            lifecycle.append('enable')
+            if failure_at == 'enable': raise OSError('optional enable')
+        def disable(self):
+            lifecycle.append('disable')
+            if failure_at == 'disable': raise OSError('optional disable')
+        def getstats(self):
+            lifecycle.append('stats')
+            if failure_at == 'stats': raise OSError('optional stats')
+            return []
+    def create():
+        lifecycle.append('create')
+        if failure_at == 'create': raise OSError('optional creation')
+        return Profile()
+    def emit(*_):
+        if failure_at == 'diagnostic': raise OSError('optional diagnostic')
+    monkeypatch.setattr(n.cProfile, 'Profile', create)
+    monkeypatch.setattr(n, 'emit_diagnostic', emit)
+    pipeline._advance_revisions = advance
+    try:
+        for _ in range(2):
+            if business_failure:
+                with pytest.raises(VetoError) as raised:
+                    pipeline._profiled_advance_revisions(('selected',), work_deadline=42)
+                assert raised.value is failure
+            else:
+                assert pipeline._profiled_advance_revisions(('selected',), work_deadline=42) is result
+        assert calls == [(('selected',), {'work_deadline': 42})] * 2
+        assert lifecycle.count('create') == 1
+        assert lifecycle.count('disable') == (0 if failure_at == 'create' else 1)
+    finally:
+        connection.close()
+
+
+def test_ordinary_profile_does_not_hijack_existing_hook(tmp_path, monkeypatch):
+    pipeline, _journal, connection, _units, _calls, _dispositions = _open(tmp_path, monkeypatch)
+    existing, result = object(), []
+    monkeypatch.setattr(n.sys, 'getprofile', lambda: existing)
+    monkeypatch.setattr(n.cProfile, 'Profile', lambda: pytest.fail('existing profiler must be preserved'))
+    monkeypatch.setattr(n, 'emit_diagnostic', lambda *_: pytest.fail('external profiling is not our observation'))
+    pipeline._advance_revisions = lambda *_, **__: result
+    try:
+        assert pipeline._profiled_advance_revisions((), work_deadline=42) is result
+        assert n.sys.getprofile() is existing
+        assert pipeline._ordinary_profile_pending is False
+    finally:
+        connection.close()
