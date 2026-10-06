@@ -1289,8 +1289,16 @@ def _localised_fact_is_bound(
             re.IGNORECASE,
         )
         def occurs(expression, text):
-            return any(match.group() == expression and _canonical_localised_fact(match.group()) == fact
-                       for match in pound_expression.finditer(text))
+            for match in pound_expression.finditer(text):
+                if match.group() != expression or _canonical_localised_fact(match.group()) != fact:
+                    continue
+                before, after = text[:match.start()].rstrip(), text[match.end():]
+                if before.endswith(('-', '−', '+', '負', '负')):
+                    continue
+                if after and (after[0].isnumeric() or after[0] in '/⁄'):
+                    continue
+                return True
+            return False
         return (occurs(source, claim) or occurs(source, excerpt)) and occurs(target, rendered)
     return (source in claim or source in excerpt) and target in rendered
 
