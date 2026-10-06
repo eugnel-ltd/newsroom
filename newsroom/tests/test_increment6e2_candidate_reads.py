@@ -45,10 +45,17 @@ def two_candidate_reads(tmp_path):
         connection.close()
 
 
+def _selected_read(port, version, proof, method):
+    if method == 'retained':
+        return port.require_retained_version_in_transaction(version.version_id)
+    return port.require_current_head_in_transaction(version.candidate_id, proof=proof)
+
+
+@pytest.mark.parametrize('method', ('retained', 'current-head'))
 def test_runtime_candidate_read_verifies_only_the_selected_history(
-    two_candidate_reads, monkeypatch,
+    two_candidate_reads, monkeypatch, method,
 ):
-    connection, port, (first, other), _adapter, _location = two_candidate_reads
+    connection, port, (first, other), _adapter, location = two_candidate_reads
     assert first.candidate_id != other.candidate_id
     verified = []
     original = _CandidateStore._verify_row
@@ -61,7 +68,7 @@ def test_runtime_candidate_read_verifies_only_the_selected_history(
     monkeypatch.setattr(_CandidateStore, "_verify_row", counted)
     changes = connection.total_changes
     connection.execute("BEGIN")
-    assert port.require_retained_version_in_transaction(first.version_id) == first
+    assert _selected_read(port, first, location.seed[0][3], method) == first
     assert verified == [first.candidate_id]
     assert connection.total_changes == changes
     connection.execute("ROLLBACK")
@@ -101,9 +108,10 @@ def test_selected_bulk_preserves_duplicates_missing_values_and_empty_requests(
     assert connection.total_changes == changes
 
 
-@pytest.mark.parametrize("damage", ["receipt", "head", "collision", "foreign_key"])
-def test_selected_history_fails_closed_on_its_own_damage(two_candidate_reads, damage):
-    connection, port, (first, _other), _adapter, _location = two_candidate_reads
+@pytest.mark.parametrize("method", ("retained", "current-head"))
+@pytest.mark.parametrize("damage", ["receipt", "head", "collision", "foreign_key", "cross_candidate_head", "orphan_version"])
+def test_selected_history_fails_closed_on_its_own_damage(two_candidate_reads, damage, method):
+    connection, port, (first, other), _adapter, location = two_candidate_reads
     connection.execute("PRAGMA foreign_keys=OFF")
     if damage == "receipt":
         connection.execute("DROP TRIGGER immutable_candidate_receipt")
@@ -115,6 +123,15 @@ def test_selected_history_fails_closed_on_its_own_damage(two_candidate_reads, da
     elif damage == "collision":
         connection.execute("DROP TRIGGER retained_candidate_collision")
         connection.execute("DELETE FROM story_candidate_collision_bindings WHERE candidate_id=?", (first.candidate_id,))
+    elif damage == "cross_candidate_head":
+        connection.execute("DROP TRIGGER candidate_head_update_guard")
+        connection.execute("DROP TRIGGER retained_candidate_head")
+        connection.execute("DELETE FROM story_candidate_heads WHERE candidate_id=?", (other.candidate_id,))
+        connection.execute("UPDATE story_candidate_heads SET current_admission_digest=?,current_version_id=?,current_version_digest=? WHERE candidate_id=?",
+                           (connection.execute("SELECT admission_digest FROM story_candidate_admission_receipts_v2 WHERE candidate_id=?", (other.candidate_id,)).fetchone()[0], other.version_id, other.canonical_digest, first.candidate_id))
+    elif damage == "orphan_version":
+        connection.execute("DROP TRIGGER retained_candidate_receipt")
+        connection.execute("DELETE FROM story_candidate_admission_receipts_v2 WHERE candidate_id=?", (first.candidate_id,))
     else:
         connection.execute("DROP TRIGGER immutable_candidate_receipt")
         connection.execute("UPDATE story_candidate_admission_receipts_v2 SET authority_event_id=? WHERE candidate_id=?",
@@ -122,7 +139,7 @@ def test_selected_history_fails_closed_on_its_own_damage(two_candidate_reads, da
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("BEGIN")
     with pytest.raises((CandidateContractError, AuthorityPersistenceError)):
-        port.require_retained_version_in_transaction(first.version_id)
+        _selected_read(port, first, location.seed[0][3], method)
 
 
 def test_selected_event_coverage_rejects_an_extra_event(two_candidate_reads):
@@ -138,9 +155,10 @@ def test_selected_event_coverage_rejects_an_extra_event(two_candidate_reads):
         port.require_retained_version_in_transaction(first.version_id)
 
 
+@pytest.mark.parametrize("method", ("retained", "current-head"))
 @pytest.mark.parametrize("damage", ["receipt", "foreign_key"])
 def test_unrelated_damage_is_not_a_target_gate_but_full_inventory_rejects_it(
-    two_candidate_reads, damage,
+    two_candidate_reads, damage, method,
 ):
     connection, port, (first, other), adapter, location = two_candidate_reads
     connection.execute("PRAGMA foreign_keys=OFF")
@@ -154,10 +172,47 @@ def test_unrelated_damage_is_not_a_target_gate_but_full_inventory_rejects_it(
     connection.execute("PRAGMA foreign_keys=ON")
     changes = connection.total_changes
     connection.execute("BEGIN")
-    assert port.require_retained_version_in_transaction(first.version_id) == first
+    assert _selected_read(port, first, location.seed[0][3], method) == first
     assert connection.total_changes == changes
     with pytest.raises((CandidateContractError, AuthorityPersistenceError)):
         port.verify_retained_integrity_in_transaction()
     connection.execute("ROLLBACK")
     with pytest.raises(IntegrityViolation, match="Candidate authority open failed"):
         adapter.open_handle(location)._opened()
+
+
+def test_associated_current_candidate_uses_selected_history_without_persistent_cache(
+    two_candidate_reads, monkeypatch,
+):
+    connection, _port, (first, other), adapter, location = two_candidate_reads
+    handle = adapter.open_handle(location)
+    authority = handle._opened()
+    checked = []
+    original = _CandidateStore._verify_row
+    def counted(store, digest):
+        result = original(store, digest)
+        checked.append(result[2].candidate_id)
+        return result
+    monkeypatch.setattr(_CandidateStore, '_verify_row', counted)
+    changes = connection.total_changes
+    try:
+        for _ in range(2):
+            candidate, hypothesis = authority.exact_associated_current_producers(
+                first.candidate_id, proof=location.seed[0][3],
+            )
+            assert candidate == first
+            assert hypothesis.version_id == first.governing_manifest.hypothesis_version_id
+        assert checked == [first.candidate_id, first.candidate_id]
+        assert other.candidate_id not in checked
+        assert connection.total_changes == changes
+    finally:
+        handle.close()
+
+
+def test_selected_current_candidate_rejects_wrong_authenticated_producer_proof(two_candidate_reads):
+    from newsroom.authority.auth import AuthenticationProof
+    connection, port, (first, _other), _adapter, _location = two_candidate_reads
+    connection.execute('BEGIN')
+    with pytest.raises(CandidateContractError):
+        port.require_current_head_in_transaction(first.candidate_id,
+            proof=AuthenticationProof(method='STATIC_TOKEN', credential='not-the-fixture-principal'))
