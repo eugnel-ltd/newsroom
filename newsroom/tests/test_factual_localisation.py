@@ -159,3 +159,23 @@ def test_pound_weight_cannot_be_rendered_as_sterling():
             claim='The shipment weighs 200 million pounds.',
             supporting_excerpt='The shipment weighs 200 million pounds.',
             localised_factual_expressions=(('200 million pounds', '二億英鎊'),))
+
+
+@pytest.mark.parametrize(('source_text', 'source_key', 'target_text', 'target_key'), (
+    ('£200 million', '£200', '二百英鎊', '二百英鎊'),
+    ('£200', '£20', '二十英鎊', '二十英鎊'),
+    ('£2.5 million', '£2', '二英鎊', '二英鎊'),
+    ('£200', '£200', '二千二百英鎊', '二百英鎊'),
+    ('£2', '£2', '二十二英鎊', '二英鎊'),
+    ('E£200 million', '£200 million', '二億英鎊', '二億英鎊'),
+    ('-£200', '£200', '二百英鎊', '二百英鎊'),
+))
+def test_pound_fact_binding_rejects_partial_amount_or_scale(
+    source_text, source_key, target_text, target_key,
+):
+    with pytest.raises(ValueError, match='equivalent exact claim facts'):
+        replace(_claim('£200', '二百英鎊'),
+            claim=f'The grant is {source_text}.',
+            supporting_excerpt=f'The grant is {source_text}.',
+            rendered_assertion_zh_hant_hk=f'資助額係{target_text}。',
+            localised_factual_expressions=((source_key, target_key),))
