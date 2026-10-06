@@ -1292,7 +1292,7 @@ def _localised_fact_is_bound(
             for match in pound_expression.finditer(text):
                 if match.group() != expression or _canonical_localised_fact(match.group()) != fact:
                     continue
-                before, after = text[:match.start()].rstrip(), text[match.end():]
+                before, after = text[:match.start()].rstrip(), text[match.end():].lstrip()
                 if before.endswith(('-', '−', '+', '負', '负')):
                     continue
                 if after and (after[0].isnumeric() or after[0] in '/⁄'):
