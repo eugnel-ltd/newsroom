@@ -163,9 +163,9 @@ def _localiser(consumer,service,usage,candidate,base,calls):
     def runner(prompt):
         value=json.loads(prompt);calls.append(value)
         assert 'candidate_id' not in value and 'source_binding' not in value
-        return WriterCliExecution(canonical_json_bytes({'renderings':{
-            'S1L1':{'rendered_assertion_zh_hant_hk_fragments':['當局現時推出的是新政策。'],'factual_localisations':[],'quotation_source_keys':[]},
-            'S1L2':{'rendered_assertion_zh_hant_hk_fragments':['住戶屬於此政策的適用對象。'],'factual_localisations':[],'quotation_source_keys':[]}}}).decode(),
+        return WriterCliExecution(canonical_json_bytes({'renderings':[
+            {'span_id':'S1L1','rendered_assertion_zh_hant_hk_fragments':['當局現時推出的是新政策。'],'factual_localisations':[],'quotation_source_keys':[]},
+            {'span_id':'S1L2','rendered_assertion_zh_hant_hk_fragments':['住戶屬於此政策的適用對象。'],'factual_localisations':[],'quotation_source_keys':[]}] }).decode(),
             {'usage_basis':'PROVIDER_REPORTED','input_tokens':100,'output_tokens':30,'cached_read_tokens':0,'cached_write_tokens':0,'reasoning_tokens':0,'context_tokens':100,'total_tokens':130})
     localiser=NativeClaimLocaliser(usage=usage,objects=service.objects,
         policy=localisation_policy(evidence_digest=digest_bytes(b'qualified-localisation-fixture'),qualified=True),source_fence=service.fence,runner=runner,implementation_worktree_clean=True,clock=lambda:datetime(2026,10,4,tzinfo=UTC))

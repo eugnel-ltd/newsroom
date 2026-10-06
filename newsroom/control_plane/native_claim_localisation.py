@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 
 from newsroom.authority import HydrationRequest, ObjectAdmissionId, ObjectAdmissionRequest
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical, validate_sha256_digest
@@ -16,16 +16,17 @@ from .govuk_evidence import _unique_object
 from .model_usage import (
     InvocationAllocation, InvocationEfficiencyPolicy, ModelUsageIntegrityError, ModelUsageService,
     UsageStatus, WorkEnvelope, WorkloadClass, _policy_for_allocation,
-    _require_reported_telemetry, _retained_terminal_allocation,
+    _require_reported_telemetry, _retained_terminal_allocation, _has_exact_dispatch, _envelope_from_record, _utc_text,
 )
 from .native_embeddings import _retained_allocation
 from .writer import _run_grok_json, CONT_DISABLED_CAPABILITIES, _grok_command_flags
 
-VERSION = 'newsroom.native-claim-localisation.v1'
+LEGACY_VERSION = 'newsroom.native-claim-localisation.v1'
+VERSION = 'newsroom.native-claim-localisation.v2'
 ROUTE = 'NATIVE_CLAIM_LOCALISATION'
 MODEL = 'grok-4.7'
 COMMAND_FLAGS = _grok_command_flags('high', model=MODEL)
-SYSTEM = ('Render only the supplied factual source assertions in natural Hong Kong Traditional Chinese. '
+LEGACY_SYSTEM = ('Render only the supplied factual source assertions in natural Hong Kong Traditional Chinese. '
           'Do not choose news, add facts, change negation, proposal/effective status, dates, quantities or attribution. '
           'Return one entry for every supplied span ID and no others. Return exactly entities+1 fragments: '
           'the application inserts the original ordered entity names between them. '
@@ -41,8 +42,16 @@ ITEM = {'type': 'object', 'additionalProperties': False, 'required': [
             'rendered_expression': {'type': 'string', 'maxLength': 256}}}},
     'quotation_source_keys': {'type': 'array', 'maxItems': 32, 'items': {'type': 'string', 'maxLength': 256}},
 }}
-SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['renderings'],
+LEGACY_SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['renderings'],
     'properties': {'renderings': {'type': 'object', 'additionalProperties': ITEM}}}
+LEGACY_SCHEMA_DIGEST = digest_canonical(LEGACY_SCHEMA)
+SYSTEM = (LEGACY_SYSTEM + ' Each rendering is an array entry with the exact span_id. '
+          'Source lookup and quotation keys must be exact verbatim source fragments of at most 256 UTF-8 bytes; '
+          'use separate sentence-sized verbatim keys for a long quotation. Do not paraphrase source keys.')
+ENTRY = {**ITEM, 'required': ['span_id', *ITEM['required']],
+    'properties': {'span_id': {'type': 'string', 'maxLength': 256}, **ITEM['properties']}}
+SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['renderings'],
+    'properties': {'renderings': {'type': 'array', 'minItems': 1, 'maxItems': 32, 'items': ENTRY}}}
 SCHEMA_DIGEST = digest_canonical(SCHEMA)
 
 
@@ -70,7 +79,7 @@ def localisation_policy(*, evidence_digest, qualified):
         hard_estimate_ceiling_tokens=300000, evidence_digest=evidence_digest, qualified=qualified)
 
 
-def _prompt(state):
+def _prompt(state, *, version=VERSION):
     if type(state) is not dict or set(state) != {'source_binding', 'claims'}:
         raise LocalisationHold('LOCALISATION_INPUT_HOLD')
     validate_sha256_digest(state['source_binding']['content_digest'])
@@ -83,18 +92,52 @@ def _prompt(state):
         if len(claim.get('entities', ())) >= 65 or claim.get('rendering_fragment_count') != len(claim.get('entities', ())) + 1:
             raise LocalisationHold('LOCALISATION_FRAGMENT_INVENTORY_HOLD')
     # Authority, rights and caller IDs stay in the local manifest, not the model prompt.
-    return canonical_json_bytes({'contract': VERSION, 'claims': claims}).decode()
+    return canonical_json_bytes({'contract': version, 'claims': claims}).decode()
 
 
-def _renderings(raw, state):
+def _renderings(raw, state, *, version=VERSION):
     value = json.loads(raw.decode(), object_pairs_hook=_unique_object)
-    validate(value, SCHEMA)
-    if set(value['renderings']) != set(state['claims']):
+    validate(value, LEGACY_SCHEMA if version == LEGACY_VERSION else SCHEMA)
+    if version == LEGACY_VERSION:
+        renderings = value['renderings']
+    else:
+        renderings = {}
+        for item in value['renderings']:
+            identity = item['span_id']
+            if identity in renderings:
+                raise LocalisationHold('LOCALISATION_DUPLICATE_SPAN_HOLD')
+            renderings[identity] = {key: value for key, value in item.items() if key != 'span_id'}
+    if set(renderings) != set(state['claims']):
         raise LocalisationHold('LOCALISATION_SPAN_PARTITION_HOLD')
-    for identity, item in value['renderings'].items():
+    for identity, item in renderings.items():
         if len(item['rendered_assertion_zh_hant_hk_fragments']) != state['claims'][identity]['rendering_fragment_count']:
             raise LocalisationHold('LOCALISATION_FRAGMENT_COUNT_HOLD')
-    return value['renderings']
+        # v1 reads retain their original character-based contract; v2 source keys are byte bounded.
+        if version != LEGACY_VERSION and any(len(text.encode()) > 256 for text in (
+                *item['quotation_source_keys'],
+                *(pair['source_lookup_key'] for pair in item['factual_localisations']),
+                *(pair['rendered_expression'] for pair in item['factual_localisations']))):
+            raise LocalisationHold('LOCALISATION_SOURCE_KEY_BOUND_HOLD')
+    return renderings
+
+
+def _failure_diagnostic(error):
+    """Record structure and digests, never exception messages or source text."""
+    result = {'failure_class': type(error).__name__}
+    if isinstance(error, ValidationError):
+        value = json.dumps(error.instance, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+        result.update(validator=error.validator,
+            instance_path=[str(part)[:64] for part in list(error.absolute_path)[:8]],
+            schema_path=[str(part)[:64] for part in list(error.absolute_schema_path)[:8]],
+            value_bytes=len(value), value_digest=digest_bytes(value))
+    elif isinstance(error, json.JSONDecodeError):
+        result.update(position=error.pos, line=error.lineno, column=error.colno)
+    elif isinstance(error, LocalisationHold) and str(error) in {
+            'LOCALISATION_DUPLICATE_SPAN_HOLD', 'LOCALISATION_SPAN_PARTITION_HOLD',
+            'LOCALISATION_FRAGMENT_COUNT_HOLD', 'LOCALISATION_SOURCE_KEY_BOUND_HOLD',
+            'LOCALISATION_RESULT_BOUND_HOLD'}:
+        result['reason'] = str(error)
+    return result
 
 
 class NativeClaimLocaliser:
@@ -112,14 +155,18 @@ class NativeClaimLocaliser:
             system_instruction=SYSTEM, temporary_prefix='newsroom-claim-localisation-',
             reasoning_effort='high', model=MODEL))
 
-    def _input(self, state, *, candidate_id, hypothesis_digest, evidence_package_digest):
-        prompt = _prompt(state)
+    def _input(self, state, *, candidate_id, hypothesis_digest, evidence_package_digest,
+               version=VERSION, repair_of=None):
+        prompt = _prompt(state, version=version)
         if len(prompt.encode()) > self.policy.max_prompt_bytes:
             raise LocalisationHold('LOCALISATION_INPUT_BOUND_HOLD')
         snapshot = {'state': state, 'candidate_id': candidate_id, 'hypothesis_digest': hypothesis_digest,
                     'evidence_package_digest': evidence_package_digest}
         digest = digest_canonical(snapshot)
-        envelope = WorkEnvelope.create(cycle_id='claim-localisation:'+digest,
+        purpose = 'claim-localisation:' if version == LEGACY_VERSION else 'claim-localisation-v2:'
+        if repair_of is not None:
+            purpose = 'claim-localisation-v2-repair:'+repair_of+':'
+        envelope = WorkEnvelope.create(cycle_id=purpose+digest,
             workload_class=self.policy.workload_class, admitted_at=self.clock(), admission_decision_id=None,
             candidate_id=candidate_id, hypothesis_digest=hypothesis_digest,
             evidence_package_digest=evidence_package_digest, ingest_id=None, graphiti_attempt_id=None)
@@ -138,18 +185,97 @@ class NativeClaimLocaliser:
         manifest['context_manifest_digest'] = digest_canonical(manifest)
         return prompt, digest, envelope, manifest
 
+    def _terminal(self, invocation_id, *, expected_snapshot=None):
+        with sqlite3.connect(Path(self.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
+            if c.execute('SELECT 1 FROM model_invocation_terminals WHERE invocation_id=?',
+                         (invocation_id,)).fetchone() is None:
+                raise LocalisationHold('LOCALISATION_PRIOR_ACTIVE_HOLD')
+            allocation, terminal = _retained_terminal_allocation(c, invocation_id)
+            policy = _policy_for_allocation(c, allocation)
+            if terminal.usage_status is not UsageStatus.REPORTED or terminal.policy_breach:
+                raise LocalisationHold('LOCALISATION_PRIOR_USAGE_HOLD')
+            _require_reported_telemetry(c, terminal)
+            envelope_row = c.execute('SELECT envelope_id,cycle_id,workload_class,admitted_at,canonical_digest,record_json '
+                'FROM model_work_envelopes WHERE envelope_id=?', (allocation.envelope_id,)).fetchone()
+            if envelope_row is None:
+                raise LocalisationHold('LOCALISATION_REPLAY_SCOPE_HOLD')
+            retained_envelope = _envelope_from_record(json.loads(envelope_row[5]))
+            if (tuple(envelope_row[:5]) != (retained_envelope.envelope_id, retained_envelope.cycle_id,
+                    retained_envelope.workload_class.value, retained_envelope.as_record()['admitted_at'], retained_envelope.canonical_digest)
+                    or any(getattr(retained_envelope, key) != expected_snapshot[key]
+                           for key in ('candidate_id','hypothesis_digest','evidence_package_digest'))):
+                raise LocalisationHold('LOCALISATION_REPLAY_SCOPE_HOLD')
+            row = c.execute('SELECT provider,route,evidence_package_digest,record_json FROM model_invocation_context_manifests '
+                'WHERE context_manifest_digest=?', (allocation.context_manifest_digest,)).fetchone()
+            if row is None:
+                raise LocalisationHold('LOCALISATION_REPLAY_MANIFEST_HOLD')
+            manifest = json.loads(row[3])
+            unsigned = {key: value for key, value in manifest.items() if key != 'context_manifest_digest'}
+            version = allocation.prompt_contract_version
+            system = LEGACY_SYSTEM if version == LEGACY_VERSION else SYSTEM
+            if (tuple(row[:3]) != (manifest.get('provider'), manifest.get('route'), manifest.get('evidence_package_digest'))
+                    or manifest.get('evidence_package_digest') != expected_snapshot['evidence_package_digest']
+                    or manifest.get('source_snapshot_digest') != digest_canonical(expected_snapshot)
+                    or version not in {LEGACY_VERSION, VERSION}
+                    or manifest.get('context_manifest_digest') != allocation.context_manifest_digest
+                    or digest_canonical(unsigned) != allocation.context_manifest_digest
+                    or manifest.get('system_digest') != digest_bytes(system.encode())
+                    or manifest.get('prompt_digest') != allocation.prompt_digest
+                    or manifest.get('output_schema_digest') != allocation.output_schema_digest
+                    or manifest.get('implementation_revision') != policy.implementation_revision
+                    or tuple(manifest.get('command_flags', ())) != COMMAND_FLAGS
+                    or allocation.model != MODEL or allocation.reasoning != 'high'):
+                raise LocalisationHold('LOCALISATION_REPLAY_MANIFEST_HOLD')
+        return allocation, terminal, policy
+
+    def _reference(self, invocation_id, *, proof):
+        admitted = self.objects.committed_admission(ObjectAdmissionRequest('evidence.record',
+            'claim-localisation-receipt:'+invocation_id), proof=proof)
+        if admitted is None:
+            raise LocalisationHold('LOCALISATION_PRIOR_RESULT_UNAVAILABLE')
+        retained = json.loads(self.objects.rehydrate(HydrationRequest(admitted.admission.admission_id,
+            'evidence.record'), proof=proof).data)
+        return LocalisationReference(invocation_id, ObjectAdmissionId.parse(retained['raw_admission_id']),
+            admitted.admission.admission_id)
+
     def localise(self, state, *, proof, **scope):
-        prompt, snapshot, envelope, manifest = self._input(state, **scope)
-        prior = _retained_allocation(self.usage, envelope=envelope, prompt_digest=digest_bytes(prompt.encode()), policy=self.policy)
+        # A version upgrade is not a retry credit for unknown, active or breached old work.
+        legacy_prompt, _, legacy_envelope, _ = self._input(state, version=LEGACY_VERSION, **scope)
+        legacy = _retained_allocation(self.usage, envelope=legacy_envelope,
+            prompt_digest=digest_bytes(legacy_prompt.encode()), policy=self.policy)
+        repair_of = None
+        if legacy is not None:
+            allocation, terminal, policy = self._terminal(legacy.invocation_id, expected_snapshot={
+                'state':state, **{key:scope[key] for key in ('candidate_id','hypothesis_digest','evidence_package_digest')}})
+            if (not policy.qualified or policy.prompt_contract_version != LEGACY_VERSION
+                    or policy.output_schema_digest != LEGACY_SCHEMA_DIGEST
+                    or allocation.prompt_contract_version != LEGACY_VERSION
+                    or allocation.output_schema_digest != LEGACY_SCHEMA_DIGEST):
+                raise LocalisationHold('LOCALISATION_LEGACY_POLICY_HOLD')
+            if terminal.outcome == 'LOCALISATION_COMPLETE':
+                reference = self._reference(legacy.invocation_id, proof=proof)
+                self.read_localisation(reference, state, proof=proof, **scope)
+                return reference
+            if terminal.outcome != 'LOCALISATION_FAILED' or terminal.failure_class != 'ValidationError':
+                raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+            if terminal.components.provenance != 'PROVIDER_REPORTED' or terminal.pre_dispatch_zero_proved:
+                raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+            with sqlite3.connect(Path(self.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
+                if not _has_exact_dispatch(c, terminal):
+                    raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+                dispatches = c.execute('SELECT observed_at,evidence_digest FROM model_transport_observations '
+                    "WHERE invocation_id=? AND state='DISPATCH_STARTED'", (allocation.invocation_id,)).fetchall()
+                if len(dispatches) != 1 or tuple(dispatches[0]) != (_utc_text(terminal.dispatch_at), allocation.request_digest):
+                    raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+            if ModelUsageService._validate_terminal(terminal, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR, policy,
+                    requested_max_output_tokens=allocation.max_output_tokens) is not None:
+                raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
+            repair_of = legacy.invocation_id
+        prompt, snapshot, envelope, manifest = self._input(state, repair_of=repair_of, **scope)
+        prior = _retained_allocation(self.usage, envelope=envelope,
+            prompt_digest=digest_bytes(prompt.encode()), policy=self.policy)
         if prior is not None:
-            admitted = self.objects.committed_admission(ObjectAdmissionRequest('evidence.record',
-                'claim-localisation-receipt:'+prior.invocation_id), proof=proof)
-            if admitted is None:
-                raise LocalisationHold('LOCALISATION_PRIOR_RESULT_UNAVAILABLE')
-            retained = json.loads(self.objects.rehydrate(HydrationRequest(admitted.admission.admission_id,
-                'evidence.record'), proof=proof).data)
-            reference = LocalisationReference(prior.invocation_id, ObjectAdmissionId.parse(retained['raw_admission_id']),
-                admitted.admission.admission_id)
+            reference = self._reference(prior.invocation_id, proof=proof)
             self.read_localisation(reference, state, proof=proof, **scope)
             return reference
         envelope = self.usage.resume_or_open_native_assessor_envelope(envelope)
@@ -183,40 +309,54 @@ class NativeClaimLocaliser:
             failure_class=None if failure is None else type(failure).__name__,
             usage=None if execution is None else execution.usage, dispatch_at=dispatched,
             completed_at=self.clock(), provider_dispatched=dispatched is not None, policy=self.policy)
+        terminal = self.usage.terminal(allocation.invocation_id)
+        reference = None
+        if raw is not None and len(raw) <= 262144:
+            with self.fence(state['source_binding'], proof):
+                raw_admission = self.objects.admit(ObjectAdmissionRequest('evidence.record',
+                    'claim-localisation-raw:'+allocation.invocation_id), raw, proof=proof).admission
+                receipt = {'version': VERSION, 'invocation_id': allocation.invocation_id,
+                    'allocation_digest': allocation.canonical_digest, 'terminal_digest': terminal.terminal_digest,
+                    'source_snapshot_digest': snapshot, 'source_binding': state['source_binding'],
+                    'raw_admission_id': str(raw_admission.admission_id), 'raw_digest': digest_bytes(raw),
+                    'schema_digest': SCHEMA_DIGEST, 'outcome': terminal.outcome, 'repair_of': repair_of,
+                    'diagnostic': None if failure is None else _failure_diagnostic(failure)}
+                admitted = self.objects.admit(ObjectAdmissionRequest('evidence.record',
+                    'claim-localisation-receipt:'+allocation.invocation_id),
+                    canonical_json_bytes(receipt), proof=proof).admission
+                reference = LocalisationReference(allocation.invocation_id, raw_admission.admission_id,
+                    admitted.admission_id)
         if failure is not None:
             raise failure
-        terminal = self.usage.terminal(allocation.invocation_id)
         if terminal.usage_status is not UsageStatus.REPORTED or terminal.policy_breach:
             raise LocalisationHold('LOCALISATION_USAGE_HOLD')
-        with self.fence(state['source_binding'], proof):
-            raw_admission = self.objects.admit(ObjectAdmissionRequest('evidence.record', 'claim-localisation-raw:'+allocation.invocation_id), raw, proof=proof).admission
-            receipt = {'version': VERSION, 'invocation_id': allocation.invocation_id, 'allocation_digest': allocation.canonical_digest,
-                'terminal_digest': terminal.terminal_digest, 'source_snapshot_digest': snapshot, 'source_binding': state['source_binding'],
-                'raw_admission_id': str(raw_admission.admission_id), 'raw_digest': digest_bytes(raw)}
-            admitted = self.objects.admit(ObjectAdmissionRequest('evidence.record', 'claim-localisation-receipt:'+allocation.invocation_id),
-                canonical_json_bytes(receipt), proof=proof).admission
-        return LocalisationReference(allocation.invocation_id, raw_admission.admission_id, admitted.admission_id)
+        return reference
 
     def read_localisation(self, reference, state, *, proof, **scope):
-        _prompt_value, snapshot, envelope, _manifest = self._input(state, **scope)
         with self.fence(state['source_binding'], proof):
-            with sqlite3.connect(Path(self.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
-                allocation, terminal = _retained_terminal_allocation(c, reference.invocation_id)
-                policy = _policy_for_allocation(c, allocation)
-                if terminal is None or terminal.usage_status is not UsageStatus.REPORTED:
-                    raise LocalisationHold('LOCALISATION_REPLAY_USAGE_HOLD')
-                _require_reported_telemetry(c, terminal)
+            allocation, terminal, policy = self._terminal(reference.invocation_id, expected_snapshot={
+                'state':state, **{key:scope[key] for key in ('candidate_id','hypothesis_digest','evidence_package_digest')}})
             raw = self.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'), proof=proof).data
             receipt_raw = self.objects.rehydrate(HydrationRequest(reference.receipt_admission_id, 'evidence.record'), proof=proof).data
         receipt = json.loads(receipt_raw)
-        if (canonical_json_bytes(receipt) != receipt_raw or receipt['version'] != VERSION
+        version = receipt.get('version')
+        if version not in {LEGACY_VERSION, VERSION}:
+            raise LocalisationHold('LOCALISATION_REPLAY_VERSION_HOLD')
+        repair_of = receipt.get('repair_of') if version == VERSION else None
+        _prompt_value, snapshot, envelope, _manifest = self._input(state, version=version,
+            repair_of=repair_of, **scope)
+        schema_digest = LEGACY_SCHEMA_DIGEST if version == LEGACY_VERSION else SCHEMA_DIGEST
+        if (canonical_json_bytes(receipt) != receipt_raw or not policy.qualified
                 or allocation.envelope_id != envelope.envelope_id or allocation.prompt_digest != digest_bytes(_prompt_value.encode())
                 or allocation.route != ROUTE or allocation.provider != 'grok-build-cli'
-                or policy.prompt_contract_version != VERSION or policy.output_schema_digest != SCHEMA_DIGEST
+                or policy.prompt_contract_version != version or policy.output_schema_digest != schema_digest
+                or allocation.prompt_contract_version != version or allocation.output_schema_digest != schema_digest
+                or (version == VERSION and (receipt.get('schema_digest') != schema_digest
+                    or receipt.get('outcome') != 'LOCALISATION_COMPLETE' or receipt.get('diagnostic') is not None))
                 or terminal is None or terminal.outcome != 'LOCALISATION_COMPLETE' or terminal.usage_status is not UsageStatus.REPORTED
                 or terminal.policy_breach or receipt['invocation_id'] != reference.invocation_id
                 or receipt['allocation_digest'] != allocation.canonical_digest or receipt['terminal_digest'] != terminal.terminal_digest
                 or receipt['source_snapshot_digest'] != snapshot or receipt['source_binding'] != state['source_binding']
                 or receipt['raw_admission_id'] != str(reference.raw_admission_id) or receipt['raw_digest'] != digest_bytes(raw)):
             raise LocalisationHold('LOCALISATION_REPLAY_BINDING_HOLD')
-        return {**receipt, 'renderings': _renderings(raw, state), 'receipt_admission_id': str(reference.receipt_admission_id)}
+        return {**receipt, 'renderings': _renderings(raw, state, version=version), 'receipt_admission_id': str(reference.receipt_admission_id)}
