@@ -78,7 +78,6 @@ def _read(runtime, snapshot, source):
 
 def test_actual_refresh_bundles_ten_fresh_sources_and_reopens(tmp_path, monkeypatch, record_property):
     bodies, calls = _terms(monkeypatch), []
-    monkeypatch.setattr(native_composition, "fetch_licensing_observations", lambda **_: bodies)
     args = _args(tmp_path, monkeypatch)
     with open_native_runtime(**args) as runtime:
         _, first_inputs, first = _refresh(runtime, bodies, "2026-09-08T15:00:00Z", calls)
@@ -265,6 +264,7 @@ def test_composed_current_rights_checks_fresh_member_and_definition_version(tmp_
     from newsroom.tests.projection_b2_helpers import MemoryNeo4jAdapter
 
     bodies, calls = _terms(monkeypatch), []
+    monkeypatch.setattr(native_composition, "fetch_licensing_observations", lambda **_: bodies)
     now = [datetime(2026, 9, 8, 14, tzinfo=UTC)]
     def no_govuk(**_):
         raise NativeEvidenceHold("GOVUK_LICENCE_REVIEW_HOLD", "UK-GOVUK")
