@@ -22,6 +22,7 @@ from .native_cycle import advance_native_cycle
 from .native_assessor import assessor_admission_recovery_due, assessment_revalidation_due, same_assessment_producer
 from .native_evidence import NativeEvidenceHold
 from .native_graphiti import _native_phase
+from .govuk_evidence import _api_url
 
 from .native_progress import NativeRevisionJournal, source_header
 from .native_source_disposition import archival_nil_return_candidate, archival_nil_return_disposition
@@ -36,6 +37,21 @@ def _source_update_time(item: tuple) -> tuple:
         except ValueError:
             continue
     return False, None
+
+
+
+def _news_or_speech_header(item: tuple) -> bool:
+    """Metadata ordering only; Source authority and qualification stay downstream."""
+    url = getattr(item[1], 'canonical_url', None)
+    if (type(url) is not str or any(character.isspace() for character in url)
+            or not url.startswith(('https://www.gov.uk/government/news/',
+                                   'https://www.gov.uk/government/speeches/'))):
+        return False
+    try:
+        _api_url(url)  # Reuse the exact GOV.UK URL boundary; no fetch or body read.
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _pending_units(journal, revisions):
@@ -165,7 +181,7 @@ class NativePipeline:
             # Use the same current/archive turn for already-admitted downstream
             # work; recent source updates must not wait behind old recovery backlog.
             if not self._spill_archive_turn:
-                ordinary.sort(key=_source_update_time, reverse=True)
+                ordinary.sort(key=lambda item: (_news_or_speech_header(item), _source_update_time(item)), reverse=True)
             # Interrupted/unknown effects still settle before ordinary work. The
             # stable sort preserves source recency, or LAND order on archive turns.
             # Each turn has the existing quantum; an atomic revision may overrun it.
