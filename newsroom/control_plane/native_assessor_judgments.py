@@ -438,7 +438,11 @@ class NativeSemanticWitnesses:
         self.require_current()
         inputs = _semantic_witness_inputs(qualification, claim, package, binding)
         self._read_parent(qualification, claim, package, binding, self.candidate_for(binding['candidate_version_id']))
-        ref = self.judgments.evaluate(**inputs, proof=self.proof)
+        try:
+            ref = self.judgments.evaluate(**inputs, proof=self.proof)
+        except Exception as exc:
+            self._usage_hold(exc,claim)
+            raise
         value = tuple(sorted({'contract': SEMANTIC_WITNESS_CONTRACT, 'question_id': 'criterion',
             'invocation_id': ref.invocation_id, 'raw_admission_id': str(ref.raw_admission_id),
             'receipt_admission_id': str(ref.receipt_admission_id)}.items()))
@@ -447,6 +451,39 @@ class NativeSemanticWitnesses:
         if not self.read(checked, claim, package):
             raise ValueError('semantic witness is not affirmatively verified')
         return value
+
+    def read_existing(self, qualification, claim, package, binding):
+        """Resolve one exact existing paid-v1 receipt; never evaluate or allocate."""
+        import sqlite3,time
+        from pathlib import Path
+        from .typesafe_judgment import JudgmentReference
+        from .evidence import SEMANTIC_WITNESS_CONTRACT
+        self.require_current()
+        inputs = _semantic_witness_inputs(qualification,claim,package,binding)
+        with sqlite3.connect(Path(self.judgments.usage.path).resolve().as_uri()+'?mode=ro',uri=True)as c:
+            c.execute('PRAGMA query_only=ON')
+            deadline=time.monotonic()+5;c.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
+            rows=c.execute('SELECT a.invocation_id FROM model_invocation_allocations a JOIN model_work_envelopes e USING(envelope_id) '
+                'WHERE e.cycle_id=? AND a.route=? LIMIT 2',(inputs['cycle_id'],self.judgments.policy.route)).fetchall()
+        if len(rows)!=1:return None
+        admitted=self.judgments.objects.committed_admission(ObjectAdmissionRequest('evidence.record','typesafe-receipt:'+rows[0][0]),proof=self.proof)
+        if admitted is None:return None
+        raw=self.judgments.objects.rehydrate(HydrationRequest(admitted.admission.admission_id,'evidence.record'),proof=self.proof).data
+        receipt=json.loads(raw)
+        if canonical_json_bytes(receipt)!=raw:raise ValueError('retained semantic witness receipt differs')
+        ref=tuple(sorted({'contract':SEMANTIC_WITNESS_CONTRACT,'question_id':'criterion','invocation_id':rows[0][0],
+            'raw_admission_id':receipt['raw_admission_id'],'receipt_admission_id':str(admitted.admission.admission_id)}.items()))
+        from dataclasses import replace
+        return self.read(replace(qualification,semantic_witness_ref=ref),claim,package)
+
+    @staticmethod
+    def _usage_hold(error, claim):
+        from .typesafe_judgment import TypesafeJudgmentError
+        from .native_evidence import NativeEvidenceHold
+        unresolved = {'TYPESAFE_EXISTING_INTENT_UNSETTLED','TYPESAFE_UNSETTLED_OR_INVALID_TRANSPORT',
+            'TYPESAFE_REPLAY_USAGE_HOLD','TYPESAFE_RESULT_HOLD'}
+        if isinstance(error, TimeoutError) or isinstance(error, TypesafeJudgmentError) and str(error) in unresolved:
+            raise NativeEvidenceHold('QUALIFICATION_SEMANTIC_WITNESS_UNKNOWN_HOLD',claim.source_ids[0]) from error
 
     def _read_parent(self, qualification, claim, package, binding, candidate):
         from newsroom.increment10.evidence import _base_package
@@ -491,9 +528,22 @@ class NativeSemanticWitnesses:
         inputs = _semantic_witness_inputs(qualification, claim, package, binding)
         if value['question_id'] != 'criterion':
             raise ValueError('semantic witness question differs')
-        verified = self.judgments.read(ref, **inputs, proof=self.proof)
-        return (verified.get('outcome') == 'TYPESAFE_COMPLETE'
-                and verified['answers']['criterion'].get('choice') == 'YES')
+        try:
+            verified = self.judgments.read(ref, **inputs, proof=self.proof)
+        except Exception as exc:
+            self._usage_hold(exc,claim)
+            raise
+        from .native_evidence import NativeEvidenceHold
+        if verified.get('outcome') != 'TYPESAFE_COMPLETE':
+            raise NativeEvidenceHold('QUALIFICATION_SEMANTIC_WITNESS_UNKNOWN_HOLD',claim.source_ids[0])
+        answer = verified['answers']['criterion']
+        choice = answer.get('choice')
+        if choice in {'NO','UNCERTAIN'}:
+            held = NativeEvidenceHold('QUALIFICATION_SEMANTIC_WITNESS_'+choice,claim.source_ids[0])
+            held.semantic_witness_disposition = {'reference':value,'confidence_ppm':answer['confidence_ppm'],
+                'probabilities_ppm':answer['probabilities_ppm']}
+            raise held
+        return choice == 'YES'
 
     def _read_source_rendering(self, claim, package):
         from .evidence import source_rendering_reference, _localised_fact_is_bound

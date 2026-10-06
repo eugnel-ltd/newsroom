@@ -34,6 +34,55 @@ class NativeQualifiedSourceConsumer:
         return self.qualifier.read_qualification(reference, state, proof=proof, candidate_id=candidate.candidate_id,
             hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest)['materialisation']
 
+    def read_current_disposition(self, candidate, base, sources, *, proof):
+        """Proof-only retained CURRENT projection, not external-now acquisition."""
+        import sqlite3,time
+        from pathlib import Path
+        from types import SimpleNamespace
+        from .native_source_qualification import ROUTE,VERSION,QualificationReference
+        from .native_source_qualification_replay import original_qualification_state
+        from .evidence import QualificationEvidence,Evid012QualificationTest
+        from .admission import _qualification_relation_is_proven
+        with sqlite3.connect(Path(self.qualifier.usage.path).resolve().as_uri()+'?mode=ro',uri=True)as c:
+            c.execute('PRAGMA query_only=ON');deadline=time.monotonic()+5
+            c.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
+            rows=c.execute('SELECT a.invocation_id FROM model_invocation_allocations a JOIN model_work_envelopes e USING(envelope_id) '
+                "WHERE a.route=? AND json_extract(e.record_json,'$.candidate_id')=? "
+                "AND json_extract(e.record_json,'$.hypothesis_digest')=? AND json_extract(e.record_json,'$.evidence_package_digest')=? LIMIT 2",
+                (ROUTE,candidate.candidate_id,candidate.governing_manifest.canonical_digest,base.digest)).fetchall()
+        if len(rows)!=1:return None
+        admitted=self.objects.committed_admission(ObjectAdmissionRequest('evidence.record','source-qualification-receipt:'+rows[0][0]),proof=proof)
+        if admitted is None:return None
+        raw=self.objects.rehydrate(HydrationRequest(admitted.admission.admission_id,'evidence.record'),proof=proof).data
+        receipt=json.loads(raw);binding=receipt['source_binding']
+        if canonical_json_bytes(receipt)!=raw or receipt['version']!=VERSION:return None
+        current=binding.get('current_scope',{}).get('sources',[])
+        if (len(current)!=len(sources) or any(row['source_id']!=source.unit.source_id or row['body']!=source.unit.body
+                or row['published_at']!=source.unit.published_at or row['updated_at']!=source.unit.updated_at
+                for row,source in zip(current,sources,strict=True))):return None
+        pins=binding.get('source_currentness',[])
+        if len(pins)!=len(sources) or any(row['definition_id']!=str(source.unit.authority.definition_id)
+                or row['definition_version_id']!=str(source.unit.authority.definition_version_id)
+                for row,source in zip(pins,sources,strict=True)):return None
+        for row in binding.get('first_publication',[]):
+            source=next((item for item in sources if item.unit.source_id==row['source_id']),None)
+            if source is None or row['source_revision_digest']!=source.unit.revision_digest:return None
+        state=original_qualification_state(self.qualifier,candidate,base,binding,proof=proof)
+        reference=QualificationReference(rows[0][0],ObjectAdmissionId.parse(receipt['raw_admission_id']),admitted.admission.admission_id)
+        checked=self.qualifier.read_qualification(reference,state,proof=proof,candidate_id=candidate.candidate_id,
+            hypothesis_digest=candidate.governing_manifest.canonical_digest,evidence_package_digest=base.digest)
+        package=json.loads(checked['materialisation']['materialised_text'])['package']
+        if not package['substantive_new_information']:return None
+        claims={row['claim_id']:SimpleNamespace(**{**row,'source_ids':tuple(row['source_ids'])})for row in package['governed_claims']}
+        for item in package['qualification_evidence']:
+            claim=claims[item['governed_claim_id']]
+            q=QualificationEvidence(Evid012QualificationTest(item['test']),claim.claim_id,'retained-qualification',tuple(item['test_evidence'].items()),item['policy_version'])
+            if not _qualification_relation_is_proven(q,claim,source_context=base.passages[claim.passage_index]):
+                self.semantic_witnesses.read_existing(q,claim,base,{**binding,'semantic_witness_consumer':PAID_BINDING_VERSION,
+                    'source_qualification_reference':{'invocation_id':reference.invocation_id,'raw_admission_id':str(reference.raw_admission_id),
+                        'receipt_admission_id':str(reference.receipt_admission_id)}})
+        return None
+
     def compose_selected(self, original, candidate, base, sources, acquired, *, proof):
         """A new witness/render purpose, never qualification-model redispatch."""
         from types import SimpleNamespace

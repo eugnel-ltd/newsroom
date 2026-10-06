@@ -931,7 +931,8 @@ def _publication_caller_without_bootstrap(**bindings):
     assert len(nodes) == 1
     # The extracted legacy caller has the same dormant semantic closure as the
     # ordinary opener without a configured judgment credential.
-    scope = {**vars(native_composition), 'judgment_api_key': None, **bindings}
+    scope = {**vars(native_composition), 'judgment_api_key': None,
+        'semantic_witness_disposition_reader': None, **bindings}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), native_composition.__file__, 'exec'), scope)
     return scope['Publication']()
 
