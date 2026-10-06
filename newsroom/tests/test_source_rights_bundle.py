@@ -264,6 +264,7 @@ def test_composed_current_rights_checks_fresh_member_and_definition_version(tmp_
     from newsroom.tests.projection_b2_helpers import MemoryNeo4jAdapter
 
     bodies, calls = _terms(monkeypatch), []
+    monkeypatch.setattr(native_composition, "fetch_licensing_observations", lambda **_: bodies)
     now = [datetime(2026, 9, 8, 14, tzinfo=UTC)]
     def no_govuk(**_):
         raise NativeEvidenceHold("GOVUK_LICENCE_REVIEW_HOLD", "UK-GOVUK")
@@ -271,7 +272,8 @@ def test_composed_current_rights_checks_fresh_member_and_definition_version(tmp_
         def fetch(url):
             calls.append(url)
             return bodies[url]
-        return rights.observe_portfolio_terms(**arguments, fetch=fetch)
+        arguments["fetch"] = fetch
+        return rights.observe_portfolio_terms(**arguments)
     monkeypatch.setattr(native_composition, "retain_current_govuk_licence", no_govuk)
     monkeypatch.setattr(native_composition, "observe_portfolio_terms", observed_terms)
     monkeypatch.setattr("newsroom.authority._graphiti_increment4_system._open_structural_graph_adapter",

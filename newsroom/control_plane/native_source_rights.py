@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from collections.abc import Callable
 from typing import ContextManager
 from threading import RLock
@@ -22,7 +22,7 @@ from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, dig
 from newsroom.increment9.proving import SOURCE_URLS
 
 from .govuk_evidence import _NoRedirect
-from .govuk_rights import GovUkLicenceEvidence
+from .govuk_rights import GovUkLicenceEvidence, REUSE_URL, LICENCE_URL, _fetch_licence_observation
 from .native_evidence import PublicationRightsAssessment
 from .veto import VetoError
 
@@ -508,9 +508,39 @@ class NativePortfolioRights:
                     raise ValueError("retained permitted terms differ")
 
 
+def fetch_licensing_observations(*, stop_check, stop_fence,
+                                 govuk_fetch=None, portfolio_fetch=None) -> dict:
+    """Fresh network-only batches; owner fences end after all workers settle."""
+    govuk_fetch = _fetch_licence_observation if govuk_fetch is None else govuk_fetch
+    portfolio_fetch = _fetch_terms if portfolio_fetch is None else portfolio_fetch
+    jobs = [(url, govuk_fetch) for url in (REUSE_URL, LICENCE_URL)]
+    jobs += [(url, portfolio_fetch) for terms in TERMS.values() for url, _ in terms]
+    observed = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for start in range(0, len(jobs), 4):
+            stop_check()
+            batch = jobs[start:start + 4]
+            with stop_fence():
+                try:
+                    pending = tuple(pool.submit(fetch, url) for url, fetch in batch)
+                    wait(pending)
+                    for (url, _fetch), future in zip(batch, pending, strict=True):
+                        try:
+                            observed[url] = future.result()
+                        except VetoError:
+                            raise
+                        except Exception as exc:
+                            observed[url] = exc
+                except BaseException:
+                    pool.shutdown(wait=True, cancel_futures=True)
+                    raise
+    return observed
+
+
 def observe_portfolio_terms(*, objects, proof, stop_check,
                             stop_fence: Callable[[], ContextManager[None]], fetch=_fetch_terms,
-                            clock=lambda: datetime.now(tz=UTC)) -> dict[str, SourceTermsEvidence]:
+                            clock=lambda: datetime.now(tz=UTC),
+                            parallel_observation=True) -> dict[str, SourceTermsEvidence]:
     """One bounded parallel observation, then serial governed retention."""
     def observe(source_id):
         bodies, reason = [], RESTRICTIONS.get(source_id, "REVIEWED_REUSE_PERMITTED")
@@ -529,8 +559,13 @@ def observe_portfolio_terms(*, objects, proof, stop_check,
     # One stable owner-stop decision covers the complete bounded network phase.
     # Governed-object writes remain outside the fence and are serial below.
     with stop_fence():
-        with ThreadPoolExecutor(max_workers=len(TERMS)) as pool:
-            results = tuple(pool.map(observe, TERMS))
+        if parallel_observation:
+            with ThreadPoolExecutor(max_workers=len(TERMS)) as pool:
+                results = tuple(pool.map(observe, TERMS))
+        else:
+            # Combined acquisition has already settled; preserve Source order
+            # and observed-at validation without creating empty worker jobs.
+            results = tuple(map(observe, TERMS))
     evidence = {}
     for source_id, bodies, reason, observed_at in results:
         stop_check()

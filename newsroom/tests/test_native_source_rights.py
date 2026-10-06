@@ -469,3 +469,96 @@ def test_govuk_v2_semantic_input_mismatch_refuses_before_retention(fault):
             observed_at='2026-09-08T12:00:00Z', reason='REVIEWED_REUSE_PERMITTED', observations=(),
             govuk_semantic_evidence=supplied,
         )
+
+
+def test_licensing_network_batches_are_four_bounded_fresh_and_owner_fenced(monkeypatch):
+    import threading
+    from contextlib import contextmanager
+    owner = threading.get_ident()
+    first_wave = threading.Event()
+    lock = threading.Lock()
+    state = {'active': 0, 'maximum': 0, 'fenced': False}
+    calls, fences, stops = [], [], []
+    @contextmanager
+    def fence():
+        assert threading.get_ident() == owner
+        fences.append('enter');state['fenced'] = True
+        try: yield
+        finally:
+            assert state['active'] == 0
+            state['fenced'] = False
+    def fetch(url):
+        assert threading.get_ident() != owner and state['fenced']
+        with lock:
+            calls.append(url);state['active'] += 1
+            state['maximum'] = max(state['maximum'], state['active'])
+            initial_wave = len(calls) <= 4
+            if state['active'] == 4:first_wave.set()
+        try:
+            if initial_wave:assert first_wave.wait(2)
+            return url.encode()
+        finally:
+            with lock:state['active'] -= 1
+    for _ in range(2):
+        observed = rights.fetch_licensing_observations(stop_check=lambda: stops.append('check'),
+            stop_fence=fence, govuk_fetch=fetch, portfolio_fetch=fetch)
+        urls = [rights.REUSE_URL, rights.LICENCE_URL, *(url for terms in rights.TERMS.values() for url,_ in terms)]
+        assert list(observed) == urls
+        assert all(observed[url] == url.encode() for url in urls)
+    assert state['maximum'] == 4
+    assert len(calls) == 18 and len(fences) == len(stops) == 6
+
+
+@pytest.mark.parametrize('failure', ('source', 'stop'))
+def test_licensing_network_failure_settles_before_fence_exit(monkeypatch, failure):
+    from contextlib import contextmanager
+    from threading import Lock
+    active, calls, checks = [0], [], [0]
+    lock = Lock()
+    @contextmanager
+    def fence():
+        try:yield
+        finally:assert active[0] == 0
+    def check():
+        checks[0] += 1
+        if failure == 'stop' and checks[0] == 2:raise VetoError('owner stop')
+    def fetch(url):
+        with lock:active[0] += 1;calls.append(url)
+        try:
+            if url == rights.REUSE_URL:raise OSError('unavailable')
+            return url.encode()
+        finally:
+            with lock:active[0] -= 1
+    if failure == 'stop':
+        with pytest.raises(VetoError):
+            rights.fetch_licensing_observations(stop_check=check, stop_fence=fence,
+                govuk_fetch=fetch, portfolio_fetch=fetch)
+        assert len(calls) == 4
+    else:
+        observed = rights.fetch_licensing_observations(stop_check=check, stop_fence=fence,
+            govuk_fetch=fetch, portfolio_fetch=fetch)
+        assert isinstance(observed[rights.REUSE_URL], OSError)
+        assert len(observed) == 9 and len(calls) == 9
+
+
+def test_licensing_worker_veto_propagates_after_current_batch_settles():
+    from contextlib import contextmanager
+    from threading import Lock
+    active,calls=[0],[]
+    lock=Lock()
+    failure=VetoError('owner stop')
+    @contextmanager
+    def fence():
+        try:yield
+        finally:assert active[0]==0
+    def fetch(url):
+        with lock:active[0]+=1;calls.append(url)
+        try:
+            if url==rights.REUSE_URL:raise failure
+            return url.encode()
+        finally:
+            with lock:active[0]-=1
+    with pytest.raises(VetoError) as raised:
+        rights.fetch_licensing_observations(stop_check=lambda:None,stop_fence=fence,
+            govuk_fetch=fetch,portfolio_fetch=fetch)
+    assert raised.value is failure and len(calls)==4

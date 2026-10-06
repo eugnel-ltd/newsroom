@@ -207,3 +207,60 @@ def test_semantic_identity_does_not_replace_current_retained_licence_checks(tmp_
             error = NativeEvidenceHold
         with pytest.raises(error):
             licence.require_retained(objects=objects, proof=proof)
+
+
+@pytest.mark.parametrize('bad_url', (None, rights.REUSE_URL, rights.LICENCE_URL))
+def test_prefetched_licence_preserves_order_atomic_validation_and_serial_retention(bad_url):
+    import threading
+    import dataclasses
+    from newsroom.control_plane.native_source_rights import fetch_licensing_observations
+    from newsroom.control_plane import native_source_rights
+    owner, admitted, fences = threading.get_ident(), [], []
+    raw = {rights.REUSE_URL:b'<main>fixture reuse</main>',rights.LICENCE_URL:b'<main>fixture ogl</main>'}
+    def fetched(url):
+        if url == bad_url:raise OSError('fixture unavailable')
+        return raw.get(url,b'<main>fixture portfolio</main>')
+    @contextmanager
+    def fence():
+        assert threading.get_ident() == owner
+        fences.append(True);yield
+    observed = fetch_licensing_observations(stop_check=lambda:None,stop_fence=fence,
+        govuk_fetch=fetched,portfolio_fetch=fetched)
+    def retained_fetch(url):
+        value = observed[url]
+        if isinstance(value,Exception):raise value
+        return value
+    class Objects:
+        def admit(self, request, body, *, proof):
+            assert threading.get_ident() == owner
+            admitted.append(body)
+            return SimpleNamespace(admission=SimpleNamespace(admission_id='fixture-'+str(len(admitted)),
+                blob=SimpleNamespace(blob_digest=rights.digest_bytes(body))))
+    expected = {url:rights.licence_text_digest(body) for url,body in raw.items()}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(rights,'REVIEWED_TEXT',expected)
+        if bad_url:
+            with pytest.raises(NativeEvidenceHold,match='GOVUK_LICENCE_REVIEW_HOLD'):
+                rights.retain_current_govuk_licence(objects=Objects(),proof=object(),dispatch_fence=fence,fetch=retained_fetch)
+            assert admitted == []
+            assert all(not isinstance(observed[url],Exception) for terms in native_source_rights.TERMS.values() for url,_ in terms)
+        else:
+            licence=rights.retain_current_govuk_licence(objects=Objects(),proof=object(),dispatch_fence=fence,fetch=retained_fetch)
+            assert admitted == [raw[rights.REUSE_URL],raw[rights.LICENCE_URL]]
+            assert licence.raw_digests == tuple(rights.digest_bytes(raw[url]) for url in (rights.REUSE_URL,rights.LICENCE_URL))
+
+
+@pytest.mark.parametrize('damage', ('status','redirect','empty','oversize'))
+def test_network_only_licence_transport_preserves_exact_bounds(monkeypatch, damage):
+    class Response(io.BytesIO):
+        status = 503 if damage == 'status' else 200
+        def __init__(self):super().__init__(b'' if damage=='empty' else b'x'*(rights.MAX_BODY_BYTES+1) if damage=='oversize' else b'<main>terms</main>')
+        def geturl(self):return 'https://wrong.example/' if damage=='redirect' else rights.REUSE_URL
+    class Opener:
+        def open(self,request,timeout):
+            assert request.get_method()=='GET' and timeout==20
+            assert request.get_header('User-agent')=='Newsroom-Hermes-Rights-Review/1.0'
+            assert request.get_header('Accept-encoding')=='identity'
+            return Response()
+    monkeypatch.setattr('urllib.request.build_opener',lambda *_args:Opener())
+    with pytest.raises(ValueError):rights._fetch_licence_observation(rights.REUSE_URL)

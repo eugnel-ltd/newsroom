@@ -448,6 +448,7 @@ def test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(
 ) -> None:
     _RetrievalProjection.bootstraps = 0
     rights_observations = []
+    monkeypatch.setattr(native_composition, "fetch_licensing_observations", lambda **_: {})
 
     def observe_terms(**_):
         rights_observations.append("observed")
@@ -490,7 +491,7 @@ def test_native_composition_opens_factory_once_reopens_and_has_no_pre_effect(
         },
     )
 
-    def retain_licence(*, objects, proof, dispatch_fence, clock):
+    def retain_licence(*, objects, proof, dispatch_fence, clock, fetch=None):
         for _ in terms:
             with dispatch_fence():
                 pass
@@ -762,11 +763,12 @@ def composed_rights_cohort(tmp_path, monkeypatch):
     from newsroom.control_plane.native_evidence import NativeEvidenceHold
     from newsroom.tests.test_source_rights_bundle import _terms
     bodies = _terms(monkeypatch)
+    monkeypatch.setattr(native_composition, "fetch_licensing_observations", lambda **_: bodies)
     now, stops, stop_requested = [NOW], [], [False]
     def no_govuk(**_):
         raise NativeEvidenceHold("GOVUK_LICENCE_REVIEW_HOLD", "UK-GOVUK")
     def observed_terms(**arguments):
-        return native_source_rights.observe_portfolio_terms(**arguments, fetch=lambda url: bodies[url])
+        return native_source_rights.observe_portfolio_terms(**arguments)
     def stop():
         stops.append("checked")
         if stop_requested[0]:
@@ -1253,3 +1255,15 @@ def test_actual_native_composition_rights_accepts_checked_immutable_headers(comp
     else:
         with fixture.retrieval._rights_cohort() as rights:
             assert rights(header) == rights(fixture.unit)
+
+
+def test_combined_licensing_refresh_keeps_independent_portfolio_rights(composed_rights_cohort):
+    fixture = composed_rights_cohort
+    before = len(fixture.observations)
+    fixture.retrieval._journal.sources(())
+    fixture.pipeline._intake._licence.refresh()
+    # The GOVUK fixture retains its original licence HOLD; independent HKO
+    # observations still refresh through serial governed retention.
+    assert len(fixture.observations) >= before
+    assert fixture.pipeline._intake._licence.for_source(source_id='HK-02',
+        definition_url=SOURCE_URLS['HK-02']).decision == 'PERMITTED'

@@ -168,6 +168,8 @@ class _Response(io.BytesIO):
 
 
 def _install_boundaries(monkeypatch, counters):
+    # Licensing acquisition is a separate fake boundary, never real HTTP.
+    monkeypatch.setattr(native_composition, "fetch_licensing_observations", lambda **_: {})
     from newsroom.control_plane import native_story_model
     from newsroom.control_plane.native_story_writer import DRAFT_SYSTEM
     original_model = native_story_model.NativeStoryModel
@@ -242,7 +244,7 @@ def _install_boundaries(monkeypatch, counters):
         },
     )
 
-    def retain_licence(*, objects, proof, dispatch_fence, clock):
+    def retain_licence(*, objects, proof, dispatch_fence, clock, fetch=None):
         admissions = tuple(
             objects.admit(
                 ObjectAdmissionRequest(
