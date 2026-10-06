@@ -114,6 +114,29 @@ _REFRESHABLE_EVIDENCE_HOLDS = frozenset({
 })
 
 
+def _semantic_input_fingerprint_v2(base, acquired, sources):
+    """Meaning pins only; fresh acquisition/access authority remains separate."""
+    if len(acquired) != len(sources) or not sources:
+        raise NativePublicationError("semantic Source partition differs")
+    descriptors = []
+    for source, item in zip(sources, acquired, strict=True):
+        descriptors.append({
+            'source_id': source.unit.source_id, 'revision_id': source.unit.revision_id,
+            'revision_digest': source.unit.revision_digest,
+            'definition_version_id': str(source.source_version.version_id),
+            'definition_version_digest': source.source_version.canonical_digest,
+            'rights': {key: getattr(source.rights, key) for key in ('decision', 'permitted_use', 'policy_digest')},
+            'acquired': {key: getattr(item, key) for key in (
+                'request_digest', 'body_digest', 'canonical_url', 'publisher', 'responsible_body',
+                'source_type', 'publication_time', 'source_updated_time', 'geography', 'language',
+                'currentness_basis', 'exclusion_signals', 'text_only', 'body_origin',
+            )},
+        })
+    value = {'version': 'newsroom.semantic-input-fingerprint.v2', 'base_digest': base.digest,
+             'sources': descriptors}
+    return {**value, 'digest': digest_canonical(value)}
+
+
 @dataclass(frozen=True, slots=True)
 class NativePublicationContinuationResult:
     state: str
@@ -1565,13 +1588,20 @@ class NativePublicationContinuation:
                 nonlocal facts
                 current = current_facts()
                 intent = dict(current['semantic_assessment_intent'])
-                digest = digest_canonical({'base_digest': base.digest,
-                    'acquired': [(item.receipt_digest, item.body_digest) for item in acquired]})
-                retained_digest = intent.get('input_digest')
-                if retained_digest is not None and retained_digest != digest:
+                if intent.get('input_digest') is not None:
+                    # Old hash-only intents retain their exact guard. No automatic
+                    # migration or recovery of unavailable original constituents.
+                    digest = digest_canonical({'base_digest': base.digest,
+                        'acquired': [(item.receipt_digest, item.body_digest) for item in acquired]})
+                    if intent['input_digest'] != digest:
+                        raise NativeEvidenceHold('SEMANTIC_INTENT_INPUT_CHANGED_HOLD', revision_id)
+                    return
+                fingerprint = _semantic_input_fingerprint_v2(base, acquired, self._sources[revision_id])
+                previous = intent.get('semantic_input_fingerprint_v2')
+                if previous is not None and canonical_json_bytes(previous) != canonical_json_bytes(fingerprint):
                     raise NativeEvidenceHold('SEMANTIC_INTENT_INPUT_CHANGED_HOLD', revision_id)
-                if retained_digest is None:
-                    intent['input_digest'] = digest
+                if previous is None:
+                    intent['semantic_input_fingerprint_v2'] = fingerprint
                     current['semantic_assessment_intent'] = intent
                     facts = current
                     self._journal.advance(revision_id, stage='ACQUISITION_STARTED', facts=current)
