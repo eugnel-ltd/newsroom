@@ -1295,7 +1295,7 @@ def _localised_fact_is_bound(
                 before, after = text[:match.start()].rstrip(), text[match.end():].lstrip()
                 if before.endswith(('-', '−', '+', '負', '负')):
                     continue
-                if after and (after[0].isnumeric() or after[0] in '/⁄'):
+                if after and (after[0].isnumeric() or after[0] in '/⁄半'):
                     continue
                 return True
             return False

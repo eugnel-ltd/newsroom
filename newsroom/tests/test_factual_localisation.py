@@ -175,6 +175,7 @@ def test_pound_weight_cannot_be_rendered_as_sterling():
     ('£2 1/2 million', '£2', '二英鎊', '二英鎊'),
     ('£2/5 million', '£2', '二英鎊', '二英鎊'),
     ('£200', '£200', '- 二百英鎊', '二百英鎊'),
+    ('£200', '£200', '二百英鎊半', '二百英鎊'),
 ))
 def test_pound_fact_binding_rejects_partial_amount_or_scale(
     source_text, source_key, target_text, target_key,
