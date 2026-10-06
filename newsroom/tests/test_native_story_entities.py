@@ -96,3 +96,19 @@ def test_admitted_country_does_not_hide_an_unbound_publisher_actor():
         attribution='Home Office')
     assert not story_entity_names_are_bound('英國內政部制定政策。', (claim,))
     assert story_entity_names_are_bound('英國內政部表示，有關改動須經諮詢。', (claim,))
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('英國內政部表示，有關改動須經諮詢。', {'英國內政部'}),
+    ('Home Office表示，有關改動須經諮詢。', {'Home Office'}),
+    ('英國內政部稱霸有關政策。', set()),
+    ('英國內政部指出有關政策。', set()),
+    ("'申述。英國內政部表示，有關改動須經諮詢。'", set()),
+    ("'The government's statement。\n英國內政部表示，有關改動須經諮詢。'", set()),
+    ("The government's briefing。\n英國內政部表示，有關改動須經諮詢。", {'英國內政部'}),
+    ("Officials' briefing。\n英國內政部表示，有關改動須經諮詢。", {'英國內政部'}),
+])
+def test_reporting_verb_boundary_and_ascii_quote_roles(text, expected):
+    from newsroom.control_plane.native_story_entities import source_publisher_reporting_names
+    claim = N(named_entities=(), named_entity_evidence=(), attribution='Home Office')
+    assert source_publisher_reporting_names(text, (claim,)) == expected

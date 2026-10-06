@@ -19,15 +19,28 @@ _PLACE_NAMES = (frozenset({'UK', '英國'}), frozenset({'Hong Kong', '香港'}))
 # attribution, never a feed anchor or permission to perform a policy action.
 # https://www.gov.uk/government/news/311079.zh-tw
 _PUBLISHER_REPORTING_NAMES = ('Home Office', '英國內政部')
-_REPORTING_VERB = re.compile(r"\s*(?:表示|指出|稱)")
+_REPORTING_VERB = re.compile(r"\s*(?:表示|指出|稱)\s*[,，:：]")
 _REPORTING_START = re.compile(r"(?:^|[\n。！？!?])\s*$")
 
 
 def _outside_quotation(text, position):
     closes = {'「': '」', '『': '』', '“': '”', '‘': '’'}
     stack = []
-    for char in text[:position]:
-        if char == '"':
+    for index, char in enumerate(text[:position]):
+        if char == "'":
+            before = text[index - 1] if index else ''
+            after = text[index + 1] if index + 1 < len(text) else ''
+            # Contractions/possessives are not quotation boundaries. A closing
+            # quote is still honoured when its matching quote is already open.
+            if before.isascii() and before.isalpha() and after.isascii() and after.isalpha():
+                continue
+            if stack and stack[-1] == "'":
+                stack.pop()
+            elif before.isascii() and before.isalpha():
+                continue
+            else:
+                stack.append("'")
+        elif char == '"':
             if stack and stack[-1] == '"':
                 stack.pop()
             else:
