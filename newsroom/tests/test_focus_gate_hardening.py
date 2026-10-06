@@ -983,11 +983,12 @@ _BODY_CONTRACT_TESTS = (
 )
 
 
-def _body_contract_repo(tmp_path):
+def _body_contract_repo(tmp_path, source_override=None):
     """Real Git identities; actual consumer source is parsed, never executed."""
     subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
     root = Path(__file__).parents[2]
     sources = {path: (root / path).read_text() for path in _BODY_CONTRACT_SOURCES}
+    sources.update(source_override or {})
     for path, source in sources.items():
         _write(tmp_path, path, source)
     for name in _BODY_CONTRACT_TESTS:
@@ -1026,8 +1027,27 @@ def test_closed_source_name_date_bodies_use_direct_contract_without_service(tmp_
     assert 'explicit_source_name_date_body_contract:F2' in route['reasons']
 
 
+def test_actual_natural_copy_date_fix_keeps_existing_data_callee_contract(tmp_path):
+    root = Path(__file__).parents[2]
+    path = _BODY_CONTRACT_SOURCES[1]
+    before = subprocess.run(('git', 'show', '30d663e3b9971cf668ddb3aacf5c2a84e0a752e9:' + path),
+                            cwd=root, capture_output=True, text=True, check=True).stdout
+    after = subprocess.run(('git', 'show', 'b033de4b69c8bb28aff508068cfe954f94178f1a:' + path),
+                           cwd=root, capture_output=True, text=True, check=True).stdout
+    assert "and selected[0][1]['rendered_assertion'] == claim.rendered_assertion_zh_hant_hk" in before
+    assert "and selected[0][1]['rendered_assertion'] == claim.rendered_assertion_zh_hant_hk" not in after
+    _sources, base = _body_contract_repo(tmp_path, {path: before})
+    _write(tmp_path, path, after)
+    head = _commit(tmp_path, 'actual b033 natural-copy predicate removal')
+    route = selector.select_focus((path,), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_tests'] == sorted('newsroom/tests/' + name for name in _BODY_CONTRACT_TESTS)
+    assert route['selected_service_tests'] == [] and route['gates'] == ['F0', 'F1', 'F2']
+    assert 'explicit_source_name_date_body_contract:F2' in route['reasons']
+
+
 @pytest.mark.parametrize('kind', ['open', 'import', 'map', 'signature', 'callee', 'version',
-    'protected-path', 'helper', 'getattr', 'shadow', 'reference', 'other-test', 'control', 'deploy', 'missing-test'])
+    'protected-path', 'helper', 'getattr', 'shadow', 'reference', 'other-test', 'control', 'deploy',
+    'missing-test', 'reflected-field', 'dunder-key', 'existing-reference-call'])
 def test_unproved_source_name_date_delta_keeps_normal_service_discovery(tmp_path, kind):
     sources, base = _body_contract_repo(tmp_path)
     names, _dates = _BODY_CONTRACT_SOURCES
@@ -1049,6 +1069,12 @@ def test_unproved_source_name_date_delta_keeps_normal_service_discovery(tmp_path
         source += '\ndef new_helper():\n    return True\n'
     elif kind == 'getattr':
         source = source.replace(marker, marker + "    getattr(text, '__class__')\n")
+    elif kind == 'reflected-field':
+        source = source.replace("getattr(claim, 'attribution', None)", "getattr(claim, '__class__', None)")
+    elif kind == 'dunder-key':
+        source = source.replace(marker, marker + "    text['__dict__']\n")
+    elif kind == 'existing-reference-call':
+        source = source.replace(marker, marker + '    text()\n')
     elif kind == 'shadow':
         source = source.replace(marker, marker + '    bounded_named_entities = text\n')
     elif kind == 'reference':

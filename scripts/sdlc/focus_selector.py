@@ -256,7 +256,22 @@ def _closed_existing_function_bodies(modules) -> bool:
         return False
     references = (ast.Call, ast.Name, ast.Attribute, ast.Import, ast.ImportFrom,
                   ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom, ast.Await)
-    footprint = lambda node: {ast.dump(item) for item in ast.walk(node) if isinstance(item, references)}
+    def footprint(node):
+        result = set()
+        for item in ast.walk(node):
+            if isinstance(item, ast.Call):
+                # Argument predicates may change under the same inspected data
+                # callee. Reflected attribute arguments are not data-only proof.
+                reflected = isinstance(item.func, ast.Name) and item.func.id in {
+                    "getattr", "setattr", "delattr", "hasattr",
+                }
+                result.add("CALL:" + ast.dump(item if reflected else item.func))
+            elif isinstance(item, references) or (
+                isinstance(item, ast.Constant) and isinstance(item.value, str)
+                and item.value.startswith("__") and item.value.endswith("__")
+            ):
+                result.add(ast.dump(item))
+        return result
     for name in changed:
         left, right = previous[name], current[name]
         if footprint(right) - footprint(left):
