@@ -1117,3 +1117,93 @@ def test_hko_publisher_fence_uses_canonical_latest_not_latest_story(case):
         module._require_hko_current_source(package,current,**arguments)
     if case=='other-issuer': assert calls==[]
     assert len(calls)<=2
+
+
+@pytest.mark.parametrize('outcome', ('complete', 'source-hold', 'owner-stop'))
+@pytest.mark.parametrize('diagnostic_failure', (False, True))
+def test_source_binding_cost_diagnostic_preserves_one_call_result_or_failure(
+    monkeypatch, outcome, diagnostic_failure,
+):
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    from newsroom.control_plane.veto import VetoError
+
+    revision_id = '00000000-0000-4000-8000-000000000611'
+    units, observations = (object(),), object()
+    selected_sources, selected_objects = object(), object()
+    licence, proof = object(), object()
+    result = (object(), object())
+    failure = (NativeEvidenceHold('SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE', 'UK-01')
+               if outcome == 'source-hold' else VetoError('signed owner stop'))
+    loaded, calls, diagnostics = [], [], []
+
+    class SelectedUnits:
+        def __getitem__(self, selected):
+            loaded.append(selected)
+            return units
+
+    def bind_sources(**request):
+        calls.append(request)
+        if outcome != 'complete':
+            raise failure
+        return result
+
+    def emit(event, data):
+        diagnostics.append((event, data))
+        if diagnostic_failure:
+            raise OSError('optional diagnostic storage unavailable')
+
+    monkeypatch.setattr(native_composition, 'emit_diagnostic', emit, raising=False)
+    wall, cpu = iter((1_000_000, 4_500_000)), iter((2_000_000, 3_250_000))
+    monkeypatch.setattr(native_composition, 'perf_counter_ns', lambda: next(wall), raising=False)
+    monkeypatch.setattr(native_composition, 'process_time_ns', lambda: next(cpu), raising=False)
+    publication = _publication_caller_without_bootstrap(
+        journal=SimpleNamespace(units=SelectedUnits(), observations=observations),
+        runtime=SimpleNamespace(authority=SimpleNamespace(sources=selected_sources, objects=selected_objects)),
+        licence=licence, proof=proof, native_evidence_sources=bind_sources,
+    )
+    if outcome == 'complete':
+        assert publication.sources_for(revision_id) is result
+    else:
+        with pytest.raises(type(failure)) as raised:
+            publication.sources_for(revision_id)
+        assert raised.value is failure
+    assert loaded == [revision_id]
+    assert calls == [dict(units=units, sources=selected_sources, objects=selected_objects,
+                          licence=licence, proof=proof, observations=observations)]
+    assert diagnostics == [('native_source_binding_cost', {
+        'revision_id': revision_id, 'wall_ms': 3.5, 'cpu_ms': 1.25,
+        'status': 'COMPLETE' if outcome == 'complete' else 'HOLD' if outcome == 'source-hold' else 'FAILED',
+        'failure_class': None if outcome == 'complete' else type(failure).__name__,
+        'source_count': 2 if outcome == 'complete' else None,
+    })]
+
+
+@pytest.mark.parametrize('clock', ('perf_counter_ns', 'process_time_ns'))
+@pytest.mark.parametrize('source_hold', (False, True))
+def test_source_binding_cost_clock_failure_preserves_source_boundary(monkeypatch, clock, source_hold):
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+
+    result, calls = (object(),), []
+    failure = NativeEvidenceHold('SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE', 'UK-01')
+    def bind_sources(**request):
+        calls.append(request)
+        if source_hold:
+            raise failure
+        return result
+    def unavailable():
+        raise OSError('optional diagnostic clock unavailable')
+    monkeypatch.setattr(native_composition, clock, unavailable)
+    monkeypatch.setattr(native_composition, 'emit_diagnostic',
+        lambda *_: pytest.fail('no diagnostic is emitted without an initial clock sample'))
+    publication = _publication_caller_without_bootstrap(
+        journal=SimpleNamespace(units={'selected': (object(),)}, observations=object()),
+        runtime=SimpleNamespace(authority=SimpleNamespace(sources=object(), objects=object())),
+        licence=object(), proof=object(), native_evidence_sources=bind_sources,
+    )
+    if source_hold:
+        with pytest.raises(NativeEvidenceHold) as raised:
+            publication.sources_for('selected')
+        assert raised.value is failure
+    else:
+        assert publication.sources_for('selected') is result
+    assert len(calls) == 1
