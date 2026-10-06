@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from dataclasses import replace
 
 import pytest
 
@@ -12,6 +13,7 @@ from newsroom.control_plane.native_evidence import (
     NativeEvidenceHold,
     NativeEvidenceSource,
     PublicationRightsAssessment,
+    AcquiredEvidence,
 )
 from newsroom.control_plane.graphiti_operational_readiness import _source_requests
 from newsroom.control_plane.native_progress import NativeRevisionJournal
@@ -20,6 +22,7 @@ from newsroom.control_plane.native_assessor import (
     RetainedAssessorPreDispatchFailure,
 )
 from newsroom.control_plane.native_publication import NativePublicationContinuation
+from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from newsroom.control_plane.store import connect
 from newsroom.increment10.editorial import (
     EditorialPolicyDecision,
@@ -1650,8 +1653,11 @@ def test_separate_semantic_continuation_retains_original_interruption_and_never_
         assert retained['origin_invocation_id'] == 'original-invocation'
         assert retained['origin_journal']['assessment_started_at'] == old['assessment_started_at']
         changed = scenario == 'changed-input' and bool(calls)
-        request['before_semantic_assessment'](SimpleNamespace(digest=_DIGEST),
-            (SimpleNamespace(receipt_digest=digest_bytes(b'changed' if changed else b'original'), body_digest=_DIGEST),))
+        acquired = _meaning_acquisition(unit)
+        if changed:
+            acquired = replace(acquired, body=b'Changed official source.', body_digest=digest_bytes(b'Changed official source.'),
+                receipt_digest=digest_canonical({**json.loads(acquired.receipt_bytes), 'body_digest':digest_bytes(b'Changed official source.')}))
+        request['before_semantic_assessment'](SimpleNamespace(digest=_DIGEST), (acquired,))
         request['before_assessment']()
         calls.append(request)
         if scenario in {'changed-input','same-input'}:
@@ -1807,8 +1813,7 @@ def test_reported_validation_origin_survives_allocation_denial_and_uses_distinct
         assert intent['origin_result_digest'] == _DIGEST and intent['origin_result_receipt_digest'] == _DIGEST
         assert intent['origin_journal']['assessment_superseded'] == original['assessment_superseded']
         calls.append(request)
-        request['before_semantic_assessment'](SimpleNamespace(digest=_DIGEST),
-            (SimpleNamespace(receipt_digest=_DIGEST, body_digest=_DIGEST),))
+        request['before_semantic_assessment'](SimpleNamespace(digest=_DIGEST), (_meaning_acquisition(unit),))
         raise NativeEvidenceHold('CURRENT_RIGHTS_HOLD' if scenario == 'source-hold' else 'NO_QUALIFYING_NEW_INFORMATION', unit.source_id)
     monkeypatch.setattr(NativeEvidenceController, 'acquire_and_retain', acquire)
     runtime = SimpleNamespace(authority=_Authority(), ingress=object(), publication=_Publication(),
@@ -2022,3 +2027,118 @@ def test_old_valueerror_is_reclassified_only_by_current_authenticated_existing_w
             assert (len(qa),len(jev),len(render))==counts
             with sqlite3.connect(usage.path)as db:assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
         finally:connection.close()
+
+
+def _meaning_acquisition(unit, *, refreshed=False, **changes):
+    values = dict(request_digest=_DIGEST, outcome='COMPLETE',
+        canonical_url=unit.canonical_url, body=b'Exact official source.', body_digest=digest_bytes(b'Exact official source.'),
+        publisher='Official Department', responsible_body='Official Department', source_type='PRIMARY_OFFICIAL',
+        publication_time='2026-09-08T10:00:00Z', source_updated_time='2026-09-08T11:00:00Z',
+        retrieval_time='2026-09-08T14:00:00Z' if refreshed else '2026-09-08T12:00:00Z',
+        geography='UK', language='en', transport_evidence_digest=digest_bytes(b'fresh' if refreshed else b'first'),
+        rights_eligibility_digest=digest_bytes(b'fresh-rights' if refreshed else b'first-rights'),
+        currentness_basis='AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT', text_only=True)
+    values.update(changes)
+    return AcquiredEvidence.create(**values)
+
+
+@pytest.mark.parametrize('legacy', (False, True))
+def test_future_semantic_input_is_stable_across_fresh_receipts_without_recovering_legacy(tmp_path, monkeypatch, legacy):
+    from datetime import UTC, datetime
+    from newsroom.control_plane.native_assessor import RetainedAssessorResult
+    unit = _native(); source = _source(unit); acquired = [_meaning_acquisition(unit)]
+    connection = connect(str(tmp_path / 'meaning.sqlite3')); journal = NativeRevisionJournal(connection); journal.land((unit,))
+    old = {'candidate_id':'candidate', 'candidate_version_id':'candidate-version','graphiti_receipts':[{}],
+        'intake_receipt_id':'original-intake','assessment_contract_version':'newsroom.native-evidence-assessor.v23+consumer.v1',
+        'reason':'ACQUISITION_RESULT_NOT_RETAINED','failure_class':'CliTimeoutError','assessment_started_at':'old-start'}
+    origin = RetainedAssessorResult(RetainedAssessorContractFailure('old-envelope','old-invocation',_DIGEST,_DIGEST,_DIGEST),
+        'newsroom.native-evidence-assessor.v23',_DIGEST,'ASSESSOR_PROVIDER_FAILED',datetime(2026,9,8,tzinfo=UTC),None)
+    intent = {'contract':'newsroom.native-assessor-judgments.v1','candidate_version_id':'candidate-version',
+        'origin_envelope_id':origin.proof.envelope_id,'origin_invocation_id':origin.proof.invocation_id,
+        'origin_allocation_digest':_DIGEST,'origin_terminal_digest':_DIGEST,'origin_context_manifest_digest':_DIGEST,
+        'origin_journal':dict(old)}
+    if legacy:
+        intent['input_digest'] = digest_canonical({'base_digest':_DIGEST,
+            'acquired':[(acquired[0].receipt_digest,acquired[0].body_digest)]})
+        old['semantic_assessment_intent'] = intent
+    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED',facts=old)
+    accepted = []
+    def acquire(_self, **request):
+        request['before_semantic_assessment'](SimpleNamespace(digest=_DIGEST),tuple(acquired))
+        accepted.append(acquired[0].receipt_digest)
+        request['before_assessment']()
+        raise RuntimeError('Existing semantic accounting remains unresolved; no provider in this fixture')
+    monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+    continuation = NativePublicationContinuation(journal=journal,
+        runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),proof=proof(),
+            policies=SimpleNamespace(publication=object())), evidence_controller=object.__new__(NativeEvidenceController),
+        sources={unit.revision_id:(source,)}, semantic_origin_failure=lambda _:origin,
+        semantic_intent_contract=intent['contract'], assessment_contract_version=old['assessment_contract_version'],
+        clock=lambda:UtcTimestamp.parse('2026-09-08T15:00:00Z'))
+    try:
+        if not legacy: continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+        acquired[0] = _meaning_acquisition(unit,refreshed=True)
+        result = continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+        retained = journal.current(unit.revision_id)['facts']['semantic_assessment_intent']
+        if legacy:
+            assert result.reason=='SEMANTIC_INTENT_INPUT_CHANGED_HOLD' and accepted==[]
+            assert retained['input_digest']==intent['input_digest'] and 'semantic_input_fingerprint_v2' not in retained
+        else:
+            assert len(accepted)==2 and accepted[0]!=accepted[1]
+            assert retained['semantic_input_fingerprint_v2']['version']=='newsroom.semantic-input-fingerprint.v2'
+            assert 'input_digest' not in retained
+        assert retained['origin_invocation_id']=='old-invocation'
+        if legacy: assert retained['origin_journal']==intent['origin_journal']
+        else: assert all(retained['origin_journal'][key]==old.get(key) for key in retained['origin_journal'])
+    finally:connection.close()
+
+
+@pytest.mark.parametrize('changed', ['body', 'request', 'revision', 'definition', 'publisher',
+    'publication', 'update', 'category', 'geography', 'permission', 'rights-policy', 'base'])
+def test_semantic_meaning_fingerprint_changes_for_true_source_or_permission_inputs(changed):
+    from newsroom.control_plane.native_publication import _semantic_input_fingerprint_v2
+    unit = _native(); source = _source(unit); base = SimpleNamespace(digest=_DIGEST)
+    acquired = _meaning_acquisition(unit)
+    before = _semantic_input_fingerprint_v2(base,(acquired,),(source,))
+    if changed == 'body': acquired = _meaning_acquisition(unit,body=b'Changed.',body_digest=digest_bytes(b'Changed.'))
+    elif changed == 'request': acquired = _meaning_acquisition(unit,request_digest=digest_bytes(b'changed request'))
+    elif changed == 'revision':
+        from newsroom.tests.test_graphiti_operational_readiness import _next_revision
+        source = replace(source,unit=_next_revision(unit))
+    elif changed == 'definition':
+        from newsroom.sources import SourceDefinitionVersionId
+        request = replace(source.source_version.request,version_id=SourceDefinitionVersionId.new())
+        source = replace(source,source_version=replace(source.source_version,request=request,canonical_digest=request.digest))
+    elif changed == 'publisher': acquired = _meaning_acquisition(unit,publisher='Different Department')
+    elif changed == 'publication': acquired = _meaning_acquisition(unit,publication_time='2026-09-09T10:00:00Z')
+    elif changed == 'update': acquired = _meaning_acquisition(unit,source_updated_time='2026-09-09T11:00:00Z')
+    elif changed == 'category': acquired = _meaning_acquisition(unit,source_type='SECONDARY_REPORT')
+    elif changed == 'geography': acquired = _meaning_acquisition(unit,geography='HK')
+    elif changed in {'permission','rights-policy'}:
+        rights = PublicationRightsAssessment.create(decision='HOLD' if changed=='permission' else 'PERMITTED',
+            permitted_use=source.rights.permitted_use,policy_digest=digest_bytes(b'changed policy') if changed=='rights-policy' else _DIGEST,
+            evidence_digest=_DIGEST)
+        source = replace(source,rights=rights)
+    else: base=SimpleNamespace(digest=digest_bytes(b'changed base'))
+    assert canonical_json_bytes(_semantic_input_fingerprint_v2(base,(acquired,),(source,)))!=canonical_json_bytes(before)
+
+
+def test_semantic_base_constructor_has_no_retrieval_or_rights_receipt_fields():
+    from newsroom.control_plane.evidence import EvidencePackage
+    unit=_native();first=_meaning_acquisition(unit);fresh=_meaning_acquisition(unit,refreshed=True)
+    def base(item):
+        return EvidencePackage(candidate_id='candidate',hypothesis_id='hypothesis',signal_ids=('signal',),
+            lead_ids=('lead',),source_ids=(unit.source_id,),observation_digests=(item.body_digest,),
+            passages=(item.body.decode(),))
+    assert first.receipt_digest!=fresh.receipt_digest and base(first).digest==base(fresh).digest
+
+
+def test_semantic_meaning_ignores_fresh_permission_evidence_identity_only():
+    from newsroom.control_plane.native_publication import _semantic_input_fingerprint_v2
+    source=_source(_native());base=SimpleNamespace(digest=_DIGEST)
+    refreshed=replace(source,rights=PublicationRightsAssessment.create(decision='PERMITTED',
+        permitted_use=source.rights.permitted_use,policy_digest=source.rights.policy_digest,
+        evidence_digest=digest_bytes(b'new authenticated observation')))
+    assert refreshed.rights.record_id!=source.rights.record_id
+    assert canonical_json_bytes(_semantic_input_fingerprint_v2(base,(_meaning_acquisition(source.unit),),(source,)))==canonical_json_bytes(
+        _semantic_input_fingerprint_v2(base,(_meaning_acquisition(source.unit,refreshed=True),),(refreshed,)))
