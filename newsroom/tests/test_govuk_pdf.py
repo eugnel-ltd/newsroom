@@ -438,3 +438,25 @@ def test_worker_input_is_exact_bounded_anonymous_file_and_always_closed(monkeypa
     else:
         assert len(module.parse_govuk_pdf(PARENT, parent_bytes(raw), ASSET, raw, retrieved_at=NOW).page_inventory) == 2
     assert len(captured) == 1 and captured[0].closed
+
+
+def test_optional_scope_metadata_preserves_legacy_pdf_bytes_and_tuple_replay():
+    from dataclasses import asdict, replace
+    from newsroom.authority.canonical import canonical_json_bytes, digest_canonical, digest_bytes
+    from newsroom.control_plane.govuk_evidence import GovUkAssetScopeExclusion
+    from newsroom.control_plane.govuk_pdf import GovUkPdfDocument, pdf_parse_binding, pdf_parse_receipt, read_pdf_parse_receipt
+    raw=pdf_bytes('Complete first page.')
+    binding=pdf_parse_binding(PARENT,parent_bytes(raw,1),ASSET,raw,retrieved_at=NOW,source_version='fixture')
+    declared=binding['declaration'];text='Complete first page.'
+    document=GovUkPdfDocument('pdf',declared['title'],'Attachment: '+ASSET+'\nPage 1\n'+text,
+        datetime.fromisoformat(declared['publication']),datetime.fromisoformat(declared['updated']),tuple(declared['organisations']),(),
+        digest_bytes(raw),({'page':1,'glyphs':len(text),'text_digest':digest_bytes(text.encode()),'decorative_images':0},),binding['parser_version'])
+    old=asdict(document);old.pop('scope_excluded_assets')
+    for key in ['publication','updated']:old[key]=old[key].isoformat()
+    value={'binding':binding,'outcome':'COMPLETE','document':old}
+    expected=canonical_json_bytes({**value,'receipt_digest':digest_canonical(value)})
+    assert pdf_parse_receipt(binding,document)==expected
+    assert read_pdf_parse_receipt(expected,binding)==document
+    excluded=GovUkAssetScopeExclusion('https://assets.publishing.service.gov.uk/media/example/picture.jpg','image/jpeg',digest_bytes(b'root'),('body',))
+    changed=replace(document,scope_excluded_assets=(excluded,))
+    assert read_pdf_parse_receipt(pdf_parse_receipt(binding,changed),binding)==changed

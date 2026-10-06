@@ -32,6 +32,40 @@ def _pair_digest(facts: dict) -> str | None:
     return digest_bytes(canonical_json_bytes({key: facts[key] for key in _RETRIEVAL_FIELDS}))
 
 
+def _require_scope_exclusion_records(source):
+    """Closed optional CURRENT metadata, bound to this Source's observed root."""
+    from urllib.parse import urlsplit
+    from .govuk_evidence import _safe_attachment_location
+    records = source.get('scope_excluded_assets')
+    if type(records) is not list or not records:
+        raise ValueError('source scope exclusion inventory differs')
+    fields = {'asset_url','mime','raw_root_digest','definition_scope','policy_version','disposition'}
+    text_fields = {'body','canonical_url','headline','published_at','updated_at'}
+    roots = {row[1] for row in source.get('observations', ())
+             if len(row) == 4 and type(row[0]) is str
+             and row[0].startswith('https://www.gov.uk/api/content/')}
+    identities = set()
+    for record in records:
+        if type(record) is not dict or set(record) != fields:
+            raise ValueError('source scope exclusion fields differ')
+        url, mime, scope, root = (record[key] for key in ('asset_url','mime','definition_scope','raw_root_digest'))
+        extensions = {'image/jpeg':('.jpg','.jpeg'),'image/png':('.png',)}.get(mime, ()) if type(mime) is str else ()
+        if (type(source.get('source_id')) is not str or not source['source_id']
+                or type(url) is not str or not _safe_attachment_location(url)
+                or urlsplit(url).netloc != 'assets.publishing.service.gov.uk'
+                or not urlsplit(url).path.lower().endswith(extensions)
+                or type(root) is not str or root not in roots
+                or type(scope) is not list or not scope or any(type(value) is not str for value in scope)
+                or len(scope) != len(set(scope)) or 'body' not in scope or not set(scope) <= text_fields
+                or record['policy_version'] != 'newsroom.govuk-text-body-image-scope.v1'
+                or record['disposition'] != 'SOURCE_SCOPE_EXCLUDED'
+                or (root,url) in identities):
+            raise ValueError('source scope exclusion binding differs')
+        from newsroom.authority.canonical import validate_sha256_digest
+        validate_sha256_digest(root)
+        identities.add((root,url))
+
+
 def _state_digest(stage: str, facts: dict, pair_digest: str | None) -> str:
     # The verified pair digest avoids re-serialising large referenced values on
     # replay. Keep every other fact inline, including embedding evidence.
@@ -394,6 +428,8 @@ class NativeRevisionJournal:
         elif kind == PORTFOLIO:
             self.portfolio = tuple(value["sources"])
             for source in self.portfolio:
+                if 'scope_excluded_assets' in source:
+                    _require_scope_exclusion_records(source)
                 for raw in source.get("observations", ()):
                     observation = tuple(raw)
                     if len(observation) != 4 or any(type(item) is not str or not item for item in observation):
@@ -604,13 +640,24 @@ class NativeRevisionJournal:
         return logical
 
     def sources(self, dispositions: tuple) -> None:
-        values = tuple({
+        from .govuk_evidence import GovUkAssetScopeExclusion
+        values = []
+        for item in dispositions:
+            value = {
             "source_id": item.source_id, "status": item.status,
             "reason_code": item.reason_code,
             "revision_ids": sorted({unit.revision_id for unit in item.units}),
             "observations": [list(value) for value in getattr(item, "observations", ())],
             "item_holds": [list(value) for value in getattr(item, "item_holds", ())],
-        } for item in dispositions)
+            }
+            excluded = getattr(item, 'scope_excluded_assets', ())
+            if type(excluded) is not tuple or any(type(row) is not GovUkAssetScopeExclusion for row in excluded):
+                raise ValueError('source scope exclusion values differ')
+            if excluded:
+                value['scope_excluded_assets'] = json.loads(canonical_json_bytes([asdict(row) for row in excluded]))
+                _require_scope_exclusion_records(value)
+            values.append(value)
+        values = tuple(values)
         if self._portfolio_record is None or values != self.portfolio:
             self._retain(PORTFOLIO, {"sources": list(values)})
 

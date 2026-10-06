@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from contextlib import AbstractContextManager
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from urllib.parse import unquote, urlsplit
 
@@ -49,6 +49,16 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 @dataclass(frozen=True, slots=True)
+class GovUkAssetScopeExclusion:
+    asset_url: str
+    mime: str
+    raw_root_digest: str
+    definition_scope: tuple[str, ...]
+    policy_version: str = "newsroom.govuk-text-body-image-scope.v1"
+    disposition: str = "SOURCE_SCOPE_EXCLUDED"
+
+
+@dataclass(frozen=True, slots=True)
 class GovUkContentDocument:
     document_type: str
     title: str
@@ -57,6 +67,7 @@ class GovUkContentDocument:
     updated: datetime
     organisations: tuple[str, ...]
     exclusion_signals: tuple[str, ...]
+    scope_excluded_assets: tuple[GovUkAssetScopeExclusion, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +89,7 @@ class GovUkContentHold(ValueError):
         child_items: tuple[tuple[str, str], ...] = (),
         unsupported_attachments: tuple[tuple[str, str], ...] = (),
         exclusion_signals: tuple[str, ...] = (),
+        scope_excluded_assets: tuple[GovUkAssetScopeExclusion, ...] = (),
     ) -> None:
         self.reason_code = reason_code
         self.child_items = child_items
@@ -90,6 +102,7 @@ class GovUkContentHold(ValueError):
         )
         self.historical_coverage_status = "UNASSESSED" if self.archival_references else None
         self.exclusion_signals = exclusion_signals
+        self.scope_excluded_assets = scope_excluded_assets
         super().__init__(reason_code)
 
 
@@ -191,7 +204,8 @@ class GovUkEvidenceAcquisition:
             raise hold("GOVUK_ACQUISITION_INCOMPLETE")
         try:
             document = parse_govuk_content_document(
-                request.canonical_url, raw, retrieved_at=retrieved
+                request.canonical_url, raw, retrieved_at=retrieved,
+                extraction_scope=getattr(version.request, "extraction_scope", ()),
             )
             body = (document.title + "\n\n" + document.body_text).encode("utf-8")
         except (ValueError, TypeError, KeyError, UnicodeError, etree.ParserError):
@@ -202,6 +216,8 @@ class GovUkEvidenceAcquisition:
             "content_type": content_type, "response_digest": digest_bytes(raw),
             "extracted_body_digest": digest_bytes(body),
             "public_updated_at": _utc(document.updated), "retrieved_at": _utc(retrieved),
+            **({"scope_excluded_assets": [asdict(item) for item in document.scope_excluded_assets]}
+               if document.scope_excluded_assets else {}),
         })
         # These are observed acquisition facts, not six invented semantic PASS
         # decisions. Editorial claim checks still decide what may be rewritten.
@@ -247,7 +263,8 @@ def _unique_object(pairs):
 
 
 def parse_govuk_content_document(
-    canonical_url: str, raw: bytes, *, retrieved_at: datetime
+    canonical_url: str, raw: bytes, *, retrieved_at: datetime,
+    extraction_scope: tuple[str, ...] = (),
 ) -> GovUkContentDocument:
     """Validate and extract one complete current GOV.UK Content API document."""
 
@@ -269,6 +286,7 @@ def parse_govuk_content_document(
         raise ValueError("source title is absent")
     names = _organisation_names(value)
     document_type = value["document_type"]
+    excluded = ()
     if document_type in {
         "news_story", "press_release", "guidance", "detailed_guide",
         "html_publication", "notice", "policy_paper", "written_statement",
@@ -278,12 +296,17 @@ def parse_govuk_content_document(
         body_text = _document_text(value)
         if value.get("details", {}).get("attachments") or value.get("links", {}).get("children"):
             children, unsupported = _require_attachment_inventory(value)
-            raise GovUkContentHold(
-                "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE",
-                child_items=children,
-                unsupported_attachments=unsupported,
-                exclusion_signals=_exclusion_signals(value, body_text),
-            )
+            excluded = _text_body_image_exclusions(value, raw, extraction_scope)
+            excluded_urls = {item.asset_url for item in excluded}
+            unsupported = tuple(item for item in unsupported if item[0] not in excluded_urls)
+            if children or unsupported:
+                raise GovUkContentHold(
+                    "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE",
+                    child_items=children,
+                    unsupported_attachments=unsupported,
+                    exclusion_signals=_exclusion_signals(value, body_text),
+                    scope_excluded_assets=excluded,
+                )
     elif document_type == "official_statistics_announcement":
         _require_future_statistics_announcement(value, retrieved_at=retrieved_at)
         raise GovUkContentHold("SOURCE_ITEM_NOT_YET_PUBLISHED")
@@ -369,7 +392,50 @@ def parse_govuk_content_document(
     return GovUkContentDocument(
         document_type, title.strip(), body_text, publication, updated, names,
         _exclusion_signals(value, body_text),
+        scope_excluded_assets=excluded,
     )
+
+
+def _text_body_image_exclusions(value, raw, extraction_scope):
+    """Scope metadata only: no claim about unseen image contents or extraction."""
+    text_fields = {"body", "canonical_url", "headline", "published_at", "updated_at"}
+    if (type(extraction_scope) is not tuple or not extraction_scope
+            or any(type(field) is not str for field in extraction_scope)
+            or "body" not in extraction_scope or not set(extraction_scope) <= text_fields):
+        return ()
+    details = value["details"]
+    fragment = details.get("body")
+    if type(fragment) is not str:
+        return ()
+    document = html.fragment_fromstring(fragment, create_parent="div")
+    references = "\n".join(unquote(text) for text in (
+        fragment, document.text_content(), *document.xpath(".//@href | .//@src | .//@data-src"),
+    )).casefold()
+    # A meaningful visual/data relationship requires evidence, not a format bypass.
+    if (document.xpath(".//figure | .//figcaption | .//table | .//img")
+            or re.search(r"\b(?:diagram|figure|image data|chart|table)\b", document.text_content(), re.I)
+            or any(details.get(key) for key in ("figures", "diagrams", "charts", "tables"))):
+        return ()
+    images = details.get("images", [])
+    if (type(images) is not list or any(type(image) is not dict
+            or image.get("type") not in (None, "lead")
+            or any(image.get(key) not in (None, "") for key in ("caption", "description", "alt_text")) for image in images)):
+        return ()
+    result = []
+    for entry in details.get("attachments", []):
+        url, mime, filename = entry.get("url"), entry.get("content_type"), entry.get("filename")
+        extensions = {"image/jpeg": {".jpg", ".jpeg"}, "image/png": {".png"}}.get(mime, set())
+        if (entry.get("attachment_type") != "file" or type(url) is not str
+                or not _safe_attachment_location(url) or urlsplit(url).netloc != "assets.publishing.service.gov.uk"
+                or type(filename) is not str or not filename
+                or unquote(urlsplit(url).path).rsplit("/", 1)[-1] != filename
+                or not any(filename.lower().endswith(extension) for extension in extensions)
+                or any(entry.get(key) not in (None, "") for key in ("caption", "description", "alt_text"))
+                or any(entry.get(key) for key in ("role", "type", "data_table", "diagram", "figure"))
+                or unquote(url).casefold() in references or filename.casefold() in references):
+            continue
+        result.append(GovUkAssetScopeExclusion(url, mime, digest_bytes(raw), extraction_scope))
+    return tuple(result)
 
 
 def _require_future_statistics_announcement(

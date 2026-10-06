@@ -1017,3 +1017,74 @@ def test_retrieval_rights_headers_validate_current_bytes_without_full_unit_recon
             with pytest.raises(FrozenInstanceError): headers[0].authority.definition_id = 'other'
     finally:
         connection.close()
+
+
+def _scoped_digital_age_disposition():
+    from pathlib import Path
+    from datetime import UTC,datetime
+    from newsroom.control_plane.govuk_evidence import parse_govuk_content_document,_api_url
+    from newsroom.control_plane.native_source_intake import NativeSourceDisposition
+    from newsroom.authority.canonical import digest_bytes
+    raw=(Path(__file__).parent/'fixtures/govuk/digital-age-0be.json').read_bytes()
+    url='https://www.gov.uk/government/news/new-rules-pave-the-way-for-businesses-to-adopt-digital-proof-of-age-for-alcohol-sales'
+    document=parse_govuk_content_document(url,raw,retrieved_at=datetime(2026,10,6,tzinfo=UTC),
+        extraction_scope=('body','canonical_url','headline','published_at','updated_at'))
+    observation=(_api_url(url),digest_bytes(raw),'admission','access')
+    return NativeSourceDisposition('UK-01','READY','GOVERNED_REVISIONS_RETAINED',observations=(observation,),
+        scope_excluded_assets=document.scope_excluded_assets)
+
+
+def test_current_portfolio_preserves_exact_text_scope_exclusions_without_repeat_writes(tmp_path):
+    from dataclasses import replace
+    path=str(tmp_path/'scope-portfolio.sqlite3');connection=connect(path);journal=NativeRevisionJournal(connection)
+    disposition=_scoped_digital_age_disposition();journal.sources((disposition,));reference=journal.portfolio_reference(journal.portfolio)
+    record=journal.portfolio[0]['scope_excluded_assets'][0]
+    assert record['disposition']=='SOURCE_SCOPE_EXCLUDED'and record['mime']=='image/jpeg'
+    assert record['raw_root_digest']=='sha256:72e9e48805c3140acde256535c45f80500bc1db6ed937e625f60722094a6e52c'
+    assert record['definition_scope']==['body','canonical_url','headline','published_at','updated_at']
+    rows=connection.execute('SELECT COUNT(*)FROM ledger').fetchone()[0]
+    journal.sources((disposition,));assert connection.execute('SELECT COUNT(*)FROM ledger').fetchone()[0]==rows
+    connection.close();connection=connect(path)
+    try:
+        reopened=NativeRevisionJournal(connection)
+        assert reopened.portfolio[0]['scope_excluded_assets'][0]==record
+        assert reopened.portfolio_reference(reopened.portfolio)==reference
+        changed=replace(disposition,scope_excluded_assets=(replace(disposition.scope_excluded_assets[0],asset_url=disposition.scope_excluded_assets[0].asset_url.replace('Digital-Proof-of-Age-Image.jpg','another.jpg')),))
+        reopened.sources((changed,));assert reopened.portfolio_reference(reopened.portfolio)['payload_digest']!=reference['payload_digest']
+        reopened.sources((replace(disposition,scope_excluded_assets=()),))
+        assert 'scope_excluded_assets'not in reopened.portfolio[0]
+    finally:connection.close()
+
+
+@pytest.mark.parametrize('fault',['root','mime','scope','policy','host','dict'])
+def test_current_scope_exclusion_projection_rejects_unbound_metadata(tmp_path,fault):
+    from dataclasses import asdict,replace
+    disposition=_scoped_digital_age_disposition();record=disposition.scope_excluded_assets[0]
+    if fault=='root':record=replace(record,raw_root_digest='sha256:'+'f'*64)
+    elif fault=='mime':record=replace(record,mime='application/pdf')
+    elif fault=='scope':record=replace(record,definition_scope=('all_assets',))
+    elif fault=='policy':record=replace(record,policy_version='unapproved')
+    elif fault=='host':record=replace(record,asset_url='https://example.invalid/picture.jpg')
+    else:record=asdict(record)
+    c=connect(str(tmp_path/'invalid-scope.sqlite3'))
+    try:
+        journal=NativeRevisionJournal(c)
+        with pytest.raises(ValueError,match='scope exclusion'):
+            journal.sources((replace(disposition,scope_excluded_assets=(record,)),))
+        assert c.execute('SELECT COUNT(*)FROM ledger').fetchone()[0]==0
+    finally:c.close()
+
+
+def test_empty_scope_exclusion_keeps_original_current_portfolio_bytes(tmp_path):
+    from newsroom.control_plane.native_source_intake import NativeSourceDisposition
+    from newsroom.authority.canonical import canonical_json_bytes,digest_bytes
+    c=connect(str(tmp_path/'empty-scope.sqlite3'))
+    try:
+        journal=NativeRevisionJournal(c);journal.sources((NativeSourceDisposition('UK-01','READY','UNCHANGED'),))
+        expected={'sources':[{'source_id':'UK-01','status':'READY','reason_code':'UNCHANGED','revision_ids':[],
+            'observations':[],'item_holds':[]}]}
+        raw,digest=c.execute('SELECT portfolio_json,portfolio_digest FROM native_current_portfolio WHERE singleton=1').fetchone()
+        assert raw==canonical_json_bytes(expected).decode()
+        assert digest==digest_bytes(canonical_json_bytes(expected))
+        assert 'scope_excluded_assets'not in raw
+    finally:c.close()
