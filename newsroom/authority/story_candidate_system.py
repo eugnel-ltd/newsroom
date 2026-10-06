@@ -1119,7 +1119,7 @@ class _CandidateStore(_EventAuthorityStore):
         return candidate, snapshot.subject
 
     def _exact_current_receipt(self, candidate_id: str):
-        verified = self._verify_local()
+        verified = self._verify_local(candidate_ids=frozenset({candidate_id}))
         row = self._connection.execute(
             "SELECT current_admission_digest FROM "
             "story_candidate_heads WHERE candidate_id=?",
