@@ -1217,6 +1217,178 @@ def test_manual_network_fetches_are_bounded_parallel_and_writes_stay_serial(tmp_
         ]
 
 
+def _feed_items(count):
+    entry = ATOM.split(b'<entry>', 1)[1].split(b'</entry>', 1)[0]
+    return (b'<feed xmlns="http://www.w3.org/2005/Atom">' + b''.join(
+        b'<entry>' + entry.replace(b'item-1', f'item-{index}'.encode()) + b'</entry>'
+        for index in range(1, count + 1)
+    ) + b'</feed>')
+
+
+@pytest.mark.parametrize('failed_item', (None, 2))
+def test_feed_fetches_overlap_in_bounded_batches_and_settle_in_order(tmp_path, monkeypatch, failed_item):
+    import threading
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    owner = threading.get_ident()
+    barriers = (threading.Barrier(4), threading.Barrier(2))
+    completed = [threading.Event() for _ in range(6)]
+    lock = threading.Lock()
+    active, peaks, worker_ids, completion_order = [], [], set(), []
+    fenced, settled, admitted = [], [], []
+
+    @contextmanager
+    def fence(source_id, url):
+        assert source_id == 'UK-01' and threading.get_ident() == owner
+        if url.endswith(('item-5', 'item-6')):
+            assert settled == [index for index in range(1, 5) if index != failed_item]
+        fenced.append(url)
+        try:
+            yield
+        finally:
+            fenced.pop()
+
+    def fetch(url):
+        if url == SOURCE_URLS['UK-01']:
+            assert threading.get_ident() == owner
+            return 200, _feed_items(6)
+        index = int(url.rsplit('-', 1)[1]) - 1
+        assert len(fenced) == (4 if index < 4 else 2)
+        with lock:
+            active.append(index)
+            peaks.append(len(active))
+            worker_ids.add(threading.get_ident())
+        barriers[index // 4].wait(timeout=2)
+        if index not in (3, 5):
+            assert completed[index + 1].wait(timeout=2)
+        with lock:
+            completion_order.append(index + 1)
+            active.remove(index)
+        completed[index].set()
+        return (503, b'') if index + 1 == failed_item else (
+            200, _document(path=f'/item-{index + 1}', body=f'Complete item {index + 1}.')
+        )
+
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-01': _seed_uk01(runtime)},
+            licence=_licence(), dispatch_fence=fence, fetch=fetch,
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC),
+        )
+        original_retain, original_admit = intake._retain_item, intake._admit_observation
+        def retain(*a, **kw):
+            assert threading.get_ident() == owner and not fenced
+            settled.append(int(a[4].canonical_url.rsplit('-', 1)[1]))
+            return original_retain(*a, **kw)
+        def admit(*a, **kw):
+            assert threading.get_ident() == owner and not fenced
+            admitted.append(kw['url'])
+            return original_admit(*a, **kw)
+        monkeypatch.setattr(intake, '_retain_item', retain)
+        monkeypatch.setattr(intake, '_admit_observation', admit)
+        dispositions = intake.poll()
+        assert tuple(value.source_id for value in dispositions) == SOURCE_IDS
+        result = dispositions[0]
+        expected = [index for index in range(1, 7) if index != failed_item]
+        assert max(peaks) == 4 and owner not in worker_ids
+        assert completion_order == [4, 3, 2, 1, 6, 5]
+        assert settled == expected
+        assert [unit.canonical_url for unit in result.units] == [
+            f'https://www.gov.uk/item-{index}' for index in expected
+        ]
+        assert admitted == [SOURCE_URLS['UK-01']] + [
+            f'https://www.gov.uk/api/content/item-{index}' for index in expected
+        ]
+        assert [observation[0] for observation in result.observations] == admitted
+        assert result.status == ('READY' if failed_item is None else 'HOLD')
+        assert result.item_holds == (() if failed_item is None else ((
+            'https://www.gov.uk/item-2', 'SOURCE_ITEM_FETCH_INCOMPLETE',
+        ),))
+        assert not active and not fenced
+
+
+@pytest.mark.parametrize('stop_item', (2, 5))
+def test_feed_stop_before_batch_submission_prevents_later_fetches(tmp_path, monkeypatch, stop_item):
+    import threading
+    from newsroom.control_plane.veto import VetoError
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    owner, fetched, retained = threading.get_ident(), [], []
+    @contextmanager
+    def fence(source_id, url):
+        assert source_id == 'UK-01' and threading.get_ident() == owner
+        if url.endswith(f'item-{stop_item}'):
+            assert retained == ([] if stop_item == 2 else [1, 2, 3, 4])
+            raise VetoError('owner stop before batch submission')
+        yield
+    def fetch(url):
+        fetched.append(url)
+        if url == SOURCE_URLS['UK-01']:
+            return 200, _feed_items(6)
+        return 200, _document(path='/item-' + url.rsplit('-', 1)[1])
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-01': _seed_uk01(runtime)},
+            licence=_licence(), dispatch_fence=fence, fetch=fetch,
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC),
+        )
+        original = intake._retain_item
+        def retain(*a, **kw):
+            retained.append(int(a[4].canonical_url.rsplit('-', 1)[1]))
+            return original(*a, **kw)
+        monkeypatch.setattr(intake, '_retain_item', retain)
+        with pytest.raises(VetoError, match='before batch submission'):
+            intake.poll()
+    assert sorted(fetched[1:]) == ([] if stop_item == 2 else [
+        f'https://www.gov.uk/api/content/item-{i}' for i in range(1, 5)
+    ])
+
+
+@pytest.mark.parametrize('rejection', ('canonical', 'fence'))
+def test_feed_batch_keeps_individual_dispatch_rejections_and_successful_peers(tmp_path, monkeypatch, rejection):
+    from newsroom.control_plane.native_source_intake import NativeSourceIntakeHold
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    foreign = 'https://example.test/item-2'
+    rejected_url = foreign if rejection == 'canonical' else 'https://www.gov.uk/item-2'
+    feed = _feed_items(3)
+    if rejection == 'canonical':
+        feed = feed.replace(b'https://www.gov.uk/item-2', foreign.encode())
+    fetched, fenced = [], []
+    @contextmanager
+    def fence(source_id, url):
+        assert source_id == 'UK-01'
+        fenced.append(url)
+        if rejection == 'fence' and url.endswith('item-2'):
+            raise NativeSourceIntakeHold('CURRENT_SOURCE_ITEM_HOLD')
+        yield
+    def fetch(url):
+        fetched.append(url)
+        return (200, feed) if url == SOURCE_URLS['UK-01'] else (
+            200, _document(path='/item-' + url.rsplit('-', 1)[1])
+        )
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-01': _seed_uk01(runtime)},
+            licence=_licence(), dispatch_fence=fence, fetch=fetch,
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC),
+        )
+        result = intake.poll()[0]
+        assert result.status == 'HOLD'
+        assert result.item_holds == ((rejected_url,
+            'SOURCE_ITEM_CANONICAL_URL_HOLD' if rejection == 'canonical' else 'CURRENT_SOURCE_ITEM_HOLD'),)
+        assert [unit.canonical_url for unit in result.units] == [
+            'https://www.gov.uk/item-1', 'https://www.gov.uk/item-3',
+        ]
+        assert sorted(fetched[1:]) == [
+            'https://www.gov.uk/api/content/item-1', 'https://www.gov.uk/api/content/item-3',
+        ]
+        assert foreign not in fenced
+
+
 @pytest.mark.parametrize('failure', ('submit', 'wait'))
 def test_manual_fetch_failure_settles_workers_before_releasing_owner_fence(monkeypatch, failure):
     import threading
@@ -1273,6 +1445,39 @@ def test_manual_fetch_failure_settles_workers_before_releasing_owner_fence(monke
     assert shutdown_depths[0] == 2
     assert completion_depths and set(completion_depths) == {2}
     assert not fenced
+
+
+def test_manual_section_dispatch_denial_retains_successful_peer_coverage(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_source_intake import NativeSourceIntakeHold
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    fetched = []
+    @contextmanager
+    def fence(source_id, url):
+        assert source_id == 'UK-03'
+        if url.endswith('part-1'):
+            raise NativeSourceIntakeHold('CURRENT_SOURCE_SECTION_HOLD')
+        yield
+    def fetch(url):
+        fetched.append(url)
+        return (200, _manual()) if url == SOURCE_URLS['UK-03'] else (200, _manual_section(2))
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-03': _seed_missing(runtime, 'UK-03')},
+            licence=_licence(), dispatch_fence=fence, fetch=fetch,
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC),
+        )
+        result = intake.poll()[SOURCE_IDS.index('UK-03')]
+        assert result.status == 'HOLD'
+        assert result.item_holds == ((
+            'https://www.gov.uk/guidance/immigration-rules/part-1', 'CURRENT_SOURCE_SECTION_HOLD',
+        ),)
+        assert [unit.canonical_url for unit in result.units] == [
+            'https://www.gov.uk/guidance/immigration-rules/part-2',
+        ]
+        assert fetched == [SOURCE_URLS['UK-03'], 'https://www.gov.uk/api/content/guidance/immigration-rules/part-2']
+        assert [observation[0] for observation in result.observations] == fetched
 
 
 def test_collection_body_rights_notice_vetoes_child_file_fetches(tmp_path, monkeypatch):

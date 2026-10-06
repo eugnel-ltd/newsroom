@@ -81,7 +81,7 @@ def test_actual_catch_stages_preserve_hold_and_expose_only_safe_frame(monkeypatc
         intake._proof = None
         intake._licence = NS(for_source=lambda **_: NS(decision='PERMITTED', record_id='rights'))
         monkeypatch.setattr(n, 'parse_observation', lambda **_: (item,))
-        intake._fetch_complete_item = lambda *a: (_ for _ in ()).throw(error)
+        intake._fetch_items = lambda *a: ((item, _failed(error)),)
     else:
         if stage == 'DECLARED_CHILD':
             hold = n.NativeSourceIntakeHold('DECLARED_PARENT', child_items=(('/item-child', 'Child'),))
