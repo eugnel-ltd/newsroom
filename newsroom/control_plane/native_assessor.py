@@ -1393,6 +1393,7 @@ class NativeAssessmentUsage:
             ).fetchall()
             matches: list[RetainedAssessorResult] = []
             reference_views = {}
+            semantic_unallocated = False
             for row in rows:
                 try:
                     envelope_record = json.loads(row[5])
@@ -1427,6 +1428,16 @@ class NativeAssessmentUsage:
                     (envelope.envelope_id,),
                 ).fetchall()
                 if not allocation_rows:
+                    if _semantic_origin:
+                        if not any(envelope.cycle_id == _assessment_cycle_id(
+                            version_id, envelope.evidence_package_digest, contract,
+                        ) for contract in (_V15_PRODUCER_VERSION, _V16_PRODUCER_VERSION, *_REFERENCE_PRODUCERS)):
+                            return None
+                        # Preserve this unresolved separate purpose. Selecting
+                        # an earlier settled semantic origin grants neither zero
+                        # settlement nor resume/retry of the unallocated envelope.
+                        semantic_unallocated = True
+                        continue
                     # An exact current-version envelope with no allocation
                     # cannot have dispatched. Its admission may resume; older
                     # or differently bound envelopes remain unresolved.
@@ -1801,6 +1812,22 @@ class NativeAssessmentUsage:
                     retained_result_digest,
                     retained_receipt_digest,
                 ))
+            if semantic_unallocated:
+                if (not matches or max(matches, key=lambda item: item.completed_at).outcome
+                        != 'ASSESSOR_VALIDATION_FAILED'):
+                    # A pending footprint does not widen UNKNOWN-origin eligibility.
+                    return None
+                # Once per reader, use the existing model FK invariant to deny
+                # deleted allocations whose independent anchors still survive.
+                # Context manifests have no allocation FK; absence is not proof
+                # that a purpose never dispatched or all history is recoverable.
+                for table in ('model_invocation_allocations', 'model_transport_observations',
+                        'model_invocation_context_observations', 'model_invocation_provider_attempt_links',
+                        'model_invocation_terminals', 'model_provider_telemetry', 'model_usage_reconciliations',
+                        'model_usage_conservative_dispositions', 'model_usage_reported_output_dispositions',
+                        'model_usage_current', 'graphiti_internal_requests'):
+                    if connection.execute(f'PRAGMA foreign_key_check({table})').fetchone() is not None:
+                        return None
             return tuple(matches)
         except (KeyError, TypeError, ValueError, ModelUsageIntegrityError, NativeEvidenceError, EvidencePackageError):
             return None

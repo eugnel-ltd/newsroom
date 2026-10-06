@@ -3228,3 +3228,120 @@ def test_reported_validation_semantic_origin_denies_incomplete_authenticated_foo
             assert retained.execute('SELECT count(*) FROM model_invocation_allocations').fetchone() == (1,)
     finally:
         connection.close()
+
+
+def _unallocated_semantic_origin_envelope(service, candidate, *, contract='newsroom.native-evidence-assessor.v19',
+    candidate_id=None, hypothesis_digest=None, cycle_id=None, evidence_package_digest=None):
+    with sqlite3.connect(service.path) as retained:
+        base_digest = json.loads(retained.execute('SELECT record_json FROM model_work_envelopes LIMIT 1').fetchone()[0])['evidence_package_digest']
+    base_digest = evidence_package_digest or base_digest
+    envelope = WorkEnvelope.create(
+        cycle_id=cycle_id or native_assessor_module._assessment_cycle_id(candidate.version_id, base_digest, contract),
+        workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+        admitted_at=datetime(2026, 9, 9, tzinfo=UTC), admission_decision_id=None,
+        candidate_id=candidate_id or candidate.candidate_id,
+        hypothesis_digest=hypothesis_digest or candidate.governing_manifest.canonical_digest,
+        evidence_package_digest=base_digest, ingest_id=None, graphiti_attempt_id=None)
+    service.open_envelope(envelope)
+    return envelope
+
+
+@pytest.mark.parametrize('contract', ['newsroom.native-evidence-assessor.v15', 'newsroom.native-evidence-assessor.v17'])
+def test_semantic_origin_keeps_later_unallocated_native_footprint_unresolved(tmp_path, monkeypatch, contract):
+    connection, candidate, service, current, allocation = _reported_validation_origin(tmp_path, monkeypatch, contract)
+    envelope = _unallocated_semantic_origin_envelope(service, candidate)
+    def rows():
+        with sqlite3.connect(service.path) as retained:
+            return tuple(retained.execute(f'SELECT * FROM {table}').fetchall() for table in (
+                'model_work_envelopes', 'model_invocation_allocations', 'model_invocation_terminals', 'ledger'))
+    before = rows()
+    try:
+        assert current.retained_assessments(candidate) is None  # Ordinary base guard is unchanged.
+        for _ in range(2):
+            origin = current.retained_semantic_origin_failure(candidate)
+            assert origin is not None and origin.outcome == 'ASSESSOR_VALIDATION_FAILED'
+            assert origin.proof.invocation_id == allocation.invocation_id
+            assert origin.result_digest == digest_bytes(b'{')
+            assert origin.proof.envelope_id != envelope.envelope_id
+        assert current.retained_assessments(candidate) is None
+        assert current.retained_pre_dispatch_failure(candidate) is None  # Old paid call is never zero.
+        assert rows() == before
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT count(*) FROM model_invocation_allocations WHERE envelope_id=?',
+                (envelope.envelope_id,)).fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def _secondary_semantic_origin_allocation(tmp_path, monkeypatch, candidate, *, outcome):
+    base = _base_package(_ready_package(candidate)[1])
+    with monkeypatch.context() as historical:
+        historical.setattr(native_assessor_module, 'VERSION', native_assessor_module._V21_PRODUCER_VERSION)
+        historical.setattr(native_assessor_module, 'SYSTEM', native_assessor_module._V21_SYSTEM)
+        service, usage = _usage(tmp_path, historical)
+        usage._clock = lambda: datetime(2026, 9, 10, tzinfo=UTC)
+        allocation = usage.begin(candidate, base, 'Synthetic later distinct paid-purpose fixture')
+        if outcome == 'active': return allocation
+        dispatch_at = usage.mark_dispatch(allocation)
+        execution = None if outcome == 'unknown' else NativeAssessmentExecution('{', {} if outcome == 'unreported' else {
+            'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 1, 'output_tokens': 1,
+            'cached_read_tokens': 0, 'cached_write_tokens': 0, 'reasoning_tokens': 0,
+            'context_tokens': 1, 'total_tokens': 2,
+        })
+        if execution is not None: usage.retain_result(allocation, execution, dispatch_at=dispatch_at)
+        usage.complete(allocation, outcome='ASSESSOR_PROVIDER_FAILED' if outcome == 'unknown' else 'ASSESSOR_VALIDATION_FAILED',
+            execution=execution, provider_dispatched=True, dispatch_at=dispatch_at,
+            failure_class='UNKNOWN_PROVIDER_FAILURE' if outcome == 'unknown' else 'ASSESSMENT_VALIDATION_FAILED')
+    return allocation
+
+
+@pytest.mark.parametrize('defect', ['wrong-cycle', 'wrong-candidate', 'wrong-hypothesis', 'wrong-base',
+    'unknown-producer', 'row-tamper', 'active', 'unknown', 'unreported', 'deleted-allocation-anchor'])
+def test_semantic_origin_unallocated_boundary_denies_changed_or_unsettled_footprints(tmp_path, monkeypatch, defect):
+    connection, candidate, service, current, old_allocation = _reported_validation_origin(
+        tmp_path, monkeypatch, 'newsroom.native-evidence-assessor.v17')
+    kwargs = {}
+    if defect == 'wrong-cycle': kwargs['cycle_id'] = 'foreign-cycle'
+    elif defect == 'wrong-hypothesis': kwargs['hypothesis_digest'] = 'sha256:' + 'f' * 64
+    elif defect == 'unknown-producer': kwargs['contract'] = 'newsroom.native-evidence-assessor.v999'
+    elif defect == 'wrong-base':
+        with sqlite3.connect(service.path) as retained:
+            base = json.loads(retained.execute('SELECT record_json FROM model_work_envelopes LIMIT 1').fetchone()[0])['evidence_package_digest']
+        kwargs.update(cycle_id=native_assessor_module._assessment_cycle_id(candidate.version_id, base,
+            'newsroom.native-evidence-assessor.v19'), evidence_package_digest='sha256:' + 'f' * 64)
+    envelope = _unallocated_semantic_origin_envelope(service, candidate, **kwargs)
+    if defect in {'active', 'unknown', 'unreported', 'deleted-allocation-anchor'}:
+        allocation = _secondary_semantic_origin_allocation(tmp_path, monkeypatch, candidate,
+            outcome='reported' if defect == 'deleted-allocation-anchor' else defect)
+        if defect == 'deleted-allocation-anchor':
+            with sqlite3.connect(service.path) as retained:
+                retained.execute('PRAGMA foreign_keys=OFF')
+                retained.execute('DELETE FROM model_invocation_allocations WHERE invocation_id=?', (allocation.invocation_id,))
+                assert retained.execute('SELECT 1 FROM model_invocation_terminals WHERE invocation_id=?',
+                    (allocation.invocation_id,)).fetchone() is not None
+    elif defect == 'row-tamper':
+        with sqlite3.connect(service.path) as retained:
+            raw = envelope.as_record(); raw['cycle_id'] = 'altered'
+            retained.execute('UPDATE model_work_envelopes SET record_json=? WHERE envelope_id=?',
+                (canonical_json_bytes(raw).decode(), envelope.envelope_id))
+    elif defect == 'wrong-candidate':
+        candidate = replace(candidate, candidate_id='11111111-1111-4111-8111-111111111111')
+    try:
+        assert current.retained_semantic_origin_failure(candidate) is None
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT record_json FROM model_invocation_allocations WHERE invocation_id=?',
+                (old_allocation.invocation_id,)).fetchone() == (canonical_json_bytes(old_allocation.as_record()).decode(),)
+    finally:
+        connection.close()
+
+
+def test_pending_native_envelope_does_not_expand_unknown_semantic_origin_eligibility(tmp_path, monkeypatch):
+    connection, candidate, base, service, current, allocation, terminal = _old_provider_failure(tmp_path, monkeypatch)
+    try:
+        assert current.retained_semantic_origin_failure(candidate).outcome == 'ASSESSOR_PROVIDER_FAILED'
+        _unallocated_semantic_origin_envelope(service, candidate)
+        assert current.retained_semantic_origin_failure(candidate) is None
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0] == terminal
+    finally:
+        connection.close()
