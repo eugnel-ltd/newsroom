@@ -1549,7 +1549,7 @@ def test_story_consumer_revalidation_only_reads_retained_copy_once(tmp_path,monk
     connection.close()
 
 
-@pytest.mark.parametrize('fault', [None, 'accepted', 'changed-clock', 'unknown', 'same-consumer', 'already-checked', 'pending-effect'])
+@pytest.mark.parametrize('fault', [None, 'accepted', 'changed-clock', 'rendering', 'unknown', 'same-consumer', 'already-checked', 'pending-effect'])
 def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_path, monkeypatch, fault):
     from newsroom.control_plane.native_evidence import NativeEvidenceHold
     unit = _native()
@@ -1571,7 +1571,8 @@ def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_p
     if fault=='already-checked':facts['retained_qualification_checked_contract']=current
     if fault=='pending-effect':facts['publication_started_at']='pending'
     if fault=='changed-clock':facts['reason']='SEMANTIC_INTENT_INPUT_CHANGED_HOLD'
-    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD'if fault=='changed-clock'else'ASSESSMENT_INTERRUPTED',facts=facts)
+    if fault=='rendering':facts.update(reason='ASSESSOR_RENDERING_CONTRACT_HOLD',failure_class='stale-ModelUsageAdmissionError')
+    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD'if fault in {'changed-clock','rendering'}else'ASSESSMENT_INTERRUPTED',facts=facts)
     calls=[]
     package_id=ObjectAdmissionId.new()
     def acquire(_self, **request):
@@ -1595,11 +1596,11 @@ def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_p
         semantic_origin_failure=lambda _:None,semantic_intent_contract=contract,assessment_contract_version=current)
     continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
     after=journal.current(unit.revision_id)['facts']
-    assert len(calls)==(1 if fault in (None,'accepted','changed-clock') else 0), after
+    assert len(calls)==(1 if fault in (None,'accepted','changed-clock','rendering') else 0), after
     assert after['semantic_assessment_intent']==intent
     assert after['semantic_acquisition_attempt_count']==2
     assert after['assessment_started_at']==facts['assessment_started_at']
-    if fault is None:
+    if fault in (None,'rendering'):
         assert after['retained_qualification_checked_contract']==current
         continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
         assert len(calls)==1

@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Callable
+from types import SimpleNamespace
 from newsroom.increment6.candidates import StoryCandidateVersion
 
 from newsroom.authority.canonical import (
@@ -23,6 +24,7 @@ from newsroom.control_plane.evidence import (
     GOVERNED_CLAIM_POLICY_VERSION,
     GovernedClaimStatus,
     NAMED_ENTITY_POLICY_VERSION,
+    SOURCE_RENDERING_CONTRACT,
     ORIGINALITY_POLICY_VERSION,
     Evid012QualificationTest,
     bounded_named_entities,
@@ -2227,11 +2229,15 @@ class AutonomousNativeEvidenceAssessor:
             original=self._retained_qualification(candidate,base,sources,acquired)
             if type(original)is not JudgedAssessment:
                 raise NativeEvidenceHold('CONTEXT_ORIGINAL_QUALIFICATION_HOLD',source_id)
-            self._validated_execution(original.execution,candidate,base,sources,acquired)
+            self._validated_execution(original.execution,candidate,base,sources,acquired,
+                semantic_witnesses=original.semantic_witnesses, source_renderings=original.source_renderings,
+                semantic_witness_reader=getattr(self._judgments,'semantic_witness_reader',None))
             enriched=self._context_enrichment(original,candidate,base,sources,acquired)
             if type(enriched)is not JudgedAssessment:
                 raise NativeEvidenceHold('CONTEXT_PACKAGE_RESULT_HOLD',source_id)
-            return self._validated_execution(enriched.execution,candidate,base,sources,acquired)
+            return self._validated_execution(enriched.execution,candidate,base,sources,acquired,
+                semantic_witnesses=original.semantic_witnesses, source_renderings=original.source_renderings,
+                semantic_witness_reader=getattr(self._judgments,'semantic_witness_reader',None))
         if qualification_cached_only:
             from .native_assessor_judgments import JudgedAssessment
             if self._retained_qualification is None:
@@ -2243,7 +2249,9 @@ class AutonomousNativeEvidenceAssessor:
             if type(result) is not JudgedAssessment:
                 raise NativeEvidenceHold('QUALIFICATION_RETAINED_RESULT_UNAVAILABLE', source_id)
             try:
-                return self._validated_execution(result.execution, candidate, base, sources, acquired)
+                return self._validated_execution(result.execution, candidate, base, sources, acquired,
+                    semantic_witnesses=result.semantic_witnesses, source_renderings=result.source_renderings,
+                    semantic_witness_reader=getattr(self._judgments, 'semantic_witness_reader', None))
             except EvidencePackageError as exc:
                 raise NativeEvidenceHold(_contract_hold_reason(exc), source_id) from exc
         def qualification_exception(fallback):
@@ -2254,7 +2262,9 @@ class AutonomousNativeEvidenceAssessor:
                 result = self._qualification(candidate, base, sources, acquired, fallback)
             if type(result) is not JudgedAssessment:
                 raise NativeEvidenceError('native qualification exception result differs')
-            return self._validated_execution(result.execution, candidate, base, sources, acquired)
+            return self._validated_execution(result.execution, candidate, base, sources, acquired,
+                semantic_witnesses=result.semantic_witnesses, source_renderings=result.source_renderings,
+                semantic_witness_reader=getattr(self._judgments, 'semantic_witness_reader', None))
 
         def validate_judged(result):
             try:
@@ -2539,7 +2549,7 @@ class AutonomousNativeEvidenceAssessor:
         return result
 
     @staticmethod
-    def _validated_execution(execution, candidate, base, sources, acquired):
+    def _validated_execution(execution, candidate, base, sources, acquired, *, semantic_witnesses=None, semantic_witness_reader=None, source_renderings=None):
         if type(execution) is not NativeAssessmentExecution:
             raise NativeEvidenceHold("ASSESSOR_TRANSPORT_HOLD", sources[0].unit.source_id)
         value = _document(execution.text)
@@ -2562,6 +2572,10 @@ class AutonomousNativeEvidenceAssessor:
         raw_claims = raw_package.get("governed_claims")
         if type(raw_claims) is not list:
             raise EvidencePackageError("assessment claims differ")
+        from .native_assessor_judgments import SourceRenderingMetadata, source_rendering_names
+        if source_renderings is not None and type(source_renderings) is not SourceRenderingMetadata:
+            raise EvidencePackageError('Source rendering side-channel differs')
+        rendering_refs = dict(source_renderings.references) if source_renderings is not None else {}
         for raw_claim in raw_claims:
             if type(raw_claim) is not dict or set(raw_claim) != set(_CLAIM_FIELDS):
                 raise EvidencePackageError("assessment claim fields differ")
@@ -2649,6 +2663,8 @@ class AutonomousNativeEvidenceAssessor:
                 raise EvidencePackageError(
                     "assessment named entities differ from source evidence"
                 )
+            if claim_id in rendering_refs:
+                claim_entities = source_rendering_names(SimpleNamespace(claim=claim_text),source_contexts[0])
             named_entities = tuple(sorted(claim_entities))
             if rendered_named_entities(
                 rendered, frozenset(named_entities)
@@ -2689,6 +2705,7 @@ class AutonomousNativeEvidenceAssessor:
                 "semantic_relation_evidence_id": _semantic_record_id(
                     claim_id, claim_text, rendered
                 ),
+                **({'source_rendering_ref':dict(rendering_refs[claim_id])} if claim_id in rendering_refs else {}),
                 "named_entity_evidence": [
                     [
                         text,
@@ -2702,10 +2719,16 @@ class AutonomousNativeEvidenceAssessor:
                     item[0] for item in named_entities
                 ],
             })
+        if set(rendering_refs) - {row['claim_id']for row in governed_claims}:
+            raise EvidencePackageError('Source rendering claim partition differs')
         raw_qualifications = raw_package.get("qualification_evidence")
         if type(raw_qualifications) is not list:
             raise EvidencePackageError("assessment qualifications differ")
         qualifications = []
+        from .native_assessor_judgments import SemanticWitnessMetadata
+        if semantic_witnesses is not None and type(semantic_witnesses) is not SemanticWitnessMetadata:
+            raise EvidencePackageError('semantic witness side-channel differs')
+        semantic_refs = dict(semantic_witnesses.references) if semantic_witnesses is not None else {}
         for item in raw_qualifications:
             if type(item) is not dict or set(item) != {
                 "test", "governed_claim_id", "test_evidence", "policy_version"
@@ -2723,7 +2746,11 @@ class AutonomousNativeEvidenceAssessor:
                     evidence_pairs,
                 ),
                 "test_evidence": evidence_pairs,
+                **({'semantic_witness_ref': dict(semantic_refs[(item['governed_claim_id'], item['test'])])}
+                    if (item['governed_claim_id'], item['test']) in semantic_refs else {}),
             })
+        if set(semantic_refs) - {(item['governed_claim_id'], item['test']) for item in raw_qualifications}:
+            raise EvidencePackageError('semantic witness claim partition differs')
         package_value = evidence_package_value(base)
         package_value.update(raw_package)
         package_value["governed_claims"] = governed_claims
@@ -2788,6 +2815,10 @@ class AutonomousNativeEvidenceAssessor:
             )
             for source, result in zip(sources, acquired, strict=True)
         )
+        from .admission import qualification_relation_is_admitted, source_rendering_is_admitted
+        for claim in package.governed_claims:
+            if not source_rendering_is_admitted(claim,package,semantic_witness_reader=semantic_witness_reader):
+                raise EvidencePackageError('Source rendering is not authenticated')
         claims_by_id = {claim.claim_id: claim for claim in package.governed_claims}
         verified_qualifications = []
         unsupported_auxiliary = False
@@ -2799,9 +2830,8 @@ class AutonomousNativeEvidenceAssessor:
                 item, claim, acquired[claim.passage_index], base,
             )
             if (
-                not _qualification_relation_is_proven(
-                    item, claim,
-                    source_context=acquired[claim.passage_index].body.decode("utf-8"),
+                not qualification_relation_is_admitted(
+                    item, claim, package, semantic_witness_reader=semantic_witness_reader,
                 )
                 or any(
                     field not in _QUALIFICATION_CLASSIFIER_FIELDS
@@ -2854,6 +2884,7 @@ class AutonomousNativeEvidenceAssessor:
                 "test": item.test.value,
                 "test_evidence": [list(value) for value in item.test_evidence],
                 "policy_version": item.policy_version,
+                **({'semantic_witness_ref': dict(item.semantic_witness_ref)} if item.semantic_witness_ref else {}),
                 "evidence_span_digest": digest_bytes(
                     claims_by_id[item.governed_claim_id].supporting_excerpt.encode()
                 ),
@@ -2875,7 +2906,8 @@ class AutonomousNativeEvidenceAssessor:
                 "rendered_span_digest": digest_bytes(
                     claim.rendered_named_entities[index].encode()
                 ),
-                "policy_version": NAMED_ENTITY_POLICY_VERSION,
+                "policy_version": (SOURCE_RENDERING_CONTRACT
+                    if entity_type == 'SOURCE_LITERAL' else NAMED_ENTITY_POLICY_VERSION),
                 "evidence_span_digest": digest_bytes(text.encode()),
                 "source_record_ids": list(claim.source_record_ids),
             }

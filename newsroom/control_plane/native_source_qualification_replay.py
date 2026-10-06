@@ -61,6 +61,43 @@ def read_current_result(qualifier, candidate, base, sources, acquired, *, scope,
         raise QualificationHold('QUALIFICATION_CURRENT_SNAPSHOT_HOLD')
     if scope.get('newness')=='SOURCE_DECLARED_FIRST_PUBLICATION' and not NativeAssessorJudgments._first_publication_proven(scope,sources,acquired):
         raise QualificationHold('QUALIFICATION_FIRST_PUBLICATION_HOLD')
+    state = original_qualification_state(qualifier, candidate, base, binding, proof=proof)
+    reference=QualificationReference(allocation.invocation_id,ObjectAdmissionId.parse(receipt['raw_admission_id']),receipt_admission.admission.admission_id)
+    checked=qualifier.read_qualification(reference,state,proof=proof,**ids)
+    expected={'schema':VERSION,'source_binding':binding,'materialisation_receipt':checked['materialisation'],
+        'qualification_reference':{'invocation_id':reference.invocation_id,'raw_admission_id':str(reference.raw_admission_id),
+            'receipt_admission_id':str(reference.receipt_admission_id)}}
+    decision=qualifier.objects.committed_admission(ObjectAdmissionRequest('evidence.record','source-qualification-decision:'+digest_canonical(state)),proof=proof)
+    if decision is None:
+        raise QualificationHold('QUALIFICATION_PRIOR_DECISION_UNAVAILABLE')
+    raw=qualifier.objects.rehydrate(HydrationRequest(decision.admission.admission_id,'evidence.record'),proof=proof).data
+    if raw!=canonical_json_bytes(expected):
+        raise QualificationHold('QUALIFICATION_PRIOR_DECISION_CHANGED')
+    with qualifier.fence(current,proof):
+        original = JudgedAssessment(NativeAssessmentExecution(checked['materialisation']['materialised_text'],{}),raw,decision.admission.admission_id)
+    return original
+
+
+def original_qualification_state(qualifier, candidate, base, binding, *, proof):
+    """Reconstruct the supported original paid recipe, with no producer dispatch."""
+    from .native_assessor_judgments import source_role_questions, VERSION as JUDGMENT_VERSION
+    from .typesafe_judgment import JudgmentReference
+    view = build_lossless_source_view(base.passages, base.source_ids)
+    from .native_assessor import _reference_binding
+    if (binding.get('candidate_id') != candidate.candidate_id
+            or binding.get('candidate_version_id') != candidate.version_id
+            or binding.get('hypothesis_digest') != candidate.governing_manifest.canonical_digest
+            or binding.get('content_digest') != base.digest
+            or binding.get('evidence_package_digest') != base.digest
+            or binding.get('source_reference_binding') != _reference_binding(view)):
+        raise QualificationHold('QUALIFICATION_PARENT_INPUT_HOLD')
+    current = binding.get('current_scope', {})
+    if (tuple(row.get('source_id')for row in current.get('sources',())) != base.source_ids
+            or tuple(row.get('body')for row in current.get('sources',())) != base.passages):
+        raise QualificationHold('QUALIFICATION_PARENT_SOURCE_HOLD')
+    ids = dict(candidate_id=candidate.candidate_id, hypothesis_digest=candidate.governing_manifest.canonical_digest)
+    original = {key:value for key,value in binding.items()
+                if key not in {'qualification_contract','prior_judgments','failure_inventory'}}
     refs=binding.get('prior_judgments',[])
     inventory=binding.get('failure_inventory')
     if (binding.get('qualification_contract')!=VERSION or len(refs)!=1
@@ -88,16 +125,4 @@ def read_current_result(qualifier, candidate, base, sources, acquired, *, scope,
                 for segment in view.segments if segment.source_id==row['source_id']]}for row in source_rows]},
         'issue':{'reason':'JUDGMENT_INPUT_BOUND','failed_questions':inventory,'newness':binding['newness'],'prior_scope':binding['prior_scope']},
         'judgments':[{'questions':questions,'answers':role['answers'],'outcome':role['outcome']}]}
-    reference=QualificationReference(allocation.invocation_id,ObjectAdmissionId.parse(receipt['raw_admission_id']),receipt_admission.admission.admission_id)
-    checked=qualifier.read_qualification(reference,state,proof=proof,**ids)
-    expected={'schema':VERSION,'source_binding':binding,'materialisation_receipt':checked['materialisation'],
-        'qualification_reference':{'invocation_id':reference.invocation_id,'raw_admission_id':str(reference.raw_admission_id),
-            'receipt_admission_id':str(reference.receipt_admission_id)}}
-    decision=qualifier.objects.committed_admission(ObjectAdmissionRequest('evidence.record','source-qualification-decision:'+digest_canonical(state)),proof=proof)
-    if decision is None:
-        raise QualificationHold('QUALIFICATION_PRIOR_DECISION_UNAVAILABLE')
-    raw=qualifier.objects.rehydrate(HydrationRequest(decision.admission.admission_id,'evidence.record'),proof=proof).data
-    if raw!=canonical_json_bytes(expected):
-        raise QualificationHold('QUALIFICATION_PRIOR_DECISION_CHANGED')
-    with qualifier.fence(current,proof):
-        return JudgedAssessment(NativeAssessmentExecution(checked['materialisation']['materialised_text'],{}),raw,decision.admission.admission_id)
+    return state

@@ -86,6 +86,7 @@ class GovernedEvidencePackages:
         record_hydration_policy_digest: str,
         package_hydration_policy_digest: str,
         package_admission_definition_digest: str,
+        semantic_witness_reader=None,
     ) -> None:
         if (
             type(objects) is not GovernedObjects
@@ -114,6 +115,7 @@ class GovernedEvidencePackages:
         self._record_policy_digest = record_hydration_policy_digest
         self._package_policy_digest = package_hydration_policy_digest
         self._package_definition_digest = package_admission_definition_digest
+        self.semantic_witness_reader = semantic_witness_reader
 
     def retain(
         self,
@@ -344,6 +346,17 @@ class GovernedEvidencePackages:
         )
         if resolved_records is None:
             raise EvidencePackageError("governed evidence records differ")
+        from newsroom.control_plane.admission import qualification_relation_is_admitted
+        claims = {claim.claim_id: claim for claim in package.governed_claims}
+        for qualification in package.qualification_evidence:
+            if qualification.semantic_witness_ref and not qualification_relation_is_admitted(
+                    qualification, claims[qualification.governed_claim_id], package,
+                    semantic_witness_reader=self.semantic_witness_reader):
+                raise EvidencePackageError('governed semantic witness is not authenticated')
+        from newsroom.control_plane.admission import source_rendering_is_admitted
+        for claim in package.governed_claims:
+            if not source_rendering_is_admitted(claim, package, semantic_witness_reader=self.semantic_witness_reader):
+                raise EvidencePackageError('governed Source rendering is not authenticated')
         resolved = replace(package, resolved_evidence_records=resolved_records)
         envelope = canonical_json_bytes(
             {
@@ -453,6 +466,7 @@ def _package_from_value(raw: object) -> EvidencePackage:
                 qualification_record_id=item["qualification_record_id"],
                 test_evidence=tuple(map(tuple, item["test_evidence"])),
                 policy_version=item["policy_version"],
+                semantic_witness_ref=tuple(sorted(item.get('semantic_witness_ref', {}).items())),
             )
             for item in _tuple(value["qualification_evidence"])
         )
@@ -519,6 +533,7 @@ def _claim_from_value(raw: object) -> GovernedClaimEvidence:
             "named_entities": _tuple(item["named_entities"]),
             "rendered_named_entities": _tuple(item["rendered_named_entities"]),
             "quotations": _tuple(item["quotations"]),
+            "source_rendering_ref":tuple(sorted(item.get("source_rendering_ref",{}).items())),
         }
     )
 
