@@ -1113,7 +1113,7 @@ def _canonical_localised_fact(value: str) -> tuple[object, ...] | None:
         r"(?:£|GBP\s+)\s*" + pound_number + pound_scale, value, re.IGNORECASE,
     )
     if pounds is None:
-        pounds = re.fullmatch(pound_number + pound_scale + r"\s+pounds", value, re.IGNORECASE)
+        pounds = re.fullmatch(pound_number + pound_scale + r"\s+pounds sterling", value, re.IGNORECASE)
     if pounds is not None:
         scale = {None: 1, 'thousand': 1_000, 'million': 1_000_000, 'billion': 1_000_000_000}
         multiplier = scale[pounds.group(2).lower() if pounds.group(2) else None]

@@ -122,7 +122,7 @@ def test_retained_month_claim_contexts_are_calendar_facts(source, target, claim,
     ('GBP 200 million', '2億英鎊'),
     ('£150,000', '十五萬英鎊'),
     ('£1 billion', '十億英鎊'),
-    ('200 million pounds', '200000000英鎊'),
+    ('200 million pounds sterling', '200000000英鎊'),
 ))
 def test_pound_localisation_preserves_currency_and_integer_scale(source, target):
     claim = _claim(source, target)
@@ -145,7 +145,17 @@ def test_pound_localisation_preserves_currency_and_integer_scale(source, target)
     ('£2.5 million', '二百五十萬英鎊'),
     ('£-200', '二百英鎊'),
     ('£200 million', '2億美元'),
+    ('200 million pounds', '二億英鎊'),
+    ('200 million Egyptian pounds', '二億英鎊'),
 ))
 def test_pound_localisation_rejects_unsupported_or_changed_money(source, target):
     with pytest.raises(ValueError, match='equivalent exact claim facts'):
         _claim(source, target)
+
+
+def test_pound_weight_cannot_be_rendered_as_sterling():
+    with pytest.raises(ValueError, match='equivalent exact claim facts'):
+        replace(_claim('£200 million', '二億英鎊'),
+            claim='The shipment weighs 200 million pounds.',
+            supporting_excerpt='The shipment weighs 200 million pounds.',
+            localised_factual_expressions=(('200 million pounds', '二億英鎊'),))
