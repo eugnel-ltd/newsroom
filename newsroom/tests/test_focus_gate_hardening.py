@@ -1106,3 +1106,27 @@ def test_unproved_source_name_date_delta_keeps_normal_service_discovery(tmp_path
         assert 'sdlc_control:F2' in route['reasons']
     if kind == 'deploy':
         assert route['owner_authority_required'] is True and 'F4' in route['gates']
+
+
+@pytest.mark.parametrize('declaration', [
+    '    def _require(*args, **kwargs):\n        return None\n',
+    '    def unused_helper():\n        return None\n',
+    '    lambda: None\n',
+    '    class Unused:\n        pass\n',
+    '    async def unused_helper():\n        return None\n',
+])
+def test_nested_date_consumer_declarations_keep_normal_discovery(tmp_path, declaration):
+    sources, _base = _body_contract_repo(tmp_path)
+    path = _BODY_CONTRACT_SOURCES[1]
+    service_test = 'newsroom/tests/test_other_neo4j_service.py'
+    _write(tmp_path, service_test,
+           'from newsroom.control_plane.native_story_dates import derive_and_verify\n')
+    base = _commit(tmp_path, 'direct consumer of the changed date function')
+    marker = '                      source_records=(), final_draft=None, date_derivation=None):\n'
+    assert marker in sources[path]
+    _write(tmp_path, path, sources[path].replace(marker, marker + declaration))
+    head = _commit(tmp_path, 'nested declaration outside the closed top-level contract')
+    route = selector.select_focus((path,), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert 'explicit_source_name_date_body_contract:F2' not in route['reasons']
+    assert route['selected_service_tests'] == [service_test]
+    assert 'F3' in route['gates']

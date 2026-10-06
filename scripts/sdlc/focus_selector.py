@@ -274,6 +274,9 @@ def _closed_existing_function_bodies(modules) -> bool:
         return result
     for name in changed:
         left, right = previous[name], current[name]
+        if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda))
+               for function in (left, right) for node in ast.walk(function) if node is not function):
+            return False  # Nested bindings are outside the top-level closure.
         if footprint(right) - footprint(left):
             return False
         left_body, right_body = left.body, right.body
