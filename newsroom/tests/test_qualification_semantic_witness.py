@@ -490,3 +490,149 @@ def test_authenticated_witness_rejects_replacement_context_instead_of_rescuing_s
         assert not qualification_relation_is_admitted(verified,c,p,semantic_witness_reader=w.read,
             source_context=p.passages[0]+'\nThe original assertion is withdrawn.')
         assert len(calls)==1
+
+
+# Exact public Source bytes and two original QA selections from the retained
+# 821 proposal. These fixtures prove framing only, never criterion YES.
+_ACTUAL_821_SOURCE = 'Biggest ever overhaul of SEND teacher training begins\n\nEvery single teacher in England will be empowered to better support children and young people with SEND, as government kickstarts the most comprehensive teacher training offer in a generation. Developed by training experts Ambition Institute, and building on expertise from the sector, the first-of-their-kind free, adaptable and practical training materials for schools and post-16 settings are now available to be used in the way that works best for them, throughout the year or on existing training days. The materials will put inclusion at the heart of every classroom and workshop, giving teachers practical techniques such as breaking instructions into digestible steps, pre-teaching specialist vocabulary, and carving out time for children and young people to practise it. They will go hand in hand with online training for early years staff, developed and delivered by early years charity Dingley’s Promise, supporting staff to use age-appropriate inclusive practices from day one - like using visual timetables to help children with transitions between activities, or adapting environments to reduce unnecessary noise that can be a barrier to communication and emotional regulation. The move is the first step as part of the government’s wider £200 million investment into teacher training to transform support for children and young people with SEND, ending a postcode lottery that has left too many families fighting for support. Minister for School Standards, Georgia Gould, said: Every child and young person deserves the chance to thrive, whatever their needs, and that starts with brilliant teaching. I’ve heard from teachers, parents and young people across the country about the need for more investment in teacher training and today we are responding to those concerns. We are backing staff with the tools to spot and support additional needs from the earliest years, making sure all children and young people feel included. One in three teachers in a recent survey said they want more training on supporting children with SEND. Alongside this, a quarter of surveyed teaching assistants in schools reported that a lack of sufficient training was a barrier to them effectively providing support for these pupils. This is just start of reforms to change that, with further resources due to published in January and April next year. New fully funded training courses will then follow in September next year available to teachers, leaders and support staff across the country. The offer fits into the government’s wider work to ensure there is a pathway for every child, no matter their background or needs. As research finds that young people with SEND are around 80 per cent more likely to be NEET, than average, it is more important than ever to deliver the right support earlier so every child is set up to achieve later in life. Claire Heywood, Vice Principal at Kidderminster College, who provided feedback on the materials, said: The strongest feature of these materials is that they place inclusive practice at the heart of high-quality teaching, recognising that meeting the needs of learners with SEND is an integral part of effective teaching and learning. The attention given to vocational and technical learning, learner independence, progression and preparation for adulthood means the resources feel both evidence-informed and genuinely relevant to the further education sector. Crucially, they provide staff with practical approaches and tools that can be readily applied in the classroom and workshops to support the success of all learners. Hilary Spencer, Chief Executive of Ambition Institute, said: Every child and young person deserves to feel included and able to achieve their potential. We know that educators across the country want to feel more confident and well-equipped to support children and young people with SEND. Our aim throughout has been to create practical, adaptable materials that help teachers and support staff to respond to a wide range of needs and strengthen their inclusive teaching practice. At Ambition Institute, our mission is to help educators serving children from disadvantaged backgrounds to keep getting better. We hope these materials contribute to helping every child and young person thrive, whatever their starting point. Catherine Mole, CEO of Dingley’s Promise, said: We are delighted to have been selected to lead on this vital training programme. This programme offers early years educators the opportunity to upskill and gain more confidence to support children with SEND at no cost to themselves or the setting and shows the increasing value being placed on early years education and its impact. This government investment is a key step towards ensuring that every child has access to the right support at the earliest point possible to give many more children the best start in life. We would encourage all early years settings to access this training and take a whole setting approach to inclusion as we know first-hand how transformational this can be”.'
+_ACTUAL_821_SELECTED = [({'admitted_use': 'PUBLICATION_EVIDENCE', 'certainty': 'CONFIRMED', 'claim': 'Every single teacher in England will be empowered to better support children and young people with SEND, as government kickstarts the most comprehensive teacher training offer in a generation. ', 'claim_id': 'sha256:ca7fac8c4b78607d99c82ffee4abd9b8e5abeed5cb63458d81389ad8ac4c2166', 'claim_role': 'HEADLINE', 'localised_factual_expressions': [], 'originality_basis': 'FACTUAL_REWRITE_REQUIRED', 'originality_policy_version': 'newsroom.cont-originality.v3', 'passage_index': 0, 'policy_version': 'newsroom.governed-claim.v7', 'quotations': [], 'rendered_assertion_zh_hant_hk': '隨著政府啟動一代人以來最全面的教師培訓安排，英格蘭每一名教師將更有能力支援有SEND的兒童及青少年。', 'semantic_relation': {'relation': 'SEMANTICALLY_EQUIVALENT', 'rendered_modality': 'ASSERTED', 'rendered_polarity': 'AFFIRMED', 'source_modality': 'ASSERTED', 'source_polarity': 'AFFIRMED'}, 'source_ids': ['UK-05'], 'status': 'CONFIRMED_FACT', 'supporting_excerpt': 'Every single teacher in England will be empowered to better support children and young people with SEND, as government kickstarts the most comprehensive teacher training offer in a generation. '}, {'governed_claim_id': 'sha256:ca7fac8c4b78607d99c82ffee4abd9b8e5abeed5cb63458d81389ad8ac4c2166', 'policy_version': 'newsroom.evid-012.v7', 'test': 'LAW_RIGHT_STATUS_POLICY', 'test_evidence': {'change_kind': 'PUBLIC_POLICY', 'change_relation': 'NEW_OR_CHANGED_STATE', 'event_polarity': 'AFFIRMED', 'material_relation_span': 'government kickstarts the most comprehensive teacher training offer in a generation', 'new_state': 'the most comprehensive teacher training offer in a generation'}}), ({'admitted_use': 'PUBLICATION_EVIDENCE', 'certainty': 'CONFIRMED', 'claim': 'Developed by training experts Ambition Institute, and building on expertise from the sector, the first-of-their-kind free, adaptable and practical training materials for schools and post-16 settings are now available to be used in the way that works best for them, throughout the year or on existing training days. ', 'claim_id': 'sha256:dca69485329626afe4a0753dab82766aedc9496218c6e1216af4feb167b139c1', 'claim_role': 'SUBSTANTIVE', 'localised_factual_expressions': [], 'originality_basis': 'FACTUAL_REWRITE_REQUIRED', 'originality_policy_version': 'newsroom.cont-originality.v3', 'passage_index': 0, 'policy_version': 'newsroom.governed-claim.v7', 'quotations': [], 'rendered_assertion_zh_hant_hk': '這些材料由培訓專家Ambition Institute開發，並建基於界別的專業經驗；供學校及16歲後教育場所使用的首創、免費、可調適及實用培訓材料現已可供使用，讓它們按最合適的方式，於全年或現有培訓日採用。', 'semantic_relation': {'relation': 'SEMANTICALLY_EQUIVALENT', 'rendered_modality': 'ASSERTED', 'rendered_polarity': 'AFFIRMED', 'source_modality': 'ASSERTED', 'source_polarity': 'AFFIRMED'}, 'source_ids': ['UK-05'], 'status': 'CONFIRMED_FACT', 'supporting_excerpt': 'Developed by training experts Ambition Institute, and building on expertise from the sector, the first-of-their-kind free, adaptable and practical training materials for schools and post-16 settings are now available to be used in the way that works best for them, throughout the year or on existing training days. '}, {'governed_claim_id': 'sha256:dca69485329626afe4a0753dab82766aedc9496218c6e1216af4feb167b139c1', 'policy_version': 'newsroom.evid-012.v7', 'test': 'LAW_RIGHT_STATUS_POLICY', 'test_evidence': {'change_kind': 'PUBLIC_POLICY', 'change_relation': 'NEW_OR_CHANGED_STATE', 'event_polarity': 'AFFIRMED', 'material_relation_span': 'the first-of-their-kind free, adaptable and practical training materials for schools and post-16 settings are now available to be used in the way that works best for them, throughout the year or on existing training days.', 'new_state': 'are now available to be used'}})]
+
+
+@pytest.mark.parametrize('index',[0,1])
+def test_retained_821_trailing_space_preserves_exact_witness_frame(index):
+    from newsroom.authority.canonical import digest_canonical
+    from newsroom.control_plane.evidence import EvidencePackage
+    from newsroom.increment10.evidence import _base_package
+    row, proposed = _ACTUAL_821_SELECTED[index]
+    claim=SimpleNamespace(**{**row,'source_ids':tuple(row['source_ids'])})
+    qualification=QualificationEvidence(Evid012QualificationTest(proposed['test']),claim.claim_id,
+        'retained-qualification',tuple(proposed['test_evidence'].items()),proposed['policy_version'])
+    base=EvidencePackage(candidate_id='candidate-fixture',hypothesis_id='hypothesis-fixture',signal_ids=('signal-fixture',),lead_ids=('lead-fixture',),
+        source_ids=('UK-05',),observation_digests=(digest_bytes(_ACTUAL_821_SOURCE.encode()),),passages=(_ACTUAL_821_SOURCE,))
+    binding={'candidate_id':base.candidate_id,'candidate_version_id':'retained-version','hypothesis_digest':digest_bytes(b'hypothesis'),
+        'content_digest':base.digest,'evidence_package_digest':base.digest,'coverage':'COMPLETE','newness':'KNOWN_CHANGE',
+        'current_scope':{'sources':[{'source_id':'UK-05','body':_ACTUAL_821_SOURCE}]},'prior_scope':{'sources':[]}}
+    original=claim.claim.encode();assert original[-1:]==b' '
+    input_before=canonical_json_bytes({'qualification':proposed,'claim':row,'binding':binding})
+    inputs=_semantic_witness_inputs(qualification,claim,base,binding)
+    start=_ACTUAL_821_SOURCE.encode().find(original);end=start+len(original)
+    assert inputs['state']['claim']['range']=={'start_byte':start,'end_byte':end}
+    assert _ACTUAL_821_SOURCE.encode()[start:end]==original
+    assert inputs['state']['sources'][0]['text']==_ACTUAL_821_SOURCE
+    assert inputs['state']['fields']==proposed['test_evidence']
+    assert canonical_json_bytes({'qualification':proposed,'claim':row,'binding':binding})==input_before
+
+
+@pytest.mark.parametrize('fault',['fragment','spaced-substring','excerpt','digest','condition','negation'])
+def test_witness_sentence_boundary_rejects_partial_or_mismatched_parent(fault):
+    from newsroom.control_plane.evidence import EvidencePackage
+    statement='Schools now receive practical education materials. '
+    body=statement+'The programme remains supported.'
+    if fault=='fragment':statement='Schools now receive practical education materials ';body=statement+'after approval.'
+    if fault=='spaced-substring':body='The notice states: '+body
+    if fault=='condition':body='If approved; '+body
+    if fault=='negation':body='It is false that '+body
+    base=EvidencePackage(candidate_id='candidate',hypothesis_id='hypothesis',signal_ids=('signal',),lead_ids=('lead',),
+        source_ids=('source',),observation_digests=(digest_bytes(body.encode()),),passages=(body,))
+    claim=SimpleNamespace(claim_id='claim',claim=statement,supporting_excerpt=statement if fault!='excerpt'else statement.rstrip(),
+        source_ids=('source',),passage_index=0,claim_role='HEADLINE',status='CONFIRMED_FACT')
+    qualification=QualificationEvidence(Evid012QualificationTest.HOUSEHOLD_PRACTICAL_EFFECT,'claim','qualification',
+        (('domain','EDUCATION'),('event_polarity','AFFIRMED'),('effect_relation','MATERIAL_PRACTICAL_EFFECT'),
+         ('material_relation_span',statement),('practical_effect',statement)))
+    binding={'candidate_id':'candidate','candidate_version_id':'version','hypothesis_digest':digest_bytes(b'hypothesis'),
+        'content_digest':base.digest if fault!='digest'else digest_bytes(b'wrong'),'evidence_package_digest':base.digest,
+        'coverage':'COMPLETE','newness':'KNOWN_CHANGE','current_scope':{'sources':[{'source_id':'source','body':body}]}}
+    with pytest.raises(ValueError):_semantic_witness_inputs(qualification,claim,base,binding)
+
+
+@pytest.mark.parametrize('fault',[None,'witness-unknown','render-unknown','qa-NO'])
+def test_consumer_stamp_revalidation_keeps_existing_paid_purposes(tmp_path,monkeypatch,fault):
+    from newsroom.control_plane import native_source_qualification_consumer as consumer_module
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    with _selected_qualification_case(tmp_path,monkeypatch,malformed_rendering=True,fault='qa-NO'if fault=='qa-NO'else None)as(q,w,old,c,b,s,a,scope,proof,usage,qa,jev,render):
+        if fault=='witness-unknown':
+            transport=w.judgments.transport
+            def unknown(request,**kwargs):
+                if 'criterion' in json.loads(request.data)['questions']:
+                    jev.append('synthetic unknown witness');raise TimeoutError('fixture unknown witness')
+                return transport(request,**kwargs)
+            w.judgments.transport=unknown
+        if fault=='render-unknown':
+            # Retain a genuine unknown localiser result with the same source-bound
+            # request and ledger, rather than faking a resolved zero effect.
+            cells=q.localise.__closure__
+            localiser=next(cell.cell_contents for cell in cells if type(cell.cell_contents).__name__=='NativeClaimLocaliser')
+            def unknown_render(_prompt):render.append('synthetic unknown rendering');raise TimeoutError('fixture unknown renderer')
+            localiser.runner=unknown_render
+        original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=proof)
+        # Create the old app-v1 outcome, then change ONLY the pure consumer stamp.
+        monkeypatch.setattr(consumer_module,'CONSUMER_VERSION','newsroom.source-qualification-consumer.v1')
+        if fault in {'witness-unknown','render-unknown'}:
+            with pytest.raises((ValueError,RuntimeError,TimeoutError)):q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        else: prior=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        import sqlite3
+        with sqlite3.connect(usage.path)as db:
+            pins=db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()
+        counts=(len(qa),len(jev),len(render))
+        monkeypatch.setattr(consumer_module,'CONSUMER_VERSION','newsroom.source-qualification-consumer.v2')
+        if fault in {'witness-unknown','render-unknown'}:
+            with pytest.raises((ValueError,RuntimeError,TimeoutError)):q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        else:
+            current=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+            assert current.execution==prior.execution and current.semantic_witnesses==prior.semantic_witnesses
+        assert (len(qa),len(jev),len(render))==counts
+        with sqlite3.connect(usage.path)as db:
+            assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
+
+
+def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_path,monkeypatch):
+    import sqlite3
+    from newsroom.control_plane.native_publication import NativePublicationContinuation
+    from newsroom.control_plane.native_progress import NativeRevisionJournal
+    from newsroom.control_plane.store import connect
+    from newsroom.control_plane.native_evidence import NativeEvidenceController,NativeEvidenceHold
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    from newsroom.control_plane.native_composition import ASSESSMENT_CONTRACT_VERSION
+    from newsroom.tests.test_native_publication_continuation import _native,_source,_Authority,_Publication,_Reader
+    from newsroom.authority.types import UtcTimestamp
+    with _selected_qualification_case(tmp_path,monkeypatch)as(q,w,old,c,b,s,a,scope,proof,usage,qa,jev,render):
+        unit=_native();connection=connect(str(tmp_path/'reachability.sqlite3'))
+        journal=NativeRevisionJournal(connection);journal.land((unit,))
+        contract='newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2'
+        intent={'contract':contract,'input_digest':'sha256:'+'a'*64,'origin_invocation_id':'retained-original'}
+        facts={'candidate_id':c.candidate_id,'candidate_version_id':c.version_id,'graphiti_receipts':[{}],
+            'intake_receipt_id':'retained-intake','semantic_assessment_intent':intent,
+            'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.replace('consumer.v2','consumer.v1'),
+            'retained_qualification_checked_contract':ASSESSMENT_CONTRACT_VERSION.replace('consumer.v2','consumer.v1'),
+            'reason':'SEMANTIC_INTENT_INPUT_CHANGED_HOLD','failure_class':'ValueError','acquisition_retryable':False,
+            'assessment_started_at':'retained-start','acquisition_attempt_count':2,'semantic_acquisition_attempt_count':2}
+        journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+        class CandidateAuthority(_Authority):
+            def candidate_version(self,_version):return c
+        requests=[]
+        def acquire(_self,**request):
+            requests.append(request);assert request['assessment_qualification_cached_only']is True
+            assert request['assessment_cached_only']is True and 'before_semantic_assessment'not in request
+            request['before_assessment']()
+            with sqlite3.connect(usage.path)as db:before=db.execute('SELECT COUNT(*)FROM model_invocation_allocations').fetchone()[0]
+            original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=proof)
+            with sqlite3.connect(usage.path)as db:assert db.execute('SELECT COUNT(*)FROM model_invocation_allocations').fetchone()[0]==before
+            selected=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+            assert selected.semantic_witnesses and len(qa)==1 and len(jev)==2
+            raise NativeEvidenceHold('PROVIDER_FREE_FIXTURE_COMPLETE',unit.source_id)
+        monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+        monkeypatch.setattr('newsroom.control_plane.native_publication.open_private_serving_read_port',lambda *_a,**_k:_Reader())
+        runtime=SimpleNamespace(authority=CandidateAuthority(),ingress=object(),publication=_Publication(),proof=proof,
+            policies=SimpleNamespace(publication=SimpleNamespace(target_path=tmp_path/'serving.sqlite3',target_id='private',target_context_digest='sha256:'+'a'*64)))
+        continuation=NativePublicationContinuation(journal=journal,runtime=runtime,evidence_controller=object.__new__(NativeEvidenceController),
+            sources={unit.revision_id:(_source(unit),)},semantic_origin_failure=lambda _:None,semantic_intent_contract=contract,
+            assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,clock=lambda:UtcTimestamp.parse('2026-10-06T20:00:00Z'))
+        try:
+            continuation.advance(revision_id=unit.revision_id,candidate_version_id=c.version_id)
+            after=journal.current(unit.revision_id)['facts']
+            assert after['semantic_assessment_intent']==intent and after['assessment_started_at']=='retained-start'
+            assert after['retained_qualification_checked_contract']==ASSESSMENT_CONTRACT_VERSION
+            assert len(requests)==1 and runtime.publication.calls==0
+            continuation.advance(revision_id=unit.revision_id,candidate_version_id=c.version_id)
+            assert len(requests)==1 and len(qa)==1 and len(jev)==2
+        finally:connection.close()

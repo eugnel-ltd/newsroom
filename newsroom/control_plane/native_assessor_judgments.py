@@ -389,7 +389,7 @@ def _semantic_witness_inputs(qualification, claim, package, binding):
     if (first < 0 or raw.find(selected, first + 1) >= 0 or claim.supporting_excerpt != claim.claim
             or preceding and preceding[-1:] not in {b'\n', b'.', b'!', b'?'}
             or first + len(selected) < len(raw) and raw[first + len(selected):].lstrip(b' \t')[:1] != b'\n'
-                and selected[-1:] not in {b'.', b'!', b'?'}):
+                and selected.rstrip(b' \t\r\n\v\f')[-1:] not in {b'.', b'!', b'?'}):
         raise ValueError('semantic witness exact range differs')
     fields = dict(qualification.test_evidence)
     from .admission import _QUALIFICATION_CLASSIFIER_FIELDS
