@@ -1710,3 +1710,15 @@ def test_old_unresolved_context_does_not_receive_a_new_purpose(stage_reason):
     before = json.loads(json.dumps(facts))
     assert not NativePublicationContinuation.context_enrichment_due(facts)
     assert facts == before
+
+
+@pytest.mark.parametrize('reason,checked,due', [('CONTEXT_SUPPORT_UNPROVEN_HOLD', None, True),
+    ('CONTEXT_SUPPORT_UNPROVEN_HOLD', 'newsroom.native-context-support.assembled.v1', False),
+    ('CONTEXT_SELECTION_UNCERTAIN_HOLD', None, False)])
+def test_only_closed_old_support_judgement_is_scheduled_for_assembled_input(reason, checked, due):
+    facts = {'context_enrichment_intent': {'contract':'newsroom.native-context-package.v2',
+             'original_package_admission_id':'original'}, 'context_enrichment_settled':'newsroom.native-context-package.v2',
+             'reason':reason,'context_support_checked_contract':checked}
+    assert NativePublicationContinuation.context_enrichment_due(facts) is due
+    facts['publication_event_id'] = 'pending-publication'
+    assert not NativePublicationContinuation.context_enrichment_due(facts)
