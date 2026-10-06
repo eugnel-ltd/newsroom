@@ -1961,7 +1961,7 @@ def test_semantic_witness_disposition_is_retained_without_retry_or_free_text(tmp
         finally:connection.close()
 
 
-@pytest.mark.parametrize('fault',['NO','UNCERTAIN','missing-ref','source-change','unknown','stop'])
+@pytest.mark.parametrize('fault',['NO','UNCERTAIN','missing-ref','source-change','unknown','stop','deadline'])
 def test_old_valueerror_is_reclassified_only_by_current_authenticated_existing_witness(tmp_path,monkeypatch,fault):
     import sqlite3
     from newsroom.authority.canonical import digest_canonical
@@ -2006,7 +2006,7 @@ def test_old_valueerror_is_reclassified_only_by_current_authenticated_existing_w
                 if fault=='stop'and len(checks)>1:
                     from newsroom.control_plane.veto import VetoError
                     raise VetoError('owner stop after authenticated read')
-                return True
+                return not(fault=='deadline'and len(checks)>1)
             if fault=='stop':
                 from newsroom.control_plane.veto import VetoError
                 with pytest.raises(VetoError,match='after authenticated read'):
@@ -2023,7 +2023,7 @@ def test_old_valueerror_is_reclassified_only_by_current_authenticated_existing_w
                 assert after['facts']['semantic_witness_previous_hold']['failure_class']=='ValueError'
                 assert after['facts']['semantic_assessment_intent']==intent and after['facts']['original_fee']=='retained'
             else:assert result==()and after==before
-            if fault!='stop':assert continuation.recover_pre_dispatch((unit.revision_id,),failure_many=lambda *_:pytest.fail('retry'),before_revision=lambda:True)==()
+            if fault not in {'stop','deadline'}:assert continuation.recover_pre_dispatch((unit.revision_id,),failure_many=lambda *_:pytest.fail('retry'),before_revision=lambda:True)==()
             assert (len(qa),len(jev),len(render))==counts
             with sqlite3.connect(usage.path)as db:assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
         finally:connection.close()

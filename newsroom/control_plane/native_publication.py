@@ -1099,7 +1099,7 @@ class NativePublicationContinuation:
         except (OperatorDrainRequested,VetoError):raise
         except NativeEvidenceHold as error:
             if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:return False
-            before_write()  # Recheck stop/drain after the authenticated reads.
+            if not before_write():return False  # Honour stop/drain and the remaining quantum.
             if self._journal.summary(revision_id)!=progress:return False
             updated=dict(facts)
             self._retain_witness_disposition(updated,error)
