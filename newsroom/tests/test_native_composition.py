@@ -1227,3 +1227,29 @@ def test_source_binding_cost_clock_failure_preserves_source_boundary(monkeypatch
     else:
         assert publication.sources_for('selected') is result
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('changed', (None, 'definition-version', 'locator', 'stop'))
+def test_actual_native_composition_rights_accepts_checked_immutable_headers(composed_rights_cohort, changed):
+    from newsroom.control_plane.native_retrieval import NativeRetrievalHold
+    fixture = composed_rights_cohort
+    journal = fixture.pipeline._journal
+    journal.land((fixture.unit,))
+    reader = fixture.retrieval._unit_headers_for
+    assert reader.__self__ is journal.units
+    header = reader(fixture.unit.revision_id)[0]
+    assert not hasattr(header, 'body') and not hasattr(header.authority, 'records')
+    if changed == 'definition-version':
+        header = replace(header, authority=replace(header.authority,
+            definition_version_id='00000000-0000-4000-8000-000000000123'))
+    elif changed == 'locator':
+        header = replace(header, source_definition_url='https://wrong.example/source')
+    elif changed == 'stop':
+        fixture.stop_requested[0] = True
+    if changed:
+        with pytest.raises(RuntimeError if changed == 'stop' else NativeRetrievalHold):
+            with fixture.retrieval._rights_cohort() as rights:
+                rights(header)
+    else:
+        with fixture.retrieval._rights_cohort() as rights:
+            assert rights(header) == rights(fixture.unit)

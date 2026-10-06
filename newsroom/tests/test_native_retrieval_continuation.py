@@ -961,3 +961,43 @@ def test_native_subject_inventory_uses_owned_rights_cohort_and_keeps_generic_per
     native=NativeRetrievalContinuation(**kwargs,rights_cohort=cohort)
     assert native._current_subjects()==baseline
     assert windows==["enter","exit"] and calls==[unit.ingest_id,other.ingest_id]
+
+
+@pytest.mark.parametrize('held', (False, True))
+def test_native_header_subjects_preserve_full_inventory_and_generic_unit_fallback(tmp_path, monkeypatch, held):
+    from newsroom.control_plane import native_progress as progress
+    connection = connect(str(tmp_path / 'header-subjects.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    first = replace(_native('headers-subjects'), chunk_count=2)
+    second = replace(first, chunk_ordinal=2, authority=replace(first.authority,
+        definition_version_id='00000000-0000-4000-8000-000000000123'))
+    units = (first, second)
+    journal.land(units)
+    receipts = {u.ingest_id: NativeDocumentReceipt(str(uuid.uuid4()), str(uuid.uuid4()),
+        AggregateId.new(), 1, ObjectAdmissionId.new(), digest_bytes(u.ingest_id.encode()),
+        ObjectAdmissionId.new(), ObjectAdmissionId.new()) for u in units}
+    facts = {'retrieval_documents': {u.ingest_id: {'receipt': receipts[u.ingest_id].projection_value(),
+              'graph_root_id': 'root-'+str(i)} for i,u in enumerate(units)}}
+    journal.advance(first.revision_id, stage='EVIDENCE_HOLD', facts=facts)
+    calls = []
+    def rights(unit):
+        calls.append((unit.ingest_id, unit.authority.definition_version_id))
+        if held and unit.ingest_id == second.ingest_id:
+            raise NativeRetrievalHold('CURRENT_DEFINITION_VERSION_HOLD')
+        return digest_canonical([unit.source_id, unit.source_definition_url,
+            unit.authority.definition_id, unit.authority.definition_version_id])
+    arguments = dict(system=object(), documents=object(), journal=journal, connection=connection,
+        embedder=object(), generation_id=GENERATION, port_for=lambda *_: pytest.fail('no port'), rights_check=rights)
+    generic = NativeRetrievalContinuation(**arguments)
+    expected = generic._current_subjects()
+    assert calls == [(u.ingest_id, u.authority.definition_version_id) for u in units]
+    calls.clear()
+    native = NativeRetrievalContinuation(**arguments, unit_headers_for=journal.units.retrieval_headers)
+    monkeypatch.setattr(progress, '_landed_units', lambda *_a, **_k: pytest.fail('full units reconstructed'))
+    try:
+        assert native._current_subjects() == expected
+        assert calls == [(u.ingest_id, u.authority.definition_version_id) for u in units]
+        assert len(expected[1]) == 2
+        assert len(expected[0]) == (1 if held else 2)
+    finally:
+        connection.close()

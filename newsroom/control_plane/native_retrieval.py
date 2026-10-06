@@ -76,11 +76,13 @@ class NativeRetrievalContinuation:
         embedder, generation_id: str, port_for: Callable,
         rights_check: Callable[[CorpusIngestUnit], str | None],
         rights_cohort: Callable | None = None,
+        unit_headers_for: Callable | None = None,
     ) -> None:
         self._system, self._documents, self._journal = system, documents, journal
         self._connection, self._embedder = connection, embedder
         self._generation, self._port_for, self._rights = generation_id, port_for, rights_check
         self._rights_cohort = rights_cohort
+        self._unit_headers_for = unit_headers_for
 
     def _facts(self, revision_id: str) -> dict:
         return dict(self._journal.current(revision_id).get("facts", {}))
@@ -189,7 +191,8 @@ class NativeRetrievalContinuation:
             records = facts.get("retrieval_documents", {})
             if not records:
                 continue
-            source_units = self._journal.units[source_revision]
+            source_units = (self._journal.units[source_revision] if self._unit_headers_for is None
+                            else self._unit_headers_for(source_revision))
             exclusions = dict(facts.get("retrieval_exclusions", {}))
             for unit in source_units:
                 record = records.get(unit.ingest_id)
