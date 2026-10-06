@@ -11,7 +11,9 @@ from .native_assessor import NativeAssessmentExecution
 from .native_assessor_spans import build_lossless_source_view
 from .native_source_qualification import QualificationHold, QualificationReference, _materialisation
 
-CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v1'
+CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v2'
+# Pure consumer repairs never reopen an identical paid witness/render purpose.
+PAID_BINDING_VERSION = 'newsroom.source-qualification-consumer.v1'
 
 
 class NativeQualifiedSourceConsumer:
@@ -62,7 +64,7 @@ class NativeQualifiedSourceConsumer:
                 qualification_record_id=_qualification_record_id(claim.claim_id, item['test'], [list(p)for p in fields]),
                 test_evidence=fields, policy_version=item['policy_version'])
             if not _qualification_relation_is_proven(q, claim, source_context=base.passages[claim.passage_index]):
-                verified_binding = {**binding, 'semantic_witness_consumer': CONSUMER_VERSION,
+                verified_binding = {**binding, 'semantic_witness_consumer': PAID_BINDING_VERSION,
                     'source_qualification_reference': decision['qualification_reference']}
                 ref = self.semantic_witnesses.evaluate(q, claim, base, verified_binding)
                 witnesses.append(((claim.claim_id, q.test.value), ref))
@@ -114,7 +116,7 @@ class NativeQualifiedSourceConsumer:
                 selected[str(index)] = {'source_id':claim.source_ids[0], 'text':claim.claim,
                     'source_range':wire_claim['source_range'], 'entities':[list(p)for p in names], 'rendering_fragment_count':len(names)+1,
                     **({'source_derived_facts':[list(year[:2])]}if year is not None else {})}
-            request = {'source_binding': {**binding, 'source_qualification_rendering': CONSUMER_VERSION,
+            request = {'source_binding': {**binding, 'source_qualification_rendering': PAID_BINDING_VERSION,
                 'qualification_reference': decision['qualification_reference'], 'semantic_witnesses': [[list(key), dict(ref)]for key,ref in witnesses]}, 'claims':selected}
             rendering_ref = self.localise(request)
             rendered = self.read_localisation(rendering_ref, request)

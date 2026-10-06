@@ -543,3 +543,96 @@ def test_witness_sentence_boundary_rejects_partial_or_mismatched_parent(fault):
         'content_digest':base.digest if fault!='digest'else digest_bytes(b'wrong'),'evidence_package_digest':base.digest,
         'coverage':'COMPLETE','newness':'KNOWN_CHANGE','current_scope':{'sources':[{'source_id':'source','body':body}]}}
     with pytest.raises(ValueError):_semantic_witness_inputs(qualification,claim,base,binding)
+
+
+@pytest.mark.parametrize('fault',[None,'witness-unknown','render-unknown','qa-NO'])
+def test_consumer_stamp_revalidation_keeps_existing_paid_purposes(tmp_path,monkeypatch,fault):
+    from newsroom.control_plane import native_source_qualification_consumer as consumer_module
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    with _selected_qualification_case(tmp_path,monkeypatch,malformed_rendering=True,fault='qa-NO'if fault=='qa-NO'else None)as(q,w,old,c,b,s,a,scope,proof,usage,qa,jev,render):
+        if fault=='witness-unknown':
+            transport=w.judgments.transport
+            def unknown(request,**kwargs):
+                if 'criterion' in json.loads(request.data)['questions']:
+                    jev.append('synthetic unknown witness');raise TimeoutError('fixture unknown witness')
+                return transport(request,**kwargs)
+            w.judgments.transport=unknown
+        if fault=='render-unknown':
+            # Retain a genuine unknown localiser result with the same source-bound
+            # request and ledger, rather than faking a resolved zero effect.
+            cells=q.localise.__closure__
+            localiser=next(cell.cell_contents for cell in cells if type(cell.cell_contents).__name__=='NativeClaimLocaliser')
+            def unknown_render(_prompt):render.append('synthetic unknown rendering');raise TimeoutError('fixture unknown renderer')
+            localiser.runner=unknown_render
+        original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=proof)
+        # Create the old app-v1 outcome, then change ONLY the pure consumer stamp.
+        monkeypatch.setattr(consumer_module,'CONSUMER_VERSION','newsroom.source-qualification-consumer.v1')
+        if fault in {'witness-unknown','render-unknown'}:
+            with pytest.raises((ValueError,RuntimeError,TimeoutError)):q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        else: prior=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        import sqlite3
+        with sqlite3.connect(usage.path)as db:
+            pins=db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()
+        counts=(len(qa),len(jev),len(render))
+        monkeypatch.setattr(consumer_module,'CONSUMER_VERSION','newsroom.source-qualification-consumer.v2')
+        if fault in {'witness-unknown','render-unknown'}:
+            with pytest.raises((ValueError,RuntimeError,TimeoutError)):q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        else:
+            current=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+            assert current.execution==prior.execution and current.semantic_witnesses==prior.semantic_witnesses
+        assert (len(qa),len(jev),len(render))==counts
+        with sqlite3.connect(usage.path)as db:
+            assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
+
+
+def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_path,monkeypatch):
+    import sqlite3
+    from newsroom.control_plane.native_publication import NativePublicationContinuation
+    from newsroom.control_plane.native_progress import NativeRevisionJournal
+    from newsroom.control_plane.store import connect
+    from newsroom.control_plane.native_evidence import NativeEvidenceController,NativeEvidenceHold
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    from newsroom.control_plane.native_composition import ASSESSMENT_CONTRACT_VERSION
+    from newsroom.tests.test_native_publication_continuation import _native,_source,_Authority,_Publication,_Reader
+    from newsroom.authority.types import UtcTimestamp
+    with _selected_qualification_case(tmp_path,monkeypatch)as(q,w,old,c,b,s,a,scope,proof,usage,qa,jev,render):
+        unit=_native();connection=connect(str(tmp_path/'reachability.sqlite3'))
+        journal=NativeRevisionJournal(connection);journal.land((unit,))
+        contract='newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2'
+        intent={'contract':contract,'input_digest':'sha256:'+'a'*64,'origin_invocation_id':'retained-original'}
+        facts={'candidate_id':c.candidate_id,'candidate_version_id':c.version_id,'graphiti_receipts':[{}],
+            'intake_receipt_id':'retained-intake','semantic_assessment_intent':intent,
+            'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.replace('consumer.v2','consumer.v1'),
+            'retained_qualification_checked_contract':ASSESSMENT_CONTRACT_VERSION.replace('consumer.v2','consumer.v1'),
+            'reason':'SEMANTIC_INTENT_INPUT_CHANGED_HOLD','failure_class':'ValueError','acquisition_retryable':False,
+            'assessment_started_at':'retained-start','acquisition_attempt_count':2,'semantic_acquisition_attempt_count':2}
+        journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+        class CandidateAuthority(_Authority):
+            def candidate_version(self,_version):return c
+        requests=[]
+        def acquire(_self,**request):
+            requests.append(request);assert request['assessment_qualification_cached_only']is True
+            assert request['assessment_cached_only']is True and 'before_semantic_assessment'not in request
+            request['before_assessment']()
+            with sqlite3.connect(usage.path)as db:before=db.execute('SELECT COUNT(*)FROM model_invocation_allocations').fetchone()[0]
+            original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=proof)
+            with sqlite3.connect(usage.path)as db:assert db.execute('SELECT COUNT(*)FROM model_invocation_allocations').fetchone()[0]==before
+            selected=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+            assert selected.semantic_witnesses and len(qa)==1 and len(jev)==2
+            raise NativeEvidenceHold('PROVIDER_FREE_FIXTURE_COMPLETE',unit.source_id)
+        monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+        monkeypatch.setattr('newsroom.control_plane.native_publication.open_private_serving_read_port',lambda *_a,**_k:_Reader())
+        runtime=SimpleNamespace(authority=CandidateAuthority(),ingress=object(),publication=_Publication(),proof=proof,
+            policies=SimpleNamespace(publication=SimpleNamespace(target_path=tmp_path/'serving.sqlite3',target_id='private',target_context_digest='sha256:'+'a'*64)))
+        continuation=NativePublicationContinuation(journal=journal,runtime=runtime,evidence_controller=object.__new__(NativeEvidenceController),
+            sources={unit.revision_id:(_source(unit),)},semantic_origin_failure=lambda _:None,semantic_intent_contract=contract,
+            assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,clock=lambda:UtcTimestamp.parse('2026-10-06T20:00:00Z'))
+        try:
+            continuation.advance(revision_id=unit.revision_id,candidate_version_id=c.version_id)
+            after=journal.current(unit.revision_id)['facts']
+            assert after['semantic_assessment_intent']==intent and after['assessment_started_at']=='retained-start'
+            assert after['retained_qualification_checked_contract']==ASSESSMENT_CONTRACT_VERSION
+            assert len(requests)==1 and runtime.publication.calls==0
+            continuation.advance(revision_id=unit.revision_id,candidate_version_id=c.version_id)
+            assert len(requests)==1 and len(qa)==1 and len(jev)==2
+        finally:connection.close()

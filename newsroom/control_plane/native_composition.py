@@ -78,6 +78,7 @@ from .native_source_rights import (
     retain_rights_snapshot_bundle, require_rights_assessment, fetch_licensing_observations,
 )
 from .native_assessor_spans import PARTITION_VERSION
+from .native_source_qualification_consumer import CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
 from .native_weather_sources import poll_other_source
 from .native_weather_evidence import NativeWeatherEvidenceAcquisition, POLICY_DIGEST as WEATHER_TRANSPORT_POLICY
@@ -90,7 +91,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"{QUALIFICATION_RELATION_POLICY_VERSION}+{RETAINED_ASSESSMENT_POLICY_VERSION}+{PARTITION_VERSION}"
     f"+{QUALIFICATION_CLAUSE_CONSUMER_VERSION}"
     f"+{CONTEXT_MATERIALISATION_VERSION}"
-    "+newsroom.source-qualification-consumer.v1"
+    f"+{QUALIFICATION_CONSUMER_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
