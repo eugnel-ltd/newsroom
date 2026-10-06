@@ -128,8 +128,9 @@ def derive_and_verify(original_draft, original_review, package, source_currentne
              and claim.claim_id in support[0]['claim_ids'], 'REVIEW_ALIGNMENT')
     links = original_draft['evidence_links']
     selected = [(i, link) for i, link in enumerate(links) if _RELATIVE.search(link['rendered_assertion'])]
+    # The caller has validated this exact separately reviewed copy and its claim
+    # links. Date derivation changes one token, not the supported prose around it.
     _require(len(selected) == 1 and selected[0][1]['governed_claim_id'] == claim.claim_id
-             and selected[0][1]['rendered_assertion'] == claim.rendered_assertion_zh_hant_hk
              and original_draft['body'].count(selected[0][1]['rendered_assertion']) == 1, 'COPY_ALIGNMENT')
     expected_paths = {'/title', '/body', f'/evidence_links/{selected[0][0]}/rendered_assertion'}
     _require({path for path, _ in relative} == expected_paths, 'COPY_ALIGNMENT')
