@@ -154,7 +154,6 @@ class NativeQualifiedSourceConsumer:
 
 def validate_source_literal_copy(copy, package, *, semantic_witness_reader=None):
     """Only correct quote delimiters within currently authenticated literal names."""
-    from dataclasses import replace
     from .writer import validate_writer_copy
     from .admission import source_rendering_is_admitted
     from .evidence import _entity_pattern
@@ -173,9 +172,23 @@ def validate_source_literal_copy(copy, package, *, semantic_witness_reader=None)
                     if char in {"'",'’'} and 0 < index < len(name)-1
                     and name[index-1].isalpha() and name[index+1].isalpha())
         return ''.join('x'if index in positions else char for index,char in enumerate(text))
-    title, body = mask(copy.title), mask(copy.body)
-    if (title, body) == (copy.title, copy.body):
+    text = f"{copy.title}\n{copy.body}"
+    scanned = mask(text)
+    if scanned == text:
         return original
-    masked = validate_writer_copy(replace(copy,title=title,body=body), package)
-    quoted = next(row for row in masked if row.validator == 'QUOTE_FIDELITY')
-    return tuple(quoted if row.validator == 'QUOTE_FIDELITY' else row for row in original)
+    from .writer import _has_unicode_quote_delimiter, WriterValidatorResult
+    # Scan positions are unchanged; comparator values remain authoritative text.
+    patterns = (r'"([^"\n]+)"',r"“([^”\n]+)”",r"「([^」\n]+)」",r"『([^』\n]+)』",
+        r"‘([^’\n]+)’",r"〝([^〞\n]+)〞",r"﹁([^﹂\n]+)﹂",r"❝([^❞\n]+)❞",
+        r"﹃([^﹄\n]+)﹄",r"«([^»\n]+)»",r"‹([^›\n]+)›",
+        r"(?<![A-Za-z])'([^'\n]+)'(?![A-Za-z])")
+    quoted = {text[match.start(1):match.end(1)]for pattern in patterns for match in re.finditer(pattern,scanned)}
+    positions = tuple(index for index,char in enumerate(scanned) if _has_unicode_quote_delimiter(char))
+    quoted.update(text[start+1:end]for start,end in zip(positions[::2],positions[1::2])if start+1<end)
+    segments = tuple(segment.strip()for segment in re.split(r'\n+',text)if segment.strip())
+    passed = len(positions)%2 == 0 and all(any(value in claim.quotations
+        and claim.attribution in claim.rendered_assertion_zh_hant_hk
+        and any(value in segment and claim.attribution in segment for segment in segments)
+        for claim in package.governed_claims)for value in quoted)
+    corrected = WriterValidatorResult('QUOTE_FIDELITY','PASS'if passed else'FAIL','UNSUPPORTED_OR_UNATTRIBUTED_QUOTATION')
+    return tuple(corrected if row.validator == 'QUOTE_FIDELITY'else row for row in original)

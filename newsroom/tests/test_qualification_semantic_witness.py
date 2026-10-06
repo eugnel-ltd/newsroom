@@ -158,10 +158,12 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         'date':'Schools could receive practical education materials next year.',
         'value':'Schools now receive £0.50 for practical education materials.',
         'terms':'Schools now receive SEND training.',
+        'quoted-terms':'Schools now receive SEND training.',
         'year':'Schools will receive fully funded education materials next year.'}.get(fault,
         'Schools now receive fully funded practical education materials.')
     supporting = ('The SEND programme is delivered by Ambition Institute and charity Dingley’s Promise.'
-        if fault=='terms' else 'The materials are now available to households.')
+        if fault=='terms' else 'The SEND programme is delivered by charity Dingley’s Promise, under the name “Dingley’s Promise”.'
+        if fault=='quoted-terms' else 'The materials are now available to households.')
     body=headline+'\n'+supporting
     with typed_case(tmp_path,monkeypatch,max_prompt_bytes=7000,body=body) as (consumer,service,candidate,base,source,acquired,usage,jev_calls):
         if candidate_binding is not None:
@@ -197,6 +199,9 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         if fault=='qa-NO':
             from newsroom.tests.test_native_source_qualification import WIRE
             wire=WIRE
+        if fault=='quoted-terms':
+            acquired.publisher='Dingley’s Promise'
+            wire['package']['governed_claims'][1]['quotation_source_keys']=['Dingley’s Promise']
         qa_calls=[];render_calls=[]
         def qa_runner(_prompt):
             qa_calls.append(_prompt)
@@ -213,15 +218,17 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         service.transport=transport
         def render_runner(prompt):
             render_calls.append(prompt)
-            if fault in {'terms','year'}:
+            if fault in {'terms','year','quoted-terms'}:
                 requested=json.loads(prompt)['claims']
                 rows=[]
                 for index,row in requested.items():
                     names=row['entities']
                     fragments=((['學校現時獲提供']+['培訓。']*len(names))if index=='0'else(['計劃由']+['提供支援。']*len(names))) if names else ['學校將於2027年獲提供全額資助教育教材。'if index=='0'else'教材現時可供家庭使用。']
+                    if fault=='quoted-terms' and index=='1':
+                        fragments=['','計劃由','提供。名稱為「','」。']
                     rows.append({'span_id':index,'rendered_assertion_zh_hant_hk_fragments':fragments,
                         'factual_localisations':[{'source_lookup_key':a,'rendered_expression':b}for a,b in row.get('source_derived_facts',[])],
-                        'quotation_source_keys':[]})
+                        'quotation_source_keys':['Dingley’s Promise']if fault=='quoted-terms'and index=='1'else[]})
                 return WriterCliExecution(json.dumps({'renderings':rows},ensure_ascii=False),
                     {'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':10,'total_tokens':50})
             return WriterCliExecution(json.dumps({'renderings':[
@@ -447,3 +454,30 @@ def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path
             assert len(qa)==1 and len(jev)==2 and len(render)==1
         finally:
             connection.rollback();connection.close();ingress.close();system.close()
+
+
+def test_source_literal_quote_wrapper_preserves_supported_outer_quote_and_attribution(tmp_path,monkeypatch):
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
+    from newsroom.control_plane.native_source_qualification_consumer import validate_source_literal_copy
+    from newsroom.control_plane.writer import WriterCopy,validate_writer_copy,required_surface_copy
+    with _selected_qualification_case(tmp_path,monkeypatch,malformed_rendering=True,fault='quoted-terms')as(q,w,old,c,b,s,a,scope,proof,usage,qa,jev,render):
+        original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=proof)
+        selected=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        assessment=AutonomousNativeEvidenceAssessor._validated_execution(selected.execution,c,b,(s,),(a,),
+            semantic_witnesses=selected.semantic_witnesses,source_renderings=selected.source_renderings,semantic_witness_reader=w.read)
+        package=replace(b,governed_claims=assessment.governed_claims,qualification_evidence=assessment.qualification_evidence,
+            substantive_new_information=assessment.substantive_new_information)
+        title,body,links=required_surface_copy(package,paragraphs=True,context_preserving=True)
+        copy=WriterCopy(title,body,'newsroom.offline-exact-copy.v3',package.digest,links)
+        before=canonical_json_bytes(evidence_package_value(package));copy_before=repr(copy)
+        original_results=validate_writer_copy(copy,package)
+        corrected=validate_source_literal_copy(copy,package,semantic_witness_reader=w.read)
+        assert next(row for row in corrected if row.validator=='QUOTE_FIDELITY').result=='PASS'
+        assert [row for row in corrected if row.validator!='QUOTE_FIDELITY']==[row for row in original_results if row.validator!='QUOTE_FIDELITY']
+        assert canonical_json_bytes(evidence_package_value(package))==before and repr(copy)==copy_before
+        assert next(row for row in validate_source_literal_copy(copy,package)if row.validator=='QUOTE_FIDELITY').result=='FAIL'
+        for wrong in (replace(copy,body=copy.body.replace('名稱為「','名稱為「未經證實')),replace(copy,body=copy.body+'\n“unattributed quotation”'),
+                replace(copy,body=copy.body+'\n“unbalanced'),replace(copy,body=copy.body+'\npolicy’s invention')):
+            assert next(row for row in validate_source_literal_copy(wrong,package,semantic_witness_reader=w.read)if row.validator=='QUOTE_FIDELITY').result=='FAIL'
+        assert len(qa)==1 and len(jev)==2 and len(render)==1
