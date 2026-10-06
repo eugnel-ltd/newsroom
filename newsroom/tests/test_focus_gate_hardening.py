@@ -1030,15 +1030,17 @@ def test_closed_source_name_date_bodies_use_direct_contract_without_service(tmp_
 def test_actual_natural_copy_date_fix_keeps_existing_data_callee_contract(tmp_path):
     root = Path(__file__).parents[2]
     path = _BODY_CONTRACT_SOURCES[1]
-    before = subprocess.run(('git', 'show', '30d663e3b9971cf668ddb3aacf5c2a84e0a752e9:' + path),
-                            cwd=root, capture_output=True, text=True, check=True).stdout
-    after = subprocess.run(('git', 'show', 'b033de4b69c8bb28aff508068cfe954f94178f1a:' + path),
-                           cwd=root, capture_output=True, text=True, check=True).stdout
-    assert "and selected[0][1]['rendered_assertion'] == claim.rendered_assertion_zh_hant_hk" in before
-    assert "and selected[0][1]['rendered_assertion'] == claim.rendered_assertion_zh_hant_hk" not in after
+    after = (root / path).read_text(encoding='utf-8')
+    anchor = "             and original_draft['body'].count(selected[0][1]['rendered_assertion']) == 1, 'COPY_ALIGNMENT')"
+    literal = "             and selected[0][1]['rendered_assertion'] == claim.rendered_assertion_zh_hant_hk\n"
+    assert after.count(anchor) == 1 and after.count(literal) == 0
+    # Recreate the observed predicate removal without requiring private commits
+    # to survive squash or to exist in the CI checkout's Git history.
+    before = after.replace(anchor, literal + anchor, 1)
+    assert before.count(anchor) == 1 and before.count(literal) == 1
     _sources, base = _body_contract_repo(tmp_path, {path: before})
     _write(tmp_path, path, after)
-    head = _commit(tmp_path, 'actual b033 natural-copy predicate removal')
+    head = _commit(tmp_path, 'observed natural-copy literal predicate removal')
     route = selector.select_focus((path,), repo_root=tmp_path, base_sha=base, head_sha=head)
     assert route['selected_tests'] == sorted('newsroom/tests/' + name for name in _BODY_CONTRACT_TESTS)
     assert route['selected_service_tests'] == [] and route['gates'] == ['F0', 'F1', 'F2']
