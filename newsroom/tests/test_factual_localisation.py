@@ -115,3 +115,37 @@ def test_retained_month_claim_contexts_are_calendar_facts(source, target, claim,
         rendered_assertion_zh_hant_hk=rendered,
     )
     assert actual.localised_factual_expressions == ((source, target),)
+
+
+@pytest.mark.parametrize(('source', 'target'), (
+    ('£200 million', '二億英鎊'),
+    ('GBP 200 million', '2億英鎊'),
+    ('£150,000', '十五萬英鎊'),
+    ('£1 billion', '十億英鎊'),
+    ('200 million pounds', '200000000英鎊'),
+))
+def test_pound_localisation_preserves_currency_and_integer_scale(source, target):
+    claim = _claim(source, target)
+    assert claim.localised_factual_expressions == ((source, target),)
+    for changes in (
+        {'claim': 'The grant changed.', 'supporting_excerpt': 'The grant changed.'},
+        {'rendered_assertion_zh_hant_hk': '津貼已修訂。'},
+    ):
+        with pytest.raises(ValueError, match='equivalent exact claim facts'):
+            replace(claim, **changes)
+
+
+@pytest.mark.parametrize(('source', 'target'), (
+    ('£200 million', '二億港元'),
+    ('£200 million', '二千萬英鎊'),
+    ('£200 million', '三億英鎊'),
+    ('$200 million', '二億英鎊'),
+    ('€200 million', '二億英鎊'),
+    ('£20,00', '二千英鎊'),
+    ('£2.5 million', '二百五十萬英鎊'),
+    ('£-200', '二百英鎊'),
+    ('£200 million', '2億美元'),
+))
+def test_pound_localisation_rejects_unsupported_or_changed_money(source, target):
+    with pytest.raises(ValueError, match='equivalent exact claim facts'):
+        _claim(source, target)

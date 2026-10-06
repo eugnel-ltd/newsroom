@@ -1107,6 +1107,22 @@ def _canonical_localised_fact(value: str) -> tuple[object, ...] | None:
         if not _valid_canonical_date(result):
             return None
         return result
+    pound_number = r"([0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)"
+    pound_scale = r"(?:\s+(thousand|million|billion))?"
+    pounds = re.fullmatch(
+        r"(?:£|GBP\s+)\s*" + pound_number + pound_scale, value, re.IGNORECASE,
+    )
+    if pounds is None:
+        pounds = re.fullmatch(pound_number + pound_scale + r"\s+pounds", value, re.IGNORECASE)
+    if pounds is not None:
+        scale = {None: 1, 'thousand': 1_000, 'million': 1_000_000, 'billion': 1_000_000_000}
+        multiplier = scale[pounds.group(2).lower() if pounds.group(2) else None]
+        return ('MONEY', 'GBP', int(pounds.group(1).replace(',', '')) * multiplier)
+    chinese_pounds = re.fullmatch(r"([0-9零〇一二三四五六七八九十百千萬万億亿兩两]+)英鎊", value)
+    if chinese_pounds is not None:
+        amount = _chinese_integer(chinese_pounds.group(1))
+        if amount is not None:
+            return ('MONEY', 'GBP', amount)
     english_money = re.fullmatch(r"HK\$\s*([\d,]+)", value, re.IGNORECASE)
     if english_money:
         return ("MONEY", "HKD", int(english_money.group(1).replace(",", "")))
