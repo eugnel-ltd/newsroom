@@ -1447,6 +1447,39 @@ def test_manual_fetch_failure_settles_workers_before_releasing_owner_fence(monke
     assert not fenced
 
 
+def test_manual_section_dispatch_denial_retains_successful_peer_coverage(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_source_intake import NativeSourceIntakeHold
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    fetched = []
+    @contextmanager
+    def fence(source_id, url):
+        assert source_id == 'UK-03'
+        if url.endswith('part-1'):
+            raise NativeSourceIntakeHold('CURRENT_SOURCE_SECTION_HOLD')
+        yield
+    def fetch(url):
+        fetched.append(url)
+        return (200, _manual()) if url == SOURCE_URLS['UK-03'] else (200, _manual_section(2))
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(
+            sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-03': _seed_missing(runtime, 'UK-03')},
+            licence=_licence(), dispatch_fence=fence, fetch=fetch,
+            clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC),
+        )
+        result = intake.poll()[SOURCE_IDS.index('UK-03')]
+        assert result.status == 'HOLD'
+        assert result.item_holds == ((
+            'https://www.gov.uk/guidance/immigration-rules/part-1', 'CURRENT_SOURCE_SECTION_HOLD',
+        ),)
+        assert [unit.canonical_url for unit in result.units] == [
+            'https://www.gov.uk/guidance/immigration-rules/part-2',
+        ]
+        assert fetched == [SOURCE_URLS['UK-03'], 'https://www.gov.uk/api/content/guidance/immigration-rules/part-2']
+        assert [observation[0] for observation in result.observations] == fetched
+
+
 def test_collection_body_rights_notice_vetoes_child_file_fetches(tmp_path, monkeypatch):
     args = _args(tmp_path, monkeypatch)
     args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
