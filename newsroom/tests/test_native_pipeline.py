@@ -276,7 +276,7 @@ def test_ordinary_phase_timing_keeps_pipeline_decisions_and_ledger_when_dropped(
     try:
         first = pipeline.tick(cycle_id="timed")
         assert first.revision_states == {"ACKNOWLEDGED": 2}
-        assert {value["phase"] for _, value in events} == {"CLASSIFY", "ORDINARY_RECOVERY", "ORDINARY_ADVANCE"}
+        assert {value["phase"] for _, value in events} == {"RIGHTS_REFRESH", "SOURCE_POLL", "CLASSIFY", "ORDINARY_RECOVERY", "ORDINARY_ADVANCE"}
         assert all(value["status"] == "COMPLETE" and value["cpu_scope"] == "PROCESS"
                    and type(value["elapsed_ms"]) is int for _, value in events)
         before_calls, before_changes = tuple(calls), connection.total_changes
