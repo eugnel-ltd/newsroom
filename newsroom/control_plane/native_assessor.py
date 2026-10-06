@@ -681,6 +681,8 @@ class RetainedAssessorResult:
     outcome: str
     completed_at: datetime
     execution: NativeAssessmentExecution | None
+    result_digest: str | None = None
+    result_receipt_digest: str | None = None
 
 
 def _validation_feedback(execution: NativeAssessmentExecution, reason: str) -> dict:
@@ -1339,12 +1341,20 @@ class NativeAssessmentUsage:
         return latest if latest.outcome == "ASSESSOR_PROVIDER_FAILED" else None
 
     def retained_semantic_origin_failure(self, candidate: object) -> RetainedAssessorResult | None:
-        """Authenticate an unknown origin without settling or retrying that purpose."""
+        """Authenticate a failed origin, never settle it or retry its old purpose."""
         results = self.retained_assessments(candidate, _semantic_origin=True)
         if not results:
             return None
         latest = max(results, key=lambda item: item.completed_at)
-        return latest if latest.outcome == 'ASSESSOR_PROVIDER_FAILED' and latest.execution is None else None
+        if latest.outcome == 'ASSESSOR_PROVIDER_FAILED' and latest.execution is None:
+            return latest
+        if (latest.outcome == 'ASSESSOR_VALIDATION_FAILED' and self._policy.qualified
+                and self._policy.prompt_contract_version == VERSION
+                and latest.result_digest is not None and latest.result_receipt_digest is not None):
+            # REPORTED validation is not UNKNOWN or a valid copy. Only a new,
+            # separately qualified semantic intent may consume this origin.
+            return latest
+        return None
 
     def retained_assessments(
         self, candidate: object, base: EvidencePackage | None = None, *, _semantic_origin: bool = False,
@@ -1697,6 +1707,7 @@ class NativeAssessmentUsage:
                     (_ASSESSMENT_RESULT_KIND, allocation.invocation_id),
                 ).fetchall()
                 execution = None
+                retained_result_digest = retained_receipt_digest = None
                 if len(result_rows) > 1 or (bounded_provider_failure and result_rows):
                     return None
                 if result_rows:
@@ -1722,6 +1733,8 @@ class NativeAssessmentUsage:
                         ):
                             return None
                         execution = NativeAssessmentExecution(output, {})
+                        retained_result_digest = result["result_digest"]
+                        retained_receipt_digest = result_digest
                     elif result.get("retention_outcome") != "OVERSIZED":
                         return None
                 if allocation.prompt_contract_version in _REFERENCE_PRODUCERS:
@@ -1785,6 +1798,8 @@ class NativeAssessmentUsage:
                     terminal.outcome,
                     terminal.completed_at,
                     execution,
+                    retained_result_digest,
+                    retained_receipt_digest,
                 ))
             return tuple(matches)
         except (KeyError, TypeError, ValueError, ModelUsageIntegrityError, NativeEvidenceError, EvidencePackageError):

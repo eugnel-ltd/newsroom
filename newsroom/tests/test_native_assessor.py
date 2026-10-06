@@ -3144,3 +3144,87 @@ def test_unknown_current_producer_can_be_read_as_separate_semantic_origin_not_re
             assert retained.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0] == old_terminal
     finally:
         connection.close()
+
+
+def _reported_validation_origin(tmp_path, monkeypatch, contract):
+    """Genuine disposable accounting; returned bytes are intentionally invalid."""
+    connection, _port, candidate = candidate_fixture(tmp_path)
+    base = _base_package(_ready_package(candidate)[1])
+    with monkeypatch.context() as historical:
+        historical.setattr(native_assessor_module, 'VERSION', contract)
+        historical.setattr(native_assessor_module, 'SYSTEM', getattr(
+            native_assessor_module, '_V15_SYSTEM' if contract.endswith('.v15') else '_V17_SYSTEM'))
+        historical.setattr(native_assessor_module, 'PROVIDER_SCHEMA_DIGEST',
+            SCHEMA_DIGEST if contract.endswith('.v15') else native_assessor_module._V17_PROVIDER_SCHEMA_DIGEST)
+        service, usage = _usage(tmp_path, historical)
+        allocation = usage.begin(candidate, base, 'Synthetic retained validation-origin fixture')
+        dispatch_at = usage.mark_dispatch(allocation)
+        execution = NativeAssessmentExecution('{', {
+            'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 1, 'output_tokens': 1,
+            'cached_read_tokens': 0, 'cached_write_tokens': 0, 'reasoning_tokens': 0,
+            'context_tokens': 1, 'total_tokens': 2,
+        })
+        usage.retain_result(allocation, execution, dispatch_at=dispatch_at)
+        usage.complete(allocation, outcome='ASSESSOR_VALIDATION_FAILED', execution=execution,
+            provider_dispatched=True, dispatch_at=dispatch_at, failure_class='ASSESSMENT_VALIDATION_FAILED')
+    _, current = _usage(tmp_path, monkeypatch)
+    return connection, candidate, service, current, allocation
+
+
+@pytest.mark.parametrize('contract', ['newsroom.native-evidence-assessor.v15', 'newsroom.native-evidence-assessor.v17'])
+def test_reported_validation_is_authenticated_semantic_origin_not_executable_copy(tmp_path, monkeypatch, contract):
+    connection, candidate, service, current, allocation = _reported_validation_origin(tmp_path, monkeypatch, contract)
+    with sqlite3.connect(service.path) as retained:
+        before = tuple(retained.execute(f'SELECT * FROM {table}').fetchall() for table in (
+            'model_invocation_allocations', 'model_invocation_terminals', 'ledger'))
+    try:
+        for _ in range(2):
+            origin = current.retained_semantic_origin_failure(candidate)
+            assert origin is not None and origin.outcome == 'ASSESSOR_VALIDATION_FAILED'
+            assert origin.contract_version == contract
+            assert origin.proof.invocation_id == allocation.invocation_id
+            assert origin.result_digest == digest_bytes(b'{')
+            assert origin.result_receipt_digest.startswith('sha256:')
+            assert current.retained_old_provider_failure(candidate) is None
+            if contract.endswith('.v17'):
+                assert origin.execution is None  # Missing materialisation is not a copy grant.
+        with sqlite3.connect(service.path) as retained:
+            after = tuple(retained.execute(f'SELECT * FROM {table}').fetchall() for table in (
+                'model_invocation_allocations', 'model_invocation_terminals', 'ledger'))
+        assert after == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('defect', ['foreign-candidate', 'raw-tamper', 'missing-raw', 'partial-manifest',
+    'active', 'unreported', 'telemetry', 'allocation-binding', 'result-retired', 'unqualified-current'])
+def test_reported_validation_semantic_origin_denies_incomplete_authenticated_footprint(tmp_path, monkeypatch, defect):
+    from dataclasses import asdict
+    connection, candidate, service, current, allocation = _reported_validation_origin(
+        tmp_path, monkeypatch, 'newsroom.native-evidence-assessor.v17')
+    with sqlite3.connect(service.path) as retained:
+        if defect == 'raw-tamper':
+            raw = json.loads(retained.execute("SELECT payload_json FROM ledger WHERE kind='NATIVE_ASSESSMENT_RESULT'").fetchone()[0])
+            raw['result_text'] = 'altered'
+            retained.execute("UPDATE ledger SET payload_json=? WHERE kind='NATIVE_ASSESSMENT_RESULT'", (canonical_json_bytes(raw).decode(),))
+        elif defect in {'missing-raw', 'result-retired'}:
+            retained.execute("DELETE FROM ledger WHERE kind='NATIVE_ASSESSMENT_RESULT'")
+        elif defect == 'partial-manifest':
+            retained.execute('DELETE FROM model_invocation_context_manifests')
+        elif defect == 'active':
+            retained.execute('DELETE FROM model_invocation_terminals')
+        elif defect == 'unreported':
+            retained.execute("UPDATE model_invocation_terminals SET usage_status='ESTIMATED'")
+        elif defect == 'telemetry':
+            retained.execute('DELETE FROM model_provider_telemetry')
+        elif defect == 'allocation-binding':
+            retained.execute("UPDATE model_invocation_allocations SET request_digest='sha256:'||?", ('f' * 64,))
+    if defect == 'foreign-candidate': candidate = replace(candidate, candidate_id='11111111-1111-4111-8111-111111111111')
+    if defect == 'unqualified-current':
+        current._policy = InvocationEfficiencyPolicy.create(**{**asdict(current._policy), 'qualified': False})
+    try:
+        assert current.retained_semantic_origin_failure(candidate) is None
+        with sqlite3.connect(service.path) as retained:
+            assert retained.execute('SELECT count(*) FROM model_invocation_allocations').fetchone() == (1,)
+    finally:
+        connection.close()
