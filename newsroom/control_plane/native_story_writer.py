@@ -10,12 +10,13 @@ from jsonschema import ValidationError, validate
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_canonical
 from .evidence import EvidencePackage, bounded_named_entities
-from .native_story_entities import story_entity_names_are_bound, declared_source_speakers_are_retained
+from .native_story_entities import (story_entity_names_are_bound, declared_source_speakers_are_retained,
+                                    source_publisher_reporting_names)
 from .writer import WriterCopy, WriterEvidenceLink, WriterValidatorResult, _writer_evidence_value, _writer_numeric_localisations
 from .zh_hant import contains_discourse_filler, contains_non_han_letter, contains_simplified_variant
 
 WRITER_ID = "newsroom.native-story-writer.v1"
-CONSUMER_VERSION = "newsroom.native-story-support.v3"
+CONSUMER_VERSION = "newsroom.native-story-support.v4"
 LEGACY_DRAFT_SYSTEM = (
     "Write original Hong Kong Traditional Chinese news, not claim declarations. Use only approved facts "
     "and supporting source windows: a natural headline, attributed lead, detail and available context. "
@@ -183,6 +184,7 @@ def validate_retained_story(copy: WriterCopy, package: EvidencePackage, review_r
                          (claim.claim, claim.rendered_assertion_zh_hant_hk, *(target for _, target in _writer_numeric_localisations(claim))))
     check("NATIVE_STORY_FACTUAL_NUMBERS", set(number.findall(text)) <= set(number.findall(approved)))
     entities = {name for claim in claims.values() for name in (*claim.named_entities, *claim.rendered_named_entities)}
+    entities.update(source_publisher_reporting_names(text, claims.values()))
     check("NATIVE_STORY_FACTUAL_ENTITIES", story_entity_names_are_bound(text, claims.values()))
     check("NATIVE_STORY_SOURCE_SPEAKERS", declared_source_speakers_are_retained(claims.values(), links))
     modality = ("可能", "或會", "預計", "預料", "暫定", "初步", "尚未", "未確定", "至少", "最多")

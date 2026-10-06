@@ -217,3 +217,29 @@ def test_publisher_clock_requires_authenticated_page_text_body_origin(case):
             record['publisher']='changed'
     with pytest.raises(NativeStoryWriterHold,match='BODY_PROVENANCE'):
         _derive(draft,review,package,currentness,source_records=records)
+
+
+@pytest.mark.parametrize('wrong_claim', [False, True])
+def test_source_date_derivative_uses_reviewed_natural_paraphrase(wrong_claim):
+    draft, review, package, currentness = _fixture()
+    paraphrase = ('有關改動須經諮詢，該項諮詢已於昨日展開，正尋求公眾、業界及商界的意見，'
+                  '以衡量這些改動會如何影響他們。')
+    draft['body'] = '英國內政部表示，' + paraphrase
+    draft['evidence_links'][0]['rendered_assertion'] = paraphrase
+    if wrong_claim:
+        draft['evidence_links'][0]['governed_claim_id'] = 'unrelated-claim'
+    review['draft_digest'] = digest_canonical(draft)
+    review['sentence_support'] = [{'sentence_index': index, 'claim_ids': ['launch'],
+                                  'verdict': 'SUPPORTED'} for index in range(2)]
+    before = deepcopy((draft, review))
+    if wrong_claim:
+        with pytest.raises(NativeStoryWriterHold, match='COPY_ALIGNMENT'):
+            derive_and_verify(draft, review, package, currentness)
+        return
+    final, proof = derive_and_verify(draft, review, package, currentness)
+    assert final['body'] == draft['body'].replace('昨日', '2026年10月1日')
+    assert final['evidence_links'][0]['rendered_assertion'] == paraphrase.replace('昨日', '2026年10月1日')
+    assert (draft, review) == before
+    assert proof['claim_id'] == 'launch' and proof['anchor']['resolved_date'] == '2026-10-01'
+    assert derive_and_verify(draft, review, package, currentness,
+                            final_draft=final, date_derivation=proof) == (final, proof)
