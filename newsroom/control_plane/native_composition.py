@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter_ns, process_time_ns
 
 from newsroom.authority import AuthenticationProof, UtcTimestamp
 from newsroom.authority.canonical import digest_canonical
@@ -30,6 +31,7 @@ from newsroom.projection.neo4j.models import Neo4jProjectorConfig
 from newsroom.sources import SourceDefinitionId, SourceDefinitionVersionId
 
 from .admission import QUALIFICATION_RELATION_POLICY_VERSION
+from .diagnostic_logging import emit_diagnostic
 from .evidence import FACTUAL_LOCALISATION_POLICY_VERSION, NAMED_ENTITY_POLICY_VERSION
 from .govuk_evidence import GovUkEvidenceAcquisition, POLICY_DIGEST as GOVUK_TRANSPORT_POLICY
 from .govuk_spreadsheet_evidence import (
@@ -1134,11 +1136,36 @@ def open_native_pipeline(
                 return runtime.publication.restore_current_publisher_output(journal,proof=proof)
 
             def sources_for(self, revision_id):
-                return native_evidence_sources(
-                    units=journal.units[revision_id], sources=runtime.authority.sources,
-                    objects=runtime.authority.objects, licence=licence, proof=proof,
-                    observations=journal.observations,
-                )
+                started = None
+                try:
+                    started = (perf_counter_ns(), process_time_ns())
+                except Exception:
+                    pass
+                result, status, failure_class = None, 'COMPLETE', None
+                try:
+                    result = native_evidence_sources(
+                        units=journal.units[revision_id], sources=runtime.authority.sources,
+                        objects=runtime.authority.objects, licence=licence, proof=proof,
+                        observations=journal.observations,
+                    )
+                    return result
+                except BaseException as exc:
+                    status = 'HOLD' if isinstance(exc, NativeEvidenceHold) else 'FAILED'
+                    failure_class = type(exc).__name__
+                    raise
+                finally:
+                    if started is not None:
+                        try:
+                            emit_diagnostic('native_source_binding_cost', {
+                                'revision_id': revision_id,
+                                'wall_ms': (perf_counter_ns() - started[0]) / 1_000_000,
+                                'cpu_ms': (process_time_ns() - started[1]) / 1_000_000,
+                                'status': status, 'failure_class': failure_class,
+                                'source_count': len(result) if failure_class is None else None,
+                            })
+                        except Exception:
+                            # Optional diagnostics never alter Source authority or failures.
+                            pass
 
             def continuation(self, sources):
                 return NativePublicationContinuation(
