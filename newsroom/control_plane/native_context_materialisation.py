@@ -15,7 +15,7 @@ from .native_assessor_judgments import JudgedAssessment, VERSION as JUDGMENT_VER
 from .native_assessor_references import SourceView, MAX_CLAIMS, VERSION as REFERENCE_VERSION
 from .native_source_qualification import VERSION as QUALIFICATION_VERSION
 
-VERSION = 'newsroom.native-context-materialisation.v2'
+VERSION = 'newsroom.native-context-materialisation.v3'
 
 
 # Advisory prose is not a typed numeric/date/unit substitution. Keep anything
@@ -41,6 +41,16 @@ _FACTUAL_EXPRESSION_TOKEN = re.compile(
 )
 
 
+# These lexical uses are prose, not an ordinal or calendar-month substitution.
+# Any other token on either side still reaches the strict factual validator.
+_PROSE_TOKEN_USE = re.compile(
+    r"\bfirst\s+(?:duty|aid)\b|"
+    r"\bmay\s+(?:not\s+)?(?:be|have|apply|seek|provide|consult|contact|"
+    r"submit|need|wish|require|include)\b",
+    re.IGNORECASE,
+)
+
+
 def _typed_context_pairs(claim):
     from .evidence import _canonical_localised_fact
 
@@ -48,7 +58,9 @@ def _typed_context_pairs(claim):
     for pair in claim["localised_factual_expressions"]:
         source, target = pair
         if any(_canonical_localised_fact(value) is not None
-               or _FACTUAL_EXPRESSION_TOKEN.search(value) for value in pair):
+               or any(_PROSE_TOKEN_USE.match(value, token.start()) is None
+                      for token in _FACTUAL_EXPRESSION_TOKEN.finditer(value))
+               for value in pair):
             retained.append(pair)
     return retained
 

@@ -1437,7 +1437,7 @@ def test_stale_prepared_intent_retains_paired_ack_proof_across_reopen(tmp_path, 
     connection.close()
 
 
-@pytest.mark.parametrize('resumed', [False, True, 'completed-v1'])
+@pytest.mark.parametrize('resumed', [False, True, 'completed-v1', 'settled-consumer-failure', 'consumer-failure-loop'])
 def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_path,monkeypatch,resumed):
     unit=_native();connection=connect(str(tmp_path/'context-purpose.sqlite3'))
     journal=NativeRevisionJournal(connection);journal.land((unit,))
@@ -1448,18 +1448,21 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
         'editorial_decision':json.loads(_decision(old_package).canonical_bytes()),
         'semantic_assessment_intent':semantic,'reason':'NATIVE_STORY_FACTUAL_ENTITIES',
         'publication_started_at':'original-writer-purpose','acquisition_attempt_count':2}
-    if resumed is True:
+    if resumed in (True, 'settled-consumer-failure', 'consumer-failure-loop'):
         old.update(context_enrichment_intent={'contract':'newsroom.native-context-package.v2',
             'original_package_admission_id':str(old_package),
             'original_journal':{'publication_started_at':old.pop('publication_started_at')}},
             reason='ACQUISITION_RESULT_NOT_RETAINED', failure_class='EvidencePackageError',
             assessment_contract_version='newsroom.native-evidence-assessor.v23+previous-consumer')
         old.pop('package_admission_id');old.pop('editorial_decision')
+        if resumed == 'settled-consumer-failure':
+            old.update(context_enrichment_settled='newsroom.native-context-package.v2',
+                reason='SEMANTIC_INTENT_INPUT_CHANGED_HOLD')
     if resumed == 'completed-v1':
         old.update(context_enrichment_intent={'contract':'newsroom.native-context-package.v1',
             'original_package_admission_id':'original-before-context'},
             context_enrichment_completed=True)
-    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED' if resumed is True else 'EVIDENCE_HOLD',facts=old)
+    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED' if resumed in (True, 'settled-consumer-failure', 'consumer-failure-loop') else 'EVIDENCE_HOLD',facts=old)
     requests=[]
     def acquire(_self,**request):
         requests.append(request)
@@ -1468,6 +1471,9 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
         assert not request.get('assessment_qualification_cached_only')
         assert 'assessment_semantic_only'not in request
         request['before_assessment']()
+        if resumed == 'consumer-failure-loop':
+            from newsroom.increment10.evidence import EvidencePackageError
+            raise EvidencePackageError('fixture unchanged consumer rejection')
         return SimpleNamespace(retained=SimpleNamespace(package_admission_id=new_package),
             editorial_decision=_decision(new_package),acquisition_receipt_digests=(_DIGEST,))
     monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
@@ -1486,6 +1492,14 @@ def test_distinct_context_package_preserves_old_writer_and_semantic_intent(tmp_p
         assessment_contract_version='newsroom.native-evidence-assessor.v23+new-consumer')
     continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
     facts=journal.current(unit.revision_id)['facts']
+    if resumed == 'consumer-failure-loop':
+        assert facts['context_enrichment_settled'] == 'newsroom.native-context-package.v2'
+        assert facts['failure_class'] == 'EvidencePackageError'
+        assert not continuation.context_enrichment_due(facts)
+        assert facts['semantic_assessment_intent'] == semantic
+        assert len(requests) == 1 and publication.calls == 0
+        connection.close()
+        return
     assert facts['context_enrichment_intent']['original_package_admission_id']==str(old_package)
     assert facts['context_enrichment_intent']['original_journal']['publication_started_at']=='original-writer-purpose'
     assert facts['semantic_assessment_intent']==semantic and facts['acquisition_attempt_count']==2
@@ -1722,3 +1736,21 @@ def test_only_closed_old_support_judgement_is_scheduled_for_assembled_input(reas
     assert NativePublicationContinuation.context_enrichment_due(facts) is due
     facts['publication_event_id'] = 'pending-publication'
     assert not NativePublicationContinuation.context_enrichment_due(facts)
+
+
+@pytest.mark.parametrize('override,due', [({}, True),
+    ({'context_consumer_checked_version': 'newsroom.native-context-materialisation.v3'}, False),
+    ({'context_enrichment_completed': True}, False),
+    ({'failure_class': 'TimeoutError'}, False),
+    ({'reason': 'CONTEXT_SUPPORT_UNPROVEN_HOLD', 'context_support_checked_contract': 'newsroom.native-context-support.assembled.v1'}, False),
+    ({'reason': 'CONTEXT_SELECTION_UNCERTAIN_HOLD'}, False),
+    ({'publication_event_id': 'pending'}, False)])
+def test_settled_context_consumer_failure_replays_only_changed_consumer(override, due):
+    facts = {'context_enrichment_intent': {'contract': 'newsroom.native-context-package.v2',
+             'original_package_admission_id': 'retained-original'},
+             'context_enrichment_settled': 'newsroom.native-context-package.v2',
+             'failure_class': 'EvidencePackageError', 'reason': 'SEMANTIC_INTENT_INPUT_CHANGED_HOLD',
+             **override}
+    before = json.loads(json.dumps(facts))
+    assert NativePublicationContinuation.context_enrichment_due(facts) is due
+    assert facts == before

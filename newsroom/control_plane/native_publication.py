@@ -67,7 +67,7 @@ from newsroom.increment10.editorial import (
     StoryVersion,
     StoryVersionRequest,
 )
-from newsroom.increment10.evidence import GovernedEvidencePackages
+from newsroom.increment10.evidence import EvidencePackageError, GovernedEvidencePackages
 from newsroom.increment10.private_serving import (
     ATTEMPT_COMMAND,
     ATTEMPT_EVENT,
@@ -973,10 +973,20 @@ class NativePublicationContinuation:
         if any(facts.get(key)for key in ('story_event_id','publication_event_id',
                 'delivery_attempt_event_id','delivery_evidence_event_id')):
             return False
-        if facts.get('context_enrichment_settled')==VERSION:
-            return (facts.get('reason')=='CONTEXT_SUPPORT_UNPROVEN_HOLD'
-                and facts.get('context_support_checked_contract')!=SUPPORT_CONTRACT)
         intent=facts.get('context_enrichment_intent')
+        if facts.get('context_enrichment_settled')==VERSION:
+            from .native_context_materialisation import VERSION as consumer
+            consumer_replay = (
+                type(intent) is dict and intent.get('contract') == VERSION
+                and bool(intent.get('original_package_admission_id'))
+                and not facts.get('context_enrichment_completed')
+                and facts.get('failure_class') == 'EvidencePackageError'
+                and facts.get('reason') in {'ACQUISITION_RESULT_NOT_RETAINED',
+                    'SEMANTIC_INTENT_INPUT_CHANGED_HOLD'}
+                and facts.get('context_consumer_checked_version') != consumer
+            )
+            return consumer_replay or (facts.get('reason')=='CONTEXT_SUPPORT_UNPROVEN_HOLD'
+                and facts.get('context_support_checked_contract')!=SUPPORT_CONTRACT)
         if type(intent)is dict and intent.get('contract')==VERSION:
             return bool(intent.get('original_package_admission_id'))and not facts.get('context_enrichment_completed')
         return (facts.get('reason')in {'NATIVE_STORY_FACTUAL_ENTITIES','NATIVE_STORY_SENTENCE_SUPPORT'}
@@ -1220,6 +1230,12 @@ class NativePublicationContinuation:
                         'expected_publication_version','expected_delivery_evidence_version','publication_started_at'):
                     facts.pop(key,None)
                 progress=self._journal.advance(revision_id,stage='CONTEXT_ASSESSMENT_PENDING',facts=facts)
+            # Reopening this exact intent must not retain a previous support HOLD
+            # that diverts a later pure consumer failure into generic assessment.
+            from .native_context_materialisation import VERSION as consumer
+            facts.pop('context_enrichment_settled', None)
+            facts['context_consumer_checked_version'] = consumer
+            progress=self._journal.advance(revision_id,stage='CONTEXT_ASSESSMENT_PENDING',facts=facts)
             writer_cached_revalidation=False
         admission_recovery = (
             progress.get("stage") == "EVIDENCE_HOLD"
@@ -1631,6 +1647,9 @@ class NativePublicationContinuation:
                 return retain_acquisition_failure(type(exc).__name__)
             except Exception as exc:
                 facts = current_facts()
+                if context_only and isinstance(exc, EvidencePackageError):
+                    from .native_context_enrichment import VERSION
+                    facts['context_enrichment_settled'] = VERSION
                 facts["reason"] = "ACQUISITION_RESULT_NOT_RETAINED"
                 facts["failure_class"] = type(exc).__name__
                 self._journal.advance(
