@@ -7,7 +7,7 @@ import re
 import ssl
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager, ExitStack
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -333,9 +333,9 @@ class NativeSourceIntake:
                 tuple(observations),
             )
         units, item_holds = [], []
-        for item in items:
+        for item, fetched in self._fetch_items(source_id, items):
             try:
-                item_url, item_raw, retrieved = self._fetch_complete_item(source_id, item)
+                item_url, item_raw, retrieved = fetched.result()
                 settled_units, settled_observations, settled_holds = self._settle_item(
                     source_id, definition_id, summary.version_id, version, item,
                     item_url, item_raw, retrieved, rights.record_id,
@@ -576,22 +576,41 @@ class NativeSourceIntake:
         )
 
     def _fetch_manual_sections(self, source_id, root_digest, sections):
+        items = tuple(SourceItem(
+            source_id, root_digest + "|" + path, title, title,
+            "https://www.gov.uk" + path,
+        ) for path, title in sections)
+        yield from self._fetch_items(source_id, items)
+
+    def _fetch_items(self, source_id, items):
         # Network only in workers; SQLite admission and deterministic coverage
         # stay on the owner thread. Four responses bound the live working set.
         with ThreadPoolExecutor(max_workers=4) as pool:
-            for start in range(0, len(sections), 4):
-                items = tuple(SourceItem(
-                    source_id, root_digest + "|" + path, title, title,
-                    "https://www.gov.uk" + path,
-                ) for path, title in sections[start:start + 4])
+            for start in range(0, len(items), 4):
+                batch = items[start:start + 4]
                 # Owner-stop fences use a re-entrant transaction on this thread.
                 # Hold it once for the batch, not competing writer locks in each
                 # worker; no authority writes take place under the network fence.
                 with ExitStack() as fences:
-                    for item in items:
-                        fences.enter_context(self._fence(source_id, _api_url(item.canonical_url)))
+                    pending = []
+                    for item in batch:
+                        try:
+                            try:
+                                url = _api_url(item.canonical_url)
+                            except ValueError:
+                                raise NativeSourceIntakeHold("SOURCE_ITEM_CANONICAL_URL_HOLD") from None
+                            fences.enter_context(self._fence(source_id, url))
+                        except VetoError:
+                            raise
+                        except Exception as exc:
+                            failed = Future()
+                            failed.set_exception(exc)
+                        else:
+                            failed = None
+                        pending.append((item, failed))
                     try:
-                        pending = tuple((item, pool.submit(self._fetch_item_response, item)) for item in items)
+                        pending = tuple((item, failed if failed is not None else
+                            pool.submit(self._fetch_item_response, item)) for item, failed in pending)
                         wait(tuple(future for _, future in pending))
                     except BaseException:
                         # Settle even partially submitted work before the owner
@@ -599,14 +618,6 @@ class NativeSourceIntake:
                         pool.shutdown(wait=True, cancel_futures=True)
                         raise
                 yield from pending
-
-    def _fetch_complete_item(self, source_id, item):
-        try:
-            url = _api_url(item.canonical_url)
-        except ValueError:
-            raise NativeSourceIntakeHold("SOURCE_ITEM_CANONICAL_URL_HOLD") from None
-        with self._fence(source_id, url):
-            return self._fetch_item_response(item)
 
     def _fetch_declared_assets(self, source_id, declarations):
         declarations = tuple(declarations)
