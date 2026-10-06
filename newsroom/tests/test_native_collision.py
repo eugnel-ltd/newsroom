@@ -983,3 +983,127 @@ def test_native_collision_rejects_noncanonical_timestamp(text):
     from newsroom.increment6.collision import _parse_utc, CollisionEligibilityContractError
     with pytest.raises(CollisionEligibilityContractError):
         _parse_utc(text, field="serving_time")
+
+
+@pytest.mark.parametrize('missing_original', [False, True])
+def test_current_rebuild_preserves_same_state_successor_relationship(tmp_path, monkeypatch, missing_original):
+    """A real retained association must survive selected-root closure, not be invented."""
+    from newsroom.authority.native_current_rebuild import copy_selected_native_store
+    from newsroom.authority.native_current_checkpoint_migrations import initialise_empty_checkpoint_store
+    import shutil
+    from newsroom.control_plane.native_triage import (
+        advance_native_triage, build_native_triage_work, plan_native_schedule,
+    )
+
+    monkeypatch.setattr('newsroom.control_plane.cycle._dispatch_rights_decision',
+                        lambda *args, **kwargs: _current_rights())
+    retrieval_authority, _ = _no_match_retrieval(tmp_path)
+    contexts, receipts = {}, {}
+    retrieval_authority._native_context_read_port = _read_port(contexts)
+    collision = _native_collision(tmp_path, contexts, receipts)
+    with sqlite3.connect(':memory:') as proving, _shared_system(
+        tmp_path, monkeypatch, retrieval_authority, collision=collision.enforcer,
+        candidate_citations=collision.candidate_citation_read_port(),
+    ) as system:
+        controller = _controller(system, proving)
+        first_unit = _unit()
+        same_unit = _same_state_revision(first_unit)
+        candidate = associated = None
+        for index, unit in enumerate((first_unit, same_unit)):
+            _retain_source_revision(system, unit,
+                prior_revision_id=None if index == 0 else first_unit.authority.revision_id)
+            now = UtcTimestamp.parse(unit.effective_revision.first_observed_at)
+            status = controller.admit_lead(controller.deliver(unit, now=now, proof=proof()),
+                                           now=now, proof=proof())
+            binding, receipt, context = _native_binding(tmp_path / f'retrieval-{index}', status.lead)
+            contexts[context.context_id] = context
+            receipts[receipt.event_id] = receipt
+            arguments = dict(retrieval=SimpleNamespace(retrieve=lambda lead, *, proof: binding),
+                collision_requests=collision, actor_identity_digest=_actor_digest(),
+                proof=proof(), owner_stop_check=lambda: None, owner_stop_fence=nullcontext)
+            if index == 1 and missing_original:
+                def interrupted(*args, **kwargs):
+                    raise RuntimeError('local fixture stopped before relationship commit')
+                with monkeypatch.context() as crash:
+                    crash.setattr(type(system.relationships), 'retain', interrupted)
+                    with pytest.raises(RuntimeError, match='before relationship commit'):
+                        advance_native_cycle(system, (status,), **arguments)
+                continue
+            outcome = advance_native_cycle(system, (status,), **arguments)[0]
+            if index == 0:
+                assert outcome.state == 'CANDIDATE_ADMITTED'
+                candidate = outcome.triage.candidate
+            else:
+                assert outcome.state == 'SAME_STATE_ASSOCIATED'
+                associated = outcome.triage
+        store = system.candidates._StoryCandidateAuthority__authority._authority
+        successor = system.hypotheses.current(candidate.governing_manifest.hypothesis_id, proof=proof())
+        if missing_original:
+            decision = None
+            with pytest.raises(CandidateContractError, match='SAME_STATE relationship'):
+                system.candidates._exact_associated_current_producers(candidate.candidate_id, proof=proof())
+            assert store._connection.execute('SELECT decision_id FROM event_hypothesis_relationship_decisions '
+                'WHERE subject_version_id=?', (successor.version_id,)).fetchone() is None
+        else:
+            current_candidate, current_hypothesis = system.candidates._exact_associated_current_producers(
+                candidate.candidate_id, proof=proof())
+            assert current_candidate == candidate and current_hypothesis == associated.hypothesis
+            decision = associated.relationship.canonical_digest
+            assert store._connection.execute('SELECT decision_id FROM event_hypothesis_relationship_decisions '
+                'WHERE subject_version_id=?', (successor.version_id,)).fetchone()[0] == decision
+        unrelated_unit = _unit(item_key='unrelated-current-rebuild-item')
+        _retain_source_revision(system, unrelated_unit)
+        now = UtcTimestamp.parse(unrelated_unit.effective_revision.first_observed_at)
+        unrelated_status = controller.admit_lead(
+            controller.deliver(unrelated_unit, now=now, proof=proof()), now=now, proof=proof())
+        unrelated_binding, unrelated_receipt, unrelated_context = _native_binding(
+            tmp_path / 'unrelated-retrieval', unrelated_status.lead)
+        contexts[unrelated_context.context_id] = unrelated_context
+        receipts[unrelated_receipt.event_id] = unrelated_receipt
+        work = build_native_triage_work(admitted_leads=((unrelated_status.lead,
+            unrelated_status.current_disposition),), retrieval=unrelated_binding)
+        unrelated = advance_native_triage(system, work=work,
+            scheduling_decision=plan_native_schedule(work).decision, proof=proof())
+        assert unrelated.relationship is not None and unrelated.hypothesis.hypothesis_id != successor.hypothesis_id
+        roots = {
+            'story_candidate_admission_receipts_v2': tuple(tuple(row) for row in store._connection.execute(
+                'SELECT admission_digest FROM story_candidate_admission_receipts_v2')),
+            'story_candidate_heads': ((candidate.candidate_id,),),
+            'story_candidate_collision_bindings': tuple(tuple(row) for row in store._connection.execute(
+                'SELECT collision_namespace,collision_key_digest FROM story_candidate_collision_bindings')),
+        }
+        selected_root = tmp_path / 'selected'
+        selected_root.mkdir(mode=0o700)
+        selected_path = selected_root / 'native.sqlite3'
+        before_decisions = tuple(tuple(row) for row in store._connection.execute(
+            'SELECT * FROM event_hypothesis_relationship_decisions ORDER BY decision_id'))
+        with sqlite3.connect(selected_path, isolation_level=None) as destination:
+            initialise_empty_checkpoint_store(destination)
+            copy_selected_native_store(store, destination, roots=roots, dev_rebuild=True)
+            assert destination.execute('PRAGMA foreign_key_check').fetchall() == []
+            assert destination.execute('SELECT version_id FROM event_hypothesis_heads_v2 '
+                'WHERE hypothesis_id=?', (successor.hypothesis_id,)).fetchone()[0] == successor.version_id
+            expected = None if missing_original else (decision,)
+            assert destination.execute('SELECT decision_id FROM event_hypothesis_relationship_decisions '
+                'WHERE subject_version_id=?', (successor.version_id,)).fetchone() == expected
+            assert destination.execute('SELECT 1 FROM event_hypothesis_relationship_decisions '
+                'WHERE decision_id=?', (unrelated.relationship.canonical_digest,)).fetchone() is None
+            selected_decisions = destination.execute(
+                'SELECT * FROM event_hypothesis_relationship_decisions ORDER BY decision_id').fetchall()
+        with sqlite3.connect(tmp_path / 'selected-repeat.sqlite3', isolation_level=None) as repeated:
+            initialise_empty_checkpoint_store(repeated)
+            copy_selected_native_store(store, repeated, roots=roots, dev_rebuild=True)
+            assert repeated.execute('SELECT * FROM event_hypothesis_relationship_decisions '
+                'ORDER BY decision_id').fetchall() == selected_decisions
+        assert tuple(tuple(row) for row in store._connection.execute(
+            'SELECT * FROM event_hypothesis_relationship_decisions ORDER BY decision_id')) == before_decisions
+        shutil.copytree(tmp_path / 'objects', selected_root / 'objects')
+    selected_path.chmod(0o600)
+    with _shared_system(selected_root, monkeypatch, retrieval_authority,
+        collision=collision.enforcer, candidate_citations=collision.candidate_citation_read_port()) as rebuilt:
+        if missing_original:
+            with pytest.raises(CandidateContractError, match='SAME_STATE relationship'):
+                rebuilt.candidates._exact_associated_current_producers(candidate.candidate_id, proof=proof())
+        else:
+            assert rebuilt.candidates._exact_associated_current_producers(candidate.candidate_id, proof=proof()) == (
+                candidate, successor)
