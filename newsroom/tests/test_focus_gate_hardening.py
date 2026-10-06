@@ -967,3 +967,168 @@ def test_exact_diff_first_adopter_retains_focused_graphiti_model_consumers(tmp_p
     assert route['selected_tests'] == ['newsroom/tests/test_graphiti_consumer.py', 'newsroom/tests/test_graphiti_models.py']
     assert route['selected_service_tests'] == []
     assert route['full_health_required'] is False
+
+
+_BODY_CONTRACT_SOURCES = (
+    'newsroom/control_plane/native_story_entities.py',
+    'newsroom/control_plane/native_story_dates.py',
+)
+_BODY_CONTRACT_TESTS = (
+    'test_native_story_entities.py', 'test_native_story_writer.py',
+    'test_native_story_model.py', 'test_native_story_dates.py',
+    'test_native_story_editorial.py', 'test_native_brief_prompt_identity.py',
+    'test_native_publication.py', 'test_native_publication_continuation.py',
+    'test_native_pipeline.py', 'test_native_composition.py',
+    'test_native_source_context_ranges.py', 'test_native_vertical.py',
+)
+
+
+def _body_contract_repo(tmp_path, source_override=None):
+    """Real Git identities; actual consumer source is parsed, never executed."""
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    root = Path(__file__).parents[2]
+    sources = {path: (root / path).read_text() for path in _BODY_CONTRACT_SOURCES}
+    sources.update(source_override or {})
+    for path, source in sources.items():
+        _write(tmp_path, path, source)
+    for name in _BODY_CONTRACT_TESTS:
+        _write(tmp_path, 'newsroom/tests/' + name)
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py',
+           'from newsroom.control_plane.native_story_entities import story_entity_names_are_bound\n'
+           'from newsroom.control_plane.native_story_dates import _anchor\n')
+    return sources, _commit(tmp_path, 'actual source-name/date consumer baseline')
+
+
+def _body_contract_change(sources, kind):
+    names, dates = _BODY_CONTRACT_SOURCES
+    changed = dict(sources)
+    if kind in {'role', 'both'}:
+        changed[names] = sources[names].replace("if kind == 'PLACE'", "if kind in ('PLACE',)")
+    if kind in {'date', 'both'}:
+        changed[dates] = sources[dates].replace("    _require(publication == update, 'ANCHOR_AMBIGUOUS')\n", '')
+    return changed
+
+
+@pytest.mark.parametrize('kind', ['role', 'date', 'both'])
+def test_closed_source_name_date_bodies_use_direct_contract_without_service(tmp_path, kind):
+    sources, base = _body_contract_repo(tmp_path)
+    changed = _body_contract_change(sources, kind)
+    paths = [path for path in sources if changed[path] != sources[path]]
+    for path in paths:
+        _write(tmp_path, path, changed[path])
+    changed_test = 'newsroom/tests/test_native_story_entities.py' if kind == 'role' else 'newsroom/tests/test_native_story_dates.py'
+    _write(tmp_path, changed_test, '# The corresponding direct regression changed.\n')
+    head = _commit(tmp_path, 'closed existing-function body delta')
+    route = selector.select_focus((*paths, changed_test), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_tests'] == sorted('newsroom/tests/' + name for name in _BODY_CONTRACT_TESTS)
+    assert route['selected_service_tests'] == []
+    assert route['gates'] == ['F0', 'F1', 'F2']
+    assert route['full_health_required'] is False
+    assert 'explicit_source_name_date_body_contract:F2' in route['reasons']
+
+
+def test_actual_natural_copy_date_fix_keeps_existing_data_callee_contract(tmp_path):
+    root = Path(__file__).parents[2]
+    path = _BODY_CONTRACT_SOURCES[1]
+    after = (root / path).read_text(encoding='utf-8')
+    anchor = "             and original_draft['body'].count(selected[0][1]['rendered_assertion']) == 1, 'COPY_ALIGNMENT')"
+    literal = "             and selected[0][1]['rendered_assertion'] == claim.rendered_assertion_zh_hant_hk\n"
+    assert after.count(anchor) == 1 and after.count(literal) == 0
+    # Recreate the observed predicate removal without requiring private commits
+    # to survive squash or to exist in the CI checkout's Git history.
+    before = after.replace(anchor, literal + anchor, 1)
+    assert before.count(anchor) == 1 and before.count(literal) == 1
+    _sources, base = _body_contract_repo(tmp_path, {path: before})
+    _write(tmp_path, path, after)
+    head = _commit(tmp_path, 'observed natural-copy literal predicate removal')
+    route = selector.select_focus((path,), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_tests'] == sorted('newsroom/tests/' + name for name in _BODY_CONTRACT_TESTS)
+    assert route['selected_service_tests'] == [] and route['gates'] == ['F0', 'F1', 'F2']
+    assert 'explicit_source_name_date_body_contract:F2' in route['reasons']
+
+
+@pytest.mark.parametrize('kind', ['open', 'import', 'map', 'signature', 'callee', 'version',
+    'protected-path', 'helper', 'getattr', 'shadow', 'reference', 'other-test', 'control', 'deploy',
+    'missing-test', 'reflected-field', 'dunder-key', 'existing-reference-call'])
+def test_unproved_source_name_date_delta_keeps_normal_service_discovery(tmp_path, kind):
+    sources, base = _body_contract_repo(tmp_path)
+    names, _dates = _BODY_CONTRACT_SOURCES
+    source = _body_contract_change(sources, 'role')[names]
+    marker = 'def story_entity_names_are_bound(text, claims):\n'
+    if kind == 'open':
+        source = source.replace(marker, marker + "    open('local-fixture')\n")
+    elif kind == 'import':
+        source = 'import socket\n' + source
+    elif kind == 'map':
+        source = source.replace("frozenset({'UK', '英國'})", "frozenset({'UK', '英國', 'United Kingdom'})")
+    elif kind == 'signature':
+        source = source.replace(marker, 'def story_entity_names_are_bound(text, claims, extra=None):\n')
+    elif kind == 'callee':
+        source = source.replace(marker, marker + '    additional_reader(text)\n')
+    elif kind == 'version':
+        source = source.replace("VERSION = 'newsroom.native-story-source-names.v2'", "VERSION = 'changed-consumer-version'")
+    elif kind == 'helper':
+        source += '\ndef new_helper():\n    return True\n'
+    elif kind == 'getattr':
+        source = source.replace(marker, marker + "    getattr(text, '__class__')\n")
+    elif kind == 'reflected-field':
+        source = source.replace("getattr(claim, 'attribution', None)", "getattr(claim, '__class__', None)")
+    elif kind == 'dunder-key':
+        source = source.replace(marker, marker + "    text['__dict__']\n")
+    elif kind == 'existing-reference-call':
+        source = source.replace(marker, marker + '    text()\n')
+    elif kind == 'shadow':
+        source = source.replace(marker, marker + '    bounded_named_entities = text\n')
+    elif kind == 'reference':
+        source = source.replace(marker, marker + '    unknown_metadata\n')
+    paths = [names]
+    if kind == 'protected-path':
+        paths.append('newsroom/control_plane/native_story_writer.py')
+        _write(tmp_path, paths[-1], 'DRAFT_SYSTEM = "changed producer"\n')
+    elif kind == 'other-test':
+        paths.append('newsroom/tests/test_native_story_writer.py')
+        _write(tmp_path, paths[-1], '# This test is selected but outside the changed-test contract.\n')
+    elif kind == 'control':
+        paths.append('.sdlc/gates.toml')
+        _write(tmp_path, paths[-1], 'scope = "fixture"\n')
+    elif kind == 'deploy':
+        paths.append('deploy/fixture.json')
+        _write(tmp_path, paths[-1], '{}\n')
+    elif kind == 'missing-test':
+        missing = 'newsroom/tests/test_native_story_writer.py'
+        (tmp_path / missing).unlink()
+        paths.append(missing)
+    _write(tmp_path, names, source)
+    head = _commit(tmp_path, 'unproved or mixed contract delta')
+    route = selector.select_focus(paths, repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert 'explicit_source_name_date_body_contract:F2' not in route['reasons']
+    assert route['selected_service_tests'] == ['newsroom/tests/test_other_neo4j_service.py']
+    assert 'F3' in route['gates']
+    if kind == 'control':
+        assert 'sdlc_control:F2' in route['reasons']
+    if kind == 'deploy':
+        assert route['owner_authority_required'] is True and 'F4' in route['gates']
+
+
+@pytest.mark.parametrize('declaration', [
+    '    def _require(*args, **kwargs):\n        return None\n',
+    '    def unused_helper():\n        return None\n',
+    '    lambda: None\n',
+    '    class Unused:\n        pass\n',
+    '    async def unused_helper():\n        return None\n',
+])
+def test_nested_date_consumer_declarations_keep_normal_discovery(tmp_path, declaration):
+    sources, _base = _body_contract_repo(tmp_path)
+    path = _BODY_CONTRACT_SOURCES[1]
+    service_test = 'newsroom/tests/test_other_neo4j_service.py'
+    _write(tmp_path, service_test,
+           'from newsroom.control_plane.native_story_dates import derive_and_verify\n')
+    base = _commit(tmp_path, 'direct consumer of the changed date function')
+    marker = '                      source_records=(), final_draft=None, date_derivation=None):\n'
+    assert marker in sources[path]
+    _write(tmp_path, path, sources[path].replace(marker, marker + declaration))
+    head = _commit(tmp_path, 'nested declaration outside the closed top-level contract')
+    route = selector.select_focus((path,), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert 'explicit_source_name_date_body_contract:F2' not in route['reasons']
+    assert route['selected_service_tests'] == [service_test]
+    assert 'F3' in route['gates']
