@@ -1044,6 +1044,8 @@ def native_evidence_sources(
             current = sources.current_summary(
                 SourceDefinitionId.parse(authority.definition_id), proof=proof,
             )
+        except VetoError:
+            raise
         except (TypeError, ValueError, LookupError, KeyError, PermissionError):
             raise hold("NATIVE_SOURCE_AUTHORITY_HOLD") from None
         request = version.request
@@ -1178,6 +1180,7 @@ def _require_parent_inventory_binding(
             raise ValueError("parent feed observation differs")
         parent_url = _canonical_url_from_api(root[0])
         parent_found = False
+        feed_urls = set()
         for feed in feed_observations:
             try:
                 feed_admission_id, feed_access = _require_observation_access(
@@ -1194,19 +1197,29 @@ def _require_parent_inventory_binding(
                     body=feed_raw,
                 )
                 parent_found = any(item.canonical_url == parent_url for item in feed_items)
-                if not parent_found and (
-                    spreadsheet_asset_url(unit) is not None or pdf_asset_url(unit) is not None
-                    or _declared_publication_leaves(raw, parent_url)
-                ):
-                    parent_found = _declared_file_parent_in_feed_child(
-                        unit=unit, parent_url=parent_url, feed_items=feed_items,
-                        observations=observations, objects=objects, proof=proof,
-                        collection_only=spreadsheet_asset_url(unit) is None and pdf_asset_url(unit) is None,
-                    )
                 if parent_found:
                     break
+                for item in feed_items:
+                    try:
+                        feed_urls.add(_api_url(item.canonical_url))
+                    except ValueError:
+                        continue
+            except VetoError:
+                raise
             except (TypeError, ValueError, LookupError, KeyError, PermissionError):
                 continue
+        if not parent_found and (
+            spreadsheet_asset_url(unit) is not None or pdf_asset_url(unit) is not None
+            or _declared_publication_leaves(raw, parent_url)
+        ):
+            # A valid ancestry is existential: one verified feed names one
+            # declaring inventory. Read each exact inventory once against the
+            # verified URL union, never once per historical feed snapshot.
+            parent_found = _declared_file_parent_in_feed_child(
+                unit=unit, parent_url=parent_url, feed_urls=feed_urls,
+                observations=observations, objects=objects, proof=proof,
+                collection_only=spreadsheet_asset_url(unit) is None and pdf_asset_url(unit) is None,
+            )
         if not parent_found:
             raise ValueError("parent is outside its retained feed inventory")
     parent_url = _canonical_url_from_api(root[0])
@@ -1257,16 +1270,10 @@ def _declared_publication_leaves(raw, parent_url) -> bool:
 
 
 def _declared_file_parent_in_feed_child(
-    *, unit, parent_url, feed_items, observations, objects, proof,
+    *, unit, parent_url, feed_urls, observations, objects, proof,
     collection_only=False,
 ) -> bool:
     """Prove exactly feed -> direct inventory -> attachment parent; never crawl."""
-    feed_urls = set()
-    for item in feed_items:
-        try:
-            feed_urls.add(_api_url(item.canonical_url))
-        except ValueError:
-            continue
     for observation in observations.values():
         if observation[0] not in feed_urls:
             continue
@@ -1290,6 +1297,8 @@ def _declared_file_parent_in_feed_child(
                 if (not exc.exclusion_signals
                         and urlsplit(parent_url).path in {path for path, _title in exc.child_items}):
                     return True
+        except VetoError:
+            raise
         except (TypeError, ValueError, LookupError, KeyError, PermissionError):
             continue
     return False

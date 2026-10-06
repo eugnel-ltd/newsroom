@@ -1929,3 +1929,155 @@ def test_current_namespace_lookup_uses_validated_headers_in_original_land_order(
         assert statements == []
     finally:
         connection.close()
+
+
+def _parent_inventory_lookup_fixture(feed_count=3, *, fault=None):
+    """Complete synthetic raw observations, with fresh governed-read facades."""
+    from collections import Counter
+    from newsroom.control_plane.native_policies import NATIVE_SOURCE_OBSERVATION_PURPOSE
+    from newsroom.control_plane.veto import VetoError
+    from newsroom.tests.test_govuk_spreadsheet import parent, PARENT
+    asset = 'https://assets.publishing.service.gov.uk/media/abc/data.csv'
+    api = 'https://www.gov.uk/api/content'
+    observations, raw_by_id, labels, reads = {}, {}, {}, Counter()
+    def add(url, raw, label):
+        admission = ObjectAdmissionId.new()
+        ref = (url, digest_bytes(raw), str(admission), str(ObjectAdmissionId.new()))
+        raw_by_id[str(admission)] = raw
+        labels[str(admission)] = label
+        observations[ref[1]] = ref
+        return ref
+    root = add(api + PARENT.removeprefix('https://www.gov.uk'), parent(b'Name,Value\nx,1\n', asset), 'parent')
+    wrong_path = '/government/collections/unrelated'
+    add(api + wrong_path, _parent_with_children('document_collection', wrong_path,
+        (('/government/publications/not-selected', 'Another parent'),)), 'shared-unrelated-inventory')
+    for number in range(feed_count - 1):
+        add(SOURCE_URLS['UK-01'], _atom_for(wrong_path) + f'<!-- observation {number} -->'.encode(), f'feed-{number}')
+    selected_path = '/government/collections/selected'
+    selected = json.loads(_parent_with_children('document_collection', selected_path,
+        ((PARENT.removeprefix('https://www.gov.uk'), 'Selected parent'),)))
+    if fault == 'excluded-inventory': selected['details']['body'] = '<p>All rights reserved</p>'
+    selected_ref = add(api + selected_path, json.dumps(selected).encode(), 'selected-inventory')
+    if fault != 'missing-feed':
+        add(SOURCE_URLS['UK-05'] if fault == 'foreign-feed' else SOURCE_URLS['UK-01'],
+            _atom_for(selected_path), 'selected-feed')
+    if fault == 'raw-tamper': raw_by_id[selected_ref[2]] += b' '
+    if fault == 'empty-feed': add(SOURCE_URLS['UK-01'], b'<feed xmlns="http://www.w3.org/2005/Atom"/>', 'empty-feed')
+    if fault == 'direct-parent':
+        # Earliest direct feed match must still avoid unrelated inventory reads.
+        direct = add(SOURCE_URLS['UK-01'], _atom_for(PARENT.removeprefix('https://www.gov.uk')), 'direct-feed')
+        observations = {direct[1]: direct, **observations}
+    class Objects:
+        deny_selected = False
+        def access_decision(self, _identity, *, admission_id, purpose, proof):
+            return self.decision(admission_id, purpose)
+        def latest_access_decision(self, admission_id, *, purpose, proof):
+            if (fault == 'current-rights' or self.deny_selected) and labels[str(admission_id)] == 'selected-inventory':
+                raise PermissionError('current object rights denied')
+            return self.decision(admission_id, purpose)
+        def decision(self, admission_id, purpose):
+            assert purpose == NATIVE_SOURCE_OBSERVATION_PURPOSE
+            return SimpleNamespace(admission_id=admission_id, purpose=purpose, offset=0,
+                allowed_bytes=len(raw_by_id[str(admission_id)]))
+        def rehydrate(self, request, *, proof):
+            label = labels[str(request.admission_id)]
+            if (fault == 'stop' and label == 'selected-inventory'
+                    or fault == 'feed-stop' and label == 'selected-feed'): raise VetoError('owner stop')
+            raw = raw_by_id[str(request.admission_id)]
+            assert request.offset == 0 and request.length == len(raw)
+            reads[label] += 1
+            return SimpleNamespace(data=raw)
+    unit = SimpleNamespace(item_key=root[1] + '|' + asset, source_id='UK-01',
+        source_definition_url=SOURCE_URLS['UK-01'], canonical_url=PARENT, observed_at='2026-09-27T12:00:00Z')
+    return unit, observations, Objects(), reads, PARENT
+
+
+@pytest.mark.parametrize('feed_count', [1, 3, 10])
+def test_parent_inventory_reads_each_complete_observation_once_per_binding(feed_count):
+    from newsroom.control_plane.native_source_intake import _require_parent_inventory_binding
+    unit, observations, objects, reads, parent_url = _parent_inventory_lookup_fixture(feed_count)
+    result = _require_parent_inventory_binding(unit=unit, observations=observations, objects=objects, proof=object())
+    assert result[0] == parent_url
+    assert reads['selected-inventory'] == reads['parent'] == 1
+    assert reads['shared-unrelated-inventory'] == (1 if feed_count > 1 else 0)
+    assert sum(reads.values()) == feed_count + (3 if feed_count > 1 else 2)
+
+
+@pytest.mark.parametrize('fault', ['raw-tamper', 'missing-feed', 'foreign-feed', 'current-rights',
+    'excluded-inventory', 'stop', 'feed-stop', 'empty-feed', 'direct-parent'])
+def test_linear_parent_inventory_keeps_provenance_bytes_rights_exclusions_and_stop(fault):
+    from newsroom.control_plane.native_source_intake import _require_parent_inventory_binding
+    from newsroom.control_plane.veto import VetoError
+    unit, observations, objects, reads, parent_url = _parent_inventory_lookup_fixture(fault=fault)
+    if fault in {'empty-feed', 'direct-parent'}:
+        assert _require_parent_inventory_binding(unit=unit, observations=observations,
+            objects=objects, proof=object())[0] == parent_url
+        if fault == 'direct-parent':
+            assert reads == {'parent': 1, 'direct-feed': 1}
+        else:
+            assert reads['empty-feed'] == 1 and reads['selected-inventory'] == 1
+    else:
+        with pytest.raises(VetoError if fault in {'stop', 'feed-stop'} else ValueError):
+            _require_parent_inventory_binding(unit=unit, observations=observations, objects=objects, proof=object())
+        assert reads['parent'] == 1
+
+
+@pytest.mark.parametrize('collection_only,document_type,allowed', [
+    (False, 'document_collection', True), (True, 'document_collection', True),
+    (False, 'correspondence', True), (True, 'correspondence', False),
+])
+def test_linear_inventory_membership_preserves_collection_only_boundary(collection_only, document_type, allowed):
+    from newsroom.control_plane.native_source_intake import _declared_file_parent_in_feed_child
+    # Bind the genuine parser's complete inventory bytes and current-access
+    # facade; URL union alone is not authority for an undeclared parent.
+    unit, observations, objects, reads, parent_url = _parent_inventory_lookup_fixture(feed_count=1)
+    selected_url = 'https://www.gov.uk/api/content/government/collections/selected'
+    if document_type == 'correspondence':
+        old = next(ref for ref in observations.values() if ref[0] == selected_url)
+        raw = _parent_with_children(document_type, '/government/collections/selected',
+            (('/government/publications/data', 'Selected parent'),))
+        # Reuse the facade closure's dictionary by constructing a fresh wrapper
+        # for this isolated inventory; no retained signed bytes are rewritten.
+        class InventoryObjects:
+            def access_decision(self, _id, *, admission_id, purpose, proof):
+                return SimpleNamespace(admission_id=admission_id, purpose=purpose, offset=0, allowed_bytes=len(raw))
+            def latest_access_decision(self, admission_id, *, purpose, proof):
+                return self.access_decision(None, admission_id=admission_id, purpose=purpose, proof=proof)
+            def rehydrate(self, request, *, proof):
+                assert request.offset == 0 and request.length == len(raw)
+                return SimpleNamespace(data=raw)
+        observations = {digest_bytes(raw): (old[0], digest_bytes(raw), old[2], old[3])}
+        objects = InventoryObjects()
+    assert _declared_file_parent_in_feed_child(unit=unit, parent_url=parent_url,
+        feed_urls={selected_url}, observations=observations, objects=objects, proof=object(),
+        collection_only=collection_only) is allowed
+
+
+def test_linear_parent_binding_rechecks_current_access_on_each_fresh_invocation():
+    from newsroom.control_plane.native_source_intake import _require_parent_inventory_binding
+    unit, observations, objects, reads, parent_url = _parent_inventory_lookup_fixture()
+    for _ in range(2):
+        assert _require_parent_inventory_binding(unit=unit, observations=observations,
+            objects=objects, proof=object())[0] == parent_url
+    assert reads['selected-inventory'] == reads['shared-unrelated-inventory'] == 2
+    objects.deny_selected = True
+    with pytest.raises(ValueError, match='outside its retained feed inventory'):
+        _require_parent_inventory_binding(unit=unit, observations=observations, objects=objects, proof=object())
+    assert reads['selected-inventory'] == 2  # Revoked current access grants no bytes.
+
+
+@pytest.mark.parametrize('stop_kind', ['owner', 'drain'])
+def test_native_source_binding_propagates_stop_from_parent_proof(monkeypatch, stop_kind):
+    from newsroom.control_plane import native_source_intake as intake
+    from newsroom.control_plane.veto import OperatorDrainRequested, VetoError
+    stop = VetoError('owner stop') if stop_kind == 'owner' else OperatorDrainRequested('drain')
+    unit = _unit(item_key='sha256:' + 'a' * 64 + '|https://assets.publishing.service.gov.uk/media/abc/data.csv')
+    unit = replace(unit, proving_run_id='native-source:' + unit.observation_digest)
+    def stopped(**_request): raise stop
+    monkeypatch.setattr(intake, '_require_parent_inventory_binding', stopped)
+    observation = ('https://assets.publishing.service.gov.uk/media/abc/data.csv', unit.observation_digest,
+        unit.authority.admission_id, unit.authority.access_decision_id)
+    with pytest.raises(type(stop)) as caught:
+        native_evidence_sources(units=(unit,), sources=object(), objects=object(),
+            observations={unit.observation_digest: observation}, licence=object(), proof=object())
+    assert caught.value is stop
