@@ -5,7 +5,11 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
+import cProfile
+import json
 import math
+import sys
+from pathlib import Path
 import time
 from typing import ContextManager
 
@@ -13,6 +17,7 @@ from newsroom.authority import UtcTimestamp
 from newsroom.sources import SourceRevisionId
 
 from .admission import write_admission_revalidation_due
+from .diagnostic_logging import MAX_MESSAGE, emit_diagnostic
 from .native_cycle import advance_native_cycle
 from .native_assessor import assessor_admission_recovery_due, assessment_revalidation_due, same_assessment_producer
 from .native_evidence import NativeEvidenceHold
@@ -91,6 +96,7 @@ class NativePipeline:
         self._reassessment_quantum = reassessment_quantum_seconds
         self._monotonic_clock = monotonic_clock
         self._spill_archive_turn = False
+        self._ordinary_profile_pending = True
         self.runtime_identity_digest: str | None = None
 
     def _drain_between_work(self) -> None:
@@ -181,7 +187,7 @@ class NativePipeline:
                 # permission for a fresh source/model retry using the batch proof.
                 ordinary = [item for item in ordinary if item[0] not in attempted]
         with _native_phase("ORDINARY_ADVANCE", cycle_id=cycle_id, cohort_count=len(ordinary)):
-            deadline_deferred_ready = self._advance_revisions(
+            deadline_deferred_ready = self._profiled_advance_revisions(
                 tuple(ordinary),
                 work_deadline=ordinary_deadline,
             )
@@ -310,6 +316,50 @@ class NativePipeline:
         return NativePipelineReport(
             self._journal.portfolio, dict(states), states.get("QUEUED", 0),
         )
+
+    def _profiled_advance_revisions(self, revisions: tuple, *, work_deadline: float) -> tuple:
+        """Observe one natural turn; diagnostics never grant or change work."""
+        if not self._ordinary_profile_pending:
+            return self._advance_revisions(revisions, work_deadline=work_deadline)
+        self._ordinary_profile_pending = False
+        profiler, started = None, None
+        try:
+            if sys.getprofile() is None:
+                started = (time.perf_counter_ns(), time.process_time_ns())
+                profiler = cProfile.Profile()
+                profiler.enable()
+        except Exception:
+            pass
+        try:
+            return self._advance_revisions(revisions, work_deadline=work_deadline)
+        finally:
+            if profiler is not None:
+                try:
+                    profiler.disable()
+                except Exception:
+                    pass
+                try:
+                    # Even a failed disable must not leave our hook installed.
+                    if sys.getprofile() is profiler:
+                        sys.setprofile(None)
+                    wall_ms = (time.perf_counter_ns() - started[0]) / 1_000_000
+                    cpu_ms = (time.process_time_ns() - started[1]) / 1_000_000
+                    rows = []
+                    for entry in sorted(profiler.getstats(), key=lambda item: item.totaltime, reverse=True)[:15]:
+                        code = entry.code
+                        module = '<builtin>' if isinstance(code, str) else Path(code.co_filename).name
+                        function = code if isinstance(code, str) else code.co_name
+                        rows.append([module[:64], function[:96], entry.callcount,
+                                     round(entry.inlinetime * 1_000, 3), round(entry.totaltime * 1_000, 3)])
+                    data = {'one_shot': True, 'profile_overhead_included': True,
+                            'timing_basis': 'ELAPSED_CALL_STATS', 'wall_ms': wall_ms, 'cpu_ms': cpu_ms,
+                            'columns': ['module', 'function', 'calls', 'total_ms', 'cumulative_ms'], 'rows': rows}
+                    # Fit the existing optional sink instead of emitting a raw profile.
+                    while rows and len(json.dumps(data, ensure_ascii=False, separators=(',', ':'))) > MAX_MESSAGE:
+                        rows.pop()
+                    emit_diagnostic('native_ordinary_profile', data)
+                except Exception:
+                    pass
 
     def _advance_revisions(
         self, revisions: tuple, *, work_deadline: float,
