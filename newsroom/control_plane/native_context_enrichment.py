@@ -10,6 +10,7 @@ from .native_assessor_judgments import JudgedAssessment, NativeAssessorJudgments
 from .native_assessor_spans import build_lossless_source_view
 
 VERSION = 'newsroom.native-context-package.v2'
+SUPPORT_CONTRACT = 'newsroom.native-context-support.assembled.v1'
 
 
 class ContextEnrichmentHold(ValueError):
@@ -134,25 +135,50 @@ class NativeContextEnricher:
         self.require_current()
         rendering_ref=self.localiser.localise(localisation_input,proof=self.proof,**identities)
         rendering=self.localiser.read_localisation(rendering_ref,localisation_input,proof=self.proof,**identities)
-        verification_state={**public,'selected':selected,'renderings':rendering['renderings']}
-        criteria={'support':'The exact complete Source supports the asserted context, not an inferred fact.',
-            'modality':'Rendering preserves negation, proposal, future, conditional and provisional meaning.',
-            'attribution':'Quoted or first-person assertions preserve the exact Source speaker and parent, never replace it with the publisher or become confirmed outcomes.',
-            'entities':'All rendered entities are exactly the supplied Source identities; no translated or added alias.'}
-        checks={identity+':'+kind:{'type':'choice','instructions':f'Verify {kind} for {identity}: {instruction}',
-            'criteria':{('SUPPORTED'if kind=='support'else'YES'):'Established in exact full Source and rendering.',
-                ('UNSUPPORTED'if kind=='support'else'NO'):'Contradicted, changed or unsupported.','UNCERTAIN':'Unresolved.'}}
-            for identity in selected for kind,instruction in criteria.items()}
-        support_ref,support=self._batch('CONTEXT_SUPPORT',verification_state,checks,context_binding,candidate)
-        if any(answer.get('choice')!=('SUPPORTED'if identity.endswith(':support')else'YES')
-                for identity,answer in support['answers'].items()):
-            raise ContextEnrichmentHold('CONTEXT_SUPPORT_UNPROVEN_HOLD')
-        from .native_context_materialisation import compose_context_execution
         wire={'package':{'select_new_information':False,'governed_claims':[
             {'claim_role':'CONTEXT','status':'CONFIRMED_FACT','source_range':item['source_range'],
                 **rendering['renderings'][identity]}for identity,item in selected.items()],
             'qualification_evidence':[],'selection_rationale':'Source-bound supporting context.',
             'geography':[],'categories':[],'explicit_exclusions':[]}}
+        from .native_assessor import _materialise_reference_result, VERSION as CODEC
+        materialised, _ = _materialise_reference_result(canonical_json_bytes(wire), view,
+            digest_canonical(context_binding), CODEC)
+        assertions = {identity: claim['rendered_assertion_zh_hant_hk']
+            for identity, claim in zip(selected, materialised['package']['governed_claims'], strict=True)}
+        verification_state={**public,'selected':selected,'renderings':rendering['renderings'],
+            'rendered_assertions':assertions,'support_contract':SUPPORT_CONTRACT}
+
+        criteria={'support':'The exact complete Source supports the asserted context, not an inferred fact.',
+            'modality':'Rendering preserves negation, proposal, future, conditional and provisional meaning.',
+            'attribution':'Quoted or first-person assertions preserve the exact Source speaker and parent, never replace it with the publisher or become confirmed outcomes.',
+            'entities':'Verify the rendered_assertions full application-materialised text, not the separate assembly fragments. All entity slots have already been filled with their exact Source names; no translated or added alias.'}
+        checks={identity+':'+kind:{'type':'choice','instructions':f'Verify {kind} for {identity}: {instruction}',
+            'criteria':{('SUPPORTED'if kind=='support'else'YES'):'Established in exact full Source and rendering.',
+                ('UNSUPPORTED'if kind=='support'else'NO'):'Contradicted, changed or unsupported.','UNCERTAIN':'Unresolved.'}}
+            for identity in selected for kind,instruction in criteria.items()}
+        # A new input contract is not credit to repeat an unknown old batch.
+        legacy_state={**public,'selected':selected,'renderings':rendering['renderings']}
+        legacy_checks=deepcopy(checks)
+        for identity in selected:
+            legacy_checks[identity+':entities']['instructions']=(
+                f'Verify entities for {identity}: All rendered entities are exactly the supplied Source identities; no translated or added alias.')
+        legacy_cycle=digest_canonical([VERSION,'CONTEXT_SUPPORT',context_binding,legacy_state,legacy_checks])
+        from .model_usage import _retained_terminal_allocation, UsageStatus
+        with self.judgments.usage._connection() as c:
+            prior=c.execute('SELECT a.invocation_id FROM model_invocation_allocations a '
+                'JOIN model_work_envelopes e ON e.envelope_id=a.envelope_id '
+                'WHERE e.cycle_id=? AND e.workload_class=?', (legacy_cycle,'TYPESAFE_JUDGMENT')).fetchall()
+            if len(prior)>1:
+                raise ContextEnrichmentHold('CONTEXT_PRIOR_SUPPORT_AMBIGUOUS_HOLD')
+            if prior:
+                _allocation,terminal=_retained_terminal_allocation(c,prior[0][0])
+                if terminal.usage_status is not UsageStatus.REPORTED or terminal.outcome!='TYPESAFE_COMPLETE' or terminal.policy_breach:
+                    raise ContextEnrichmentHold('CONTEXT_PRIOR_SUPPORT_UNSETTLED_HOLD')
+        support_ref,support=self._batch(SUPPORT_CONTRACT,verification_state,checks,context_binding,candidate)
+        if any(answer.get('choice')!=('SUPPORTED'if identity.endswith(':support')else'YES')
+                for identity,answer in support['answers'].items()):
+            raise ContextEnrichmentHold('CONTEXT_SUPPORT_UNPROVEN_HOLD')
+        from .native_context_materialisation import compose_context_execution
         execution,composition=compose_context_execution(original,wire,rendering,
             binding=context_binding,view=view,support_receipt=support)
         record={'version':VERSION,'source_binding':context_binding,'intent_key':intent_key,

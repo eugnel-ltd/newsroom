@@ -103,3 +103,79 @@ def test_context_source_change_cannot_replace_retained_intent(tmp_path,monkeypat
         with pytest.raises(ContextEnrichmentHold,match='SOURCE_BYTES'):
             c.enrich(o,ca,b,(s,),(changed,),scope=scope)
         assert len(calls)==2 and len(local)==1
+
+
+def test_context_support_receives_actual_materialised_entity_surface(tmp_path, monkeypatch):
+    with _services(tmp_path, monkeypatch) as (consumer, original, candidate, base, source, acquired, scope, usage, calls, local):
+        consumer.enrich(original, candidate, base, (source,), (acquired,), scope=scope)
+        support = calls[-1]['state']
+        assert support['rendered_assertions']['S1L2'] == '政府正提出按UK法律管制2種化學物質。'
+        assert 'Dan Jarvis' in support['rendered_assertions']['S1L3']
+        assert all('rendered_assertions' not in call['state'] for call in calls[:-1])
+        assert len(local) == 1
+
+
+def test_closed_old_support_is_preserved_and_only_one_assembled_batch_is_new(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from newsroom.control_plane.native_context_enrichment import SUPPORT_CONTRACT
+    with _services(tmp_path, monkeypatch, failed_support=True) as (consumer, original, candidate, base, source, acquired, scope, usage, calls, local):
+        batch = consumer._batch
+        def legacy_batch(phase, state, questions, binding, candidate):
+            if phase == SUPPORT_CONTRACT:
+                state = {key:value for key,value in state.items() if key not in {'rendered_assertions','support_contract'}}
+                questions = deepcopy(questions)
+                for key in questions:
+                    if key.endswith(':entities'):
+                        identity = key.rsplit(':',1)[0]
+                        questions[key]['instructions'] = f'Verify entities for {identity}: All rendered entities are exactly the supplied Source identities; no translated or added alias.'
+                phase = 'CONTEXT_SUPPORT'
+            return batch(phase, state, questions, binding, candidate)
+        monkeypatch.setattr(consumer, '_batch', legacy_batch)
+        with pytest.raises(ContextEnrichmentHold, match='SUPPORT_UNPROVEN'):
+            consumer.enrich(original, candidate, base, (source,), (acquired,), scope=scope)
+        with usage._connection() as db:
+            old = db.execute("SELECT record_json FROM model_invocation_terminals ORDER BY invocation_id").fetchall()
+        assert len(calls) == 2 and len(local) == 1
+        monkeypatch.setattr(consumer, '_batch', batch)
+        # The fixture still says NO: it is a new input contract, not a claimed
+        # semantic pass. Replay must not ask either batch or renderer again.
+        for _ in range(2):
+            with pytest.raises(ContextEnrichmentHold, match='SUPPORT_UNPROVEN'):
+                consumer.enrich(original, candidate, base, (source,), (acquired,), scope=scope)
+        assert len(calls) == 3 and len(local) == 1
+        with usage._connection() as db:
+            retained = db.execute('SELECT record_json FROM model_invocation_terminals').fetchall()
+            assert all(row in retained for row in old)
+
+
+def test_unknown_old_support_never_receives_new_assembled_purpose(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from newsroom.control_plane.native_context_enrichment import SUPPORT_CONTRACT
+    with _services(tmp_path, monkeypatch) as (consumer, original, candidate, base, source, acquired, scope, usage, calls, local):
+        batch = consumer._batch
+        transport = consumer.judgments.transport
+        def fail_support(request, **kwargs):
+            if calls:
+                calls.append(json.loads(request.data))
+                raise TimeoutError('fixture unknown legacy support')
+            return transport(request, **kwargs)
+        monkeypatch.setattr(consumer.judgments, 'transport', fail_support)
+        def old_batch(phase, state, questions, binding, candidate):
+            if phase == SUPPORT_CONTRACT:
+                state = {key:value for key,value in state.items() if key not in {'rendered_assertions','support_contract'}}
+                questions = deepcopy(questions)
+                for key in questions:
+                    if key.endswith(':entities'):
+                        identity = key.rsplit(':',1)[0]
+                        questions[key]['instructions'] = f'Verify entities for {identity}: All rendered entities are exactly the supplied Source identities; no translated or added alias.'
+                phase = 'CONTEXT_SUPPORT'
+            return batch(phase, state, questions, binding, candidate)
+        monkeypatch.setattr(consumer, '_batch', old_batch)
+        with pytest.raises(Exception):
+            consumer.enrich(original, candidate, base, (source,), (acquired,), scope=scope)
+        monkeypatch.setattr(consumer, '_batch', batch)
+        with pytest.raises(ContextEnrichmentHold, match='PRIOR_SUPPORT_UNSETTLED'):
+            consumer.enrich(original, candidate, base, (source,), (acquired,), scope=scope)
+        assert len(calls) == 2 and len(local) == 1
+        with usage._connection() as db:
+            assert db.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 3

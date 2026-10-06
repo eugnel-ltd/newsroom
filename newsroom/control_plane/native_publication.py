@@ -969,12 +969,13 @@ class NativePublicationContinuation:
 
     @staticmethod
     def context_enrichment_due(facts: dict) -> bool:
-        from .native_context_enrichment import VERSION
+        from .native_context_enrichment import VERSION, SUPPORT_CONTRACT
         if any(facts.get(key)for key in ('story_event_id','publication_event_id',
                 'delivery_attempt_event_id','delivery_evidence_event_id')):
             return False
         if facts.get('context_enrichment_settled')==VERSION:
-            return False
+            return (facts.get('reason')=='CONTEXT_SUPPORT_UNPROVEN_HOLD'
+                and facts.get('context_support_checked_contract')!=SUPPORT_CONTRACT)
         intent=facts.get('context_enrichment_intent')
         if type(intent)is dict and intent.get('contract')==VERSION:
             return bool(intent.get('original_package_admission_id'))and not facts.get('context_enrichment_completed')
@@ -1605,6 +1606,9 @@ class NativePublicationContinuation:
                         'CONTEXT_SOURCE_SPEAKER_UNRESOLVED_HOLD'}:
                     from .native_context_enrichment import VERSION
                     facts['context_enrichment_settled']=VERSION
+                    if exc.reason_code=='CONTEXT_SUPPORT_UNPROVEN_HOLD':
+                        from .native_context_enrichment import SUPPORT_CONTRACT
+                        facts['context_support_checked_contract']=SUPPORT_CONTRACT
                 facts["reason"] = exc.reason_code
                 facts["acquisition_retryable"] = False
                 self._journal.advance(
