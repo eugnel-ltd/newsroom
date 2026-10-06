@@ -2204,3 +2204,105 @@ def test_tick_prefix_spans_preserve_single_calls_and_original_failure(tmp_path, 
         assert all(data['cycle_id']=='prefix-fixture' for data in spans)
         assert spans[-1]['status']==('FAILED' if failed_phase else 'COMPLETE')
     finally:connection.close()
+
+
+@pytest.mark.parametrize('news_path', ['/government/news/material-update', '/government/speeches/material-update'])
+def test_current_news_semantic_turn_precedes_newer_reference_but_archive_keeps_land(tmp_path, monkeypatch, news_path):
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    now, calls = [0.0], []
+    pipeline._monotonic_clock = lambda: now[0]
+    pipeline._ordinary_profile_pending = False
+    reference = replace(_native('reference'), canonical_url='https://www.gov.uk/government/publications/register',
+        updated_at='2026-10-05T00:00:00Z')
+    news = replace(_native('news'), canonical_url='https://www.gov.uk' + news_path, updated_at='2026-09-26T00:00:00Z')
+    for unit in (reference, news):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts={
+            'candidate_version_id': 'candidate:' + unit.item_key, 'graphiti_receipts': [{}],
+            'intake_receipt_id': 'retained-intake', 'reason': 'ACQUISITION_RESULT_NOT_RETAINED',
+            'failure_class': 'ModelUsageAdmissionError'})
+    def advance(*, revision_id, **_request):
+        calls.append(revision_id)
+        journal.advance(revision_id, stage='EVIDENCE_HOLD', facts={**journal.current(revision_id)['facts'],
+            'reason': 'NO_QUALIFYING_NEW_INFORMATION', 'acquisition_retryable': False})
+        now[0] += 301  # One unchanged atomic caller may exhaust the 300 s quantum.
+    pipeline._publish = NS(advance=advance)
+    try:
+        pipeline.tick(cycle_id='current-news-first')
+        assert calls == [news.revision_id]
+        assert journal.current(reference.revision_id)['facts']['reason'] == 'ACQUISITION_RESULT_NOT_RETAINED'
+        assert pipeline._spill_archive_turn is True
+        pipeline.tick(cycle_id='archive-reference-fair')
+        assert calls == [news.revision_id, reference.revision_id]
+        assert pipeline._spill_archive_turn is False
+        assert set(journal.units) == {reference.revision_id, news.revision_id}
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('url,priority', [
+    ('https://www.gov.uk/government/news/material-update', True),
+    ('https://www.gov.uk/government/speeches/material-update', True),
+    ('https://www.gov.uk/government/publications/news-report', False),
+    ('https://www.gov.uk/government/statistics/news-report', False),
+    ('https://www.gov.uk/government/newsletters/update', False),
+    ('https://www.gov.uk.evil.test/government/news/update', False),
+    ('https://www.gov.uk:443/government/news/update', False),
+    ('https://name@www.gov.uk/government/news/update', False),
+    ('http://www.gov.uk/government/news/update', False),
+    (' HTTPS://www.gov.uk/government/news/update', False),
+    ('https://www.gov.uk/government/news/update?feed=1', False),
+    ('https://www.gov.uk/government/news/update#part', False),
+    ('https://www.gov.uk/government/news/../publications/register', False),
+    ('https://www.gov.uk/government/news/%2e%2e/publications/register', False),
+    ('https://www.gov.uk/government/news/update ', False),
+    (None, False), (123, False), (b'https://www.gov.uk/government/news/update', False),
+])
+def test_current_news_priority_is_exact_metadata_not_a_source_permission(url, priority):
+    assert n._news_or_speech_header(('revision', NS(canonical_url=url))) is priority
+
+
+@pytest.mark.parametrize('archive', [False, True])
+@pytest.mark.parametrize('settlement', ['ASSESSMENT_INTERRUPTED', 'ASSESSMENT_STARTED',
+    'PUBLICATION_STARTED', 'COPY_CORRECTION_PREPARED'])
+def test_news_priority_keeps_unknown_and_prepared_effect_settlement_first(tmp_path, monkeypatch, archive, settlement):
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    pipeline._spill_archive_turn = archive
+    pipeline._ordinary_profile_pending = False
+    news = replace(_native('news-ready'), canonical_url='https://www.gov.uk/government/news/update', updated_at='2026-10-05T00:00:00Z')
+    settling = replace(_native('settling-reference'), canonical_url='https://www.gov.uk/government/publications/register', updated_at='2020-01-01T00:00:00Z')
+    for unit, stage in ((news, 'CANDIDATE_ADMITTED'), (settling, settlement)):
+        journal.land((unit,)); journal.advance(unit.revision_id, stage=stage, facts={
+            'candidate_version_id': 'candidate:' + unit.item_key, 'graphiti_receipts': [{}]})
+    selected = []
+    pipeline._publish = NS(advance=lambda **request: selected.append(request['revision_id']))
+    try:
+        pipeline.tick(cycle_id='settlement-before-news')
+        assert selected == [settling.revision_id, news.revision_id]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('archive', [False, True])
+def test_news_priority_keeps_equal_class_stable_and_archive_land_order(tmp_path, monkeypatch, archive):
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    pipeline._spill_archive_turn = archive
+    pipeline._ordinary_profile_pending = False
+    units = [replace(_native(name), canonical_url=url, updated_at=date) for name, url, date in (
+        ('reference-land-first', 'https://www.gov.uk/government/publications/register', '2026-10-05T00:00:00Z'),
+        ('news-land-second', 'https://www.gov.uk/government/news/update-one', '2026-09-26T00:00:00Z'),
+        ('speech-land-third', 'https://www.gov.uk/government/speeches/update-two', '2026-09-26T00:00:00Z'),
+        ('news-most-recent', 'https://www.gov.uk/government/news/update-three', '2026-09-27T00:00:00Z'))]
+    for unit in units:
+        journal.land((unit,));journal.advance(unit.revision_id,stage='CANDIDATE_ADMITTED',facts={
+            'candidate_version_id':'candidate:'+unit.item_key,'graphiti_receipts':[{}]})
+    selected=[]
+    pipeline._publish=NS(advance=lambda **request:selected.append(request['revision_id']))
+    try:
+        pipeline.tick(cycle_id='stable-current-or-archive')
+        assert selected==[unit.revision_id for unit in (units if archive else (units[3],units[1],units[2],units[0]))]
+        assert set(journal.units)=={unit.revision_id for unit in units}
+    finally:connection.close()
