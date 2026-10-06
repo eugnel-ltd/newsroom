@@ -134,6 +134,21 @@ def _source_header(units: tuple[CorpusIngestUnit, ...]) -> NativeSourceHeader:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class NativeUnitDefinitionIdentity:
+    definition_id: str
+    definition_version_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeUnitRightsHeader:
+    ingest_id: str
+    source_id: str
+    source_definition_url: str
+    headline: str
+    authority: NativeUnitDefinitionIdentity
+
+
 class _CurrentUnits(Mapping[str, tuple[CorpusIngestUnit, ...]]):
     """Selected exact source reads; immutable row pins, never a body cache."""
 
@@ -152,6 +167,9 @@ class _CurrentUnits(Mapping[str, tuple[CorpusIngestUnit, ...]]):
         return revision_id in self._pins
 
     def __getitem__(self, revision_id: str) -> tuple[CorpusIngestUnit, ...]:
+        return _landed_units(self._selected_value(revision_id))
+
+    def _selected_value(self, revision_id: str) -> dict:
         from .native_progress_state import checked_json
         pin = self._pins[revision_id]
         owns_read = not self._connection.in_transaction
@@ -182,10 +200,23 @@ class _CurrentUnits(Mapping[str, tuple[CorpusIngestUnit, ...]]):
                 raise ValueError('native CURRENT selected source index differs')
             # Recheck the exact bytes validated before pin retention. Returned
             # units and mutable authority records belong to this selection only.
-            return _landed_units(checked_json(row[0], pin[2], label='source'))
+            return checked_json(row[0], pin[2], label='source')
         finally:
             if owns_read:
                 self._connection.rollback()
+
+    def retrieval_headers(self, revision_id: str) -> tuple[NativeUnitRightsHeader, ...]:
+        """Recheck full row bytes/index; project only immutable per-ingest rights."""
+        value = self._selected_value(revision_id)
+        expected = self._headers[revision_id].unit_index
+        raw_units = value.get('units', ())
+        if value.get('revision_id') != revision_id or len(raw_units) != len(expected):
+            raise ValueError('native CURRENT selected source identity differs')
+        return tuple(NativeUnitRightsHeader(
+            ingest_id, unit['source_id'], unit['source_definition_url'], unit['headline'],
+            NativeUnitDefinitionIdentity(unit['authority']['definition_id'],
+                                         unit['authority']['definition_version_id']),
+        ) for (ingest_id, _digest), unit in zip(expected, raw_units, strict=True))
 
     def retain(self, revision_id: str, *, seq: int, digest: str,
                content_digest: str, content_size: int,

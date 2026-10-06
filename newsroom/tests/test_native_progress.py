@@ -968,3 +968,52 @@ def test_unrelated_current_write_does_not_mask_missing_ack_head(tmp_path):
     with pytest.raises(ValueError, match='CURRENT inventory'):
         NativeRevisionJournal(connection)
     connection.close()
+
+
+@pytest.mark.parametrize('damage', (None, 'body', 'rights', 'index-digest', 'missing-index', 'pin'))
+def test_retrieval_rights_headers_validate_current_bytes_without_full_unit_reconstruction(tmp_path, monkeypatch, damage):
+    import json
+    from dataclasses import FrozenInstanceError
+    from newsroom.control_plane import native_progress as module
+    connection = connect(str(tmp_path / 'rights-headers.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    first = replace(_native('headers'), chunk_count=2)
+    second = replace(first, chunk_ordinal=2, authority=replace(first.authority,
+        definition_version_id='00000000-0000-4000-8000-000000000123'))
+    units = (first, second)
+    journal.land(units)
+    if damage in {'body', 'rights'}:
+        raw = connection.execute('SELECT content_json FROM native_current_sources WHERE revision_id=?', (first.revision_id,)).fetchone()[0]
+        value = json.loads(raw)
+        if damage == 'body':
+            key = 'shared_body' if 'shared_body' in value else None
+            if key: value[key] = 'X' + value[key][1:]
+            else: value['units'][0]['body'] = 'X' + value['units'][0]['body'][1:]
+        else:
+            old = value['units'][1]['authority']['definition_version_id']
+            value['units'][1]['authority']['definition_version_id'] = old[:-1] + '4'
+        mutated = module.canonical_json_bytes(value).decode()
+        assert len(mutated.encode()) == len(raw.encode())
+        connection.execute('UPDATE native_current_sources SET content_json=? WHERE revision_id=?', (mutated, first.revision_id))
+    elif damage == 'index-digest':
+        connection.execute('UPDATE native_current_units SET effective_revision_digest=? WHERE ingest_id=?', ('sha256:'+'f'*64, first.ingest_id))
+    elif damage == 'missing-index':
+        connection.execute('DELETE FROM native_current_units WHERE ingest_id=?', (second.ingest_id,))
+    elif damage == 'pin':
+        connection.execute('UPDATE native_current_sources SET land_digest=? WHERE revision_id=?', ('sha256:'+'f'*64, first.revision_id))
+    connection.commit()
+    monkeypatch.setattr(module, '_landed_units', lambda *_args, **_kwargs: pytest.fail('metadata reader rebuilt full units'))
+    try:
+        if damage:
+            with pytest.raises(ValueError, match='CURRENT'):
+                journal.units.retrieval_headers(first.revision_id)
+        else:
+            headers = journal.units.retrieval_headers(first.revision_id)
+            assert [h.ingest_id for h in headers] == [u.ingest_id for u in units]
+            assert [h.authority.definition_version_id for h in headers] == [u.authority.definition_version_id for u in units]
+            assert all(h.headline == first.headline and h.source_definition_url == first.source_definition_url for h in headers)
+            assert all(not hasattr(h, 'body') and not hasattr(h.authority, 'records') for h in headers)
+            with pytest.raises(FrozenInstanceError): headers[0].source_id = 'other'
+            with pytest.raises(FrozenInstanceError): headers[0].authority.definition_id = 'other'
+    finally:
+        connection.close()

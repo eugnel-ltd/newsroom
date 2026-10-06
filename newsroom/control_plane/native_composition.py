@@ -1059,6 +1059,7 @@ def open_native_pipeline(
             connection=private, embedder=embedder, generation_id=generation_id,
             port_for=port_for, rights_check=require_rights,
             rights_cohort=retrieval_rights_cohort,
+            unit_headers_for=journal.units.retrieval_headers,
         )
         govuk_acquisition = GovUkEvidenceAcquisition(
             sources=runtime.authority.sources, proof=proof,
