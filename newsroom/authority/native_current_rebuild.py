@@ -127,6 +127,10 @@ def candidate_semantic_parents(table, row, matching):
         version = EventHypothesisVersion.from_canonical_bytes(bytes(row['canonical_bytes']))
         for binding in version.source_bindings:
             matching('triage_proposal_dispositions', ('disposition_id',), (binding.disposition_id,), required=True)
+        # An associated Candidate follows successor decisions by subject, not FK.
+        # Preserve retained decisions; a genuinely unfinished version adds none.
+        matching('event_hypothesis_relationship_decisions', ('subject_version_id',),
+                 (version.version_id,), required=False)
     elif table == 'event_hypotheses_v2':
         matching('event_hypothesis_heads_v2', ('hypothesis_id',), (row['hypothesis_id'],), required=True)
     elif table == 'triage_work_items':
