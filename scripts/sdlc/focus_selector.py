@@ -102,6 +102,22 @@ EXECUTABLE_SUFFIXES = frozenset(
     {".py", ".toml", ".json", ".yml", ".yaml", ".sh", ".bash", ".sql"}
 )
 IGNORED_IMPORT_ROOTS = frozenset({"newsroom", "scripts"})
+SOURCE_BODY_CONTRACT_PATHS = frozenset({
+    "newsroom/control_plane/native_story_entities.py",
+    "newsroom/control_plane/native_story_dates.py",
+})
+SOURCE_BODY_CHANGED_TESTS = frozenset({
+    "newsroom/tests/test_native_story_entities.py",
+    "newsroom/tests/test_native_story_dates.py",
+})
+SOURCE_BODY_CONTRACT_TESTS = tuple("newsroom/tests/" + name for name in (
+    "test_native_story_entities.py", "test_native_story_writer.py",
+    "test_native_story_model.py", "test_native_story_dates.py",
+    "test_native_story_editorial.py", "test_native_brief_prompt_identity.py",
+    "test_native_publication.py", "test_native_publication_continuation.py",
+    "test_native_pipeline.py", "test_native_composition.py",
+    "test_native_source_context_ranges.py", "test_native_vertical.py",
+))
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -178,24 +194,28 @@ def _defined_names(path: Path) -> set[str]:
     return public if declared_all is None else public & declared_all
 
 
-def _changed_public_symbols(repo_root: Path, path: str, base_sha: str, head_sha: str) -> set[str] | None:
-    def source(revision: str) -> bytes | None:
+def _revision_modules(repo_root: Path, path: str, base_sha: str, head_sha: str):
+    """Read the exact declaration inputs once without importing candidate code."""
+    modules = []
+    for revision in (base_sha, head_sha):
         try:
             result = subprocess.run(
                 ("git", "show", f"{revision}:{path}"), cwd=repo_root, capture_output=True,
             )
-        except OSError:
+            if result.returncode != 0:
+                return None
+            source = result.stdout.decode("utf-8")
+            modules.append((source, ast.parse(source, filename=path)))
+        except (OSError, SyntaxError, UnicodeError):
             return None
-        return result.stdout if result.returncode == 0 else None
+    return modules
 
-    before, after = source(base_sha), source(head_sha)
-    if before is None or after is None:
+
+def _changed_public_symbols(repo_root: Path, path: str, base_sha: str, head_sha: str) -> set[str] | None:
+    modules = _revision_modules(repo_root, path, base_sha, head_sha)
+    if modules is None:
         return None
-    try:
-        old_tree = ast.parse(before, filename=path)
-        new_tree = ast.parse(after, filename=path)
-    except (SyntaxError, UnicodeError):
-        return None
+    (_, old_tree), (_, new_tree) = modules
 
     old, new = _module_declarations(old_tree), _module_declarations(new_tree)
     if old is None or new is None or old[1:] != new[1:]:
@@ -214,6 +234,55 @@ def _changed_public_symbols(repo_root: Path, path: str, base_sha: str, head_sha:
     if _local_symbol_closure(old_tree, changed) is None:
         return None
     return _local_symbol_closure(new_tree, changed)
+
+
+def _closed_existing_function_bodies(modules) -> bool:
+    """A baseline call/reference subset, not a general Python purity proof."""
+    (before, old_tree), (after, new_tree) = modules
+    old, new = _module_declarations(old_tree), _module_declarations(new_tree)
+    if old is None or new is None or old[1:] != new[1:] or old[0].keys() != new[0].keys():
+        return False
+    previous = {node.name: node for node in old_tree.body if isinstance(node, ast.FunctionDef)}
+    current = {node.name: node for node in new_tree.body if isinstance(node, ast.FunctionDef)}
+    changed = {name for name in old[0] if old[0][name] != new[0][name]}
+    if not changed or not changed <= previous.keys() or not changed <= current.keys():
+        return False
+    if _local_symbol_closure(old_tree, changed) is None or _local_symbol_closure(new_tree, changed) is None:
+        return False
+    # Keep other functions and module-time imports/maps/effects byte-identical.
+    protected = lambda source, tree: [ast.get_source_segment(source, node) for node in tree.body
+                                     if not isinstance(node, ast.FunctionDef) or node.name not in changed]
+    if protected(before, old_tree) != protected(after, new_tree):
+        return False
+    references = (ast.Call, ast.Name, ast.Attribute, ast.Import, ast.ImportFrom,
+                  ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom, ast.Await)
+    footprint = lambda node: {ast.dump(item) for item in ast.walk(node) if isinstance(item, references)}
+    for name in changed:
+        left, right = previous[name], current[name]
+        if footprint(right) - footprint(left):
+            return False
+        left_body, right_body = left.body, right.body
+        left.body, right.body = [], []
+        equal_header = ast.dump(left) == ast.dump(right)
+        left.body, right.body = left_body, right_body
+        if not equal_header:
+            return False
+    return True
+
+
+def _source_body_contract_tests(root, changed, source_paths, base_sha, head_sha):
+    allowed = SOURCE_BODY_CONTRACT_PATHS | SOURCE_BODY_CHANGED_TESTS
+    if not source_paths or not set(source_paths) <= SOURCE_BODY_CONTRACT_PATHS or any(
+        not _is_documentation(path) and path not in allowed for path in changed
+    ):
+        return None
+    if any(not (root / path).is_file() or (root / path).is_symlink() for path in SOURCE_BODY_CONTRACT_TESTS):
+        return None
+    for path in source_paths:
+        modules = _revision_modules(root, path, base_sha, head_sha)
+        if modules is None or not _closed_existing_function_bodies(modules):
+            return None
+    return set(SOURCE_BODY_CONTRACT_TESTS)
 
 
 def _module_declarations(tree: ast.Module):
@@ -713,14 +782,21 @@ def select_focus(
         tests.update(legacy._existing(root, CONTROL_TESTS))
 
     if source_paths and not research_only and root is not None:
-        discovered, unresolved = _discover_tests(
-            root, source_paths, base_sha=base_sha, head_sha=head_sha
+        contract_tests = _source_body_contract_tests(
+            root, changed, source_paths, base_sha, head_sha,
         )
+        if contract_tests is None:
+            discovered, unresolved = _discover_tests(
+                root, source_paths, base_sha=base_sha, head_sha=head_sha
+            )
+        else:
+            discovered, unresolved = contract_tests, False
         for path in discovered:
             (service_tests if _is_service_test(path) else tests).add(path)
         if discovered:
             gates.add("F2")
-            reasons.add("repository_import_or_symbol_consumers:F2")
+            reasons.add("repository_import_or_symbol_consumers:F2" if contract_tests is None
+                        else "explicit_source_name_date_body_contract:F2")
         if unresolved:
             full_health_required = True
             reasons.add("unresolved_dependency_analysis:full_health")
