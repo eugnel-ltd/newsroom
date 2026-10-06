@@ -284,3 +284,27 @@ def test_headline_paraphrase_still_requires_bound_headline_support(failure):
         return result
     with pytest.raises(NativeStoryWriterHold):
         write_native_story(_package(), generate=lambda _: draft, review=review)
+
+
+@pytest.mark.parametrize('name', ['Home Office', '英國內政部'])
+def test_bound_publisher_reporting_display_is_valid_narrative(name):
+    package = _package()
+    package = replace(package, governed_claims=tuple(replace(claim, attribution='Home Office')
+                      for claim in package.governed_claims))
+    draft = deepcopy(DRAFT)
+    draft['body'] = name + '表示，' + draft['body']
+    before = deepcopy(draft)
+    result = write_native_story(package, generate=lambda _: deepcopy(draft), review=_review)
+    assert all(check.result == 'PASS' for check in result.validators)
+    assert result.copy.body == draft['body'] and draft == before
+
+
+def test_publisher_display_does_not_grant_an_unclaimed_policy_actor():
+    package = _package()
+    package = replace(package, governed_claims=tuple(replace(claim, attribution='Home Office')
+                      for claim in package.governed_claims))
+    draft = deepcopy(DRAFT)
+    draft['body'] = '英國內政部制定政策。' + draft['body']
+    with pytest.raises(NativeStoryWriterHold) as held:
+        write_native_story(package, generate=lambda _: draft, review=_review)
+    assert 'NATIVE_STORY_FACTUAL_ENTITIES' in held.value.stable_reason_codes

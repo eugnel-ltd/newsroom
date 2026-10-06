@@ -1754,3 +1754,17 @@ def test_settled_context_consumer_failure_replays_only_changed_consumer(override
     before = json.loads(json.dumps(facts))
     assert NativePublicationContinuation.context_enrichment_due(facts) is due
     assert facts == before
+
+
+@pytest.mark.parametrize('checked,due', [('newsroom.native-story-support.v3', True),
+                                       ('newsroom.native-story-support.v4', False)])
+def test_source_publisher_display_consumer_revalidates_retained_writer_once(checked, due):
+    facts = {'reason': 'NATIVE_STORY_FACTUAL_ENTITIES',
+             'editorial_hold_reason_codes': ['NATIVE_STORY_FACTUAL_ENTITIES'],
+             'package_admission_id': 'original-retained-package', 'editorial_decision': {},
+             'writer_support_checked_version': checked}
+    before = json.loads(json.dumps(facts))
+    assert NativePublicationContinuation.writer_revalidation_due(facts) is due
+    assert facts == before
+    facts['publication_event_id'] = 'pending'
+    assert not NativePublicationContinuation.writer_revalidation_due(facts)
