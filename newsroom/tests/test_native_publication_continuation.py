@@ -1768,3 +1768,138 @@ def test_source_publisher_display_consumer_revalidates_retained_writer_once(chec
     assert facts == before
     facts['publication_event_id'] = 'pending'
     assert not NativePublicationContinuation.writer_revalidation_due(facts)
+
+
+@pytest.mark.parametrize('scenario', ['eligible', 'v17', 'missing-origin', 'wrong-producer',
+    'unknown-origin', 'missing-raw', 'missing-graph', 'pending-effect', 'settled-intent', 'source-hold'])
+def test_reported_validation_origin_survives_allocation_denial_and_uses_distinct_semantics(tmp_path, monkeypatch, scenario):
+    from datetime import UTC, datetime
+    from newsroom.control_plane.native_assessor import RetainedAssessorResult
+    unit = _native()
+    connection = connect(str(tmp_path / 'validation-semantic.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    journal.land((unit,))
+    old_contract = 'newsroom.native-evidence-assessor.v17' if scenario == 'v17' else 'newsroom.native-evidence-assessor.v15'
+    original = {'candidate_id': 'candidate', 'candidate_version_id': 'candidate-version',
+        'graphiti_receipts': [{}], 'intake_receipt_id': 'original-intake',
+        'assessment_contract_version': 'newsroom.native-evidence-assessor.v19+consumer.v1',
+        'assessment_superseded': {'contract_version': old_contract + '+consumer.v1',
+            'reason': 'ASSESSOR_RENDERING_CONTRACT_HOLD', 'package_admission_id': None,
+            'editorial_decision_id': None, 'acquisition_attempt_count': 1},
+        'acquisition_attempt_count': 1, 'reason': 'ACQUISITION_RESULT_NOT_RETAINED',
+        'failure_class': 'ModelUsageAdmissionError'}
+    if scenario == 'wrong-producer': original['assessment_superseded']['contract_version'] = 'newsroom.native-evidence-assessor.v16'
+    if scenario == 'missing-graph': original['graphiti_receipts'] = []
+    if scenario == 'pending-effect': original['publication_started_at'] = 'unknown-effect'
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=original)
+    origin = RetainedAssessorResult(RetainedAssessorContractFailure('old-envelope', 'old-invocation', _DIGEST, _DIGEST, _DIGEST),
+        old_contract, _DIGEST, 'ASSESSOR_PROVIDER_FAILED' if scenario == 'unknown-origin' else 'ASSESSOR_VALIDATION_FAILED',
+        datetime(2026, 9, 8, tzinfo=UTC), None, result_digest=None if scenario == 'missing-raw' else _DIGEST,
+        result_receipt_digest=_DIGEST)
+    calls = []
+    def acquire(_self, **request):
+        assert request['assessment_semantic_only'] is True and request['assessment_cached_only'] is False
+        intent = journal.current(unit.revision_id)['facts']['semantic_assessment_intent']
+        assert intent['origin_invocation_id'] == 'old-invocation'
+        assert intent['origin_outcome'] == 'ASSESSOR_VALIDATION_FAILED'
+        assert intent['origin_result_digest'] == _DIGEST and intent['origin_result_receipt_digest'] == _DIGEST
+        assert intent['origin_journal']['assessment_superseded'] == original['assessment_superseded']
+        calls.append(request)
+        request['before_semantic_assessment'](SimpleNamespace(digest=_DIGEST),
+            (SimpleNamespace(receipt_digest=_DIGEST, body_digest=_DIGEST),))
+        raise NativeEvidenceHold('CURRENT_RIGHTS_HOLD' if scenario == 'source-hold' else 'NO_QUALIFYING_NEW_INFORMATION', unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController, 'acquire_and_retain', acquire)
+    runtime = SimpleNamespace(authority=_Authority(), ingress=object(), publication=_Publication(),
+        proof=proof(), policies=SimpleNamespace(publication=object()))
+    continuation = NativePublicationContinuation(journal=journal, runtime=runtime,
+        evidence_controller=object.__new__(NativeEvidenceController), sources={unit.revision_id: (_source(unit),)},
+        semantic_origin_failure=lambda _: None if scenario == 'missing-origin' else origin,
+        semantic_intent_contract='newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2',
+        assessment_contract_version='newsroom.native-evidence-assessor.v23+consumer.v1',
+        clock=lambda: UtcTimestamp.parse('2026-09-08T12:30:00Z'))
+    try:
+        before = journal.current(unit.revision_id)
+        checked = continuation.recover_pre_dispatch((unit.revision_id,),
+            denial_many=lambda *_args, **_kwargs: (True,),
+            failure_many=lambda _: pytest.fail('allocated origin was mistaken for zero dispatch'),
+            before_revision=lambda: True)
+        # The denial is preserved; prospective validation is authenticated only
+        # by ordinary continuation, not manufactured by the journal shortcut.
+        assert checked == (() if scenario not in {'missing-graph', 'pending-effect'} else (unit.revision_id,))
+        assert journal.current(unit.revision_id) == before
+        result = continuation.advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
+        if scenario in {'eligible', 'v17', 'settled-intent', 'source-hold'}:
+            assert len(calls) == 1
+            assert result.reason == ('CURRENT_RIGHTS_HOLD' if scenario == 'source-hold' else 'NO_QUALIFYING_NEW_INFORMATION')
+            retained = journal.current(unit.revision_id)['facts']
+            assert retained['assessment_superseded'] == original['assessment_superseded']
+            assert retained['acquisition_attempt_count'] == 1 and retained['semantic_acquisition_attempt_count'] == 1
+            if scenario != 'source-hold':
+                assert continuation.advance(revision_id=unit.revision_id, candidate_version_id='candidate-version').reason == 'NO_QUALIFYING_NEW_INFORMATION'
+                assert len(calls) == 1
+        else:
+            assert calls == [] and result.reason == 'ACQUISITION_RESULT_NOT_RETAINED'
+            assert journal.current(unit.revision_id)['facts'] == original
+        assert runtime.authority.receives == 0 and runtime.publication.calls == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('boundary', ['missing-source', 'stop', 'origin-mismatch'])
+def test_reported_validation_semantic_origin_preserves_live_source_stop_and_exact_intent(tmp_path, monkeypatch, boundary):
+    from datetime import UTC, datetime
+    from newsroom.control_plane.native_assessor import RetainedAssessorResult
+    from newsroom.control_plane.native_publication import NativePublicationError
+    from newsroom.control_plane.veto import VetoError
+    unit = _native()
+    connection = connect(str(tmp_path / 'validation-boundaries.sqlite3'))
+    journal = NativeRevisionJournal(connection)
+    journal.land((unit,))
+    origin = RetainedAssessorResult(RetainedAssessorContractFailure('old-envelope', 'old-invocation', _DIGEST, _DIGEST, _DIGEST),
+        'newsroom.native-evidence-assessor.v15', _DIGEST, 'ASSESSOR_VALIDATION_FAILED',
+        datetime(2026, 9, 8, tzinfo=UTC), None, _DIGEST, _DIGEST)
+    contract = 'newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2'
+    facts = {'candidate_id': 'candidate', 'candidate_version_id': 'candidate-version',
+        'graphiti_receipts': [{}], 'intake_receipt_id': 'original-intake',
+        'assessment_contract_version': 'newsroom.native-evidence-assessor.v19+consumer.v1',
+        'assessment_superseded': {'contract_version': origin.contract_version,
+            'reason': 'ASSESSOR_RENDERING_CONTRACT_HOLD', 'package_admission_id': None, 'editorial_decision_id': None},
+        'reason': 'ACQUISITION_RESULT_NOT_RETAINED', 'failure_class': 'ModelUsageAdmissionError'}
+    if boundary == 'origin-mismatch':
+        facts['semantic_assessment_intent'] = {'contract': contract,
+            'candidate_version_id': 'candidate-version', 'origin_envelope_id': origin.proof.envelope_id,
+            'origin_invocation_id': 'different-old-invocation',
+            'origin_allocation_digest': _DIGEST, 'origin_terminal_digest': _DIGEST,
+            'origin_context_manifest_digest': _DIGEST, 'origin_outcome': origin.outcome,
+            'origin_contract_version': origin.contract_version, 'origin_base_digest': _DIGEST,
+            'origin_result_digest': _DIGEST, 'origin_result_receipt_digest': _DIGEST,
+            'origin_journal': dict(facts)}
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=facts)
+    def sources_for(_revision):
+        if boundary == 'stop': raise VetoError('owner stop')
+        return ()  # No full current Source/rights means no acquisition/model call.
+    monkeypatch.setattr(NativeEvidenceController, 'acquire_and_retain',
+        lambda *_args, **_kwargs: pytest.fail('Source/stop/origin boundary was bypassed'))
+    continuation = NativePublicationContinuation(journal=journal,
+        runtime=SimpleNamespace(authority=_Authority(), ingress=object(), publication=_Publication(),
+            proof=proof(), policies=SimpleNamespace(publication=object())),
+        evidence_controller=object.__new__(NativeEvidenceController), sources={},
+        evidence_sources_for=sources_for, semantic_origin_failure=lambda _: origin,
+        semantic_intent_contract=contract, assessment_contract_version='newsroom.native-evidence-assessor.v23+consumer.v1',
+        clock=lambda: UtcTimestamp.parse('2026-09-08T12:30:00Z'))
+    try:
+        if boundary in {'stop', 'origin-mismatch'}:
+            with pytest.raises(VetoError if boundary == 'stop' else NativePublicationError):
+                continuation.advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
+        else:
+            result = continuation.advance(revision_id=unit.revision_id, candidate_version_id='candidate-version')
+            assert result.state == 'EVIDENCE_HOLD'
+            assert journal.current(unit.revision_id)['facts']['failure_class'] == 'NativePublicationError'
+        if boundary == 'origin-mismatch':
+            assert journal.current(unit.revision_id)['facts'] == facts
+        else:
+            retained = journal.current(unit.revision_id)['facts']['semantic_assessment_intent']
+            assert retained['origin_invocation_id'] == 'old-invocation'
+            assert retained['origin_journal']['assessment_superseded'] == facts['assessment_superseded']
+    finally:
+        connection.close()

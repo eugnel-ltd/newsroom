@@ -40,6 +40,7 @@ from newsroom.control_plane.native_assessor import (
     assessment_revalidation_due,
     same_assessment_producer,
     RetainedAssessorContractFailure,
+    REASSESSABLE_HOLDS,
     RetainedAssessorResult,
     VERSION as ASSESSOR_PRODUCER_VERSION,
     RetainedAssessorPreDispatchFailure,
@@ -1026,6 +1027,21 @@ class NativePublicationContinuation:
             and not same_assessment_producer(prior["contract_version"], contract_version)
         )
 
+    @staticmethod
+    def _superseded_validation_origin_contract(facts: dict) -> str | None:
+        """Schedule origin authentication only; journal flags grant no dispatch."""
+        prior = facts.get('assessment_superseded')
+        if (assessor_admission_recovery_due(facts) and type(prior) is dict
+                and type(prior.get('contract_version')) is str
+                and prior.get('reason') in REASSESSABLE_HOLDS
+                and not same_assessment_producer(prior['contract_version'], facts.get('assessment_contract_version'))
+                and facts.get('graphiti_receipts') and facts.get('intake_receipt_id')
+                and not any(prior.get(key) for key in ('package_admission_id', 'editorial_decision_id'))
+                and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
+                    'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id'))):
+            return prior['contract_version']
+        return None
+
     def recover_pre_dispatch(
         self, revision_ids: tuple[str, ...], *,
         failure_many: Callable[[tuple[object, ...]], tuple],
@@ -1080,7 +1096,11 @@ class NativePublicationContinuation:
                 ):
                     # Allocation existence can only deny pre-dispatch recovery.
                     # Contract revalidation still belongs to ordinary advance.
-                    checked.append(revision_id)
+                    if (self._semantic_origin_failure is None
+                            or self._superseded_validation_origin_contract(progress.get('facts', {})) is None):
+                        checked.append(revision_id)
+                    # An allocated origin still denies zero-dispatch recovery.
+                    # Ordinary advance alone may authenticate a distinct intent.
             selected = remaining
             if not selected:
                 return tuple(sorted(checked, key=source_order.__getitem__))
@@ -1285,11 +1305,20 @@ class NativePublicationContinuation:
                 and facts.get('graphiti_receipts') and facts.get('intake_receipt_id')
                 and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
                     'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id'))
-                and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED' or semantic_intent is not None)):
+                and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED' or semantic_intent is not None
+                    or admission_recovery and self._superseded_validation_origin_contract(facts) is not None)):
             origin = self._semantic_origin_failure(version)
-            if (type(origin) is RetainedAssessorResult and origin.outcome == 'ASSESSOR_PROVIDER_FAILED'
-                    and origin.execution is None and (semantic_intent is not None or same_assessment_producer(
-                        facts.get('assessment_contract_version'), origin.contract_version))):
+            provider_origin = (type(origin) is RetainedAssessorResult
+                and origin.outcome == 'ASSESSOR_PROVIDER_FAILED' and origin.execution is None
+                and (semantic_intent is not None or progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
+                    and same_assessment_producer(facts.get('assessment_contract_version'), origin.contract_version)))
+            validation_origin = (type(origin) is RetainedAssessorResult
+                and origin.outcome == 'ASSESSOR_VALIDATION_FAILED'
+                and origin.result_digest is not None and origin.result_receipt_digest is not None
+                and (type(semantic_intent) is dict and semantic_intent.get('origin_outcome') == origin.outcome
+                    or semantic_intent is None and same_assessment_producer(
+                        self._superseded_validation_origin_contract(facts), origin.contract_version)))
+            if provider_origin or validation_origin:
                 original = origin.proof
                 binding = {'contract': self._semantic_intent_contract,
                     'candidate_version_id': candidate_version_id, 'origin_envelope_id': original.envelope_id,
@@ -1297,6 +1326,10 @@ class NativePublicationContinuation:
                     'origin_allocation_digest': original.allocation_digest,
                     'origin_terminal_digest': original.terminal_digest,
                     'origin_context_manifest_digest': original.context_manifest_digest}
+                if validation_origin:
+                    binding.update(origin_outcome=origin.outcome, origin_contract_version=origin.contract_version,
+                        origin_base_digest=origin.base_digest, origin_result_digest=origin.result_digest,
+                        origin_result_receipt_digest=origin.result_receipt_digest)
                 if semantic_intent is not None:
                     if type(semantic_intent) is not dict:
                         raise NativePublicationError('semantic continuation origin differs')
@@ -1318,7 +1351,7 @@ class NativePublicationContinuation:
                 else:
                     semantic_intent = {**binding, 'origin_journal': {key: facts.get(key) for key in (
                         'reason', 'failure_class', 'assessment_started_at', 'acquisition_started_at',
-                        'assessment_contract_version', 'acquisition_attempt_count')}}
+                        'assessment_contract_version', 'acquisition_attempt_count', 'assessment_superseded')}}
                     facts = current_facts()
                     facts['semantic_assessment_intent'] = semantic_intent
                     progress = self._journal.advance(revision_id, stage='SEMANTIC_ASSESSMENT_PENDING', facts=facts)
