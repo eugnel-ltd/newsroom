@@ -20,10 +20,10 @@ BODY = ('The government launched a public consultation.\n'
         'Security Minister Dan Jarvis said: Protecting the public is our first duty.')
 
 
-def _case():
-    view = build_lossless_source_view((BODY,), ('UK-fixture',))
+def _case(body=BODY):
+    view = build_lossless_source_view((body,), ('UK-fixture',))
     base = EvidencePackage('candidate', 'hypothesis', ('signal',), ('lead',),
-        ('UK-fixture',), (digest_bytes(BODY.encode()),), (BODY,))
+        ('UK-fixture',), (digest_bytes(body.encode()),), (body,))
     original_binding = {'content_digest': base.digest, 'source_reference_binding': _reference_binding(view),
         'candidate_id': 'candidate', 'candidate_version_id': 'version', 'hypothesis_digest': digest_bytes(b'hypothesis'),
         'source_currentness': [{'source_id': 'UK-fixture', 'definition_id': 'definition', 'definition_version_id': 'source-version'}]}
@@ -69,7 +69,7 @@ def _case():
     source = N(unit=N(source_id='UK-fixture', authority=N(definition_id='definition')),
         source_version=N(canonical_digest=h, request=N(roles=(role,))), rights=N(record_id=h),
         dependency=N(record_id=h, evidential_origin_id=h))
-    acquired = N(body=BODY.encode(), receipt_digest=h, publisher='Official authority',
+    acquired = N(body=body.encode(), receipt_digest=h, publisher='Official authority',
         currentness_basis='AUTHORITATIVE_CURRENT_CONTENT_ENDPOINT', publication_time='2026-10-04T00:00:00Z',
         source_updated_time='2026-10-04T00:00:00Z', retrieval_time='2026-10-04T00:01:00Z',
         transport_evidence_digest=h, body_origin='GOVUK_CONTENT_API_PAGE_TEXT')
@@ -233,7 +233,7 @@ def test_supported_context_discards_prose_advice_without_mutating_paid_receipt(s
     assert result.governed_claims[1].localised_factual_expressions == ()
     assert canonical_json_bytes(case[2]) == paid_before
     assert json.loads(execution.text)['package']['governed_claims'][0] == json.loads(original_before)['package']['governed_claims'][0]
-    assert proof['version'] == 'newsroom.native-context-materialisation.v2'
+    assert proof['version'] == 'newsroom.native-context-materialisation.v3'
     assert result.governed_claims[1].rendered_assertion_zh_hant_hk == '政府正提出按UK法律管制2種化學物質。'
 
 
@@ -271,3 +271,71 @@ def test_retained_unit_advice_still_fails_exact_fact_validator(pair):
     # Unproved unit-only correspondence must not acquire publication meaning.
     with pytest.raises(ValueError, match='equivalent exact claim facts'):
         replace(package.governed_claims[1], localised_factual_expressions=(pair,))
+
+
+GROUPED_DAN_SOURCE = (
+    'Security Minister, Dan Jarvis said: Protecting the public is our first duty. '
+    'While these substances can have legitimate uses, we must stop them from being weaponised by those who want to cause harm. '
+    'We will close the gaps exposed by the Southport attack and tighten the law to stop these dangerous chemicals falling into the wrong hands. ')
+
+
+def test_actual_grouped_dan_prose_v2_rendering_reaches_strict_consumer_unchanged():
+    from newsroom.control_plane.native_claim_localisation import _renderings
+    body = '\n'.join(BODY.splitlines()[:2]) + '\n' + GROUPED_DAN_SOURCE
+    case = list(_case(body))
+    original_before = case[0].decision_record
+    last = case[4].segments[-1].span_id
+    case[3]['context_ranges'] = {'speaker': {'first_span_id': 'S1L3', 'last_span_id': last}}
+    # Exact retained 7a8 speaker-parent rendering and failed prose pair, in its v2 DTO.
+    item = {'span_id': 'speaker', 'rendered_assertion_zh_hant_hk_fragments': ['保安大臣 ',
+        ' 表示：「保護公眾是我們的首要職責。雖然這些物質可以有合法用途，但我們必須阻止想要造成傷害的人把這些物質武器化。我們將堵塞紹斯波特襲擊所暴露的漏洞，並收緊法例，以阻止這些危險化學品落入不當之手。」'],
+        'factual_localisations': [{'source_lookup_key': 'Protecting the public is our first duty.',
+            'rendered_expression': '保護公眾是我們的首要職責。'}],
+        'quotation_source_keys': ['Protecting the public is our first duty.',
+            'While these substances can have legitimate uses, we must stop them from being weaponised by those who want to cause harm.',
+            'We will close the gaps exposed by the Southport attack and tighten the law to stop these dangerous chemicals falling into the wrong hands.']}
+    raw = canonical_json_bytes({'renderings': [item]})
+    rendering = _renderings(raw, {'claims': {'speaker': {'rendering_fragment_count': 2}}})
+    case[1]['package']['governed_claims'] = [{'claim_role': 'CONTEXT', 'status': 'CONFIRMED_FACT',
+        'source_range': case[3]['context_ranges']['speaker'], **deepcopy(rendering['speaker'])}]
+    case[2]['renderings'] = rendering
+    case[5]['answers'] = {f'speaker:{field}': {'choice': 'SUPPORTED' if field == 'support' else 'YES'}
+        for field in ('support', 'modality', 'attribution', 'entities')}
+    paid_before = canonical_json_bytes(case[2])
+    support_before = canonical_json_bytes(case[5])
+    execution, proof = _compose(case)
+    result = AutonomousNativeEvidenceAssessor._validated_execution(
+        execution, N(), case[6], (case[7],), (case[8],))
+    assert len(result.governed_claims) == 2
+    assert result.governed_claims[1].localised_factual_expressions == ()
+    assert result.governed_claims[1].rendered_assertion_zh_hant_hk.count('Dan Jarvis') == 1
+    assert result.governed_claims[1].claim == GROUPED_DAN_SOURCE
+    assert case[0].decision_record == original_before
+    assert canonical_json_bytes(case[2]) == paid_before and canonical_json_bytes(case[5]) == support_before
+    original_package = json.loads(case[0].execution.text)['package']
+    combined = json.loads(execution.text)['package']
+    assert combined['governed_claims'][0] == original_package['governed_claims'][0]
+    assert combined['qualification_evidence'] == original_package['qualification_evidence']
+    assert proof['version'] == 'newsroom.native-context-materialisation.v3'
+
+
+@pytest.mark.parametrize('pair', [
+    ['first duty', '首要職責'], ['first aid', '急救'],
+    ['Applicants may apply', '申請人可申請'],
+    ['They may not be eligible', '他們可能不符合資格'],
+    ['They may have concerns', '他們可能有疑慮'],
+])
+def test_only_demonstrable_lexical_fact_tokens_are_prose(pair):
+    from newsroom.control_plane.native_context_materialisation import _typed_context_pairs
+    assert _typed_context_pairs({'localised_factual_expressions': [pair]}) == []
+
+
+@pytest.mark.parametrize('pair', [
+    ['first aid for ten minutes', '急救十分鐘'],
+    ['They may apply in May', '他們可於五月申請'],
+    ['first duty', '第三職責'], ['first duty for 5 years', '首要職責'],
+    ['first aid in May', '急救'], ['May', '可能'], ['first', '首要'],
+])
+def test_lexical_prose_does_not_hide_other_factual_tokens(pair):
+    from newsroom.control_plane.native_context_materialisation import _typed_context_pairs
+    assert _typed_context_pairs({'localised_factual_expressions': [pair]}) == [pair]
