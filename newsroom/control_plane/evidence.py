@@ -1107,6 +1107,22 @@ def _canonical_localised_fact(value: str) -> tuple[object, ...] | None:
         if not _valid_canonical_date(result):
             return None
         return result
+    pound_number = r"([0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)"
+    pound_scale = r"(?:\s+(thousand|million|billion))?"
+    pounds = re.fullmatch(
+        r"(?:£|GBP\s+)\s*" + pound_number + pound_scale, value, re.IGNORECASE,
+    )
+    if pounds is None:
+        pounds = re.fullmatch(pound_number + pound_scale + r"\s+pounds sterling", value, re.IGNORECASE)
+    if pounds is not None:
+        scale = {None: 1, 'thousand': 1_000, 'million': 1_000_000, 'billion': 1_000_000_000}
+        multiplier = scale[pounds.group(2).lower() if pounds.group(2) else None]
+        return ('MONEY', 'GBP', int(pounds.group(1).replace(',', '')) * multiplier)
+    chinese_pounds = re.fullmatch(r"([0-9零〇一二三四五六七八九十百千萬万億亿兩两]+)英鎊", value)
+    if chinese_pounds is not None:
+        amount = _chinese_integer(chinese_pounds.group(1))
+        if amount is not None:
+            return ('MONEY', 'GBP', amount)
     english_money = re.fullmatch(r"HK\$\s*([\d,]+)", value, re.IGNORECASE)
     if english_money:
         return ("MONEY", "HKD", int(english_money.group(1).replace(",", "")))
@@ -1259,6 +1275,31 @@ def _localised_fact_is_bound(
             _calendar_month_occurs(source, claim)
             or _calendar_month_occurs(source, excerpt)
         ) and _calendar_month_occurs(target, rendered)
+    if fact[:2] == ('MONEY', 'GBP'):
+        # A lookup key must name the whole amount, not £20 in £200 million,
+        # sterling inside E£, or 二百 inside 一千二百英鎊.
+        digits = '0-9零〇一二三四五六七八九十百千萬万億亿兩两'
+        pound_expression = re.compile(
+            r'(?<![A-Za-z0-9£$€.,+−-])(?:£|GBP\s+)\s*[0-9]+(?:[.,][0-9]+)*'
+            r'(?:\s+(?:thousand|million|billion))?'
+            r'(?![A-Za-z0-9]|[.,][0-9]|\s+(?:thousand|million|billion)\b)|'
+            r'(?<![A-Za-z0-9£$€.,+−-])[0-9]+(?:[.,][0-9]+)*'
+            r'(?:\s+(?:thousand|million|billion))?\s+pounds sterling(?![A-Za-z])|'
+            rf'(?<![{digits}點点.,+−負负-])[{digits}]+英鎊',
+            re.IGNORECASE,
+        )
+        def occurs(expression, text):
+            for match in pound_expression.finditer(text):
+                if match.group() != expression or _canonical_localised_fact(match.group()) != fact:
+                    continue
+                before, after = text[:match.start()].rstrip(), text[match.end():].lstrip()
+                if before.endswith(('-', '−', '+', '負', '负')):
+                    continue
+                if after and (after[0].isnumeric() or after[0] in '/⁄半'):
+                    continue
+                return True
+            return False
+        return (occurs(source, claim) or occurs(source, excerpt)) and occurs(target, rendered)
     return (source in claim or source in excerpt) and target in rendered
 
 
