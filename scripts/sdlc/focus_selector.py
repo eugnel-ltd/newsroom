@@ -118,6 +118,19 @@ SOURCE_BODY_CONTRACT_TESTS = tuple("newsroom/tests/" + name for name in (
     "test_native_pipeline.py", "test_native_composition.py",
     "test_native_source_context_ranges.py", "test_native_vertical.py",
 ))
+FACTUAL_HELPER_PATH = "newsroom/control_plane/evidence.py"
+FACTUAL_HELPERS = frozenset({"_canonical_localised_fact", "_localised_fact_is_bound"})
+FACTUAL_CHANGED_TESTS = frozenset("newsroom/tests/" + name for name in (
+    "test_factual_localisation.py", "test_zero_quota_write_loop.py", "test_native_assessor.py",
+))
+FACTUAL_CONTRACT_TESTS = tuple("newsroom/tests/" + name for name in (
+    "test_factual_localisation.py", "test_zero_quota_write_loop.py",
+    "test_native_assessor.py", "test_native_context_materialisation.py",
+    "test_factual_clock_localisation.py", "test_factual_clock_revalidation.py",
+    "test_native_story_dates.py", "test_native_story_writer.py",
+    "test_increment10_evidence.py", "test_increment10_evidence_read_reuse.py",
+    "test_native_publication.py", "test_native_publication_continuation.py",
+))
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -236,23 +249,40 @@ def _changed_public_symbols(repo_root: Path, path: str, base_sha: str, head_sha:
     return _local_symbol_closure(new_tree, changed)
 
 
-def _closed_existing_function_bodies(modules) -> bool:
-    """A baseline call/reference subset, not a general Python purity proof."""
+def _unchanged_function_interfaces(modules):
+    """Keep all declarations/effects except existing function bodies exact."""
     (before, old_tree), (after, new_tree) = modules
     old, new = _module_declarations(old_tree), _module_declarations(new_tree)
     if old is None or new is None or old[1:] != new[1:] or old[0].keys() != new[0].keys():
-        return False
+        return None
     previous = {node.name: node for node in old_tree.body if isinstance(node, ast.FunctionDef)}
     current = {node.name: node for node in new_tree.body if isinstance(node, ast.FunctionDef)}
     changed = {name for name in old[0] if old[0][name] != new[0][name]}
     if not changed or not changed <= previous.keys() or not changed <= current.keys():
-        return False
-    if _local_symbol_closure(old_tree, changed) is None or _local_symbol_closure(new_tree, changed) is None:
-        return False
+        return None
     # Keep other functions and module-time imports/maps/effects byte-identical.
     protected = lambda source, tree: [ast.get_source_segment(source, node) for node in tree.body
                                      if not isinstance(node, ast.FunctionDef) or node.name not in changed]
     if protected(before, old_tree) != protected(after, new_tree):
+        return None
+    for name in changed:
+        left, right = previous[name], current[name]
+        left_body, right_body = left.body, right.body
+        left.body, right.body = [], []
+        equal_header = ast.dump(left) == ast.dump(right)
+        left.body, right.body = left_body, right_body
+        if not equal_header:
+            return None
+    return changed, previous, current
+
+
+def _closed_existing_function_bodies(modules) -> bool:
+    """A baseline call/reference subset, not a general Python purity proof."""
+    parts = _unchanged_function_interfaces(modules)
+    if parts is None:
+        return False
+    changed, previous, current = parts
+    if any(_local_symbol_closure(tree, changed) is None for _, tree in modules):
         return False
     references = (ast.Call, ast.Name, ast.Attribute, ast.Import, ast.ImportFrom,
                   ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom, ast.Await)
@@ -279,12 +309,6 @@ def _closed_existing_function_bodies(modules) -> bool:
             return False  # Nested bindings are outside the top-level closure.
         if footprint(right) - footprint(left):
             return False
-        left_body, right_body = left.body, right.body
-        left.body, right.body = [], []
-        equal_header = ast.dump(left) == ast.dump(right)
-        left.body, right.body = left_body, right_body
-        if not equal_header:
-            return False
     return True
 
 
@@ -301,6 +325,71 @@ def _source_body_contract_tests(root, changed, source_paths, base_sha, head_sha)
         if modules is None or not _closed_existing_function_bodies(modules):
             return None
     return set(SOURCE_BODY_CONTRACT_TESTS)
+
+
+def _factual_data_body(function, module_names):
+    """Inspected factual-helper primitives only; not a generic Python classifier."""
+    globals_allowed = {"re", "_ENGLISH_MONTHS", "_chinese_integer", "_valid_canonical_date",
+                       "_calendar_month_occurs", "_canonical_localised_fact", "int", "str", "tuple", "object", "bool"}
+    calls_allowed = globals_allowed - {"re", "_ENGLISH_MONTHS"}
+    methods = {"get", "group", "casefold", "istitle", "lower", "replace", "isdigit",
+               "startswith", "removesuffix", "strip", "rstrip", "lstrip", "endswith",
+               "finditer", "start", "end", "isnumeric"}
+    nodes = tuple(ast.walk(function))
+    nested = {node.name for node in nodes if isinstance(node, ast.FunctionDef) and node is not function}
+    locals_ = {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    args = {node.arg for node in nodes if isinstance(node, ast.arg)}
+    if (locals_ & (module_names | globals_allowed | nested)
+            or args & (module_names | globals_allowed | nested)
+            or nested & (module_names | globals_allowed)):
+        return False
+    for node in nodes:
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal, ast.ClassDef,
+                             ast.AsyncFunctionDef, ast.Lambda, ast.Yield, ast.YieldFrom, ast.Await, ast.With)):
+            return False
+        if isinstance(node, ast.FunctionDef) and node is not function:
+            if (node.decorator_list or node.args.defaults or any(node.args.kw_defaults)
+                    or node.args.vararg or node.args.kwarg or node.returns
+                    or any(arg.annotation for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs))):
+                return False
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in globals_allowed | locals_ | args | nested:
+            return False
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("__") and node.value.endswith("__"):
+            return False
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            return False
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id == "re":
+                if node.attr not in {"compile", "fullmatch", "IGNORECASE"}:
+                    return False
+            elif node.attr not in methods:
+                return False
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id not in calls_allowed | nested:
+                    return False
+            elif not isinstance(node.func, ast.Attribute):
+                return False
+    return True
+
+
+def _factual_helper_contract_tests(root, changed, source_paths, base_sha, head_sha):
+    if set(source_paths) != {FACTUAL_HELPER_PATH} or any(
+        not _is_documentation(path) and path not in FACTUAL_CHANGED_TESTS | {FACTUAL_HELPER_PATH}
+        for path in changed
+    ):
+        return None
+    if any(not (root / path).is_file() or (root / path).is_symlink() for path in FACTUAL_CONTRACT_TESTS):
+        return None
+    modules = _revision_modules(root, FACTUAL_HELPER_PATH, base_sha, head_sha)
+    parts = None if modules is None else _unchanged_function_interfaces(modules)
+    if parts is None or not parts[0] <= FACTUAL_HELPERS:
+        return None
+    module_names = set(_module_declarations(modules[0][1])[0])
+    if any(not _factual_data_body(functions[name], module_names)
+           for functions in parts[1:] for name in parts[0]):
+        return None
+    return set(FACTUAL_CONTRACT_TESTS)
 
 
 def _module_declarations(tree: ast.Module):
@@ -803,6 +892,10 @@ def select_focus(
         contract_tests = _source_body_contract_tests(
             root, changed, source_paths, base_sha, head_sha,
         )
+        contract_reason = "explicit_source_name_date_body_contract:F2"
+        if contract_tests is None:
+            contract_tests = _factual_helper_contract_tests(root, changed, source_paths, base_sha, head_sha)
+            contract_reason = "explicit_factual_helper_body_contract:F2"
         if contract_tests is None:
             discovered, unresolved = _discover_tests(
                 root, source_paths, base_sha=base_sha, head_sha=head_sha
@@ -814,7 +907,7 @@ def select_focus(
         if discovered:
             gates.add("F2")
             reasons.add("repository_import_or_symbol_consumers:F2" if contract_tests is None
-                        else "explicit_source_name_date_body_contract:F2")
+                        else contract_reason)
         if unresolved:
             full_health_required = True
             reasons.add("unresolved_dependency_analysis:full_health")

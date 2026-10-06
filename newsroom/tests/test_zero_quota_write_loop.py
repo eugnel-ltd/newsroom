@@ -3216,6 +3216,12 @@ def test_approved_date_is_removed_before_originality_overlap(
             "一億元",
         ),
         (
+            "The grant is £200 million.",
+            "資助額係二億英鎊",
+            "£200 million",
+            "二億英鎊",
+        ),
+        (
             "The delay lasted one hour.",
             "延誤持續一小時",
             "one hour",

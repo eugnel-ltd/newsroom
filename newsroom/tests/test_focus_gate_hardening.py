@@ -1132,3 +1132,81 @@ def test_nested_date_consumer_declarations_keep_normal_discovery(tmp_path, decla
     assert 'explicit_source_name_date_body_contract:F2' not in route['reasons']
     assert route['selected_service_tests'] == [service_test]
     assert 'F3' in route['gates']
+
+
+_FACTUAL_SOURCE = 'newsroom/control_plane/evidence.py'
+_FACTUAL_TESTS = (
+    'test_factual_localisation.py', 'test_zero_quota_write_loop.py',
+    'test_native_assessor.py', 'test_native_context_materialisation.py',
+    'test_factual_clock_localisation.py', 'test_factual_clock_revalidation.py',
+    'test_native_story_dates.py', 'test_native_story_writer.py',
+    'test_increment10_evidence.py', 'test_increment10_evidence_read_reuse.py',
+    'test_native_publication.py', 'test_native_publication_continuation.py',
+)
+
+
+def _factual_contract_repo(tmp_path):
+    """Tracked complete source; reproduce GBP without private commit history."""
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    after = (Path(__file__).parents[2] / _FACTUAL_SOURCE).read_text()
+    assert after.count('    pound_number = ') == after.count("    if fact[:2] == ('MONEY', 'GBP'):") == 1
+    before = after[:after.index('    pound_number = ')] + after[after.index('    english_money = '):]
+    start = before.index("    if fact[:2] == ('MONEY', 'GBP'):")
+    end = before.index('    return (source in claim or source in excerpt) and target in rendered', start)
+    before = before[:start] + before[end:]
+    _write(tmp_path, _FACTUAL_SOURCE, before)
+    for name in _FACTUAL_TESTS:
+        _write(tmp_path, 'newsroom/tests/' + name)
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py',
+           'from newsroom.control_plane.evidence import GovernedClaimEvidence\n')
+    return before, after, _commit(tmp_path, 'actual factual helper baseline without GBP')
+
+
+def test_actual_gbp_helpers_use_direct_factual_contract_without_service(tmp_path):
+    _before, after, base = _factual_contract_repo(tmp_path)
+    _write(tmp_path, _FACTUAL_SOURCE, after)
+    test = 'newsroom/tests/test_factual_localisation.py'
+    _write(tmp_path, test, '# Exact currency and complete-expression regression.\n')
+    head = _commit(tmp_path, 'actual integer GBP and nested complete-expression guards')
+    route = selector.select_focus((_FACTUAL_SOURCE, test), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_tests'] == sorted('newsroom/tests/' + name for name in _FACTUAL_TESTS)
+    assert route['selected_service_tests'] == [] and route['gates'] == ['F0', 'F1', 'F2']
+    assert route['full_health_required'] is False
+    assert 'explicit_factual_helper_body_contract:F2' in route['reasons']
+
+
+@pytest.mark.parametrize('kind', ['class', 'field', 'signature', 'import', 'policy', 'provider', 'dynamic', 'shadow',
+    'nested-shadow', 'alias-call', 'attribute-store', 'unclosed-name',
+    'other-helper', 'other-production', 'other-test', 'stateful', 'service', 'control'])
+def test_unproved_factual_helper_delta_preserves_normal_discovery(tmp_path, kind):
+    _before, source, base = _factual_contract_repo(tmp_path)
+    marker = '    value = value.strip()\n'
+    paths = [_FACTUAL_SOURCE]
+    if kind == 'class': source = source.replace('    def __post_init__(self) -> None:\n', '    def __post_init__(self, extra=None) -> None:\n', 1)
+    elif kind == 'field': source = source.replace('    localised_factual_expressions: tuple[tuple[str, str], ...] = ()', '    localised_factual_expressions: tuple[tuple[str, str], ...] = (("GBP", "changed"),)', 1)
+    elif kind == 'signature': source = source.replace('def _canonical_localised_fact(value: str)', 'def _canonical_localised_fact(value: str, extra=None)', 1)
+    elif kind == 'import': source = 'import socket\n' + source
+    elif kind == 'policy': source += '\nFUTURE_POLICY = "changed"\n'
+    elif kind == 'provider': source = source.replace(marker, marker + "    open('local-fixture')\n", 1)
+    elif kind == 'dynamic': source = source.replace(marker, marker + "    getattr(value, '__class__')\n", 1)
+    elif kind == 'shadow': source = source.replace(marker, marker + '    re = value\n', 1)
+    elif kind == 'nested-shadow': source = source.replace('        def occurs(expression, text):\n', '        def occurs(re, text):\n', 1)
+    elif kind == 'alias-call': source = source.replace(marker, marker + '    reader = int\n    reader(value)\n', 1)
+    elif kind == 'attribute-store': source = source.replace(marker, marker + '    re.changed = value\n', 1)
+    elif kind == 'unclosed-name': source = source.replace(marker, marker + '    external_permission\n', 1)
+    elif kind == 'other-helper': source = source.replace('    def section(raw: str) -> int | None:\n', '    def section(raw: str) -> int | None:\n        print(raw)\n', 1)
+    else:
+        extra = {'other-production': 'newsroom/control_plane/native_assessor.py',
+                 'other-test': 'newsroom/tests/test_native_publication.py',
+                 'stateful': 'newsroom/authority/factual_fixture.py',
+                 'service': 'newsroom/projection/neo4j/factual_fixture.py',
+                 'control': 'scripts/sdlc/focus_selector.py'}[kind]
+        paths.append(extra)
+        _write(tmp_path, extra, '# A protected/mixed production boundary changed.\n')
+    _write(tmp_path, _FACTUAL_SOURCE, source)
+    head = _commit(tmp_path, 'unqualified factual contract delta')
+    route = selector.select_focus(paths, repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert 'explicit_factual_helper_body_contract:F2' not in route['reasons']
+    assert 'newsroom/tests/test_other_neo4j_service.py' in route['selected_service_tests']
+    assert 'F3' in route['gates']
+    if kind == 'control': assert 'sdlc_control:F2' in route['reasons']
