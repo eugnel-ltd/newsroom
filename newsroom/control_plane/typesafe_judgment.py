@@ -280,7 +280,19 @@ class TypesafeJudgment:
             if isinstance(exc, urllib.error.HTTPError):
                 # Preserve the actual response for diagnosis, not a zero-cost or
                 # provider-completion inference. No Authorization headers/logs.
+                error = (f'HTTPError:{exc.code}' if type(exc.code) is int and 100 <= exc.code <= 599
+                         and exc.geturl() == URL else 'HTTPError:INVALID_TRANSPORT')
                 transport_failure = {'status': exc.code, 'endpoint_matches': exc.geturl() == URL}
+                if exc.headers is not None:
+                    request_id = exc.headers.get('x-typesafe-request-id')
+                    if type(request_id) is str and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', request_id):
+                        transport_failure['provider_request_id'] = request_id
+                    retry_after = exc.headers.get('Retry-After')
+                    if type(exc.code) is int and 500 <= exc.code <= 599 and exc.geturl() == URL and retry_after is not None:
+                        error = f'HTTPError:{exc.code}:RETRY_DELAY_HOLD'
+                    if type(retry_after) is str and re.fullmatch(r'\d{1,7}', retry_after):
+                        transport_failure['retry_after_seconds'] = int(retry_after)
+
                 try:
                     raw = exc.read(MAX_RESPONSE_BYTES + 1)
                 except Exception as read_error:

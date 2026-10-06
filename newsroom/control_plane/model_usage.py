@@ -4989,16 +4989,21 @@ class ModelUsageService:
         return int(row[0]) + 1
 
     @staticmethod
-    def _independent_typesafe_timeout_work(connection, allocation, envelope, route_state):
+    def _independent_typesafe_transport_work(connection, allocation, envelope, route_state):
         """Quarantine exact unknown work, never settle cash or reopen the route.
 
         No Source-wide clearance is inferred: the retained caller IDs are the
         narrowest available boundary. Same candidate/ingest remains held even
-        when its cycle, questions or attempt are changed.
+        when its cycle, questions or attempt are changed. Unknown HTTP transport
+        failures additionally quarantine exact evidence/request identity and
+        allow independent work only after five minutes, one active leaf at a time.
+        Proven authentication/payment/rate-limit failures do not use this gate.
         """
+        failures = {"TimeoutError", "HTTPError", "HTTPError:400", "HTTPError:422",
+                    "HTTPError:500", "HTTPError:502", "HTTPError:503", "HTTPError:504"}
         if (allocation.workload_class is not WorkloadClass.TYPESAFE_JUDGMENT
                 or allocation.provider != "typesafe" or allocation.route != "TYPESAFE_JUDGMENT"
-                or route_state.get("reason") != "TimeoutError"):
+                or route_state.get("reason") not in failures):
             return False
         event = connection.execute(
             "SELECT event_digest,route,state,reason,invocation_id,recorded_at,record_json "
@@ -5011,7 +5016,7 @@ class ModelUsageService:
         if (digest != event[0] or digest_canonical(unsigned) != digest
                 or _json(record) != event[6] or tuple(event[1:6]) != tuple(record.get(key)
                     for key in ("route", "state", "reason", "invocation_id", "recorded_at"))
-                or record.get("state") != "OPEN" or record.get("reason") != "TimeoutError"
+                or record.get("state") != "OPEN" or record.get("reason") != route_state.get("reason")
                 or record.get("invocation_id") != route_state.get("invocation_id")):
             return False
         current = connection.execute(
@@ -5027,8 +5032,11 @@ class ModelUsageService:
                     or prior.provider != "typesafe" or prior.route != "TYPESAFE_JUDGMENT"
                     or terminal is None or terminal.outcome != "TYPESAFE_FAILED"
                     or terminal.usage_status is not UsageStatus.UNREPORTED
-                    or terminal.failure_class != "TimeoutError" or terminal.policy_breach is not None
+                    or terminal.failure_class not in failures or terminal.policy_breach is not None
                     or terminal.dispatch_at is None or terminal.pre_dispatch_zero_proved):
+                return False
+            if terminal.failure_class not in {"TimeoutError", "HTTPError:400", "HTTPError:422"} and (
+                    allocation.allocated_at < terminal.observed_at + timedelta(minutes=5)):
                 return False
             old_policy = _policy_for_allocation(connection, prior)
             if not old_policy.qualified or not _has_exact_dispatch(connection, terminal):
@@ -5075,13 +5083,19 @@ class ModelUsageService:
 
                 return False
             scope = retained.as_record()
+            if terminal.failure_class != "TimeoutError" and (
+                    prior.prompt_digest == allocation.prompt_digest
+                    or retained.evidence_package_digest == envelope.get("evidence_package_digest")):
+                return False
             if not (scope.get("candidate_id") or scope.get("ingest_id")):
                 return False
             if any(scope.get(key) is not None and scope.get(key) == envelope.get(key)
                    for key in ("candidate_id", "ingest_id")):
                 return False
             blocked.add(invocation_id)
-            if invocation_id == route_state.get("invocation_id") and record.get("recorded_at") != _utc_text(terminal.observed_at):
+            if invocation_id == route_state.get("invocation_id") and (
+                    record.get("recorded_at") != _utc_text(terminal.observed_at)
+                    or record.get("reason") != terminal.failure_class):
                 return False
         return bool(blocked) and route_state.get("invocation_id") in blocked
 
@@ -5238,7 +5252,7 @@ class ModelUsageService:
             )
         blocking_routes = _usage_blocking_routes(connection)
         route_state = self._route_state(connection, allocation.route, blocking_routes=blocking_routes)
-        independent_timeout_work = self._independent_typesafe_timeout_work(
+        independent_timeout_work = self._independent_typesafe_transport_work(
             connection, allocation, envelope, route_state,
         )
         if _canonical_circuit_route(allocation.route) in blocking_routes and not independent_timeout_work:

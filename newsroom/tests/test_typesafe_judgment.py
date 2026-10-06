@@ -510,7 +510,7 @@ def test_http_failure_retains_bounded_response_status_without_inventing_usage(tm
         terminal = usage.terminal(reference.invocation_id)
         assert terminal.usage_status.value == 'UNREPORTED'
         assert terminal.components.total_tokens is None and not terminal.pre_dispatch_zero_proved
-        assert terminal.failure_class == 'HTTPError'
+        assert terminal.failure_class == f'HTTPError:{status}'
         with pytest.raises(TypesafeJudgmentError):
             engine.evaluate(**inputs)
         assert len(calls) == 1
@@ -543,3 +543,189 @@ def test_http_failure_diagnostic_survives_without_a_retainable_body(tmp_path, mo
         terminal = usage.terminal(invocation)
         assert terminal.usage_status.value == 'UNREPORTED' and terminal.components.total_tokens is None
         assert len(calls) == 1
+
+
+@pytest.mark.parametrize('elapsed_seconds,allowed', [(0, False), (299, False), (300, True)])
+def test_unknown_http_work_is_quarantined_with_bounded_availability_cooldown(tmp_path, monkeypatch, elapsed_seconds, allowed):
+    from datetime import timedelta
+    from urllib.error import HTTPError
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    from newsroom.control_plane.typesafe_judgment import URL
+    with _case(tmp_path, monkeypatch, transport_error=HTTPError(URL, 422, 'fixture', {}, None)) as (engine, inputs, usage, calls, raw):
+        # This reproduces the already recorded legacy status-less HTTPError.
+        monkeypatch.setattr('newsroom.control_plane.typesafe_judgment.urllib.error.HTTPError', type('DifferentError', (Exception,), {}))
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        engine.clock = lambda: NOW + timedelta(seconds=elapsed_seconds)
+        def success(request, **_):
+            calls.append(request.data)
+            return 200, request.full_url, raw
+        engine.transport = success
+        other = {**inputs, 'cycle_id': 'new-independent-work', 'candidate_id': 'candidate-2',
+                 'state': {'source':'A genuinely different Source has a new update.'},
+                 'source_binding': {'content_digest': digest_bytes(b'new source')}}
+        if allowed:
+            reference = engine.evaluate(**other)
+            assert usage.terminal(reference.invocation_id).usage_status.value == 'REPORTED'
+            assert len(calls) == 2
+            with pytest.raises(ModelUsageAdmissionError):
+                engine.evaluate(**{**inputs, 'cycle_id': 'disguised-original-retry'})
+        else:
+            with pytest.raises(ModelUsageAdmissionError):
+                engine.evaluate(**other)
+            assert len(calls) == 1
+        assert usage.route_state('TYPESAFE_JUDGMENT')['state'] == 'OPEN'
+
+
+@pytest.mark.parametrize('status', [401, 402, 403, 429, 529])
+def test_known_account_or_unapplied_rate_delay_never_uses_http_relaxation(tmp_path, monkeypatch, status):
+    from datetime import timedelta
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    from newsroom.control_plane.typesafe_judgment import URL
+    with _case(tmp_path, monkeypatch,
+               transport_error=HTTPError(URL, status, 'fixture', {}, BytesIO(b'{}'))) as (engine, inputs, usage, calls, raw):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        engine.clock = lambda: NOW + timedelta(hours=1)
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**{**inputs, 'candidate_id':'new-candidate', 'cycle_id':'fresh-work',
+                               'state':{'source':'Different independent evidence'},
+                               'source_binding':{'content_digest':digest_bytes(b'new evidence')}})
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize('change', ['candidate-only', 'binding-only'])
+def test_unknown_http_cannot_launder_a_repeated_public_request(tmp_path, monkeypatch, change):
+    from datetime import timedelta
+    from urllib.error import HTTPError
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    from newsroom.control_plane.typesafe_judgment import URL
+    failure = HTTPError(URL, 422, 'fixture legacy status loss', {}, None)
+    with _case(tmp_path, monkeypatch, transport_error=failure) as (engine, inputs, usage, calls, raw):
+        monkeypatch.setattr('newsroom.control_plane.typesafe_judgment.urllib.error.HTTPError', type('OtherError', (Exception,), {}))
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        engine.clock = lambda: NOW + timedelta(minutes=6)
+        repeated = {**inputs, 'candidate_id':'another-wrapper', 'cycle_id':'changed-wrapper'}
+        if change == 'binding-only':
+            repeated['source_binding'] = {'content_digest': digest_bytes(b'another private binding')}
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**repeated)
+        assert len(calls) == 1
+
+
+def test_http_diagnostics_only_retain_documented_allowlisted_headers(tmp_path, monkeypatch):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from newsroom.authority import HydrationRequest
+    from newsroom.control_plane.typesafe_judgment import URL
+    headers = {'x-typesafe-request-id':'req_123-safe', 'Retry-After':'600', 'Authorization':'private-never-retained'}
+    with _case(tmp_path, monkeypatch, transport_error=HTTPError(URL, 429, 'fixture', headers, BytesIO(b'{}'))) as (engine, inputs, usage, calls, _):
+        with pytest.raises(TypesafeJudgmentError) as held:
+            engine.evaluate(**inputs)
+        diagnostic = engine.objects.rehydrate(HydrationRequest(held.value.reference.receipt_admission_id, 'evidence.record'), proof=inputs['proof']).data
+        record = json.loads(diagnostic)
+        assert record['transport_failure']['provider_request_id'] == 'req_123-safe'
+        assert record['transport_failure']['retry_after_seconds'] == 600
+        assert b'private-never-retained' not in diagnostic and b'Authorization' not in diagnostic
+
+
+@pytest.mark.parametrize('retry_after', ['600', 'Wed, 07 Oct 2026 12:00:00 GMT', 'invalid'])
+def test_server_requested_503_delay_never_falls_back_to_shorter_cooldown(tmp_path, monkeypatch, retry_after):
+    from datetime import timedelta
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    from newsroom.control_plane.typesafe_judgment import URL
+    with _case(tmp_path, monkeypatch, transport_error=HTTPError(URL, 503, 'fixture', {'Retry-After':retry_after}, BytesIO(b'{}'))) as (engine, inputs, usage, calls, _):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        engine.clock = lambda: NOW + timedelta(minutes=5)
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**{**inputs, 'candidate_id':'new-candidate', 'cycle_id':'new-source',
+                               'state':{'source':'new independent source'},
+                               'source_binding':{'content_digest':digest_bytes(b'different evidence')}})
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize('status,seconds,allowed', [(400, 0, True), (422, 0, True), (500, 299, False), (503, 300, True)])
+def test_known_request_or_transient_server_error_admission_boundaries(tmp_path, monkeypatch, status, seconds, allowed):
+    from datetime import timedelta
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    from newsroom.control_plane.typesafe_judgment import URL
+    with _case(tmp_path, monkeypatch, transport_error=HTTPError(URL, status, 'fixture', {}, BytesIO(b'{}'))) as (engine, inputs, usage, calls, raw):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        engine.clock = lambda: NOW + timedelta(seconds=seconds)
+        def success(request, **_):
+            calls.append(request.data)
+            return 200, request.full_url, raw
+        engine.transport = success
+        fresh = {**inputs, 'candidate_id':'independent-candidate', 'cycle_id':'new-source',
+                 'state':{'source':'new unrelated source'}, 'source_binding':{'content_digest':digest_bytes(b'new unrelated source')}}
+        if allowed:
+            engine.evaluate(**fresh)
+            assert len(calls) == 2
+        else:
+            with pytest.raises(ModelUsageAdmissionError):
+                engine.evaluate(**fresh)
+            assert len(calls) == 1
+
+
+def test_new_unknown_server_failure_restarts_cooldown_without_clearing_old_liability(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    from newsroom.control_plane.typesafe_judgment import URL
+    with _case(tmp_path, monkeypatch, transport_error=HTTPError(URL, 503, 'fixture', {}, BytesIO(b'{}'))) as (engine, inputs, usage, calls, raw):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        with sqlite3.connect(usage.path) as db:
+            old = db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals').fetchone()
+        engine.clock = lambda: NOW + timedelta(seconds=300)
+        fresh = {**inputs, 'candidate_id':'candidate-2', 'cycle_id':'source-2',
+                 'state':{'source':'second independent source'}, 'source_binding':{'content_digest':digest_bytes(b'source-2')}}
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**fresh)
+        engine.clock = lambda: NOW + timedelta(seconds=599)
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**{**fresh, 'candidate_id':'candidate-3', 'cycle_id':'source-3',
+                               'state':{'source':'third independent source'}, 'source_binding':{'content_digest':digest_bytes(b'source-3')}})
+        assert len(calls) == 2
+        with sqlite3.connect(usage.path) as db:
+            assert db.execute('SELECT record_json FROM model_invocation_terminals WHERE invocation_id=?', (old[0],)).fetchone()[0] == old[1]
+            assert db.execute('SELECT unresolved FROM model_usage_current WHERE invocation_id=?', (old[0],)).fetchone() == (1,)
+
+
+def test_latest_canonical_circuit_reason_must_match_its_actual_terminal(tmp_path, monkeypatch):
+    from newsroom.authority.canonical import canonical_json_bytes, digest_canonical
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    with _case(tmp_path, monkeypatch, transport_error=TimeoutError('fixture')) as (engine, inputs, usage, calls, _):
+        with pytest.raises(TypesafeJudgmentError):
+            engine.evaluate(**inputs)
+        with sqlite3.connect(usage.path) as db:
+            record = json.loads(db.execute('SELECT record_json FROM model_usage_route_circuit_events').fetchone()[0])
+            record.pop('event_digest'); record['reason'] = 'HTTPError:422'
+            digest = digest_canonical(record); record['event_digest'] = digest
+            db.execute('UPDATE model_usage_route_circuit_events SET event_digest=?,reason=?,record_json=?',
+                       (digest, record['reason'], canonical_json_bytes(record).decode()))
+        with pytest.raises(ModelUsageAdmissionError):
+            engine.evaluate(**{**inputs, 'candidate_id':'candidate-2', 'cycle_id':'other',
+                               'state':{'source':'other source'}, 'source_binding':{'content_digest':digest_bytes(b'other source')}})
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize('url,status', [('https://other.invalid/', 422), ('https://api.typesafe.ai/v1/systemone', True),
+                                        ('https://api.typesafe.ai/v1/systemone', None), ('https://api.typesafe.ai/v1/systemone', '503')])
+def test_malformed_http_transport_never_becomes_legacy_unknown_retry_class(tmp_path, monkeypatch, url, status):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    with _case(tmp_path, monkeypatch, transport_error=HTTPError(url, status, 'fixture', {}, BytesIO(b'{}'))) as (engine, inputs, usage, calls, _):
+        with pytest.raises(TypesafeJudgmentError) as held:
+            engine.evaluate(**inputs)
+        assert usage.terminal(held.value.reference.invocation_id).failure_class == 'HTTPError:INVALID_TRANSPORT'
