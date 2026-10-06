@@ -1905,3 +1905,120 @@ def test_reported_validation_semantic_origin_preserves_live_source_stop_and_exac
             assert retained['origin_journal']['assessment_superseded'] == facts['assessment_superseded']
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('choice',['NO','UNCERTAIN'])
+def test_semantic_witness_disposition_is_retained_without_retry_or_free_text(tmp_path,monkeypatch,choice):
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    from newsroom.tests.test_qualification_semantic_witness import _witness_case
+    from newsroom.control_plane.native_source_qualification_consumer import CONSUMER_VERSION
+    with _witness_case(tmp_path,monkeypatch,choice=choice)as(w,q,c,p,b,usage,calls,stopped):
+        unit=_native();connection=connect(str(tmp_path/'disposition.sqlite3'))
+        journal=NativeRevisionJournal(connection);journal.land((unit,))
+        current='newsroom.native-evidence-assessor.v23+'+CONSUMER_VERSION
+        contract='newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2'
+        intent={'contract':contract,'input_digest':_DIGEST,'origin_invocation_id':'protected-original'}
+        facts={'candidate_id':p.candidate_id,'candidate_version_id':'candidate-version','graphiti_receipts':[{}],
+            'intake_receipt_id':'protected-intake','semantic_assessment_intent':intent,
+            'assessment_contract_version':current.replace('consumer.v2','consumer.v1'),
+            'reason':'SEMANTIC_INTENT_INPUT_CHANGED_HOLD','failure_class':'ValueError','assessment_started_at':'protected-start'}
+        journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+        class CurrentCandidate(_Authority):
+            def candidate_version(self,_):return SimpleNamespace(candidate_id=p.candidate_id,governing_manifest=SimpleNamespace(canonical_digest=_DIGEST))
+        requests=[]
+        def acquire(_self,**request):
+            requests.append(request);assert request['assessment_qualification_cached_only']is True
+            request['before_assessment']()
+            try:w.evaluate(q,c,p,b)
+            except NativeEvidenceHold as exc:
+                exc.free_model_text='This arbitrary field must not enter journal facts.'
+                raise
+        monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+        monkeypatch.setattr('newsroom.control_plane.native_publication.open_private_serving_read_port',lambda *_a,**_k:_Reader())
+        runtime=SimpleNamespace(authority=CurrentCandidate(),ingress=object(),publication=_Publication(),proof=proof(),
+            policies=SimpleNamespace(publication=SimpleNamespace(target_path=tmp_path/'serving.sqlite3',target_id='private',target_context_digest=_DIGEST)))
+        continuation=NativePublicationContinuation(journal=journal,runtime=runtime,evidence_controller=object.__new__(NativeEvidenceController),
+            sources={unit.revision_id:(_source(unit),)},semantic_origin_failure=lambda _:None,semantic_intent_contract=contract,
+            assessment_contract_version=current)
+        try:
+            result=continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+            after=journal.current(unit.revision_id)['facts']
+            assert result.reason==after['reason']=='QUALIFICATION_SEMANTIC_WITNESS_'+choice
+            assert after['semantic_assessment_intent']==intent and after['assessment_started_at']=='protected-start'
+            assert set(after['semantic_witness_disposition'])=={'reference','confidence_ppm','probabilities_ppm'}
+            assert 'free_model_text'not in after
+            reference=after['semantic_witness_disposition']['reference']
+            terminal=usage.terminal(reference['invocation_id'])
+            assert terminal.usage_status.value=='REPORTED'and terminal.outcome=='TYPESAFE_COMPLETE'
+            continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+            assert len(requests)==len(calls)==1 and runtime.publication.calls==0
+            assert usage.terminal(reference['invocation_id'])==terminal
+        finally:connection.close()
+
+
+@pytest.mark.parametrize('fault',['NO','UNCERTAIN','missing-ref','source-change','unknown','stop'])
+def test_old_valueerror_is_reclassified_only_by_current_authenticated_existing_witness(tmp_path,monkeypatch,fault):
+    import sqlite3
+    from newsroom.authority.canonical import digest_canonical
+    from newsroom.tests.test_qualification_semantic_witness import _selected_qualification_case
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    with _selected_qualification_case(tmp_path,monkeypatch,fault='NO'if fault!='UNCERTAIN'else None,retained_current=True)as(q,w,old,c,b,s,a,scope,auth,usage,qa,jev,render):
+        if fault in {'UNCERTAIN','unknown'}:
+            original_transport=w.judgments.transport
+            def transport(request,**kw):
+                if 'criterion'not in __import__('json').loads(request.data)['questions']:return original_transport(request,**kw)
+                if fault=='unknown':jev.append('unknown fixture');raise TimeoutError('fixture unknown')
+                status,url,raw=original_transport(request,**kw);value=__import__('json').loads(raw)
+                answer=value['answers']['criterion'];answer['choice']='UNCERTAIN';answer['probabilities']={'YES':0,'NO':0,'UNCERTAIN':1}
+                return status,url,__import__('json').dumps(value).encode()
+            w.judgments.transport=transport
+        original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=auth)
+        if fault!='missing-ref':
+            with pytest.raises(NativeEvidenceHold):q.compose_selected(original,c,b,(s,),(a,),proof=auth)
+        with sqlite3.connect(usage.path)as db:pins=db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()
+        counts=(len(qa),len(jev),len(render))
+        if fault=='source-change':s.unit.body+='\nChanged CURRENT Source.'
+        monkeypatch.setattr(w.judgments,'evaluate',lambda **_k:pytest.fail('proof-only evaluated model'))
+        monkeypatch.setattr(q.qualifier,'qualify',lambda *_a,**_k:pytest.fail('proof-only requalified QA'))
+        q.localise=lambda *_a:pytest.fail('proof-only localised')
+        unit=_native();connection=connect(str(tmp_path/'reclassification.sqlite3'));journal=NativeRevisionJournal(connection);journal.land((unit,))
+        intent={'contract':'protected-contract','input_digest':_DIGEST}
+        facts={'candidate_id':c.candidate_id,'candidate_version_id':c.version_id,'semantic_assessment_intent':intent,
+            'reason':'SEMANTIC_INTENT_INPUT_CHANGED_HOLD','failure_class':'ValueError','assessment_contract_version':'protected-v2',
+            'retained_qualification_checked_contract':'protected-v2','original_fee':'retained'}
+        journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+        before=journal.summary(unit.revision_id)
+        class Candidate(_Authority):
+            def candidate_version(self,_):return c
+        runtime=SimpleNamespace(authority=Candidate(),ingress=object(),publication=_Publication(),proof=auth,policies=SimpleNamespace(publication=object()))
+        continuation=NativePublicationContinuation(journal=journal,runtime=runtime,evidence_controller=object.__new__(NativeEvidenceController),
+            sources={},evidence_sources_for=lambda _:(s,),semantic_witness_disposition_reader=lambda candidate,sources:q.read_current_disposition(candidate,b,sources,proof=auth))
+        try:
+            checks=[]
+            def before_revision():
+                checks.append('checked')
+                if fault=='stop'and len(checks)>1:
+                    from newsroom.control_plane.veto import VetoError
+                    raise VetoError('owner stop after authenticated read')
+                return True
+            if fault=='stop':
+                from newsroom.control_plane.veto import VetoError
+                with pytest.raises(VetoError,match='after authenticated read'):
+                    continuation.recover_pre_dispatch((unit.revision_id,),failure_many=lambda *_:pytest.fail('unknown invocation recovery'),before_revision=before_revision)
+                result=()
+            else:
+                result=continuation.recover_pre_dispatch((unit.revision_id,),failure_many=lambda *_:pytest.fail('unknown invocation recovery'),before_revision=before_revision)
+            after=journal.summary(unit.revision_id)
+            if fault in {'NO','UNCERTAIN'}:
+                assert result==(unit.revision_id,)
+                assert after['facts']['reason']=='QUALIFICATION_SEMANTIC_WITNESS_'+fault
+                assert after['facts']['semantic_witness_previous_hold']['prior_state_ordinal']==before['ordinal']
+                assert after['facts']['semantic_witness_previous_hold']['prior_summary_digest']==digest_canonical(before)
+                assert after['facts']['semantic_witness_previous_hold']['failure_class']=='ValueError'
+                assert after['facts']['semantic_assessment_intent']==intent and after['facts']['original_fee']=='retained'
+            else:assert result==()and after==before
+            if fault!='stop':assert continuation.recover_pre_dispatch((unit.revision_id,),failure_many=lambda *_:pytest.fail('retry'),before_revision=lambda:True)==()
+            assert (len(qa),len(jev),len(render))==counts
+            with sqlite3.connect(usage.path)as db:assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
+        finally:connection.close()

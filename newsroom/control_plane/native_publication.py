@@ -894,6 +894,7 @@ class NativePublicationContinuation:
         ) = None,
         semantic_origin_failure: Callable[[object], RetainedAssessorResult | None] | None = None,
         semantic_intent_contract: str | None = None,
+        semantic_witness_disposition_reader=None,
         context_enrichment_contract: str | None = None,
         evidence_sources_for: Callable[[str], tuple[NativeEvidenceSource, ...]] | None = None,
         assessment_contract_version: str | None = None,
@@ -918,6 +919,7 @@ class NativePublicationContinuation:
             )
             or (assessment_old_provider_failure is not None and not callable(assessment_old_provider_failure))
             or (semantic_origin_failure is not None and not callable(semantic_origin_failure))
+            or (semantic_witness_disposition_reader is not None and not callable(semantic_witness_disposition_reader))
             or ((semantic_origin_failure is None) != (semantic_intent_contract is None))
             or (semantic_intent_contract is not None and (type(semantic_intent_contract) is not str or not semantic_intent_contract))
             or (context_enrichment_contract is not None and (type(context_enrichment_contract)is not str
@@ -944,6 +946,7 @@ class NativePublicationContinuation:
         self._assessment_pre_dispatch_failure = assessment_pre_dispatch_failure
         self._assessment_old_provider_failure = assessment_old_provider_failure
         self._semantic_origin_failure = semantic_origin_failure
+        self._semantic_witness_disposition_reader = semantic_witness_disposition_reader
         self._semantic_intent_contract = semantic_intent_contract
         self._context_enrichment_contract=context_enrichment_contract
         self._evidence_sources_for = evidence_sources_for
@@ -1042,6 +1045,49 @@ class NativePublicationContinuation:
             return prior['contract_version']
         return None
 
+    @staticmethod
+    def _retain_witness_disposition(facts, error):
+        if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:return
+        from .evidence import semantic_witness_reference
+        disposition=getattr(error,'semantic_witness_disposition',None)
+        if type(disposition) is not dict or set(disposition)!={'reference','confidence_ppm','probabilities_ppm'}:
+            raise NativePublicationError('semantic witness disposition differs')
+        reference=semantic_witness_reference(tuple(sorted(disposition['reference'].items())))
+        confidence,probabilities=disposition['confidence_ppm'],disposition['probabilities_ppm']
+        if (type(confidence) is not int or not 0<=confidence<=1000000 or type(probabilities)is not dict
+                or set(probabilities)!={'YES','NO','UNCERTAIN'}
+                or any(type(value)is not int or not 0<=value<=1000000 for value in probabilities.values())
+                or sum(probabilities.values())!=1000000):raise NativePublicationError('semantic witness probabilities differ')
+        facts['semantic_witness_disposition']={'reference':reference,'confidence_ppm':confidence,'probabilities_ppm':dict(probabilities)}
+
+    def _recover_witness_disposition(self, revision_id, progress, before_write):
+        facts=progress.get('facts',{})
+        if (self._semantic_witness_disposition_reader is None or self._evidence_sources_for is None
+                or progress.get('stage')!='EVIDENCE_HOLD' or facts.get('failure_class')!='ValueError'
+                or facts.get('reason')!='SEMANTIC_INTENT_INPUT_CHANGED_HOLD'
+                or not facts.get('candidate_version_id') or type(facts.get('semantic_assessment_intent'))is not dict
+                or facts.get('semantic_witness_disposition')
+                or any(facts.get(key)for key in ('package_admission_id','publication_started_at','publication_event_id','delivery_attempt_event_id'))):return False
+        try:
+            candidate=self._runtime.authority.candidate_version(facts['candidate_version_id'])
+            if candidate.candidate_id!=facts.get('candidate_id') or candidate.version_id!=facts['candidate_version_id']:return False
+            sources=self._evidence_sources_for(revision_id)
+            self._semantic_witness_disposition_reader(candidate,sources)
+        except (OperatorDrainRequested,VetoError):raise
+        except NativeEvidenceHold as error:
+            if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:return False
+            before_write()  # Recheck stop/drain after the authenticated reads.
+            if self._journal.summary(revision_id)!=progress:return False
+            updated=dict(facts)
+            self._retain_witness_disposition(updated,error)
+            updated['semantic_witness_previous_hold']={'reason':facts['reason'],'failure_class':facts['failure_class'],
+                'input_digest':facts['semantic_assessment_intent'].get('input_digest'),'prior_state_ordinal':progress['ordinal'],'prior_summary_digest':digest_canonical(progress)}
+            updated['reason']=error.reason_code
+            self._journal.advance(revision_id,stage='EVIDENCE_HOLD',facts=updated)
+            return True
+        except Exception:return False
+        return False
+
     def recover_pre_dispatch(
         self, revision_ids: tuple[str, ...], *,
         failure_many: Callable[[tuple[object, ...]], tuple],
@@ -1050,8 +1096,16 @@ class NativePublicationContinuation:
     ) -> tuple[str, ...]:
         """Consume one finite proof-only snapshot before ordinary effects."""
         selected = []
+        reclassified = []
         for revision_id in revision_ids:
             progress = self._journal.summary(revision_id)
+            if (self._semantic_witness_disposition_reader is not None
+                    and progress.get('stage')=='EVIDENCE_HOLD'
+                    and progress.get('facts',{}).get('failure_class')=='ValueError'
+                    and progress.get('facts',{}).get('reason')=='SEMANTIC_INTENT_INPUT_CHANGED_HOLD'
+                    and before_revision() and self._recover_witness_disposition(revision_id,progress,before_revision)):
+                reclassified.append(revision_id)
+                continue
             facts = progress.get("facts", {})
             if not (
                 (progress.get("stage") == "ASSESSMENT_INTERRUPTED"
@@ -1067,7 +1121,7 @@ class NativePublicationContinuation:
                 break
             selected.append((revision_id, progress, version_id))
         if not selected or not before_revision():
-            return ()
+            return tuple(reclassified)
         checked = []
         source_order = {revision: index for index, (revision, _, _) in enumerate(selected)}
         if denial_many is not None:
@@ -1103,7 +1157,7 @@ class NativePublicationContinuation:
                     # Ordinary advance alone may authenticate a distinct intent.
             selected = remaining
             if not selected:
-                return tuple(sorted(checked, key=source_order.__getitem__))
+                return tuple(reclassified)+tuple(sorted(checked, key=source_order.__getitem__))
         try:
             versions = self._runtime.authority.candidate_versions(
                 tuple(version_id for _, _, version_id in selected)
@@ -1112,7 +1166,7 @@ class NativePublicationContinuation:
             raise
         except Exception:
             # Global or upstream corruption grants no recovery proof.
-            return tuple(sorted(checked, key=source_order.__getitem__))
+            return tuple(reclassified)+tuple(sorted(checked, key=source_order.__getitem__))
         if type(versions) is not tuple or len(versions) != len(selected):
             raise NativePublicationError("native Candidate version partition differs")
         retained = []
@@ -1135,7 +1189,7 @@ class NativePublicationContinuation:
             retained.append((revision_id, progress, version))
         selected = retained
         if not selected:
-            return tuple(sorted(checked, key=source_order.__getitem__))
+            return tuple(reclassified)+tuple(sorted(checked, key=source_order.__getitem__))
         # An authoritative read started within the quantum may finish one
         # proved recovery atomically, even if reading the prefix overruns it.
         # The stop/drain check still applies before the proof and every write.
@@ -1177,7 +1231,7 @@ class NativePublicationContinuation:
             if result is not None:
                 attempted.append(revision_id)
                 checked.append(revision_id)
-        return tuple(sorted(checked, key=source_order.__getitem__))
+        return tuple(reclassified)+tuple(sorted(checked, key=source_order.__getitem__))
 
     def _current_candidate_facts(self, revision_id, candidate_version_id, candidate_id) -> dict:
         facts = dict(self._journal.current(revision_id).get("facts", {}))
@@ -1658,6 +1712,7 @@ class NativePublicationContinuation:
                     if exc.reason_code=='CONTEXT_SUPPORT_UNPROVEN_HOLD':
                         from .native_context_enrichment import SUPPORT_CONTRACT
                         facts['context_support_checked_contract']=SUPPORT_CONTRACT
+                self._retain_witness_disposition(facts,exc)
                 facts["reason"] = exc.reason_code
                 facts["acquisition_retryable"] = False
                 self._journal.advance(

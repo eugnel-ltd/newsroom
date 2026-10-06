@@ -144,7 +144,7 @@ def test_semantic_witness_negative_boundaries_are_fail_closed(tmp_path,monkeypat
 
 
 @contextmanager
-def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None):
+def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False):
     """Genuine disposable QA/TypeSafe/localiser ledgers and CAS; synthetic answers."""
     from newsroom.tests.test_native_assessor_judgments import _case as typed_case
     from newsroom.control_plane.native_assessor_judgments import JudgmentFallback
@@ -184,6 +184,12 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         scope={'coverage':'COMPLETE','newness':'KNOWN_CHANGE','prior_scope':{'revision_digest':digest_bytes(b'prior')},
             'current_scope':{'sources':[{'source_id':source.unit.source_id,'body':body,
                 'published_at':acquired.publication_time,'updated_at':acquired.source_updated_time,'retrieved_at':acquired.retrieval_time}]}}
+        if retained_current:
+            source.unit.body=body;source.unit.published_at=acquired.publication_time;source.unit.updated_at=acquired.source_updated_time
+            source.unit.authority.definition_version_id='current-definition-version'
+            source.unit.revision_digest=digest_bytes(b'current-retained-revision')
+            scope['source_currentness']=[{'source_id':source.unit.source_id,'definition_id':source.unit.authority.definition_id,
+                'definition_version_id':source.unit.authority.definition_version_id}]
         consumer.scope_for=lambda *_:scope
         fallback=consumer.assess(candidate,base,(source,),(acquired,))
         assert isinstance(fallback,JudgmentFallback) and fallback.reason=='JUDGMENT_INPUT_BOUND',fallback
@@ -636,3 +642,33 @@ def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_p
             continuation.advance(revision_id=unit.revision_id,candidate_version_id=c.version_id)
             assert len(requests)==1 and len(qa)==1 and len(jev)==2
         finally:connection.close()
+
+
+@pytest.mark.parametrize('choice',['NO','UNCERTAIN'])
+def test_reported_semantic_dispositions_keep_authenticated_ref_and_probabilities(tmp_path,monkeypatch,choice):
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    with _witness_case(tmp_path,monkeypatch,choice=choice)as(w,q,c,p,b,usage,calls,stopped):
+        for _ in range(2):
+            with pytest.raises(NativeEvidenceHold)as captured:w.evaluate(q,c,p,b)
+            error=captured.value
+            assert error.reason_code=='QUALIFICATION_SEMANTIC_WITNESS_'+choice
+            disposition=error.semantic_witness_disposition
+            assert set(disposition)=={'reference','confidence_ppm','probabilities_ppm'}
+            assert disposition['confidence_ppm']==1000000 and disposition['probabilities_ppm'][choice]==1000000
+            assert usage.terminal(disposition['reference']['invocation_id']).usage_status.value=='REPORTED'
+        assert len(calls)==1
+
+
+@pytest.mark.parametrize('fault',['timeout','unreported','candidate'])
+def test_unsettled_or_drifted_semantic_witness_is_never_a_no_disposition(tmp_path,monkeypatch,fault):
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    with _witness_case(tmp_path,monkeypatch,fault=fault)as(w,q,c,p,b,usage,calls,stopped):
+        if fault=='candidate':
+            ref=w.evaluate(q,c,p,b);q=replace(q,semantic_witness_ref=ref);p=replace(p,candidate_id='wrong-candidate')
+            with pytest.raises(ValueError,match='Candidate'):w.read(q,c,p)
+        else:
+            for _ in range(2):
+                with pytest.raises(NativeEvidenceHold)as captured:w.evaluate(q,c,p,b)
+                assert captured.value.reason_code=='QUALIFICATION_SEMANTIC_WITNESS_UNKNOWN_HOLD'
+                assert not hasattr(captured.value,'semantic_witness_disposition')
+        assert len(calls)==1

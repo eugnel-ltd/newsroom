@@ -79,6 +79,7 @@ from .native_source_rights import (
 )
 from .native_assessor_spans import PARTITION_VERSION
 from .native_source_qualification_consumer import CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION
+from .evidence import EvidencePackage
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
 from .native_weather_sources import poll_other_source
 from .native_weather_evidence import NativeWeatherEvidenceAcquisition, POLICY_DIGEST as WEATHER_TRANSPORT_POLICY
@@ -793,6 +794,7 @@ def open_native_pipeline(
             dispatch_fence=stop_fence,
         )
         typed_proposal_verifier = None
+        semantic_witness_disposition_reader = None
         if judgment_api_key is not None:
             from .native_assessor_judgments import NativeAssessorJudgments, VERSION as JUDGMENT_CONTRACT
             from .native_claim_localisation import NativeClaimLocaliser
@@ -847,6 +849,17 @@ def open_native_pipeline(
                 qualification_consumer = NativeQualifiedSourceConsumer(qualifier, semantic_witnesses=semantic_witnesses,
                     localise=localise_claims, read_localisation=read_claim_localisation)
                 semantic_witnesses.parent_reader = qualification_consumer.read_semantic_parent
+                def semantic_witness_disposition_reader(candidate,sources):
+                    # Already checked retained CURRENT Source projection, not a
+                    # new observation or external-now freshness assertion.
+                    base=EvidencePackage(candidate_id=candidate.candidate_id,hypothesis_id=candidate.governing_manifest.hypothesis_id,
+                        lead_ids=tuple(row.lead_id for row in candidate.governing_manifest.lead_signal_bindings),
+                        signal_ids=tuple(row.signal_id for row in candidate.governing_manifest.lead_signal_bindings),
+                        source_ids=tuple(source.unit.source_id for source in sources),
+                        passages=tuple(source.unit.body for source in sources),
+                        observation_digests=tuple(digest_bytes(source.unit.body.encode())for source in sources))
+                    qualification_consumer.read_current_disposition(candidate,base,sources,proof=proof)
+
 
                 def qualify_source(candidate, base, sources, acquired, fallback):
                     original = qualifier.assess(candidate, base, sources, acquired, fallback,
@@ -1206,6 +1219,7 @@ def open_native_pipeline(
                     context_enrichment_contract=('newsroom.native-context-package.v2'
                         if judgment_api_key is not None and source_qualification_policy is not None else None),
                     evidence_sources_for=self.sources_for,
+                    semantic_witness_disposition_reader=semantic_witness_disposition_reader,
                     assessment_contract_version=ASSESSMENT_CONTRACT_VERSION,
                     clock=now,
                 )
