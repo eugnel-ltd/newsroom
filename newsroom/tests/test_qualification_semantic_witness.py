@@ -481,3 +481,12 @@ def test_source_literal_quote_wrapper_preserves_supported_outer_quote_and_attrib
                 replace(copy,body=copy.body+'\n“unbalanced'),replace(copy,body=copy.body+'\npolicy’s invention')):
             assert next(row for row in validate_source_literal_copy(wrong,package,semantic_witness_reader=w.read)if row.validator=='QUOTE_FIDELITY').result=='FAIL'
         assert len(qa)==1 and len(jev)==2 and len(render)==1
+
+
+def test_authenticated_witness_rejects_replacement_context_instead_of_rescuing_stale_source(tmp_path,monkeypatch):
+    with _witness_case(tmp_path,monkeypatch)as(w,q,c,p,b,usage,calls,stopped):
+        verified=replace(q,semantic_witness_ref=w.evaluate(q,c,p,b))
+        assert qualification_relation_is_admitted(verified,c,p,semantic_witness_reader=w.read,source_context=p.passages[0])
+        assert not qualification_relation_is_admitted(verified,c,p,semantic_witness_reader=w.read,
+            source_context=p.passages[0]+'\nThe original assertion is withdrawn.')
+        assert len(calls)==1

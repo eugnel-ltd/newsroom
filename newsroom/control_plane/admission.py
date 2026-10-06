@@ -669,14 +669,16 @@ def _qualification_relation_is_proven(
     )
 
 
-def qualification_relation_is_admitted(qualification, claim, package, *, semantic_witness_reader=None):
+def qualification_relation_is_admitted(qualification, claim, package, *, semantic_witness_reader=None, source_context=None):
     if qualification.semantic_witness_ref:
+        if source_context is not None and source_context != package.passages[claim.passage_index]:
+            return False
         from .native_assessor_judgments import semantic_witness_reader_is_bound
         if not semantic_witness_reader_is_bound(semantic_witness_reader):
             return False
         return semantic_witness_reader(qualification, claim, package) is True
     return _qualification_relation_is_proven(qualification, claim,
-        source_context=package.passages[claim.passage_index])
+        source_context=package.passages[claim.passage_index] if source_context is None else source_context)
 
 
 def source_rendering_is_admitted(claim, package, *, semantic_witness_reader=None):

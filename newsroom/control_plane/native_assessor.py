@@ -2832,6 +2832,7 @@ class AutonomousNativeEvidenceAssessor:
             if (
                 not qualification_relation_is_admitted(
                     item, claim, package, semantic_witness_reader=semantic_witness_reader,
+                    source_context=acquired[claim.passage_index].body.decode("utf-8"),
                 )
                 or any(
                     field not in _QUALIFICATION_CLASSIFIER_FIELDS
