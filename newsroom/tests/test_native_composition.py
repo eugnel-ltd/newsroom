@@ -1119,6 +1119,26 @@ def test_hko_publisher_fence_uses_canonical_latest_not_latest_story(case):
     assert len(calls)<=2
 
 
+def _source_binding_caller_without_bootstrap(**bindings):
+    """Run the original method bytecode with its actual outer lexical closure."""
+    from inspect import unwrap
+    from types import CodeType, FunctionType, MethodType
+
+    outer = unwrap(native_composition.open_native_pipeline).__code__
+    publication = next(code for code in outer.co_consts
+                       if isinstance(code, CodeType) and code.co_name == 'Publication')
+    source_binding = next(code for code in publication.co_consts
+                          if isinstance(code, CodeType) and code.co_name == 'sources_for')
+    # Bind the real journal/licence/proof/runtime cells without opening a runtime.
+    # Global names stay global; a conditional outer import must not be hidden
+    # by compiling the extracted class alone in module scope.
+    def cell(value):
+        return (lambda: value).__closure__[0]
+    closure = tuple(cell(bindings[name]) for name in source_binding.co_freevars)
+    callback = FunctionType(source_binding, {**vars(native_composition), **bindings}, closure=closure)
+    return SimpleNamespace(sources_for=MethodType(callback, object()))
+
+
 @pytest.mark.parametrize('outcome', ('complete', 'source-hold', 'owner-stop'))
 @pytest.mark.parametrize('diagnostic_failure', (False, True))
 def test_source_binding_cost_diagnostic_preserves_one_call_result_or_failure(
@@ -1156,7 +1176,7 @@ def test_source_binding_cost_diagnostic_preserves_one_call_result_or_failure(
     wall, cpu = iter((1_000_000, 4_500_000)), iter((2_000_000, 3_250_000))
     monkeypatch.setattr(native_composition, 'perf_counter_ns', lambda: next(wall), raising=False)
     monkeypatch.setattr(native_composition, 'process_time_ns', lambda: next(cpu), raising=False)
-    publication = _publication_caller_without_bootstrap(
+    publication = _source_binding_caller_without_bootstrap(
         journal=SimpleNamespace(units=SelectedUnits(), observations=observations),
         runtime=SimpleNamespace(authority=SimpleNamespace(sources=selected_sources, objects=selected_objects)),
         licence=licence, proof=proof, native_evidence_sources=bind_sources,
@@ -1195,7 +1215,7 @@ def test_source_binding_cost_clock_failure_preserves_source_boundary(monkeypatch
     monkeypatch.setattr(native_composition, clock, unavailable)
     monkeypatch.setattr(native_composition, 'emit_diagnostic',
         lambda *_: pytest.fail('no diagnostic is emitted without an initial clock sample'))
-    publication = _publication_caller_without_bootstrap(
+    publication = _source_binding_caller_without_bootstrap(
         journal=SimpleNamespace(units={'selected': (object(),)}, observations=object()),
         runtime=SimpleNamespace(authority=SimpleNamespace(sources=object(), objects=object())),
         licence=object(), proof=object(), native_evidence_sources=bind_sources,
