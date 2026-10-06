@@ -114,10 +114,31 @@ def licence_text_digest(raw: bytes) -> str:
     return digest_bytes(text.encode("utf-8"))
 
 
+def _fetch_licence_observation(url: str) -> bytes:
+    """Acquire one approved observation; no governed retention in workers."""
+    if url not in (REUSE_URL, LICENCE_URL):
+        raise ValueError('licence endpoint differs')
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirect(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
+    request = urllib.request.Request(url, method="GET", headers={
+        "User-Agent": "Newsroom-Hermes-Rights-Review/1.0", "Accept-Encoding": "identity",
+    })
+    with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+        raw = response.read(MAX_BODY_BYTES + 1)
+        if response.status != 200 or response.geturl() != url:
+            raise ValueError("licence response identity differs")
+    if not raw or len(raw) > MAX_BODY_BYTES:
+        raise ValueError("licence response length differs")
+    return raw
+
+
 def retain_current_govuk_licence(
     *, objects: GovernedObjects, proof: AuthenticationProof,
     dispatch_fence: Callable[[], ContextManager[None]],
     clock: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
+    fetch: Callable[[str], bytes] | None = None,
 ) -> GovUkLicenceEvidence:
     """Fetch one current observation and retain exact raw terms in governed CAS.
 
@@ -125,21 +146,12 @@ def retain_current_govuk_licence(
     publication approval. The post-acquisition assessor must apply exclusions;
     the final private article/feed card must carry attribution and source links.
     """
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}), _NoRedirect(),
-        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-    )
+    fetch = _fetch_licence_observation if fetch is None else fetch
     observations = []
     for url in (REUSE_URL, LICENCE_URL):
-        request = urllib.request.Request(url, method="GET", headers={
-            "User-Agent": "Newsroom-Hermes-Rights-Review/1.0", "Accept-Encoding": "identity",
-        })
         try:
             with dispatch_fence():
-                with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-                    raw = response.read(MAX_BODY_BYTES + 1)
-                    if response.status != 200 or response.geturl() != url:
-                        raise ValueError("licence response identity differs")
+                raw = fetch(url)
             if not raw or len(raw) > MAX_BODY_BYTES:
                 raise ValueError("licence response length differs")
             if licence_text_digest(raw) != REVIEWED_TEXT[url]:

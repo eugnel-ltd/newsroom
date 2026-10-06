@@ -119,10 +119,12 @@ class NativePipeline:
     def tick(self, *, cycle_id: str) -> NativePipelineReport:
         self._check()
         self._drain_between_work()
-        self._refresh_rights()
+        with _native_phase("RIGHTS_REFRESH", cycle_id=cycle_id, cohort_count=1):
+            self._refresh_rights()
         self._check()
         self._drain_between_work()
-        dispositions = self._intake.poll()
+        with _native_phase("SOURCE_POLL", cycle_id=cycle_id, cohort_count=1):
+            dispositions = self._intake.poll()
         self._journal.sources(dispositions)
         grouped = defaultdict(list)
         for disposition in dispositions:

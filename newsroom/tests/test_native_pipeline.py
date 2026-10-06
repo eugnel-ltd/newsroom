@@ -2175,3 +2175,32 @@ def test_ordinary_profile_does_not_hijack_existing_hook(tmp_path, monkeypatch):
         assert pipeline._ordinary_profile_pending is False
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('failed_phase', (None,'RIGHTS_REFRESH','SOURCE_POLL'))
+def test_tick_prefix_spans_preserve_single_calls_and_original_failure(tmp_path, monkeypatch, failed_phase):
+    from newsroom.control_plane import native_graphiti
+    pipeline,_journal,connection,_units,_calls,dispositions=_open(tmp_path,monkeypatch)
+    dispositions[0]=()
+    calls,events=[],[]
+    failure=VetoError('owner stop')
+    def refresh():
+        calls.append('RIGHTS_REFRESH')
+        if failed_phase=='RIGHTS_REFRESH':raise failure
+    def poll():
+        calls.append('SOURCE_POLL')
+        if failed_phase=='SOURCE_POLL':raise failure
+        return ()
+    pipeline._refresh_rights=refresh;pipeline._intake.poll=poll
+    monkeypatch.setattr(native_graphiti,'emit_diagnostic',lambda event,data:events.append((event,data)))
+    try:
+        if failed_phase:
+            with pytest.raises(VetoError) as raised:pipeline.tick(cycle_id='prefix-fixture')
+            assert raised.value is failure
+        else:assert pipeline.tick(cycle_id='prefix-fixture').revision_states=={}
+        assert calls==(['RIGHTS_REFRESH'] if failed_phase=='RIGHTS_REFRESH' else ['RIGHTS_REFRESH','SOURCE_POLL'])
+        spans=[data for event,data in events if event=='native_graphiti_phase' and data['phase'] in calls]
+        assert [data['phase'] for data in spans]==calls
+        assert all(data['cycle_id']=='prefix-fixture' for data in spans)
+        assert spans[-1]['status']==('FAILED' if failed_phase else 'COMPLETE')
+    finally:connection.close()

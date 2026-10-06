@@ -75,7 +75,7 @@ from .native_source_intake import (
 )
 from .native_source_rights import (
     NativePortfolioRights, observe_portfolio_terms, read_rights_observation,
-    retain_rights_snapshot_bundle, require_rights_assessment,
+    retain_rights_snapshot_bundle, require_rights_assessment, fetch_licensing_observations,
 )
 from .native_assessor_spans import PARTITION_VERSION
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
@@ -693,10 +693,16 @@ def open_native_pipeline(
         from newsroom.increment9.proving import SOURCE_URLS
         if licence is None:
             def refresh_current_rights():
+                observed = fetch_licensing_observations(stop_check=stop_check, stop_fence=stop_fence)
+                def fetched(url):
+                    value = observed[url]
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
                 try:
                     govuk = retain_current_govuk_licence(
                         objects=runtime.authority.objects, proof=proof,
-                        dispatch_fence=stop_fence, clock=clock,
+                        dispatch_fence=stop_fence, clock=clock, fetch=fetched,
                     )
                     govuk_reason = "REVIEWED_REUSE_PERMITTED"
                 except NativeEvidenceHold as exc:
@@ -706,7 +712,8 @@ def open_native_pipeline(
                 # portfolio observation. VetoError still propagates from both.
                 evidence = observe_portfolio_terms(
                     objects=runtime.authority.objects, proof=proof,
-                    stop_check=stop_check, stop_fence=stop_fence, clock=clock,
+                    stop_check=stop_check, stop_fence=stop_fence, clock=clock, fetch=fetched,
+                    parallel_observation=False,
                 )
                 current = NativePortfolioRights(
                     govuk, evidence, govuk_reason=govuk_reason,
