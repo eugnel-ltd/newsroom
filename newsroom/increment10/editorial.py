@@ -843,7 +843,9 @@ class NativeEditorial:
                 else "HOLD"
             ),
         )
-        decision = DeterministicWriteAdmission().decide_candidate_identity(
+        decision = DeterministicWriteAdmission(
+            semantic_witness_reader=self._evidence.semantic_witness_reader,
+        ).decide_candidate_identity(
             candidate_id=evaluated.candidate_id,
             hypothesis_id=evaluated.hypothesis_id,
             package=evaluated,
@@ -941,7 +943,8 @@ class NativeEditorial:
             evaluated.digest,
             links,
         )
-        validators = validate_writer_copy(copy, evaluated)
+        from newsroom.control_plane.native_source_qualification_consumer import validate_source_literal_copy
+        validators = validate_source_literal_copy(copy, evaluated, semantic_witness_reader=self._evidence.semantic_witness_reader)
         if not validators or any(item.result != "PASS" for item in validators):
             raise EditorialError("offline Story Version validation failed")
         return StoryVersion(

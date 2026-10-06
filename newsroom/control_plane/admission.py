@@ -669,6 +669,32 @@ def _qualification_relation_is_proven(
     )
 
 
+def qualification_relation_is_admitted(qualification, claim, package, *, semantic_witness_reader=None, source_context=None):
+    if qualification.semantic_witness_ref:
+        if source_context is not None and source_context != package.passages[claim.passage_index]:
+            return False
+        from .native_assessor_judgments import semantic_witness_reader_is_bound
+        if not semantic_witness_reader_is_bound(semantic_witness_reader):
+            return False
+        return semantic_witness_reader(qualification, claim, package) is True
+    return _qualification_relation_is_proven(qualification, claim,
+        source_context=package.passages[claim.passage_index] if source_context is None else source_context)
+
+
+def source_rendering_is_admitted(claim, package, *, semantic_witness_reader=None):
+    if not claim.source_rendering_ref:
+        return True
+    from .native_assessor_judgments import semantic_witness_reader_is_bound
+    return semantic_witness_reader_is_bound(semantic_witness_reader) and semantic_witness_reader(None, claim, package) is True
+
+
+def _admitted_claim_names(claim, package):
+    if claim.source_rendering_ref:
+        from .native_assessor_judgments import source_rendering_names
+        return source_rendering_names(claim, package.passages[claim.passage_index])
+    return bounded_named_entities(claim.claim, source_context=package.passages[claim.passage_index])
+
+
 def _duration_is_exactly_supported(
     claim: GovernedClaimEvidence, duration_minutes: str
 ) -> bool:
@@ -1106,6 +1132,9 @@ def _make_decision(
 class DeterministicWriteAdmission:
     """Fail-closed admission over exact, already-retained package fields."""
 
+    def __init__(self, *, semantic_witness_reader=None):
+        self._semantic_witness_reader = semantic_witness_reader
+
     def decide(
         self,
         candidate: StoryCandidateRecord,
@@ -1196,6 +1225,7 @@ class DeterministicWriteAdmission:
                     }
                 )
             )
+            or not source_rendering_is_admitted(item, package, semantic_witness_reader=self._semantic_witness_reader)
             or not _valid_zh_hant_hk_rendering(item)
             or any(
                 entity not in item.claim
@@ -1208,20 +1238,14 @@ class DeterministicWriteAdmission:
                 item.supporting_excerpt,
                 source_context=package.passages[item.passage_index],
             )
-            or bounded_named_entities(
-                item.claim,
-                source_context=package.passages[item.passage_index],
-            )
+            or _admitted_claim_names(item, package)
             != frozenset(
                 (text, entity_type)
                 for text, entity_type, _record_id in item.named_entity_evidence
             )
             or rendered_named_entities(
                 item.rendered_assertion_zh_hant_hk,
-                bounded_named_entities(
-                    item.claim,
-                    source_context=package.passages[item.passage_index],
-                ),
+                _admitted_claim_names(item, package),
             )
             != frozenset(
                 (text, entity_type)
@@ -1327,11 +1351,9 @@ class DeterministicWriteAdmission:
             item
             for item in package.qualification_evidence
             if item.governed_claim_id not in governed_claims
-            or not _qualification_relation_is_proven(
-                item, governed_claims[item.governed_claim_id],
-                source_context=package.passages[
-                    governed_claims[item.governed_claim_id].passage_index
-                ],
+            or not qualification_relation_is_admitted(
+                item, governed_claims[item.governed_claim_id], package,
+                semantic_witness_reader=self._semantic_witness_reader,
             )
             or any(
                 field not in _QUALIFICATION_CLASSIFIER_FIELDS

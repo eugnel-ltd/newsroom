@@ -21,6 +21,8 @@ class JudgedAssessment:
     decision_record: bytes
     decision_admission_id: ObjectAdmissionId
     judgment_inputs: tuple=()
+    semantic_witnesses: object = None
+    source_renderings: object = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,7 @@ class NativeAssessorJudgments:
         self.judgments,self.scope_for,self.proof=judgments,scope_for,proof
         self.require_current=require_current
         self.localise,self.read_localisation=localise,read_localisation
+        self.semantic_witness_reader = None
 
     @staticmethod
     def _binding(candidate,base,scope,view):
@@ -294,3 +297,248 @@ class NativeAssessorJudgments:
         wire={'package':{'select_new_information':True,'governed_claims':claims,'qualification_evidence':qualification,
             'selection_rationale':'Source-bound staged judgment selection.','geography':[],'categories':[],'explicit_exclusions':[]}}
         return self._finish(wire,view,binding,(first,second),judgment_inputs,render_proof,admission_id)
+
+
+SEMANTIC_WITNESS_CONSUMER_VERSION = 'newsroom.semantic-witness-consumer.v1'
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticWitnessMetadata:
+    """Application side-channel, never part of SourceQA producer JSON."""
+    references: tuple
+
+    def __post_init__(self):
+        from .evidence import semantic_witness_reference
+        if type(self.references) is not tuple or len(dict(self.references)) != len(self.references):
+            raise ValueError('semantic witness metadata differs')
+        for key, ref in self.references:
+            if type(key) is not tuple or len(key) != 2 or any(type(p) is not str or not p for p in key):
+                raise ValueError('semantic witness key differs')
+            semantic_witness_reference(ref)
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRenderingMetadata:
+    references: tuple
+
+    def __post_init__(self):
+        from .evidence import source_rendering_reference
+        if type(self.references) is not tuple or len(dict(self.references)) != len(self.references):
+            raise ValueError('Source rendering metadata differs')
+        for claim_id, ref in self.references:
+            if type(claim_id) is not str or not claim_id:
+                raise ValueError('Source rendering claim differs')
+            source_rendering_reference(ref)
+
+
+def source_rendering_details(claim, body, chronology):
+    from .native_source_term_bindings import source_term_bindings, derive_relative_year, VERSION as TERM_VERSION
+    from .evidence import SOURCE_RENDERING_CONTRACT
+    if not SOURCE_RENDERING_CONTRACT.endswith(TERM_VERSION):
+        raise ValueError('Source term consumer identity differs')
+    from newsroom.authority.canonical import digest_bytes
+    raw, selected = body.encode(), claim.claim.encode()
+    start = raw.find(selected)
+    if start < 0 or raw.find(selected, start + 1) >= 0:
+        raise ValueError('Source rendering selected range is ambiguous')
+    args = dict(body_digest=digest_bytes(raw),start_byte=start,end_byte=start+len(selected))
+    terms = source_term_bindings(body,claim.claim,**args)
+    year = (derive_relative_year(body,claim.claim,**args,
+        publication_time=chronology['published_at'],source_updated_time=chronology['updated_at'])
+        if re.search(r'\bnext year\b',claim.claim,re.I) else None)
+    return terms, year
+
+
+def source_rendering_names(claim, body):
+    from .native_source_term_bindings import source_term_bindings
+    from .evidence import bounded_named_entities
+    from newsroom.authority.canonical import digest_bytes
+    raw, selected = body.encode(), claim.claim.encode()
+    start = raw.find(selected)
+    if start < 0 or raw.find(selected,start+1) >= 0:
+        raise ValueError('Source rendering selected range is ambiguous')
+    known = bounded_named_entities(claim.claim,source_context=body)
+    terms = source_term_bindings(body,claim.claim,body_digest=digest_bytes(raw),start_byte=start,end_byte=start+len(selected))
+    names = {name for name,_kind in known}
+    return known | frozenset((name,'SOURCE_LITERAL')for name,_kind,_start,_end in terms if name not in names)
+
+
+def _semantic_witness_inputs(qualification, claim, package, binding):
+    """Full Source plus exact ranges; never shortened lexical witness keys."""
+    from .evidence import SEMANTIC_WITNESS_CONTRACT
+    from newsroom.increment10.evidence import _base_package
+    base = _base_package(package)
+    if (binding.get('candidate_id') != base.candidate_id
+            or binding.get('content_digest') != base.digest
+            or binding.get('evidence_package_digest') != base.digest
+            or binding.get('coverage') != 'COMPLETE'
+            or binding.get('newness') not in {'KNOWN_CHANGE', 'SOURCE_DECLARED_FIRST_PUBLICATION'}
+            or not binding.get('candidate_version_id') or not binding.get('hypothesis_digest')
+            or not 0 <= claim.passage_index < len(base.passages)
+            or claim.source_ids != (base.source_ids[claim.passage_index],)
+            or qualification.governed_claim_id != claim.claim_id):
+        raise ValueError('semantic witness Source binding differs')
+    current = binding.get('current_scope')
+    if (type(current) is not dict or tuple(row.get('source_id') for row in current.get('sources', ())) != base.source_ids
+            or tuple(row.get('body') for row in current['sources']) != base.passages):
+        raise ValueError('semantic witness complete current Source differs')
+    source = base.passages[claim.passage_index]
+    raw, selected = source.encode(), claim.claim.encode()
+    first = raw.find(selected)
+    preceding = raw[:first].rstrip(b' \t') if first >= 0 else b''
+    if (first < 0 or raw.find(selected, first + 1) >= 0 or claim.supporting_excerpt != claim.claim
+            or preceding and preceding[-1:] not in {b'\n', b'.', b'!', b'?'}
+            or first + len(selected) < len(raw) and raw[first + len(selected):].lstrip(b' \t')[:1] != b'\n'
+                and selected[-1:] not in {b'.', b'!', b'?'}):
+        raise ValueError('semantic witness exact range differs')
+    fields = dict(qualification.test_evidence)
+    from .admission import _QUALIFICATION_CLASSIFIER_FIELDS
+    if any(value not in claim.claim for key, value in fields.items() if key not in _QUALIFICATION_CLASSIFIER_FIELDS):
+        raise ValueError('semantic witness field is outside selected Source')
+    # Rendering is deliberately absent: localisation never changes qualification.
+    state = {'sources': [{'source_id': identity, 'text': text}
+                         for identity, text in zip(base.source_ids, base.passages, strict=True)],
+        'claim': {'claim_id': claim.claim_id, 'source_id': claim.source_ids[0],
+            'range': {'start_byte': first, 'end_byte': first + len(selected)},
+            'parent_range': {'start_byte': 0, 'end_byte': len(raw)},
+            'claim_role': claim.claim_role, 'status': str(claim.status)},
+        'test': qualification.test.value, 'fields': fields,
+        'newness': binding['newness'], 'current': {'sources': [{k:v for k,v in row.items() if k != 'body'}for row in current['sources']]},
+        'prior': binding.get('prior_scope'), 'first_publication': binding.get('first_publication')}
+    question_id = 'criterion'
+    from .qualification_rubrics import RUBRICS, TEMPORAL_RULES
+    rubric = RUBRICS[qualification.test.value]
+    questions = {question_id: {'type': 'choice', 'instructions': {
+        'task': 'Verify the proposed qualification criterion and every supplied field against the exact selected range in complete Source/parent context. '
+                'No fixed English subject/verb vocabulary is required. Do not remove negation, conditions or future modality. '
+                'A confirmed announcement is not an already-effective rule; another category requires a separate answer.',
+        **rubric, 'temporal_and_source_rules': TEMPORAL_RULES,
+        'required_witness_fields': list(fields)},
+        'criteria': {'YES': 'Every required field and the exact selected assertion establish this criterion with newly confirmed material information.',
+            'NO': 'Wrong criterion, missing field, unsupported relation, hypothetical intention or contradicted/incomplete parent.',
+            'UNCERTAIN': 'Semantic support, newness, parent condition or required field remains unresolved.'}}}
+    inputs = {'state': state, 'questions': questions, 'source_binding': binding,
+        'cycle_id': digest_canonical([SEMANTIC_WITNESS_CONTRACT, binding, state, questions]),
+        'caller_identity': 'NATIVE_ASSESSOR', 'candidate_id': base.candidate_id,
+        'hypothesis_digest': binding['hypothesis_digest']}
+    return inputs
+
+
+class NativeSemanticWitnesses:
+    """One existing TypeSafe phase; authenticated reads are required at every use."""
+    def __init__(self, *, judgments, candidate_for, proof, require_current, parent_reader=None):
+        from .typesafe_judgment import TypesafeJudgment
+        if type(judgments) is not TypesafeJudgment or not callable(candidate_for) or not callable(require_current):
+            raise TypeError('concrete semantic witness authority required')
+        self.judgments, self.candidate_for, self.proof, self.require_current = judgments, candidate_for, proof, require_current
+        self.parent_reader = parent_reader
+
+    def evaluate(self, qualification, claim, package, binding):
+        from .evidence import SEMANTIC_WITNESS_CONTRACT
+        self.require_current()
+        inputs = _semantic_witness_inputs(qualification, claim, package, binding)
+        self._read_parent(qualification, claim, package, binding, self.candidate_for(binding['candidate_version_id']))
+        ref = self.judgments.evaluate(**inputs, proof=self.proof)
+        value = tuple(sorted({'contract': SEMANTIC_WITNESS_CONTRACT, 'question_id': 'criterion',
+            'invocation_id': ref.invocation_id, 'raw_admission_id': str(ref.raw_admission_id),
+            'receipt_admission_id': str(ref.receipt_admission_id)}.items()))
+        from dataclasses import replace
+        checked = replace(qualification, semantic_witness_ref=value)
+        if not self.read(checked, claim, package):
+            raise ValueError('semantic witness is not affirmatively verified')
+        return value
+
+    def _read_parent(self, qualification, claim, package, binding, candidate):
+        from newsroom.increment10.evidence import _base_package
+        if 'source_qualification_reference' in binding:
+            from .native_source_qualification_consumer import NativeQualifiedSourceConsumer
+            if (getattr(self.parent_reader, '__func__', None) is not NativeQualifiedSourceConsumer.read_semantic_parent
+                    or type(getattr(self.parent_reader, '__self__', None)) is not NativeQualifiedSourceConsumer):
+                raise ValueError('semantic witness original qualification reader absent')
+            parent = self.parent_reader(binding, candidate, _base_package(package), proof=self.proof)
+            original = json.loads(parent['materialised_text'])['package']
+            selected = next((row for row in original['governed_claims'] if row['claim_id'] == claim.claim_id), None)
+            proposed = next((row for row in original['qualification_evidence']
+                if row['governed_claim_id'] == claim.claim_id and row['test'] == qualification.test.value), None)
+            if (not original['substantive_new_information'] or selected is None or proposed is None
+                    or selected['claim'] != claim.claim or selected['claim_role'] != claim.claim_role
+                    or selected['status'] != str(claim.status) or selected['source_ids'] != list(claim.source_ids)
+                    or proposed['test_evidence'] != dict(qualification.test_evidence)):
+                raise ValueError('semantic witness original qualification differs')
+
+    def read(self, qualification, claim, package):
+        if qualification is None:
+            return self._read_source_rendering(claim, package)
+        from .evidence import semantic_witness_reference
+        from .typesafe_judgment import JudgmentReference
+        from newsroom.authority import HydrationRequest
+        self.require_current()
+        value = semantic_witness_reference(qualification.semantic_witness_ref)
+        ref = JudgmentReference(value['invocation_id'], ObjectAdmissionId.parse(value['raw_admission_id']),
+            ObjectAdmissionId.parse(value['receipt_admission_id']))
+        raw = self.judgments.objects.rehydrate(HydrationRequest(ref.receipt_admission_id, 'evidence.record'), proof=self.proof).data
+        record = json.loads(raw)
+        if canonical_json_bytes(record) != raw or record.get('invocation_id') != ref.invocation_id:
+            raise ValueError('semantic witness receipt differs')
+        binding = record['snapshot']['source_binding']
+        candidate = self.candidate_for(binding['candidate_version_id'])
+        if (candidate.version_id != binding['candidate_version_id']
+                or candidate.candidate_id != package.candidate_id
+                or candidate.governing_manifest.hypothesis_id != package.hypothesis_id
+                or candidate.governing_manifest.canonical_digest != binding.get('hypothesis_digest')):
+            raise ValueError('semantic witness current Candidate differs')
+        self._read_parent(qualification, claim, package, binding, candidate)
+        inputs = _semantic_witness_inputs(qualification, claim, package, binding)
+        if value['question_id'] != 'criterion':
+            raise ValueError('semantic witness question differs')
+        verified = self.judgments.read(ref, **inputs, proof=self.proof)
+        return (verified.get('outcome') == 'TYPESAFE_COMPLETE'
+                and verified['answers']['criterion'].get('choice') == 'YES')
+
+    def _read_source_rendering(self, claim, package):
+        from .evidence import source_rendering_reference, _localised_fact_is_bound
+        from .native_source_qualification import VERSION as QA_VERSION
+        from .native_source_qualification_consumer import NativeQualifiedSourceConsumer
+        from newsroom.increment10.evidence import _base_package
+        self.require_current()
+        value = source_rendering_reference(claim.source_rendering_ref)
+        if (getattr(self.parent_reader,'__func__',None) is not NativeQualifiedSourceConsumer.read_semantic_parent
+                or type(getattr(self.parent_reader,'__self__',None)) is not NativeQualifiedSourceConsumer):
+            raise ValueError('Source rendering parent reader absent')
+        raw = self.judgments.objects.rehydrate(HydrationRequest(ObjectAdmissionId.parse(value['receipt_admission_id']),
+            'evidence.record'),proof=self.proof).data
+        receipt = json.loads(raw)
+        if canonical_json_bytes(receipt) != raw or receipt.get('version') != QA_VERSION:
+            raise ValueError('Source rendering parent receipt differs')
+        binding = {**receipt['source_binding'],'source_qualification_reference':{key:value[key]for key in
+            ('invocation_id','raw_admission_id','receipt_admission_id')}}
+        candidate = self.candidate_for(binding['candidate_version_id'])
+        if candidate.governing_manifest.hypothesis_id != package.hypothesis_id:
+            raise ValueError('Source rendering Candidate differs')
+        parent = self.parent_reader(binding,candidate,_base_package(package),proof=self.proof)
+        document = json.loads(parent['materialised_text'])['package']
+        original = next((row for row in document['governed_claims'] if row['claim_id'] == claim.claim_id),None)
+        if (not document['substantive_new_information'] or original is None or any(original[key] != getattr(claim,key)
+                for key in ('claim','supporting_excerpt','claim_role','passage_index'))
+                or original['status'] != str(claim.status) or original['source_ids'] != list(claim.source_ids)
+                or original['quotations'] != list(claim.quotations)):
+            raise ValueError('Source rendering original claim differs')
+        body = package.passages[claim.passage_index]
+        chronology = binding['current_scope']['sources'][claim.passage_index]
+        terms, year = source_rendering_details(claim,body,chronology)
+        expected_names = source_rendering_names(claim,body)
+        if frozenset((name,kind)for name,kind,_ref in claim.named_entity_evidence) != expected_names:
+            raise ValueError('Source rendering literal identities differ')
+        for source,target in claim.localised_factual_expressions:
+            if not _localised_fact_is_bound(source,target,claim.claim,claim.supporting_excerpt,claim.rendered_assertion_zh_hant_hk):
+                if year is None or (source,target) != year[:2] or target not in claim.rendered_assertion_zh_hant_hk:
+                    raise ValueError('Source rendering factual derivation differs')
+        if year is not None and (year[1] not in claim.rendered_assertion_zh_hant_hk
+                or year[:2] not in claim.localised_factual_expressions):
+            raise ValueError('Source rendering anchored year omitted')
+        return True
+
+
+def semantic_witness_reader_is_bound(reader):
+    return (getattr(reader, '__func__', None) is NativeSemanticWitnesses.read
+            and type(getattr(reader, '__self__', None)) is NativeSemanticWitnesses)

@@ -1325,6 +1325,22 @@ class ClaimAuthorityClass(StrEnum):
     INDEPENDENT_RELIABLE = "INDEPENDENT_RELIABLE"
 
 
+SOURCE_RENDERING_CONTRACT = 'newsroom.source-qualified-rendering.v1+newsroom.native-source-term-bindings.v1'
+
+
+def source_rendering_reference(ref):
+    # The locator authenticates a SourceQA parent, never model-supplied truth.
+    if type(ref) is not tuple or any(type(p) is not tuple or len(p) != 2 for p in ref):
+        raise ValueError('Source rendering reference differs')
+    value = dict(ref)
+    if (len(value) != len(ref) or set(value) != {'contract','operation','invocation_id','raw_admission_id','receipt_admission_id'}
+            or value.get('contract') != SOURCE_RENDERING_CONTRACT or value.get('operation') != 'SOURCE_RENDERING'):
+        raise ValueError('Source rendering reference differs')
+    semantic_witness_reference(tuple(sorted({**{k:v for k,v in value.items() if k != 'operation'},
+        'contract':SEMANTIC_WITNESS_CONTRACT,'question_id':'criterion'}.items())))
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class GovernedClaimEvidence:
     claim_id: str
@@ -1354,8 +1370,13 @@ class GovernedClaimEvidence:
     originality_policy_version: str = ORIGINALITY_POLICY_VERSION
     admitted_use: Literal["PUBLICATION_EVIDENCE"] = "PUBLICATION_EVIDENCE"
     policy_version: str = GOVERNED_CLAIM_POLICY_VERSION
+    source_rendering_ref: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
+        if self.source_rendering_ref:
+            source_rendering_reference(self.source_rendering_ref)
+        elif self.source_rendering_ref != ():
+            raise ValueError('Source rendering reference must be immutable')
         required = (
             self.claim_id,
             self.claim,
@@ -1425,6 +1446,7 @@ class GovernedClaimEvidence:
                 "OFFICIAL_TITLE",
                 "OFFICIAL_TERM",
                 "PRODUCT",
+                *({"SOURCE_LITERAL"} if self.source_rendering_ref else set()),
             }
         )
         if (
@@ -1451,11 +1473,9 @@ class GovernedClaimEvidence:
                         and _SOURCE_BOUND_IMMIGRATION_PART_REFERENCE.fullmatch(text)
                     )
                 )
-                or not _has_bounded_named_entity_shape(
-                    text,
-                    entity_type,
-                    source_context=self.claim,
-                )
+                or (not (self.source_rendering_ref and entity_type == "SOURCE_LITERAL" and text in self.claim)
+                    and not _has_bounded_named_entity_shape(
+                        text, entity_type, source_context=self.claim))
                 for text, entity_type, _record_id in self.named_entity_evidence
             )
             or any(
@@ -1492,7 +1512,10 @@ class GovernedClaimEvidence:
                 not _localised_fact_is_bound(
                     source, target, self.claim, self.supporting_excerpt,
                     self.rendered_assertion_zh_hant_hk,
-                )
+                ) and not (self.source_rendering_ref
+                    and re.fullmatch(r"next year", source, re.I)
+                    and re.fullmatch(r"[0-9]{4}年", target)
+                    and source in self.claim and target in self.rendered_assertion_zh_hant_hk)
                 for source, target in self.localised_factual_expressions
             )
         ):
@@ -1549,6 +1572,27 @@ class EvidenceGateEvidence:
             raise ValueError("evidence gate policy version is not supported")
 
 
+SEMANTIC_WITNESS_CONTRACT = "newsroom.qualification-semantic-witness.v1"
+_SEMANTIC_WITNESS_REF_FIELDS = frozenset({"contract", "invocation_id", "raw_admission_id", "receipt_admission_id", "question_id"})
+
+
+def semantic_witness_reference(ref: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    """A closed reference is a locator, never an authenticated YES."""
+    if (type(ref) is not tuple or any(type(pair) is not tuple or len(pair) != 2
+            or any(type(part) is not str for part in pair) for pair in ref)):
+        raise ValueError('semantic witness reference differs')
+    value = dict(ref)
+    if (type(ref) is not tuple or len(value) != len(ref) or set(value) != _SEMANTIC_WITNESS_REF_FIELDS
+            or value.get('contract') != SEMANTIC_WITNESS_CONTRACT
+            or not all(type(v) is str and v for v in value.values())
+            or not re.fullmatch(r'sha256:[0-9a-f]{64}', value['invocation_id'])
+            or len(value['question_id'].encode()) > 256
+            or any(not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', value[k])
+                   for k in ('raw_admission_id', 'receipt_admission_id'))):
+        raise ValueError('semantic witness reference differs')
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class QualificationEvidence:
     test: Evid012QualificationTest
@@ -1556,6 +1600,7 @@ class QualificationEvidence:
     qualification_record_id: str
     test_evidence: tuple[tuple[str, str], ...]
     policy_version: str = EVID_012_POLICY_VERSION
+    semantic_witness_ref: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         try:
@@ -1572,6 +1617,10 @@ class QualificationEvidence:
             raise ValueError("qualification governed claim is required")
         if self.policy_version != EVID_012_POLICY_VERSION:
             raise ValueError("qualification policy version is not supported")
+        if self.semantic_witness_ref:
+            semantic_witness_reference(self.semantic_witness_ref)
+        elif self.semantic_witness_ref != ():
+            raise ValueError("semantic witness reference must be immutable")
         evidence = dict(self.test_evidence)
         if len(evidence) != len(self.test_evidence) or any(
             not key.strip() or not value.strip() for key, value in self.test_evidence
@@ -1807,6 +1856,7 @@ def evidence_package_value(package: EvidencePackage) -> dict[str, object]:
                 ),
                 "admitted_use": item.admitted_use,
                 "policy_version": item.policy_version,
+                **({"source_rendering_ref":source_rendering_reference(item.source_rendering_ref)} if item.source_rendering_ref else {}),
             }
             for item in package.governed_claims
         ],
@@ -1819,6 +1869,7 @@ def evidence_package_value(package: EvidencePackage) -> dict[str, object]:
                     list(value) for value in item.test_evidence
                 ],
                 "policy_version": item.policy_version,
+                **({'semantic_witness_ref': semantic_witness_reference(item.semantic_witness_ref)} if item.semantic_witness_ref else {}),
             }
             for item in package.qualification_evidence
         ],
@@ -2294,7 +2345,9 @@ def validate_governed_evidence_records(
             or record.get("base_package_digest") != base_package_digest
             or record.get("status") != "CURRENT"
             or (not _source_body_provenance_is_bound(record) if record_type=='SOURCE_RECORD'
-                else set(record) != _RECORD_FIELDS_BY_TYPE.get(record_type))
+                else set(record) != (_QUALIFICATION_RECORD_FIELDS | {'semantic_witness_ref'}
+                    if record_type == 'QUALIFICATION_EVIDENCE' and record.get('semantic_witness_ref') is not None
+                    else _RECORD_FIELDS_BY_TYPE.get(record_type)))
         ):
             return None
         records[record_id] = record
@@ -2425,7 +2478,8 @@ def validate_governed_evidence_records(
             rendered_text = claim.rendered_named_entities[index]
             record = records[record_id]
             entity_policy = record.get("policy_version")
-            if entity_policy not in {NAMED_ENTITY_POLICY_VERSION_V15, NAMED_ENTITY_POLICY_VERSION}:
+            if entity_policy not in ({SOURCE_RENDERING_CONTRACT} if entity_type == "SOURCE_LITERAL" and claim.source_rendering_ref
+                    else {NAMED_ENTITY_POLICY_VERSION_V15, NAMED_ENTITY_POLICY_VERSION}):
                 return None
             if record != {
                 "base_package_digest": base_package_digest,
@@ -2502,6 +2556,8 @@ def validate_governed_evidence_records(
             or record.get("test_evidence")
             != [list(item) for item in qualification.test_evidence]
             or record.get("policy_version") != qualification.policy_version
+            or (record.get('semantic_witness_ref') != semantic_witness_reference(qualification.semantic_witness_ref)
+                if qualification.semantic_witness_ref else 'semantic_witness_ref' in record)
             or record.get("evidence_span_digest")
             != digest_bytes(claim.supporting_excerpt.encode("utf-8"))
             or record_id_set(record.get("source_record_ids"))

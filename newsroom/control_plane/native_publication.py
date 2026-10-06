@@ -1289,10 +1289,10 @@ class NativePublicationContinuation:
             not context_only
             and type(semantic_intent) is dict
             and semantic_intent.get('contract') == self._semantic_intent_contract
-            and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
+            and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED' and facts.get('failure_class') == 'EvidencePackageError'
                  or progress.get('stage') == 'EVIDENCE_HOLD'
-                 and facts.get('reason') == 'SEMANTIC_INTENT_INPUT_CHANGED_HOLD')
-            and facts.get('failure_class') == 'EvidencePackageError'
+                 and (facts.get('reason') == 'SEMANTIC_INTENT_INPUT_CHANGED_HOLD' and facts.get('failure_class') == 'EvidencePackageError'
+                      or facts.get('reason') == 'ASSESSOR_RENDERING_CONTRACT_HOLD'))
             and same_assessment_producer(facts.get('assessment_contract_version'), self._assessment_contract_version)
             and facts.get('assessment_contract_version') != self._assessment_contract_version
             and facts.get('retained_qualification_checked_contract') != self._assessment_contract_version

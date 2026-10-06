@@ -90,6 +90,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"{QUALIFICATION_RELATION_POLICY_VERSION}+{RETAINED_ASSESSMENT_POLICY_VERSION}+{PARTITION_VERSION}"
     f"+{QUALIFICATION_CLAUSE_CONSUMER_VERSION}"
     f"+{CONTEXT_MATERIALISATION_VERSION}"
+    "+newsroom.source-qualification-consumer.v1"
 )
 
 TRANSPORT_POLICY = digest_canonical({
@@ -828,26 +829,37 @@ def open_native_pipeline(
                 return localiser.read_localisation(reference, request, proof=proof, **{key: binding[key]
                     for key in ('candidate_id', 'hypothesis_digest', 'evidence_package_digest')})
 
+            from .native_assessor_judgments import NativeSemanticWitnesses
+            semantic_witnesses = NativeSemanticWitnesses(judgments=judgments,
+                candidate_for=runtime.authority.candidate_version, proof=proof, require_current=stop_check)
+            runtime.evidence.semantic_witness_reader = semantic_witnesses.read
             assessor._judgments = NativeAssessorJudgments(judgments=judgments, proof=proof,
                 scope_for=judgment_scope, localise=localise_claims, read_localisation=read_claim_localisation,
                 require_current=stop_check)
+            assessor._judgments.semantic_witness_reader = semantic_witnesses.read
             if source_qualification_policy is not None:
                 from .native_source_qualification import NativeSourceQualifier, VERSION as QUALIFICATION_CONTRACT
                 qualifier = NativeSourceQualifier(usage=usage, objects=runtime.authority.objects,
                     policy=source_qualification_policy, source_fence=judgment_fence, judgments=judgments,
                     implementation_worktree_clean=implementation_worktree_clean, clock=clock)
+                from .native_source_qualification_consumer import NativeQualifiedSourceConsumer
+                qualification_consumer = NativeQualifiedSourceConsumer(qualifier, semantic_witnesses=semantic_witnesses,
+                    localise=localise_claims, read_localisation=read_claim_localisation)
+                semantic_witnesses.parent_reader = qualification_consumer.read_semantic_parent
 
                 def qualify_source(candidate, base, sources, acquired, fallback):
-                    return qualifier.assess(candidate, base, sources, acquired, fallback,
+                    original = qualifier.assess(candidate, base, sources, acquired, fallback,
                         scope=judgment_scope(candidate, base, sources, acquired), proof=proof)
+                    return qualification_consumer.compose_selected(original,candidate,base,sources,acquired,proof=proof)
 
                 assessor._qualification = qualify_source
                 def read_qualified_source(candidate, base, sources, acquired):
                     from .native_source_qualification import QualificationHold
                     from .native_source_qualification_replay import read_current_result
                     try:
-                        return read_current_result(qualifier, candidate, base, sources, acquired,
+                        original = read_current_result(qualifier, candidate, base, sources, acquired,
                             scope=judgment_scope(candidate, base, sources, acquired), proof=proof)
+                        return qualification_consumer.compose_selected(original,candidate,base,sources,acquired,proof=proof)
                     except QualificationHold as exc:
                         raise NativeEvidenceHold(str(exc), sources[0].unit.source_id) from exc
 
