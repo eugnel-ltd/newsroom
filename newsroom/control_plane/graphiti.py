@@ -49,6 +49,7 @@ from newsroom.control_plane.model_usage import (
     WorkEnvelope,
     WorkloadClass,
     native_sdk_reported_token_targets_are_advisory,
+    native_graphiti_usage_cycle_id,
 )
 from newsroom.extraction.types import ExtractionRunId
 from newsroom.control_plane.store import GRAPHITI_MAX_FAILURES, LEDGER_GENESIS
@@ -297,15 +298,31 @@ class GraphitiModelUsageObserver:
             raise ValueError("Graphiti provider attempt number must be positive")
         self._provider_attempt_number = provider_attempt_number
         self._recovered_ambiguous_progression = recovered_ambiguous_progression
-        retry_evidence = getattr(service, "graphiti_ingest_retry_evidence", None)
-        self._retry_evidence = (
-            retry_evidence(
-                ingest_id=self._ingest_obligation_id,
-                before_attempt_number=provider_attempt_number,
+        native_attempt = (
+            envelope.workload_class is WorkloadClass.GRAPHITI_CHAT_PRIMARY
+            and envelope.ingest_id == self._ingest_obligation_id
+            and envelope.graphiti_attempt_id == f"{self._ingest_obligation_id}:{provider_attempt_number}"
+            and envelope.cycle_id == native_graphiti_usage_cycle_id(
+                ingest_id=self._ingest_obligation_id, attempt_number=provider_attempt_number,
             )
-            if provider_attempt_number > 1 and callable(retry_evidence)
-            else None
         )
+        if provider_attempt_number > 1 and native_attempt:
+            # The bounded reader authenticates paid semantic verifiers separately;
+            # their envelopes are not Graphiti leaves or zero-dispatch credits.
+            self._retry_evidence = service.native_graphiti_ingest_retry_evidence_many(
+                failed_attempts={self._ingest_obligation_id: provider_attempt_number - 1},
+                max_attempts=provider_attempt_number - 1,
+            )[self._ingest_obligation_id]
+        else:
+            retry_evidence = getattr(service, "graphiti_ingest_retry_evidence", None)
+            self._retry_evidence = (
+                retry_evidence(
+                    ingest_id=self._ingest_obligation_id,
+                    before_attempt_number=provider_attempt_number,
+                )
+                if provider_attempt_number > 1 and callable(retry_evidence)
+                else None
+            )
         self._proved_pre_dispatch_zero_retry = bool(
             self._retry_evidence is not None
             and getattr(self._retry_evidence, "zero_dispatch_attempts", ())

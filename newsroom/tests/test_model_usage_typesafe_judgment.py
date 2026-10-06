@@ -100,6 +100,22 @@ def _settled_native_graphiti(usage, monkeypatch):
     return cycle
 
 
+
+def _retry_observer(usage, *, native=True, ingest='ingest-1', attempt=2):
+    from datetime import timedelta
+    from newsroom.control_plane.graphiti import GraphitiModelUsageObserver
+    from newsroom.control_plane.model_usage import WorkEnvelope, native_graphiti_usage_cycle_id
+    from newsroom.tests.test_typesafe_judgment import NOW
+    envelope = WorkEnvelope.create(
+        cycle_id=native_graphiti_usage_cycle_id(ingest_id=ingest, attempt_number=attempt) if native else 'generic-retry-fixture',
+        workload_class=WorkloadClass.GRAPHITI_CHAT_PRIMARY, admitted_at=NOW,
+        admission_decision_id=None, candidate_id=None, hypothesis_digest=None,
+        evidence_package_digest=None, ingest_id=ingest, graphiti_attempt_id=f'{ingest}:{attempt}')
+    envelope = usage.resume_or_open_graphiti_envelope(envelope)
+    return GraphitiModelUsageObserver(service=usage, envelope=envelope,
+        clock=lambda: NOW+timedelta(seconds=3), owner_stop_check=lambda: None,
+        ingest_obligation_id=ingest, provider_attempt_number=attempt)
+
 def test_reported_verifier_preserves_already_settled_whole_graphiti_attempt(tmp_path, monkeypatch):
     with _case(tmp_path, monkeypatch) as (engine, inputs, usage, calls, _):
         cycle = _settled_native_graphiti(usage, monkeypatch)
@@ -112,9 +128,14 @@ def test_reported_verifier_preserves_already_settled_whole_graphiti_attempt(tmp_
         after = usage.native_graphiti_ingest_retry_evidence_many(failed_attempts={'ingest-1':1}, max_attempts=1)['ingest-1']
         assert after == before
         assert after.zero_dispatch_attempts == () and len(calls) == 1
+        observer = _retry_observer(usage)
+        assert observer.allows_fresh_completed_rollback_retry(
+            episode_uuid='ingest-1', attempt_number=2, prior_attempt_number=1)
+        assert not observer.allows_fresh_zero_dispatch_retry(episode_uuid='ingest-1', attempt_number=2)
+        assert len(calls) == 1  # Constructor reads retained proof; no new provider work.
 
 
-@pytest.mark.parametrize('corruption', ['unreported', 'missing-terminal', 'terminal-header', 'telemetry', 'context-role', 'context-route'])
+@pytest.mark.parametrize('corruption', ['unreported', 'missing-terminal', 'terminal-header', 'telemetry', 'context-role', 'context-route', 'missing-manifest'])
 def test_unproved_paid_verifier_never_preserves_settlement(tmp_path, monkeypatch, corruption):
     import sqlite3
     import json
@@ -135,6 +156,8 @@ def test_unproved_paid_verifier_never_preserves_settlement(tmp_path, monkeypatch
                     db.execute("UPDATE model_invocation_terminals SET outcome='FOREIGN' WHERE invocation_id=?", (reference.invocation_id,))
                 elif corruption == 'telemetry':
                     db.execute('DELETE FROM model_provider_telemetry WHERE invocation_id=?', (reference.invocation_id,))
+                elif corruption == 'missing-manifest':
+                    db.execute("DELETE FROM model_invocation_context_manifests WHERE context_manifest_digest=(SELECT json_extract(record_json,'$.context_manifest_digest') FROM model_invocation_allocations WHERE invocation_id=?)", (reference.invocation_id,))
                 else:
                     digest = db.execute('SELECT json_extract(record_json,\'$.context_manifest_digest\') FROM model_invocation_allocations WHERE invocation_id=?', (reference.invocation_id,)).fetchone()[0]
                     if corruption == 'context-route':
@@ -147,9 +170,13 @@ def test_unproved_paid_verifier_never_preserves_settlement(tmp_path, monkeypatch
             evidence = usage.native_graphiti_ingest_retry_evidence_many(failed_attempts={'ingest-1':1}, max_attempts=1)['ingest-1']
             assert evidence.settled_provider_attempts == () and evidence.unresolved_attempts == (1,)
             assert evidence.zero_dispatch_attempts == ()
+            observer = _retry_observer(usage)
+            assert not observer.allows_fresh_completed_rollback_retry(
+                episode_uuid='ingest-1', attempt_number=2, prior_attempt_number=1)
+            assert not observer.allows_fresh_zero_dispatch_retry(episode_uuid='ingest-1', attempt_number=2)
         else:
             with pytest.raises(ModelUsageIntegrityError):
-                usage.native_graphiti_ingest_retry_evidence_many(failed_attempts={'ingest-1':1}, max_attempts=1)
+                _retry_observer(usage)
         assert len(calls) == 1
 
 
@@ -253,3 +280,55 @@ def test_source_qualification_nullable_output_is_exact_purpose(workload,provider
     else:
         with pytest.raises(ModelUsageIntegrityError,match='unbounded output'):
             InvocationEfficiencyPolicy.create(**values)
+
+
+@pytest.mark.parametrize('corruption', ['work-outcome', 'internal-request', 'telemetry', 'terminal-header'])
+def test_native_retry_observer_keeps_primary_accounting_required(tmp_path, monkeypatch, corruption):
+    import sqlite3
+    with _case(tmp_path, monkeypatch) as (engine, inputs, usage, calls, _):
+        cycle = _settled_native_graphiti(usage, monkeypatch)
+        inputs.update(caller_identity='GRAPHITI_VERIFIER', candidate_id=None, hypothesis_digest=None,
+            ingest_id='ingest-1', graphiti_attempt_id='ingest-1:1', cycle_id=cycle)
+        engine.evaluate(**inputs)
+        with sqlite3.connect(usage.path) as db:
+            invocation, envelope_id = db.execute('SELECT invocation_id,envelope_id FROM model_invocation_allocations '
+                'WHERE workload_class=?', (WorkloadClass.GRAPHITI_CHAT_PRIMARY.value,)).fetchone()
+            if corruption == 'work-outcome':
+                db.execute('DELETE FROM model_work_outcomes WHERE envelope_id=?', (envelope_id,))
+            elif corruption == 'internal-request':
+                db.execute('DELETE FROM graphiti_internal_requests WHERE invocation_id=?', (invocation,))
+            elif corruption == 'telemetry':
+                db.execute('DELETE FROM model_provider_telemetry WHERE invocation_id=?', (invocation,))
+            else:
+                db.execute("UPDATE model_invocation_terminals SET outcome='FOREIGN' WHERE invocation_id=?", (invocation,))
+        if corruption in {'work-outcome', 'internal-request'}:
+            observer = _retry_observer(usage)
+            assert not observer.allows_fresh_completed_rollback_retry(
+                episode_uuid='ingest-1', attempt_number=2, prior_attempt_number=1)
+            assert not observer.allows_fresh_zero_dispatch_retry(episode_uuid='ingest-1', attempt_number=2)
+        else:
+            with pytest.raises(ModelUsageIntegrityError):
+                _retry_observer(usage)
+        assert len(calls) == 1
+
+
+def test_native_retry_observer_rejects_foreign_verifier_on_selected_cycle(tmp_path, monkeypatch):
+    with _case(tmp_path, monkeypatch) as (engine, inputs, usage, calls, _):
+        cycle = _settled_native_graphiti(usage, monkeypatch)
+        inputs.update(caller_identity='GRAPHITI_VERIFIER', candidate_id=None, hypothesis_digest=None,
+            ingest_id='foreign-ingest', graphiti_attempt_id='foreign-ingest:1', cycle_id=cycle)
+        engine.evaluate(**inputs)
+        with pytest.raises(ModelUsageIntegrityError, match='verifier binding'):
+            _retry_observer(usage)
+        assert len(calls) == 1
+
+
+def test_non_native_observer_keeps_the_generic_reader_contract(tmp_path, monkeypatch):
+    with _case(tmp_path, monkeypatch) as (engine, inputs, usage, calls, _):
+        cycle = _settled_native_graphiti(usage, monkeypatch)
+        inputs.update(caller_identity='GRAPHITI_VERIFIER', candidate_id=None, hypothesis_digest=None,
+            ingest_id='ingest-1', graphiti_attempt_id='ingest-1:1', cycle_id=cycle)
+        engine.evaluate(**inputs)
+        with pytest.raises(ModelUsageIntegrityError, match='envelope binding'):
+            _retry_observer(usage, native=False)
+        assert len(calls) == 1
