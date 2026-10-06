@@ -863,3 +863,13 @@ def test_text_scope_keeps_required_peers_and_visible_excluded_png():
     assert caught.value.unsupported_attachments == (('https://assets.publishing.service.gov.uk/media/example/data.ods','Required spreadsheet'),)
     assert len(caught.value.scope_excluded_assets) == 1
     assert caught.value.scope_excluded_assets[0].mime == 'image/png'
+
+
+@pytest.mark.parametrize('scope',[None,()])
+def test_absent_configured_scope_never_excludes_actual_digital_age_image(scope):
+    raw=_digital_age_root();value=json.loads(raw)
+    with pytest.raises(GovUkContentHold)as caught:
+        parse_govuk_content_document('https://www.gov.uk'+value['base_path'],raw,
+            retrieved_at=datetime(2026,10,6,tzinfo=UTC),extraction_scope=scope)
+    assert caught.value.scope_excluded_assets==()
+    assert len(caught.value.unsupported_attachments)==1

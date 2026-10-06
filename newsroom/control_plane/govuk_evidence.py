@@ -205,7 +205,7 @@ class GovUkEvidenceAcquisition:
         try:
             document = parse_govuk_content_document(
                 request.canonical_url, raw, retrieved_at=retrieved,
-                extraction_scope=version.request.extraction_scope,
+                extraction_scope=getattr(version.request, "extraction_scope", ()),
             )
             body = (document.title + "\n\n" + document.body_text).encode("utf-8")
         except (ValueError, TypeError, KeyError, UnicodeError, etree.ParserError):

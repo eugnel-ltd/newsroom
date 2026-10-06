@@ -93,7 +93,11 @@ def test_actual_catch_stages_preserve_hold_and_expose_only_safe_frame(monkeypatc
             intake._fetch_manual_sections = lambda *a: ()
             monkeypatch.setattr(n, 'declared_spreadsheet', lambda *a, **k: NS(asset_url=asset))
             intake._fetch_declared_assets = lambda *a: ((NS(asset_url=asset), _failed(error)),)
-        intake._parse_complete_item = lambda *a: (_ for _ in ()).throw(hold)
+        def parse_held(_item, _raw, _observed, *, extraction_scope=(), scope_excluded_assets=None):
+            assert extraction_scope == ()
+            assert scope_excluded_assets is None
+            raise hold
+        intake._parse_complete_item = parse_held
         def poll_one(source):
             units, observations, holds = intake._settle_item(source, 'definition', 'version', NS(),
                 item, 'https://www.gov.uk/api/content/item', b'{}', NOW, 'rights')

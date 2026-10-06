@@ -396,7 +396,7 @@ class NativeSourceIntake:
         )]
         try:
             complete = self._parse_complete_item(item, raw, observed,
-                extraction_scope=version.extraction_scope, scope_excluded_assets=scope_excluded_assets)
+                extraction_scope=getattr(version, "extraction_scope", ()), scope_excluded_assets=scope_excluded_assets)
         except NativeSourceIntakeHold as exc:
             if exc.exclusion_signals:
                 return (), tuple(observations), ((
@@ -528,7 +528,7 @@ class NativeSourceIntake:
             try:
                 document = parse_govuk_content_document(
                     canonical_root, raw, retrieved_at=retrieved,
-                    extraction_scope=version.extraction_scope,
+                    extraction_scope=getattr(version, "extraction_scope", ()),
                 )
                 if document.document_type != "guide":
                     raise ValueError("BN(O) source is not a complete guide")
@@ -574,7 +574,7 @@ class NativeSourceIntake:
                     str(item_access.access_decision_id),
                 ))
                 item = self._parse_complete_item(item, item_raw, observed,
-                    extraction_scope=version.extraction_scope, scope_excluded_assets=scope_excluded_assets)
+                    extraction_scope=getattr(version, "extraction_scope", ()), scope_excluded_assets=scope_excluded_assets)
                 units.extend(self._retain_item(
                     source_id, definition_id, version_id, version, item,
                     digest_bytes(item_raw), _utc(observed), rights.record_id,
@@ -1039,7 +1039,7 @@ def native_evidence_sources(
                 version = sources.version_details(
                     SourceDefinitionVersionId.parse(authority.definition_version_id), proof=proof,
                 )
-                return version.request.extraction_scope
+                return getattr(version.request, "extraction_scope", ())
             expected_api_url = (
                 SOURCE_URLS[unit.source_id]
                 if weather
@@ -1141,7 +1141,7 @@ def native_evidence_sources(
                 else:
                     document = parse_govuk_content_document(
                         unit.canonical_url, raw, retrieved_at=retrieved,
-                        extraction_scope=request.extraction_scope,
+                        extraction_scope=getattr(request, "extraction_scope", ()),
                     )
                 matches = (
                     document.title == unit.headline
