@@ -101,16 +101,18 @@ def _settled_native_graphiti(usage, monkeypatch):
 
 
 
-def _retry_observer(usage, *, native=True, ingest='ingest-1', attempt=2):
+def _retry_observer(usage, *, native=True, ingest='ingest-1', attempt=2, extra_bindings=None):
     from datetime import timedelta
     from newsroom.control_plane.graphiti import GraphitiModelUsageObserver
     from newsroom.control_plane.model_usage import WorkEnvelope, native_graphiti_usage_cycle_id
     from newsroom.tests.test_typesafe_judgment import NOW
+    bindings = dict(admission_decision_id=None, candidate_id=None,
+        hypothesis_digest=None, evidence_package_digest=None)
+    bindings.update(extra_bindings or {})
     envelope = WorkEnvelope.create(
         cycle_id=native_graphiti_usage_cycle_id(ingest_id=ingest, attempt_number=attempt) if native else 'generic-retry-fixture',
         workload_class=WorkloadClass.GRAPHITI_CHAT_PRIMARY, admitted_at=NOW,
-        admission_decision_id=None, candidate_id=None, hypothesis_digest=None,
-        evidence_package_digest=None, ingest_id=ingest, graphiti_attempt_id=f'{ingest}:{attempt}')
+        ingest_id=ingest, graphiti_attempt_id=f'{ingest}:{attempt}', **bindings)
     envelope = usage.resume_or_open_graphiti_envelope(envelope)
     return GraphitiModelUsageObserver(service=usage, envelope=envelope,
         clock=lambda: NOW+timedelta(seconds=3), owner_stop_check=lambda: None,
@@ -332,3 +334,20 @@ def test_non_native_observer_keeps_the_generic_reader_contract(tmp_path, monkeyp
         with pytest.raises(ModelUsageIntegrityError, match='envelope binding'):
             _retry_observer(usage, native=False)
         assert len(calls) == 1
+
+
+@pytest.mark.parametrize('field', ['admission_decision_id', 'candidate_id',
+    'hypothesis_digest', 'evidence_package_digest'])
+@pytest.mark.parametrize('value', ['foreign-binding', ''])
+def test_extra_bound_native_cycle_keeps_generic_observer_contract(tmp_path, monkeypatch, field, value):
+    usage = ModelUsageService(str(tmp_path/'usage.sqlite3'))
+    calls = []
+    def generic_reader(**inputs):
+        calls.append(inputs)
+        raise ModelUsageIntegrityError('generic extra-binding fixture')
+    monkeypatch.setattr(usage, 'graphiti_ingest_retry_evidence', generic_reader)
+    monkeypatch.setattr(usage, 'native_graphiti_ingest_retry_evidence_many',
+        lambda **_inputs: pytest.fail('extra-bound envelope is not canonical native work'))
+    with pytest.raises(ModelUsageIntegrityError, match='generic extra-binding fixture'):
+        _retry_observer(usage, extra_bindings={field: value})
+    assert calls == [{'ingest_id': 'ingest-1', 'before_attempt_number': 2}]

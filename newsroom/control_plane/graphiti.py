@@ -300,6 +300,10 @@ class GraphitiModelUsageObserver:
         self._recovered_ambiguous_progression = recovered_ambiguous_progression
         native_attempt = (
             envelope.workload_class is WorkloadClass.GRAPHITI_CHAT_PRIMARY
+            and all(value is None for value in (
+                envelope.admission_decision_id, envelope.candidate_id,
+                envelope.hypothesis_digest, envelope.evidence_package_digest,
+            ))
             and envelope.ingest_id == self._ingest_obligation_id
             and envelope.graphiti_attempt_id == f"{self._ingest_obligation_id}:{provider_attempt_number}"
             and envelope.cycle_id == native_graphiti_usage_cycle_id(
