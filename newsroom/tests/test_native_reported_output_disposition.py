@@ -51,19 +51,21 @@ def _failed(tmp_path, monkeypatch, *, output=20_336, total=None, context=None,
     )
     peer_observer = peer_allocation = None
     if active_peer:
+        peer_unit = _native("independent-active-peer")
+        journal.land((peer_unit,))
         peer_envelope = m.WorkEnvelope.create(
-            cycle_id=_graphiti_usage_cycle_id(unit, attempt_number=2, requested_cycle_id=None),
+            cycle_id=_graphiti_usage_cycle_id(peer_unit, attempt_number=1, requested_cycle_id=None),
             workload_class=m.WorkloadClass.GRAPHITI_CHAT_PRIMARY, admitted_at=T0,
             admission_decision_id=None, candidate_id=None, hypothesis_digest=None,
-            evidence_package_digest=None, ingest_id=unit.ingest_id,
-            graphiti_attempt_id=f'{unit.ingest_id}:2',
+            evidence_package_digest=None, ingest_id=peer_unit.ingest_id,
+            graphiti_attempt_id=f'{peer_unit.ingest_id}:1',
         )
         usage.open_envelope(peer_envelope)
         peer_observer = GraphitiModelUsageObserver(
             service=usage, envelope=peer_envelope, clock=lambda: T0+timedelta(seconds=10),
             owner_stop_check=lambda: None, deadline=T0+timedelta(minutes=3),
-            effective_revision_digest=digest_canonical(asdict(unit.effective_revision)),
-            ingest_obligation_id=unit.ingest_id,
+            effective_revision_digest=digest_canonical(asdict(peer_unit.effective_revision)),
+            ingest_obligation_id=peer_unit.ingest_id,
             call_shape_policy=_load_checked_graphiti_call_shape_policy(
             Path(m.__file__).with_name("native_graphiti_call_shape_policy_v1.json")),
             fallback_policy=_load_checked_graphiti_fallback_circuit_policy(
