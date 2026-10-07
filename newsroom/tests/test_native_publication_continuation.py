@@ -2043,7 +2043,8 @@ def _meaning_acquisition(unit, *, refreshed=False, **changes):
 
 
 @pytest.mark.parametrize('legacy', (False, True))
-def test_future_semantic_input_is_stable_across_fresh_receipts_without_recovering_legacy(tmp_path, monkeypatch, legacy):
+@pytest.mark.parametrize('changed', (False, True))
+def test_future_semantic_input_is_stable_across_fresh_receipts_without_recovering_legacy(tmp_path, monkeypatch, legacy, changed):
     from datetime import UTC, datetime
     from newsroom.control_plane.native_assessor import RetainedAssessorResult
     unit = _native(); source = _source(unit); acquired = [_meaning_acquisition(unit)]
@@ -2077,20 +2078,122 @@ def test_future_semantic_input_is_stable_across_fresh_receipts_without_recoverin
         clock=lambda:UtcTimestamp.parse('2026-09-08T15:00:00Z'))
     try:
         if not legacy: continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
-        acquired[0] = _meaning_acquisition(unit,refreshed=True)
+        acquired[0] = _meaning_acquisition(unit,refreshed=True,
+            **({'body':b'Changed Source.','body_digest':digest_bytes(b'Changed Source.')}if changed else {}))
         result = continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
         retained = journal.current(unit.revision_id)['facts']['semantic_assessment_intent']
         if legacy:
             assert result.reason=='SEMANTIC_INTENT_INPUT_CHANGED_HOLD' and accepted==[]
             assert retained['input_digest']==intent['input_digest'] and 'semantic_input_fingerprint_v2' not in retained
         else:
-            assert len(accepted)==2 and accepted[0]!=accepted[1]
+            assert result.reason==('SEMANTIC_INTENT_INPUT_CHANGED_HOLD'if changed else 'SEMANTIC_ASSESSMENT_ALREADY_ATTEMPTED_HOLD')and len(accepted)==1
             assert retained['semantic_input_fingerprint_v2']['version']=='newsroom.semantic-input-fingerprint.v2'
+            assert retained['assessment_started_at']=='2026-09-08T15:00:00.000000Z'
             assert 'input_digest' not in retained
+            if not changed:
+                after=journal.summary(unit.revision_id)
+                continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+                assert journal.summary(unit.revision_id)==after and len(accepted)==1
         assert retained['origin_invocation_id']=='old-invocation'
         if legacy: assert retained['origin_journal']==intent['origin_journal']
         else: assert all(retained['origin_journal'][key]==old.get(key) for key in retained['origin_journal'])
     finally:connection.close()
+
+
+@pytest.mark.parametrize('failure',['acquisition','stop'])
+def test_semantic_source_failure_before_producer_turn_remains_bounded_retry(tmp_path,monkeypatch,failure):
+    from datetime import UTC,datetime
+    from newsroom.control_plane.native_assessor import RetainedAssessorResult
+    from newsroom.control_plane.veto import VetoError
+    unit=_native();source=_source(unit);item=_meaning_acquisition(unit)
+    connection=connect(str(tmp_path/'pre-producer.sqlite3'));journal=NativeRevisionJournal(connection);journal.land((unit,))
+    old={'candidate_id':'candidate','candidate_version_id':'candidate-version','graphiti_receipts':[{}],
+        'intake_receipt_id':'original-intake','assessment_contract_version':'newsroom.native-evidence-assessor.v23+consumer.v1',
+        'reason':'ACQUISITION_RESULT_NOT_RETAINED','failure_class':'CliTimeoutError','assessment_started_at':'old-origin-start'}
+    journal.advance(unit.revision_id,stage='ASSESSMENT_INTERRUPTED',facts=old)
+    origin=RetainedAssessorResult(RetainedAssessorContractFailure('old-envelope','old-invocation',_DIGEST,_DIGEST,_DIGEST),
+        'newsroom.native-evidence-assessor.v23',_DIGEST,'ASSESSOR_PROVIDER_FAILED',datetime(2026,9,8,tzinfo=UTC),None)
+    calls=[]
+    def acquire(_self,**request):
+        calls.append('Source acquisition')
+        if len(calls)==1:
+            if failure=='stop':raise VetoError('fixture owner stop before semantic producer')
+            raise TimeoutError('fixture acquisition timeout before semantic producer')
+        request['before_semantic_assessment'](SimpleNamespace(digest=_DIGEST),(item,))
+        assert journal.summary(unit.revision_id)['facts']['semantic_assessment_intent']['assessment_started_at']
+        request['before_assessment']()
+        raise NativeEvidenceHold('NO_QUALIFYING_NEW_INFORMATION',unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+    continuation=NativePublicationContinuation(journal=journal,
+        runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),proof=proof(),policies=SimpleNamespace(publication=object())),
+        evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(source,)},
+        semantic_origin_failure=lambda _:origin,semantic_intent_contract='newsroom.native-assessor-judgments.v2',assessment_contract_version=old['assessment_contract_version'])
+    try:
+        if failure=='stop':
+            with pytest.raises(VetoError):continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+        else:assert continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version').reason=='ACQUISITION_TRANSPORT_RETRY'
+        first=journal.summary(unit.revision_id)['facts']
+        assert 'assessment_started_at'not in first['semantic_assessment_intent']
+        assert first['semantic_assessment_intent']['origin_journal']['assessment_started_at']=='old-origin-start'
+        assert continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version').reason=='NO_QUALIFYING_NEW_INFORMATION'
+        assert len(calls)==2
+        settled=journal.summary(unit.revision_id)
+        assert continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version').reason=='NO_QUALIFYING_NEW_INFORMATION'
+        assert journal.summary(unit.revision_id)==settled and len(calls)==2
+    finally:connection.close()
+
+
+@pytest.mark.parametrize('stage',['ASSESSMENT_INTERRUPTED','ASSESSMENT_STARTED'])
+def test_existing_accounted_sourceqa_timeout_cannot_alias_a_fresh_observation(tmp_path,monkeypatch,stage):
+    import sqlite3
+    from datetime import UTC,datetime
+    from newsroom.control_plane.native_assessor import RetainedAssessorResult
+    from newsroom.control_plane.native_publication import _semantic_input_fingerprint_v2
+    from newsroom.tests.test_native_source_qualification import _retained_role_bound_recipe
+    with _retained_role_bound_recipe(tmp_path,monkeypatch,failure='timeout',first_publication=True)as(qualifier,consumer,candidate,base,source,fresh,scope,_old,usage,qa,jev):
+        unit=_native();source.unit.revision_id=unit.revision_id;source.unit.revision_digest=_DIGEST
+        source.source_version.version_id='definition-version'
+        source=NativeEvidenceSource(unit=source.unit,source_version=source.source_version,dependency=source.dependency,rights=source.rights)
+        fresh.request_digest=_DIGEST;fresh.body_origin=''
+        origin=RetainedAssessorResult(RetainedAssessorContractFailure('origin-envelope','origin-invocation',_DIGEST,_DIGEST,_DIGEST),
+            'newsroom.native-evidence-assessor.v23',base.digest,'ASSESSOR_PROVIDER_FAILED',datetime(2026,9,8,tzinfo=UTC),None)
+        intent={'contract':'newsroom.native-assessor-judgments.v2','candidate_version_id':candidate.version_id,
+            'origin_envelope_id':origin.proof.envelope_id,'origin_invocation_id':origin.proof.invocation_id,
+            'origin_allocation_digest':_DIGEST,'origin_terminal_digest':_DIGEST,'origin_context_manifest_digest':_DIGEST,
+            'origin_journal':{'assessment_started_at':'old-origin-start'},
+            'semantic_input_fingerprint_v2':_semantic_input_fingerprint_v2(base,(fresh,),(source,))}
+        connection=connect(str(tmp_path/'qa-alias.sqlite3'));journal=NativeRevisionJournal(connection);journal.land((unit,))
+        facts={'candidate_id':candidate.candidate_id,'candidate_version_id':candidate.version_id,'graphiti_receipts':[{}],
+            'intake_receipt_id':'protected-intake','semantic_assessment_intent':intent,'semantic_acquisition_attempt_count':1,
+            'assessment_started_at':'new-semantic-start','assessment_contract_version':'newsroom.native-evidence-assessor.v23+consumer.v2',
+            'reason':'ACQUISITION_RESULT_NOT_RETAINED','failure_class':'TimeoutError'}
+        journal.advance(unit.revision_id,stage=stage,facts=facts)
+        with sqlite3.connect(usage.path)as db:
+            pins=db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()
+            allocations=db.execute('SELECT invocation_id,record_json FROM model_invocation_allocations ORDER BY invocation_id').fetchall()
+        counts=(len(qa),len(jev));acquired=[]
+        def acquire(_self,**request):
+            acquired.append('fresh Source only')
+            request['before_semantic_assessment'](base,(fresh,))
+            request['before_assessment']()
+            consumer.scope_for=lambda *_:scope
+            fallback=consumer.assess(candidate,base,(source,),(fresh,))
+            qualifier.assess(candidate,base,(source,),(fresh,),fallback,scope=scope,proof=consumer.proof)
+        monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+        class CurrentCandidate(_Authority):
+            def candidate_version(self,_):return candidate
+        continuation=NativePublicationContinuation(journal=journal,
+            runtime=SimpleNamespace(authority=CurrentCandidate(),ingress=object(),publication=_Publication(),proof=proof(),policies=SimpleNamespace(publication=object())),
+            evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(source,)},
+            semantic_origin_failure=lambda _:origin,semantic_intent_contract=intent['contract'],assessment_contract_version=facts['assessment_contract_version'])
+        try:
+            result=continuation.advance(revision_id=unit.revision_id,candidate_version_id=candidate.version_id)
+            assert result.reason=='SEMANTIC_ASSESSMENT_ALREADY_ATTEMPTED_HOLD'
+            assert acquired==['fresh Source only']and(len(qa),len(jev))==counts
+            with sqlite3.connect(usage.path)as db:
+                assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
+                assert db.execute('SELECT invocation_id,record_json FROM model_invocation_allocations ORDER BY invocation_id').fetchall()==allocations
+        finally:connection.close()
 
 
 @pytest.mark.parametrize('changed', ['body', 'request', 'revision', 'definition', 'publisher',

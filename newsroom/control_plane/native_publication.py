@@ -1361,6 +1361,7 @@ class NativePublicationContinuation:
             return self._current_candidate_facts(revision_id, candidate_version_id, candidate_id)
 
         semantic_only = False
+        semantic_already_attempted = False
         semantic_intent = facts.get('semantic_assessment_intent')
         retained_semantic_consumer = (
             not context_only
@@ -1433,6 +1434,18 @@ class NativePublicationContinuation:
                     facts['semantic_assessment_intent'] = semantic_intent
                     progress = self._journal.advance(revision_id, stage='SEMANTIC_ASSESSMENT_PENDING', facts=facts)
                 semantic_only = True
+                # Pre-fix interrupted turns lack the intent-local latch. Do not
+                # mistake the original producer's carried timestamp for a new turn.
+                semantic_already_attempted = bool(semantic_intent.get('assessment_started_at')) or (
+                    progress.get('stage') in {'ASSESSMENT_STARTED','ASSESSMENT_INTERRUPTED'}
+                    and type(facts.get('semantic_acquisition_attempt_count')) is int
+                    and facts['semantic_acquisition_attempt_count'] > 0
+                    and bool(facts.get('assessment_started_at'))
+                    and facts['assessment_started_at'] != semantic_intent['origin_journal'].get('assessment_started_at'))
+
+        if (semantic_only and progress.get('stage') == 'EVIDENCE_HOLD'
+                and (semantic_already_attempted or facts.get('reason') == 'SEMANTIC_ASSESSMENT_ALREADY_ATTEMPTED_HOLD')):
+            return NativePublicationContinuationResult('EVIDENCE_HOLD', facts['reason'], None)
 
         if progress.get("stage") == "COPY_CORRECTION_PREPARED" or (
             progress.get("stage") == "ACKNOWLEDGED"
@@ -1649,16 +1662,21 @@ class NativePublicationContinuation:
                         'acquired': [(item.receipt_digest, item.body_digest) for item in acquired]})
                     if intent['input_digest'] != digest:
                         raise NativeEvidenceHold('SEMANTIC_INTENT_INPUT_CHANGED_HOLD', revision_id)
-                    return
-                fingerprint = _semantic_input_fingerprint_v2(base, acquired, self._sources[revision_id])
-                previous = intent.get('semantic_input_fingerprint_v2')
-                if previous is not None and canonical_json_bytes(previous) != canonical_json_bytes(fingerprint):
-                    raise NativeEvidenceHold('SEMANTIC_INTENT_INPUT_CHANGED_HOLD', revision_id)
-                if previous is None:
-                    intent['semantic_input_fingerprint_v2'] = fingerprint
-                    current['semantic_assessment_intent'] = intent
-                    facts = current
-                    self._journal.advance(revision_id, stage='ACQUISITION_STARTED', facts=current)
+                else:
+                    fingerprint = _semantic_input_fingerprint_v2(base, acquired, self._sources[revision_id])
+                    previous = intent.get('semantic_input_fingerprint_v2')
+                    if previous is not None and canonical_json_bytes(previous) != canonical_json_bytes(fingerprint):
+                        raise NativeEvidenceHold('SEMANTIC_INTENT_INPUT_CHANGED_HOLD', revision_id)
+                    if previous is None:
+                        intent['semantic_input_fingerprint_v2'] = fingerprint
+                if semantic_already_attempted:
+                    raise NativeEvidenceHold('SEMANTIC_ASSESSMENT_ALREADY_ATTEMPTED_HOLD', revision_id)
+                # Enter the producer turn once, before even a cached Jev decision
+                # can lead to paid SourceQA. This is not a dispatch/fee inference.
+                intent['assessment_started_at'] = acquisition_started_at
+                current['semantic_assessment_intent'] = intent
+                facts = current
+                self._journal.advance(revision_id, stage='ACQUISITION_STARTED', facts=current)
 
             def before_assessment() -> None:
                 nonlocal assessment_started, facts
