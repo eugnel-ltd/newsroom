@@ -1061,9 +1061,10 @@ def test_ambiguous_hold_does_not_mint_or_guess_relation_endpoint() -> None:
     held = resolved_mentions[0]
     assert held.attributes["resolution"] == "AMBIGUOUS_HOLD"
     assert held.attributes["resolution_basis"] == "LOW_CONFIDENCE_OR_MARGIN"
-    assert list(held.attributes["considered_canonical_entity_ids"]) == [
+    assert held.attributes["considered_canonical_entity_count"] == 2
+    assert held.attributes["considered_canonical_entity_digest"] == digest_bytes(canonical_json_bytes([
         "canonical:legco-a", "canonical:legco-b",
-    ]
+    ]))
     assert str(held.uuid) not in resolved_identities
     # The accepted empty-effect contract does not persist a leftover entity
     # when its only relation has an ambiguous endpoint.
@@ -1076,3 +1077,64 @@ def test_ambiguous_hold_does_not_mint_or_guess_relation_endpoint() -> None:
     assert proposal["relation_proposals"] == proposal["wire_payload"]["facts"]
     assert all("canonical_identity" not in item for item in proposal["entity_mentions"])
     assert all("source_identity" not in item for item in proposal["relation_proposals"])
+
+
+def test_resolution_diagnostics_do_not_scale_output_with_entire_graph_inventory():
+    candidates = tuple(
+        SimpleNamespace(uuid=f"canonical-{i:032d}", name=f"Entity {i}", attributes={
+            "entity_type_id": "organisation", "permitted_source_ids": ("UK-01",),
+        }) for i in range(2000)
+    )
+    nodes = [SimpleNamespace(uuid=f"mention-{i}", name=f"Entity {i}", attributes={
+        "entity_type_id": "organisation",
+    }) for i in range(6)]
+    resolved, identities, duplicates = resolve_nodes_locally(nodes, candidates, source_id="UK-01")
+    metadata = [node.attributes for node in resolved]
+    # Six ordinary mentions must not consume the 256 KiB extraction output
+    # budget just by repeating the same historic candidate inventory six times.
+    assert len(canonical_json_bytes(metadata)) < 4096
+    expected = digest_bytes(canonical_json_bytes([candidate.uuid for candidate in candidates]))
+    for i, attributes in enumerate(metadata):
+        assert attributes["resolution"] == "DETERMINISTIC_EXISTING_NODE"
+        assert attributes["canonical_identity"] == candidates[i].uuid
+        assert attributes["considered_canonical_entity_count"] == len(candidates)
+        assert attributes["considered_canonical_entity_digest"] == expected
+        assert "considered_canonical_entity_ids" not in attributes
+    assert identities == {node.uuid: candidates[i].uuid for i, node in enumerate(nodes)}
+    assert duplicates == []
+
+    from newsroom.graphiti_adapter.combined_temporal_pipeline import _durable_receipt
+    edge = SimpleNamespace(uuid="relation", source_node_uuid=nodes[0].uuid,
+                           target_node_uuid=nodes[1].uuid, fact_embedding=[0.1], attributes={})
+    receipt = _durable_receipt(
+        {"proposal_receipt": {"entity_mentions": [{} for _ in nodes], "relation_proposals": [{}]}},
+        nodes=resolved, edges=[edge], resolutions=tuple(a["resolution"] for a in metadata),
+        chat_invocations=[], embedding_usage={},
+    )
+    assert len(canonical_json_bytes(receipt)) < 4096
+    for mention in receipt["proposal_receipt"]["entity_mentions"]:
+        proof = mention["entity_resolution_proposal"]
+        assert proof["considered_canonical_entity_count"] == len(candidates)
+        assert proof["considered_canonical_entity_digest"] == expected
+        assert "considered_canonical_entity_ids" not in proof
+
+
+def test_legacy_resolution_inventory_is_compacted_when_sealing_new_receipt():
+    from newsroom.graphiti_adapter.combined_temporal_pipeline import _durable_receipt
+    identifiers = ["existing-a", "existing-b"]
+    node = SimpleNamespace(uuid="mention", attributes={
+        "considered_canonical_entity_ids": identifiers,
+        "resolution_basis": "MULTIPLE_EXACT_OR_GOVERNED_MATCHES",
+    })
+    receipt = _durable_receipt(
+        {"proposal_receipt": {"entity_mentions": [{}], "relation_proposals": []}},
+        nodes=[node], edges=[], resolutions=("AMBIGUOUS_HOLD",),
+        chat_invocations=[], embedding_usage={},
+    )
+    mention = receipt["proposal_receipt"]["entity_mentions"][0]
+    assert mention["canonical_identity"] is None
+    proof = mention["entity_resolution_proposal"]
+    assert proof["considered_canonical_entity_count"] == 2
+    assert proof["considered_canonical_entity_digest"] == digest_bytes(canonical_json_bytes(identifiers))
+    assert "considered_canonical_entity_ids" not in proof
+    assert node.attributes["considered_canonical_entity_ids"] == identifiers

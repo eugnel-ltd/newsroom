@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from newsroom.authority.canonical import digest_canonical
 from newsroom.graphiti_adapter.edge_guard import guard_extracted_edges
 from newsroom.graphiti_adapter.neo4j_guard import GuardState, Neo4jMutationGuard
 
@@ -105,6 +106,10 @@ def _durable_receipt(
         if not isinstance(raw, Mapping):
             raise ValueError("entity mention receipt is malformed")
         item = dict(raw)
+        attributes = getattr(node, "attributes", {}) or {}
+        # Legacy in-memory callers may still carry the list. New records retain
+        # its exact commitment, not an ever-growing graph inventory per mention.
+        considered = attributes.get("considered_canonical_entity_ids", ())
         item.update(
             {
                 "canonical_identity": (
@@ -123,10 +128,11 @@ def _durable_receipt(
                     "basis": (getattr(node, "attributes", {}) or {}).get(
                         "resolution_basis"
                     ),
-                    "considered_canonical_entity_ids": list(
-                        (getattr(node, "attributes", {}) or {}).get(
-                            "considered_canonical_entity_ids", ()
-                        )
+                    "considered_canonical_entity_count": attributes.get(
+                        "considered_canonical_entity_count", len(considered)
+                    ),
+                    "considered_canonical_entity_digest": attributes.get(
+                        "considered_canonical_entity_digest", digest_canonical(list(considered))
                     ),
                     "provider_leaf_count": 0,
                 },
