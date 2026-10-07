@@ -133,7 +133,7 @@ def test_codec_real_denial_and_sequence_sql_remain_indexed(tmp_path,monkeypatch)
         assert c.execute('SELECT max(ledger_seq) FROM ledger_events').fetchone()[0]>row[4]
 
 
-@pytest.mark.parametrize('identifier',('legacy:opaque',str(uuid.uuid5(uuid.NAMESPACE_URL,'fixture')),str(uuid.uuid4()).upper()))
+@pytest.mark.parametrize('identifier',('legacy:opaque',str(uuid.uuid5(uuid.NAMESPACE_URL,'fixture')),'12345678-1234-4ABC-8ABC-123456789ABC'))
 def test_codec_never_relabels_legally_stored_noncanonical_text(tmp_path,identifier):
     from newsroom.authority.native_marker_codec_migrations import initialise_empty_codec_store,insert_markers,marker_rows,encode_identity
     c=sqlite3.connect(tmp_path/'opaque.sqlite3',isolation_level=None)
