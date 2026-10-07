@@ -16,6 +16,17 @@ CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v2'
 PAID_BINDING_VERSION = 'newsroom.source-qualification-consumer.v1'
 
 
+def current_source_passage(source):
+    """Reproduce the paid text recipe only from an already verified CURRENT Source."""
+    from .govuk_evidence import _api_url
+    unit=source.unit
+    if unit.source_id in {'HK-02','UK-10'}:
+        raise ValueError('CURRENT weather paid projection is unsupported')
+    # GOV.UK Content API, PDF and spreadsheet acquisitions share this recipe.
+    _api_url(unit.canonical_url)
+    return unit.headline+'\n\n'+unit.body
+
+
 class NativeQualifiedSourceConsumer:
     def __init__(self, qualifier, *, semantic_witnesses, localise, read_localisation):
         self.qualifier, self.objects = qualifier, qualifier.objects
@@ -34,7 +45,7 @@ class NativeQualifiedSourceConsumer:
         return self.qualifier.read_qualification(reference, state, proof=proof, candidate_id=candidate.candidate_id,
             hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest)['materialisation']
 
-    def read_current_disposition(self, candidate, base, sources, *, proof):
+    def read_current_disposition(self, candidate, base, sources, *, proof, source_passages=None):
         """Proof-only retained CURRENT projection, not external-now acquisition."""
         import sqlite3,time
         from pathlib import Path
@@ -56,10 +67,13 @@ class NativeQualifiedSourceConsumer:
         raw=self.objects.rehydrate(HydrationRequest(admitted.admission.admission_id,'evidence.record'),proof=proof).data
         receipt=json.loads(raw);binding=receipt['source_binding']
         if canonical_json_bytes(receipt)!=raw or receipt['version']!=VERSION:return None
+        passages=tuple(source.unit.body for source in sources)if source_passages is None else tuple(current_source_passage(source)for source in sources)
+        if source_passages is not None and source_passages!=passages:return None
+        if type(passages)is not tuple or len(passages)!=len(sources) or passages!=base.passages:return None
         current=binding.get('current_scope',{}).get('sources',[])
-        if (len(current)!=len(sources) or any(row['source_id']!=source.unit.source_id or row['body']!=source.unit.body
+        if (len(current)!=len(sources) or any(row['source_id']!=source.unit.source_id or row['body']!=passage
                 or row['published_at']!=source.unit.published_at or row['updated_at']!=source.unit.updated_at
-                for row,source in zip(current,sources,strict=True))):return None
+                for row,source,passage in zip(current,sources,passages,strict=True))):return None
         pins=binding.get('source_currentness',[])
         if len(pins)!=len(sources) or any(row['definition_id']!=str(source.unit.authority.definition_id)
                 or row['definition_version_id']!=str(source.unit.authority.definition_version_id)

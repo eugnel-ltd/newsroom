@@ -845,20 +845,21 @@ def open_native_pipeline(
                 qualifier = NativeSourceQualifier(usage=usage, objects=runtime.authority.objects,
                     policy=source_qualification_policy, source_fence=judgment_fence, judgments=judgments,
                     implementation_worktree_clean=implementation_worktree_clean, clock=clock)
-                from .native_source_qualification_consumer import NativeQualifiedSourceConsumer
+                from .native_source_qualification_consumer import NativeQualifiedSourceConsumer, current_source_passage
                 qualification_consumer = NativeQualifiedSourceConsumer(qualifier, semantic_witnesses=semantic_witnesses,
                     localise=localise_claims, read_localisation=read_claim_localisation)
                 semantic_witnesses.parent_reader = qualification_consumer.read_semantic_parent
                 def semantic_witness_disposition_reader(candidate,sources):
                     # Already checked retained CURRENT Source projection, not a
                     # new observation or external-now freshness assertion.
+                    passages=tuple(current_source_passage(source)for source in sources)
                     base=EvidencePackage(candidate_id=candidate.candidate_id,hypothesis_id=candidate.governing_manifest.hypothesis_id,
                         lead_ids=tuple(row.lead_id for row in candidate.governing_manifest.lead_signal_bindings),
                         signal_ids=tuple(row.signal_id for row in candidate.governing_manifest.lead_signal_bindings),
                         source_ids=tuple(source.unit.source_id for source in sources),
-                        passages=tuple(source.unit.body for source in sources),
-                        observation_digests=tuple(digest_bytes(source.unit.body.encode())for source in sources))
-                    qualification_consumer.read_current_disposition(candidate,base,sources,proof=proof)
+                        passages=passages,
+                        observation_digests=tuple(digest_bytes(passage.encode())for passage in passages))
+                    qualification_consumer.read_current_disposition(candidate,base,sources,proof=proof,source_passages=base.passages)
 
 
                 def qualify_source(candidate, base, sources, acquired, fallback):

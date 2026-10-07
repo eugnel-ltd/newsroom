@@ -144,7 +144,7 @@ def test_semantic_witness_negative_boundaries_are_fail_closed(tmp_path,monkeypat
 
 
 @contextmanager
-def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False):
+def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False, title_body_layout=False):
     """Genuine disposable QA/TypeSafe/localiser ledgers and CAS; synthetic answers."""
     from newsroom.tests.test_native_assessor_judgments import _case as typed_case
     from newsroom.control_plane.native_assessor_judgments import JudgmentFallback
@@ -164,7 +164,7 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
     supporting = ('The SEND programme is delivered by Ambition Institute and charity Dingley’s Promise.'
         if fault=='terms' else 'The SEND programme is delivered by charity Dingley’s Promise, under the name “Dingley’s Promise”.'
         if fault=='quoted-terms' else 'The materials are now available to households.')
-    body=headline+'\n'+supporting
+    body=headline+('\n\n'if title_body_layout else'\n')+supporting
     with typed_case(tmp_path,monkeypatch,max_prompt_bytes=7000,body=body) as (consumer,service,candidate,base,source,acquired,usage,jev_calls):
         if candidate_binding is not None:
             candidate=candidate_binding
@@ -191,13 +191,24 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
             scope['source_currentness']=[{'source_id':source.unit.source_id,'definition_id':source.unit.authority.definition_id,
                 'definition_version_id':source.unit.authority.definition_version_id}]
         consumer.scope_for=lambda *_:scope
+        if title_body_layout:
+            original_transport=service.transport
+            def roles_with_separator(request,**kwargs):
+                status,url,raw=original_transport(request,**kwargs)
+                value=json.loads(raw)
+                if 'S1L2'in value['answers']:
+                    for key,choice in (('S1L2','BACKGROUND'),('S1L3','SUPPORTING')):
+                        answer=value['answers'][key];answer['choice']=choice
+                        answer['probabilities']={role:int(role==choice)for role in json.loads(request.data)['questions'][key]['criteria']}
+                return status,url,json.dumps(value).encode()
+            service.transport=roles_with_separator
         fallback=consumer.assess(candidate,base,(source,),(acquired,))
         assert isinstance(fallback,JudgmentFallback) and fallback.reason=='JUDGMENT_INPUT_BOUND',fallback
         wire={'package':{'select_new_information':True,'governed_claims':[
             {'claim_role':role,'status':'CONFIRMED_FACT','source_range':{'first_span_id':span,'last_span_id':span},
              'rendered_assertion_zh_hant_hk_fragments':[render], 'factual_localisations':[],'quotation_source_keys':[]}
             for role,span,render in [('HEADLINE','S1L1','Teaching materials available.' if malformed_rendering else '學校現時獲提供全額資助嘅實用教育教材。'),
-                                    ('SUBSTANTIVE','S1L2','教材現時可供家庭使用。')]],
+                                    ('SUBSTANTIVE','S1L3'if title_body_layout else'S1L2','教材現時可供家庭使用。')]],
             'qualification_evidence':[{'test':'HOUSEHOLD_PRACTICAL_EFFECT','claim_index':0,
                 'test_evidence':{'domain':'EDUCATION','event_polarity':'AFFIRMED','effect_relation':'MATERIAL_PRACTICAL_EFFECT',
                     'material_relation_span_source_lookup_key':body.split('\n')[0], 'practical_effect_source_lookup_key':body.split('\n')[0]}}],
@@ -672,3 +683,53 @@ def test_unsettled_or_drifted_semantic_witness_is_never_a_no_disposition(tmp_pat
                 assert captured.value.reason_code=='QUALIFICATION_SEMANTIC_WITNESS_UNKNOWN_HOLD'
                 assert not hasattr(captured.value,'semantic_witness_disposition')
         assert len(calls)==1
+
+
+@pytest.mark.parametrize('fault',['NO','body-change','title-change','definition-change','forged-projection'])
+def test_current_disposition_uses_exact_govuk_title_and_body_paid_projection(tmp_path,monkeypatch,fault):
+    """Intake keeps title apart; paid GOV.UK acquisition combines both exactly."""
+    import sqlite3
+    from newsroom.control_plane.native_source_qualification_consumer import current_source_passage
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    with _selected_qualification_case(tmp_path,monkeypatch,fault='NO',retained_current=True,title_body_layout=True)as(q,w,old,c,b,s,a,scope,auth,usage,qa,jev,render):
+        with pytest.raises(NativeEvidenceHold,match='QUALIFICATION_SEMANTIC_WITNESS_NO'):
+            q.compose_selected(old,c,b,(s,),(a,),proof=auth)
+        paid_body=b.passages[0]
+        s.unit.headline,s.unit.body=paid_body.split('\n\n',1)
+        s.unit.item_key='fixture-policy'
+        s.unit.canonical_url='https://www.gov.uk/government/news/fixture-policy'
+        s.source_version.request.locator='https://www.gov.uk/search/all.atom'
+        assert current_source_passage(s)==paid_body
+        with sqlite3.connect(usage.path)as db:
+            pins=db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()
+        counts=(len(qa),len(jev),len(render))
+        monkeypatch.setattr(w.judgments,'evaluate',lambda **_k:pytest.fail('disposition evaluated model'))
+        monkeypatch.setattr(q.qualifier,'qualify',lambda *_a,**_k:pytest.fail('disposition retried QA'))
+        if fault=='body-change':s.unit.body+='Changed.'
+        elif fault=='title-change':s.unit.headline='Changed title'
+        elif fault=='definition-change':s.unit.authority.definition_version_id='different-current-version'
+        elif fault=='forged-projection':s.unit.body+='Changed.'
+        if fault=='NO':
+            with pytest.raises(NativeEvidenceHold,match='QUALIFICATION_SEMANTIC_WITNESS_NO'):
+                q.read_current_disposition(c,b,(s,),proof=auth,source_passages=(current_source_passage(s),))
+        else:assert q.read_current_disposition(c,b,(s,),proof=auth,source_passages=b.passages if fault=='forged-projection'else(current_source_passage(s),))is None
+        assert (len(qa),len(jev),len(render))==counts
+        with sqlite3.connect(usage.path)as db:
+            assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
+
+
+@pytest.mark.parametrize('route',['govuk','weather-hk','weather-uk','pdf','spreadsheet','wrong-host'])
+def test_current_paid_text_projection_matches_the_existing_acquisition_router(route):
+    from types import SimpleNamespace
+    from newsroom.control_plane.native_source_qualification_consumer import current_source_passage
+    unit=SimpleNamespace(source_id='UK-05',canonical_url='https://www.gov.uk/government/news/fixture',
+        item_key='fixture',headline='Exact title',body='Exact body')
+    if route=='weather-hk':unit.source_id='HK-02'
+    elif route=='weather-uk':unit.source_id='UK-10'
+    elif route in {'pdf','spreadsheet'}:
+        unit.item_key=digest_bytes(b'parent')+'|https://assets.publishing.service.gov.uk/fixture.'+('pdf'if route=='pdf'else'csv')
+    elif route=='wrong-host':unit.canonical_url='https://unrelated.invalid/fixture'
+    source=SimpleNamespace(unit=unit)
+    if route in {'wrong-host','weather-hk','weather-uk'}:
+        with pytest.raises(ValueError):current_source_passage(source)
+    else:assert current_source_passage(source)=='Exact title\n\nExact body'
