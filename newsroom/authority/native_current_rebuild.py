@@ -310,12 +310,14 @@ def copy_selected_native_store(store, destination: sqlite3.Connection, *, roots,
             WHERE NOT EXISTS(SELECT 1 FROM temp._native_rebuild_selected_events s WHERE s.event_id=e.event_id)''')
         while batch:=reservations.fetchmany(256):
             if any(row[0] is None or row[1] is None for row in batch):raise AuthorityPersistenceError('old key reservation is absent')
-            destination.executemany('INSERT INTO native_expired_command_keys VALUES(?,?,?,?,?,?,?,?,?)',batch)
+            from .native_marker_codec_migrations import insert_markers
+            insert_markers(destination,batch)
             counts['native_expired_command_keys']+=len(batch)
         source.execute('DROP TABLE temp._native_rebuild_selected_events')
         if store._native_checkpoint_schema:
-            for row in source.execute('SELECT * FROM native_expired_command_keys'):
-                destination.execute('INSERT INTO native_expired_command_keys VALUES(?,?,?,?,?,?,?,?,?)',tuple(row))
+            from .native_marker_codec_migrations import marker_rows,insert_markers
+            for row in marker_rows(source):
+                insert_markers(destination,(row,))
                 counts['native_expired_command_keys']+=1
         seq=source.execute("SELECT seq FROM sqlite_sequence WHERE name='ledger_events'").fetchone()
         if seq is not None:

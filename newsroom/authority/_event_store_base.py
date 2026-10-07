@@ -73,6 +73,7 @@ class _EventStoreBase:
 
     _current_state_only = False
     _native_checkpoint_schema = False
+    _native_marker_codec = False
 
     def __init__(
         self,
@@ -233,10 +234,11 @@ class _EventStoreBase:
         conn = self._connection
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         tables = self._table_names()
-        if version in (44,45) and self._current_state_only:
+        if version in (44,45,46) and self._current_state_only:
             from .native_current_checkpoint_migrations import require_checkpoint_schema
             require_checkpoint_schema(conn)
             self._native_checkpoint_schema = True
+            self._native_marker_codec = version == 46
             self._validate_schema_and_integrity()
             return
         if version > SCHEMA_VERSION:
@@ -522,7 +524,10 @@ class _EventStoreBase:
 
     def _require_unexpired_key(self, conn, namespace: str, key: str) -> None:
         if self._native_checkpoint_schema and conn.execute(
-            'SELECT 1 FROM native_expired_command_keys WHERE namespace=? AND key=?', (namespace,key)
+            ('SELECT 1 FROM native_marker_namespaces n CROSS JOIN native_expired_command_keys m '
+             'ON m.namespace_id=n.namespace_id WHERE n.namespace=? AND m.key=?'
+             if self._native_marker_codec else
+             'SELECT 1 FROM native_expired_command_keys WHERE namespace=? AND key=?'), (namespace,key)
         ).fetchone() is not None:
             raise DiagnosticHistoryExpired('command diagnostic history expired; identity remains reserved')
         row = conn.execute(

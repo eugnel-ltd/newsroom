@@ -171,10 +171,17 @@ class _EventStoreReadMixin:
             tuple(values),
         ).fetchone()
         if row is None:
+            marker_query = (f'SELECT 1 FROM native_expired_command_keys WHERE {column}=? '
+                f'AND security_scope IN ({security_marks}) AND trust_scope IN ({trust_marks}) AND {sequence_clause}')
+            marker_values = tuple(values)
+            if self._native_marker_codec:
+                from .native_marker_codec_migrations import encode_identity
+                marker_query = (f'SELECT 1 FROM native_expired_command_keys m JOIN native_marker_scopes s ON s.scope_id=m.scope_id '
+                    f'WHERE m.{column}=? AND s.security_scope IN ({security_marks}) AND s.trust_scope IN ({trust_marks}) '
+                    f'AND {sequence_clause.replace("ledger_seq", "m.ledger_seq")}')
+                marker_values = (encode_identity(identifier), *values[1:])
             if self._native_checkpoint_schema and self._connection.execute(
-                f'SELECT 1 FROM native_expired_command_keys WHERE {column}=? '
-                f'AND security_scope IN ({security_marks}) AND trust_scope IN ({trust_marks}) AND {sequence_clause}',
-                tuple(values),
+                marker_query, marker_values,
             ).fetchone() is not None:
                 raise DiagnosticHistoryExpired('event diagnostic provenance expired')
             raise KeyError(identifier)
