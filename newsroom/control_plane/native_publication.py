@@ -1108,8 +1108,33 @@ class NativePublicationContinuation:
             updated['reason']=error.reason_code
             self._journal.advance(revision_id,stage='EVIDENCE_HOLD',facts=updated)
             return True
-        except Exception:return False
+        except Exception as error:
+            self._observe_witness_recovery(revision_id,progress,error)
+            return False
+        self._observe_witness_recovery(revision_id,progress)
         return False
+
+    @staticmethod
+    def _observe_witness_recovery(revision_id, progress, error=None):
+        # Existing asynchronous ring only: no error text, authority writes or boot dependency.
+        point = None
+        try:
+            from .diagnostic_logging import emit_diagnostic
+            point = error.__traceback__ if error is not None else None
+            while point is not None and point.tb_next is not None:
+                point = point.tb_next
+            emit_diagnostic('native_witness_recovery_observation', {
+                'revision_id': revision_id, 'summary_digest': digest_canonical(progress),
+                'outcome': 'READ_FAILED' if error is not None else 'NO_DISPOSITION',
+                'failure_class': type(error).__name__ if error is not None else None,
+                'file': point.tb_frame.f_code.co_filename.rsplit('/', 1)[-1] if point else None,
+                'function': point.tb_frame.f_code.co_name if point else None,
+                'line': point.tb_lineno if point else None,
+            })
+        except Exception:
+            pass
+        finally:
+            point = None
 
     def recover_pre_dispatch(
         self, revision_ids: tuple[str, ...], *,

@@ -39,6 +39,51 @@ def source_role_questions(candidates):
                         'BACKGROUND':'Administrative/irrelevant framing or separator.', 'UNCERTAIN':'Unresolved factual role/support, attributed allegation or provisional rather than confirmed fact.'}}for identity in candidates}
 
 
+def _packed_support_candidates(view, candidates, roles):
+    """Lossless contiguous context, never fewer material facts or Source bytes."""
+    from .admission import _qualification_text_is_negative
+    from .native_assessor_references import _claim_entities, MAX_FRAGMENT_LENGTH
+    from .native_source_context_ranges import _FIRST_PERSON, _SPEAKER
+    from .writer import _has_unicode_quote_delimiter
+
+    def barrier(text):
+        return (_qualification_text_is_negative(text) or _FIRST_PERSON.search(text)
+            or _SPEAKER.match(text) or _has_unicode_quote_delimiter(text) or '"'in text or "'"in text
+            or re.search(r'\b(?:if|unless|subject to|conditional(?:ly)?|pending|said|says|stated|announced)\b',text,re.I))
+
+    def candidate(first,last):
+        reference={'first_span_id':first.span_id,'last_span_id':last.span_id}
+        text,passage,source_id=view.resolve_range(reference)
+        entities=_claim_entities(text,view.passages[passage],policy_version=view.entity_policy_version)
+        if len(entities)>64 or len(text)>MAX_FRAGMENT_LENGTH:return None
+        return {'source_id':source_id,'text':text,'entities':[list(item)for item in entities],
+            'rendering_fragment_count':len(entities)+1,'source_range':reference}
+
+    packed={};previous=None;start=None;count=0
+    for segment in view.segments:
+        role=roles[segment.span_id]['choice']
+        if role not in {'MATERIAL','SUPPORTING'}:
+            previous=None;start=None;count=0
+            continue
+        single=candidates[segment.span_id]
+        can_join=(role=='SUPPORTING'and previous is not None and start is not None and count<32
+            and previous.passage_index==segment.passage_index and previous.ordinal+1==segment.ordinal
+            and not barrier(single['text']))
+        merged=candidate(start,segment)if can_join else None
+        if merged is not None:
+            packed[start.span_id]=merged;previous=segment;count+=1
+            continue
+        if role=='MATERIAL':packed[segment.span_id]=single
+        else:
+            single=candidate(segment,segment)
+            if single is None:return None
+            packed[segment.span_id]=single
+        if role=='SUPPORTING'and not barrier(single['text']):
+            start=previous=segment;count=1
+        else:previous=None;start=None;count=0
+    return packed
+
+
 class NativeAssessorJudgments:
     """Two accounted batches over one exact source view, not a backend router."""
     def __init__(self,*,judgments,scope_for,proof,require_current=lambda:None,
@@ -205,7 +250,12 @@ class NativeAssessorJudgments:
                 'selection_rationale':'Complete source-role judgment inventory identifies no material new assertion.',
                 'geography':[],'categories':[],'explicit_exclusions':[]}}
             return self._finish(wire,view,binding,(first,),judgment_inputs,{'mode':'NO_MATERIAL_CLAIMS'},admission_id)
-        if len(selected)>32:return fallback('MISSING_OR_UNBOUNDED_MATERIAL_CLAIMS',first)
+        render_candidates=candidates
+        if len(selected)>32:
+            render_candidates=_packed_support_candidates(view,candidates,roles)
+            if render_candidates is None or len(render_candidates)>32:
+                return fallback('MISSING_OR_UNBOUNDED_MATERIAL_CLAIMS',first)
+            selected=list(render_candidates)
         inventory=witness_inventory(view)
         state={**state,'witness_inventory':inventory}
         if any(len(inventory[identity]['candidates'])>254 or not inventory[identity]['candidates'] or inventory[identity]['uncovered_clause_ids'] for identity in material):
@@ -275,7 +325,7 @@ class NativeAssessorJudgments:
                     qualification.append({'claim_index':index,'test':test,'test_evidence':witnesses})
         if not any(q['claim_index']==0 for q in qualification):return fallback('HEADLINE_QUALIFICATION_UNPROVEN',first,second)
         if self.localise and self.read_localisation:
-            request={'source_binding':binding,'claims':{identity:candidates[identity]for identity in ordered}}
+            request={'source_binding':binding,'claims':{identity:render_candidates[identity]for identity in ordered}}
             if retained is None:
                 reference=self.localise(request)
             else:
@@ -290,7 +340,7 @@ class NativeAssessorJudgments:
                 'receipt_admission_id':str(reference.receipt_admission_id)}
         else:return fallback('QUALIFIED_LOCALISATION_REQUIRED',first,second)
         claims=[{'claim_role':'HEADLINE'if identity==headline else 'SUBSTANTIVE'if roles[identity]['choice']=='MATERIAL'else 'CONTEXT',
-            'status':'CONFIRMED_FACT','source_range':candidates[identity]['source_range'],
+            'status':'CONFIRMED_FACT','source_range':render_candidates[identity]['source_range'],
             'rendered_assertion_zh_hant_hk_fragments':renderings[identity]['rendered_assertion_zh_hant_hk_fragments'],
             'factual_localisations':renderings[identity].get('factual_localisations',[]),
             'quotation_source_keys':renderings[identity].get('quotation_source_keys',[])}for identity in ordered]
