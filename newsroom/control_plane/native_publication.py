@@ -1098,7 +1098,9 @@ class NativePublicationContinuation:
             self._semantic_witness_disposition_reader(candidate,sources)
         except (OperatorDrainRequested,VetoError):raise
         except NativeEvidenceHold as error:
-            if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:return False
+            if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:
+                self._observe_witness_recovery(revision_id,progress,error)
+                return False
             if not before_write():return False  # Honour stop/drain and the remaining quantum.
             if self._journal.summary(revision_id)!=progress:return False
             updated=dict(facts)
@@ -1108,8 +1110,36 @@ class NativePublicationContinuation:
             updated['reason']=error.reason_code
             self._journal.advance(revision_id,stage='EVIDENCE_HOLD',facts=updated)
             return True
-        except Exception:return False
+        except Exception as error:
+            self._observe_witness_recovery(revision_id,progress,error)
+            return False
+        self._observe_witness_recovery(revision_id,progress)
         return False
+
+    @staticmethod
+    def _observe_witness_recovery(revision_id, progress, error=None):
+        # Existing asynchronous ring only: no error text, authority writes or boot dependency.
+        point = current = None
+        try:
+            from .diagnostic_logging import emit_diagnostic
+            project = str(Path(__file__).resolve().parents[1]) + '/'
+            current = error.__traceback__ if error is not None else None
+            while current is not None:
+                if current.tb_frame.f_code.co_filename.replace('\\', '/').startswith(project):
+                    point = current
+                current = current.tb_next
+            emit_diagnostic('native_witness_recovery_observation', {
+                'revision_id': revision_id, 'summary_digest': digest_canonical(progress),
+                'outcome': 'READ_FAILED' if error is not None else 'NO_DISPOSITION',
+                'failure_class': type(error).__name__ if error is not None else None,
+                'file': point.tb_frame.f_code.co_filename.rsplit('/', 1)[-1] if point else None,
+                'function': point.tb_frame.f_code.co_name if point else None,
+                'line': point.tb_lineno if point else None,
+            })
+        except Exception:
+            pass
+        finally:
+            point = current = None
 
     def recover_pre_dispatch(
         self, revision_ids: tuple[str, ...], *,

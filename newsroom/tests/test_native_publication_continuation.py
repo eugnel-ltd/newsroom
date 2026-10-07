@@ -2245,3 +2245,41 @@ def test_semantic_meaning_ignores_fresh_permission_evidence_identity_only():
     assert refreshed.rights.record_id!=source.rights.record_id
     assert canonical_json_bytes(_semantic_input_fingerprint_v2(base,(_meaning_acquisition(source.unit),),(source,)))==canonical_json_bytes(
         _semantic_input_fingerprint_v2(base,(_meaning_acquisition(source.unit,refreshed=True),),(refreshed,)))
+
+
+@pytest.mark.parametrize('failure',['exception','stdlib-exception','typed-hold','no-result','logging-failure'])
+def test_witness_recovery_observes_suppressed_boundary_without_changing_authority(tmp_path,monkeypatch,failure):
+    from newsroom.control_plane import diagnostic_logging
+    unit=_native();connection=connect(str(tmp_path/'recovery-observation.sqlite3'));journal=NativeRevisionJournal(connection);journal.land((unit,))
+    facts={'candidate_id':'candidate','candidate_version_id':'candidate-version','semantic_assessment_intent':{'contract':'protected'},
+        'reason':'SEMANTIC_INTENT_INPUT_CHANGED_HOLD','failure_class':'ValueError'}
+    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts);before=journal.summary(unit.revision_id);events=[]
+    def observe(event,data):
+        if failure=='logging-failure':raise OSError('diagnostic sink unavailable')
+        events.append((event,data))
+    monkeypatch.setattr(diagnostic_logging,'emit_diagnostic',observe)
+    def reader(*_a):
+        if failure=='stdlib-exception':json.loads('INVALID TOKEN=private-secret')
+        if failure=='typed-hold':
+            from newsroom.control_plane.native_evidence import NativeEvidenceHold
+            raise NativeEvidenceHold('QUALIFICATION_SEMANTIC_WITNESS_UNKNOWN_HOLD',unit.source_id)
+        if failure!='no-result':raise ValueError('TOKEN=private-secret and full provider response must not be logged')
+    candidate=SimpleNamespace(candidate_id='candidate',version_id='candidate-version')
+    continuation=NativePublicationContinuation(journal=journal,
+        runtime=SimpleNamespace(authority=SimpleNamespace(candidate_version=lambda _:candidate),ingress=object(),publication=_Publication(),policies=SimpleNamespace(publication=object()),proof=proof()),
+        evidence_controller=object.__new__(NativeEvidenceController),sources={},
+        evidence_sources_for=lambda _:(),semantic_witness_disposition_reader=reader)
+    try:
+        assert continuation.recover_pre_dispatch((unit.revision_id,),failure_many=lambda *_:pytest.fail('provider recovery'),before_revision=lambda:True)==()
+        assert journal.summary(unit.revision_id)==before
+        if failure=='logging-failure':assert events==[]
+        else:
+            assert len(events)==1 and events[0][0]=='native_witness_recovery_observation'
+            data=events[0][1];assert data['revision_id']==unit.revision_id
+            assert data['summary_digest']==digest_canonical(before)
+            assert data['outcome']==('NO_DISPOSITION'if failure=='no-result'else'READ_FAILED')
+            assert 'private-secret'not in json.dumps(events) and 'TOKEN='not in json.dumps(events)
+            if failure in {'exception','stdlib-exception','typed-hold'}:
+                assert data['failure_class']==('JSONDecodeError'if failure=='stdlib-exception'else'NativeEvidenceHold'if failure=='typed-hold'else'ValueError')
+                assert data['function']=='reader'and data['file']=='test_native_publication_continuation.py'
+    finally:connection.close()

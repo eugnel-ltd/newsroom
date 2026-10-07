@@ -196,6 +196,133 @@ def test_fresh_actual_consumer_uses_qualified_rendering_and_current_validator(tm
         assert record['render_provenance']['mode']=='QUALIFIED_LOCALISATION'
 
 
+def test_lossless_supporting_ranges_keep_full_roles_and_material_qualification(tmp_path,monkeypatch):
+    from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
+    from newsroom.control_plane.native_claim_localisation import NativeClaimLocaliser,localisation_policy
+    from newsroom.control_plane.writer import WriterCliExecution
+    material={1:'當局現時推出新政策。',16:'當局現時推出教育新政策。',32:'當局現時推出醫療新政策。'}
+    body='\n'.join(material.get(i,f'第{i}項政策適用於住戶。')if i<46 else '行政分隔。'for i in range(1,48))
+    def choices(answers):
+        for key,answer in answers.items():
+            if ':'not in key and key!='headline':
+                n=int(key.split('L')[1]);choice='MATERIAL'if n in material else 'SUPPORTING'if n<46 else 'BACKGROUND'
+                answer.update(choice=choice,probabilities={x:int(x==choice)for x in answer['probabilities']})
+            elif key.endswith(':LAW_RIGHT_STATUS_POLICY'):
+                answer.update(choice='YES',probabilities={x:int(x=='YES')for x in answer['probabilities']})
+    with _case(tmp_path,monkeypatch,body=body,answer_change=choices)as(consumer,service,candidate,base,source,acquired,usage,calls):
+        rendered=[]
+        def runner(prompt):
+            claims=json.loads(prompt)['claims'];rendered.append(claims)
+            assert len(claims)<=32
+            assert all(not row['entities']for row in claims.values())
+            return WriterCliExecution(canonical_json_bytes({'renderings':[{'span_id':key,
+                'rendered_assertion_zh_hant_hk_fragments':[row['text'].replace('適用於住戶','以住戶為適用對象').replace('當局現時推出','當局現時推出的是')],
+                'factual_localisations':[],'quotation_source_keys':[]}for key,row in claims.items()]}).decode(),
+                {'usage_basis':'PROVIDER_REPORTED','input_tokens':100,'output_tokens':30,'total_tokens':130})
+        localiser=NativeClaimLocaliser(usage=usage,objects=service.objects,policy=localisation_policy(evidence_digest=digest_bytes(b'packing fixture'),qualified=True),
+            source_fence=service.fence,runner=runner,implementation_worktree_clean=True,clock=lambda:datetime(2026,10,4,tzinfo=UTC))
+        scope=dict(candidate_id=candidate.candidate_id,hypothesis_digest=candidate.governing_manifest.canonical_digest,evidence_package_digest=base.digest,proof=consumer.proof)
+        consumer.localise=lambda request:localiser.localise(request,**scope)
+        consumer.read_localisation=lambda ref,request:localiser.read_localisation(ref,request,**scope)
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert type(result)is JudgedAssessment,result
+        view=build_lossless_source_view(base.passages,base.source_ids)
+        wire=json.loads(result.execution.text)['package']
+        assert len(calls[0]['questions'])==47 and calls[0]['state']['candidates'].keys()=={s.span_id for s in view.segments}
+        assert all(f'S1L{i}:LAW_RIGHT_STATUS_POLICY'in calls[1]['questions']for i in material)
+        assert set(calls[1]['state']['witness_inventory'])=={s.span_id for s in view.segments}
+        coverage=[]
+        for row in rendered[0].values():
+            text,_,_=view.resolve_range(row['source_range']);assert text==row['text']
+            a=int(row['source_range']['first_span_id'].split('L')[1]);b=int(row['source_range']['last_span_id'].split('L')[1])
+            coverage.extend(range(a,b+1))
+            if a in material:assert a==b
+        assert sorted(coverage)==list(range(1,46))and len(coverage)==len(set(coverage))
+        assessment=AutonomousNativeEvidenceAssessor._validated_execution(result.execution,candidate,base,(source,),(acquired,))
+        assert len(assessment.governed_claims)<=32
+        assert len([c for c in assessment.governed_claims if c.claim_role!='CONTEXT'])==3
+        assert len(assessment.qualification_evidence)==3
+        with sqlite3.connect(usage.path)as db:before=db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()
+        assert consumer.read(result.decision_admission_id,candidate,base,(source,),(acquired,))==result
+        with sqlite3.connect(usage.path)as db:assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==before
+        assert len(calls)==2 and len(rendered)==1
+
+
+def _packing_inputs(passages, choices):
+    from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
+    view=build_lossless_source_view(tuple(passages),tuple(f'source-{i}'for i in range(len(passages))))
+    candidates={s.span_id:{'source_id':s.source_id,'text':view.resolve_range({'first_span_id':s.span_id,'last_span_id':s.span_id})[0],
+        'entities':[list(e)for e in s.entities],'rendering_fragment_count':len(s.entities)+1,
+        'source_range':{'first_span_id':s.span_id,'last_span_id':s.span_id}}for s in view.segments}
+    return view,candidates,{s.span_id:{'choice':choice}for s,choice in zip(view.segments,choices,strict=True)}
+
+
+@pytest.mark.parametrize('barrier',['The policy may change.','The policy does not change.','If approved, the policy applies.',
+    'Alice said: "The policy applies."',"Bob said: 'The policy applies.'",'We provide the service.',
+    'The policy won’t change.',"The policy shouldn't change.",'‘The policy applies.’',"Businesses' records are available.",
+    'label‘quoted’word',"label'quoted'word"])
+def test_support_packing_never_hides_modality_or_attribution(barrier):
+    from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
+    view,candidates,roles=_packing_inputs((f'First detail.\n{barrier}\nLast detail.',),['SUPPORTING']*3)
+    packed=_packed_support_candidates(view,candidates,roles)
+    assert list(packed)==list(candidates)
+    assert [x['text']for x in packed.values()]==[x['text']for x in candidates.values()]
+
+
+def test_support_packing_does_not_skip_background_material_or_sources():
+    from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
+    view,candidates,roles=_packing_inputs(('First detail.\nBackground.\nMaterial fact.\nSecond detail.','Another source.'),
+        ['SUPPORTING','BACKGROUND','MATERIAL','SUPPORTING','SUPPORTING'])
+    packed=_packed_support_candidates(view,candidates,roles)
+    assert list(packed)==['S1L1','S1L3','S1L4','S2L1']
+    assert all(row['source_range']['first_span_id']==row['source_range']['last_span_id']for row in packed.values())
+
+
+def test_support_packing_observes_entity_fragment_and_constituent_bounds(monkeypatch):
+    from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
+    from newsroom.control_plane import native_assessor_references as refs
+    view,candidates,roles=_packing_inputs(('x'*2048+'\n'+'y'*2048,),['SUPPORTING']*2)
+    assert len(_packed_support_candidates(view,candidates,roles))==2
+    view,candidates,roles=_packing_inputs(('x'*4097,),['SUPPORTING'])
+    assert _packed_support_candidates(view,candidates,roles)is None
+    view,candidates,roles=_packing_inputs(('First.\nSecond.',),['SUPPORTING']*2)
+    monkeypatch.setattr(refs,'_claim_entities',lambda text,*_a,**_k:tuple((f'Entity{i}','ORGANISATION')for i in range(66 if '\n'in text else 33)))
+    assert len(_packed_support_candidates(view,candidates,roles))==2
+    monkeypatch.setattr(refs,'_claim_entities',lambda *_a,**_k:())
+    view,candidates,roles=_packing_inputs(('\n'.join('Detail.'for _ in range(33)),),['SUPPORTING']*33)
+    packed=_packed_support_candidates(view,candidates,roles)
+    assert len(packed)==2 and packed['S1L1']['source_range']['last_span_id']=='S1L32'
+
+
+def test_packed_dates_and_source_entities_stay_exact_source_fragments():
+    from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
+    from newsroom.control_plane.native_assessor_references import _claim_entities
+    view,candidates,roles=_packing_inputs(('The service starts on 12 October 2026.\nHome Office provides the service.',),['SUPPORTING']*2)
+    packed=_packed_support_candidates(view,candidates,roles)
+    assert len(packed)==1
+    row=next(iter(packed.values()));text,passage,_=view.resolve_range(row['source_range'])
+    assert row['text']==text and '12 October 2026'in text
+    assert row['entities']==[list(x)for x in _claim_entities(text,view.passages[passage],policy_version=view.entity_policy_version)]
+    assert row['rendering_fragment_count']==len(row['entities'])+1
+
+
+@pytest.mark.parametrize('geometry',['material','sparse'])
+def test_unbounded_material_or_sparse_context_never_truncates_or_dispatches_second_stage(tmp_path,monkeypatch,geometry):
+    count=33 if geometry=='material'else 69
+    body='\n'.join(f'當局现时推出第{i}項新政策。'for i in range(1,count+1))
+    def choose(answers):
+        for key,answer in answers.items():
+            i=int(key.split('L')[1]);choice='MATERIAL'if geometry=='material'or i==1 else 'BACKGROUND'if i%2==0 else 'SUPPORTING'
+            answer.update(choice=choice,probabilities={x:int(x==choice)for x in answer['probabilities']})
+    with _case(tmp_path,monkeypatch,body=body,answer_change=choose)as(consumer,_service,candidate,base,source,acquired,usage,calls):
+        consumer.localise=lambda _:pytest.fail('unbounded range reached rendering')
+        result=consumer.assess(candidate,base,(source,),(acquired,))
+        assert result.reason=='MISSING_OR_UNBOUNDED_MATERIAL_CLAIMS'
+        assert len(result.references)==len(calls)==1
+        assert len(calls[0]['questions'])==count
+        with sqlite3.connect(usage.path)as db:assert db.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0]==1
+
+
 def test_real_localisation_reference_tampering_denies_current_consumer(tmp_path,monkeypatch):
     from newsroom.control_plane.native_claim_localisation import LocalisationHold
     with _case(tmp_path,monkeypatch) as (consumer,service,candidate,base,source,acquired,usage,_calls):
@@ -685,3 +812,21 @@ def test_selected_fragment_cannot_erase_negative_parent_context(tmp_path,monkeyp
         assert 'not confirmed' in result.details['state']['witness_inventory']['S1L1']['parent_text']
         assert result.details['failed_questions'][0]['reason']=='PARENT_NEGATION_OR_MODALITY'
         assert len(calls)==2
+
+
+@pytest.mark.parametrize("span_id,text", [('S1L7', 'For businesses, digital proof of age offers a way to verify a customer’s age with greater confidence than checking a physical document alone. '), ('S1L22', 'This is now possible thanks to the UK’s thriving digital verification sector, worth over £2 billion a year, and the UK’s DVS Trust Framework, which techUK worked closely with government to help develop. '), ('S1L27', 'Separate non-statutory guidance has also been published on GOV.UK to help businesses and digital verification providers understand what’s involved in adopting the technology, including requirements for using certified services. '), ('S1L32', 'Digital proof of age is separate from the Government’s digital driving licence and GOV.UK Wallet, although in time this will be one of the ways people can prove their age digitally to buy alcohol. ')])
+def test_retained_source_internal_apostrophes_are_not_quotation_boundaries(span_id,text):
+    from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
+    view,candidates,roles=_packing_inputs((text+"\nThe service is available.",),["SUPPORTING"]*2)
+    packed=_packed_support_candidates(view,candidates,roles)
+    assert len(packed)==1,span_id
+    row=next(iter(packed.values()))
+    assert row["text"]==view.resolve_range(row["source_range"])[0]
+    assert text in row["text"]
+
+
+def test_cross_token_ascii_quotes_are_conservative_packing_boundaries():
+    from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
+    view,candidates,roles=_packing_inputs(("The label'quoted phrase'word is printed.\nThe service is available.",),['SUPPORTING']*2)
+    packed=_packed_support_candidates(view,candidates,roles)
+    assert len(packed)==2
