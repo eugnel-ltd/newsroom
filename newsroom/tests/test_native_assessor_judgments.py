@@ -259,7 +259,8 @@ def _packing_inputs(passages, choices):
 
 @pytest.mark.parametrize('barrier',['The policy may change.','The policy does not change.','If approved, the policy applies.',
     'Alice said: "The policy applies."',"Bob said: 'The policy applies.'",'We provide the service.',
-    'The policy won’t change.',"The policy shouldn't change.",'‘The policy applies.’',"Businesses' records are available."])
+    'The policy won’t change.',"The policy shouldn't change.",'‘The policy applies.’',"Businesses' records are available.",
+    'label‘quoted’word',"label'quoted'word"])
 def test_support_packing_never_hides_modality_or_attribution(barrier):
     from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
     view,candidates,roles=_packing_inputs((f'First detail.\n{barrier}\nLast detail.',),['SUPPORTING']*3)

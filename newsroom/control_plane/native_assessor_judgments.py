@@ -47,8 +47,9 @@ def _packed_support_candidates(view, candidates, roles):
     from .writer import _has_unicode_quote_delimiter
 
     def quoted(text):
+        if re.search(r"\w+['’]\w+['’]\w+",text):return True  # Ambiguous paired quotes within a token.
         for i,char in enumerate(text):
-            if char in {"'",'’','‘'}and 0<i<len(text)-1 and text[i-1].isalnum()and text[i+1].isalnum():
+            if char in {"'",'’'}and 0<i<len(text)-1 and text[i-1].isalnum()and text[i+1].isalnum():
                 continue  # Apostrophe inside a Source word, not a quotation boundary.
             if char in {'"',"'"}or _has_unicode_quote_delimiter(char):return True
         return False
