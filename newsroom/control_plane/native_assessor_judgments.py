@@ -46,9 +46,16 @@ def _packed_support_candidates(view, candidates, roles):
     from .native_source_context_ranges import _FIRST_PERSON, _SPEAKER
     from .writer import _has_unicode_quote_delimiter
 
+    def quoted(text):
+        for i,char in enumerate(text):
+            if char in {"'",'’','‘'}and 0<i<len(text)-1 and text[i-1].isalnum()and text[i+1].isalnum():
+                continue  # Apostrophe inside a Source word, not a quotation boundary.
+            if char in {'"',"'"}or _has_unicode_quote_delimiter(char):return True
+        return False
+
     def barrier(text):
         return (_qualification_text_is_negative(text) or _FIRST_PERSON.search(text)
-            or _SPEAKER.match(text) or _has_unicode_quote_delimiter(text) or '"'in text or "'"in text
+            or _SPEAKER.match(text) or quoted(text) or re.search(r"\b[A-Za-z]+n['’]t\b",text,re.I)
             or re.search(r'\b(?:if|unless|subject to|conditional(?:ly)?|pending|said|says|stated|announced)\b',text,re.I))
 
     def candidate(first,last):

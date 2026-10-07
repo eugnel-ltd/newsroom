@@ -1098,7 +1098,9 @@ class NativePublicationContinuation:
             self._semantic_witness_disposition_reader(candidate,sources)
         except (OperatorDrainRequested,VetoError):raise
         except NativeEvidenceHold as error:
-            if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:return False
+            if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:
+                self._observe_witness_recovery(revision_id,progress,error)
+                return False
             if not before_write():return False  # Honour stop/drain and the remaining quantum.
             if self._journal.summary(revision_id)!=progress:return False
             updated=dict(facts)
@@ -1117,12 +1119,15 @@ class NativePublicationContinuation:
     @staticmethod
     def _observe_witness_recovery(revision_id, progress, error=None):
         # Existing asynchronous ring only: no error text, authority writes or boot dependency.
-        point = None
+        point = current = None
         try:
             from .diagnostic_logging import emit_diagnostic
-            point = error.__traceback__ if error is not None else None
-            while point is not None and point.tb_next is not None:
-                point = point.tb_next
+            project = str(Path(__file__).resolve().parents[1]) + '/'
+            current = error.__traceback__ if error is not None else None
+            while current is not None:
+                if current.tb_frame.f_code.co_filename.replace('\\', '/').startswith(project):
+                    point = current
+                current = current.tb_next
             emit_diagnostic('native_witness_recovery_observation', {
                 'revision_id': revision_id, 'summary_digest': digest_canonical(progress),
                 'outcome': 'READ_FAILED' if error is not None else 'NO_DISPOSITION',
@@ -1134,7 +1139,7 @@ class NativePublicationContinuation:
         except Exception:
             pass
         finally:
-            point = None
+            point = current = None
 
     def recover_pre_dispatch(
         self, revision_ids: tuple[str, ...], *,

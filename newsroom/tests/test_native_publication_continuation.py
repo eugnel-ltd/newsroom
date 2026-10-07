@@ -2247,7 +2247,7 @@ def test_semantic_meaning_ignores_fresh_permission_evidence_identity_only():
         _semantic_input_fingerprint_v2(base,(_meaning_acquisition(source.unit,refreshed=True),),(refreshed,)))
 
 
-@pytest.mark.parametrize('failure',['exception','no-result','logging-failure'])
+@pytest.mark.parametrize('failure',['exception','stdlib-exception','typed-hold','no-result','logging-failure'])
 def test_witness_recovery_observes_suppressed_boundary_without_changing_authority(tmp_path,monkeypatch,failure):
     from newsroom.control_plane import diagnostic_logging
     unit=_native();connection=connect(str(tmp_path/'recovery-observation.sqlite3'));journal=NativeRevisionJournal(connection);journal.land((unit,))
@@ -2259,6 +2259,10 @@ def test_witness_recovery_observes_suppressed_boundary_without_changing_authorit
         events.append((event,data))
     monkeypatch.setattr(diagnostic_logging,'emit_diagnostic',observe)
     def reader(*_a):
+        if failure=='stdlib-exception':json.loads('INVALID TOKEN=private-secret')
+        if failure=='typed-hold':
+            from newsroom.control_plane.native_evidence import NativeEvidenceHold
+            raise NativeEvidenceHold('QUALIFICATION_SEMANTIC_WITNESS_UNKNOWN_HOLD',unit.source_id)
         if failure!='no-result':raise ValueError('TOKEN=private-secret and full provider response must not be logged')
     candidate=SimpleNamespace(candidate_id='candidate',version_id='candidate-version')
     continuation=NativePublicationContinuation(journal=journal,
@@ -2273,7 +2277,9 @@ def test_witness_recovery_observes_suppressed_boundary_without_changing_authorit
             assert len(events)==1 and events[0][0]=='native_witness_recovery_observation'
             data=events[0][1];assert data['revision_id']==unit.revision_id
             assert data['summary_digest']==digest_canonical(before)
-            assert data['outcome']==('READ_FAILED'if failure=='exception'else'NO_DISPOSITION')
+            assert data['outcome']==('NO_DISPOSITION'if failure=='no-result'else'READ_FAILED')
             assert 'private-secret'not in json.dumps(events) and 'TOKEN='not in json.dumps(events)
-            if failure=='exception':assert data['failure_class']=='ValueError'and data['function']=='reader'
+            if failure in {'exception','stdlib-exception','typed-hold'}:
+                assert data['failure_class']==('JSONDecodeError'if failure=='stdlib-exception'else'NativeEvidenceHold'if failure=='typed-hold'else'ValueError')
+                assert data['function']=='reader'and data['file']=='test_native_publication_continuation.py'
     finally:connection.close()

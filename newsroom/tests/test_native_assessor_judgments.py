@@ -258,7 +258,8 @@ def _packing_inputs(passages, choices):
 
 
 @pytest.mark.parametrize('barrier',['The policy may change.','The policy does not change.','If approved, the policy applies.',
-    'Alice said: "The policy applies."',"Bob said: 'The policy applies.'",'We provide the service.'])
+    'Alice said: "The policy applies."',"Bob said: 'The policy applies.'",'We provide the service.',
+    'The policy won’t change.',"The policy shouldn't change.",'‘The policy applies.’',"Businesses' records are available."])
 def test_support_packing_never_hides_modality_or_attribution(barrier):
     from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
     view,candidates,roles=_packing_inputs((f'First detail.\n{barrier}\nLast detail.',),['SUPPORTING']*3)
@@ -810,3 +811,14 @@ def test_selected_fragment_cannot_erase_negative_parent_context(tmp_path,monkeyp
         assert 'not confirmed' in result.details['state']['witness_inventory']['S1L1']['parent_text']
         assert result.details['failed_questions'][0]['reason']=='PARENT_NEGATION_OR_MODALITY'
         assert len(calls)==2
+
+
+@pytest.mark.parametrize("span_id,text", [('S1L7', 'For businesses, digital proof of age offers a way to verify a customer’s age with greater confidence than checking a physical document alone. '), ('S1L22', 'This is now possible thanks to the UK’s thriving digital verification sector, worth over £2 billion a year, and the UK’s DVS Trust Framework, which techUK worked closely with government to help develop. '), ('S1L27', 'Separate non-statutory guidance has also been published on GOV.UK to help businesses and digital verification providers understand what’s involved in adopting the technology, including requirements for using certified services. '), ('S1L32', 'Digital proof of age is separate from the Government’s digital driving licence and GOV.UK Wallet, although in time this will be one of the ways people can prove their age digitally to buy alcohol. ')])
+def test_retained_source_internal_apostrophes_are_not_quotation_boundaries(span_id,text):
+    from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
+    view,candidates,roles=_packing_inputs((text+"\nThe service is available.",),["SUPPORTING"]*2)
+    packed=_packed_support_candidates(view,candidates,roles)
+    assert len(packed)==1,span_id
+    row=next(iter(packed.values()))
+    assert row["text"]==view.resolve_range(row["source_range"])[0]
+    assert text in row["text"]
