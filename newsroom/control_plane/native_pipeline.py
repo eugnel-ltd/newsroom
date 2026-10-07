@@ -217,7 +217,7 @@ class NativePipeline:
         # Reuse one current/archive preference for pending and ready work.
         # Archive turns keep LAND order so later arrivals cannot starve history.
         if not self._spill_archive_turn:
-            pending_revisions.sort(key=_source_update_time, reverse=True)
+            pending_revisions.sort(key=lambda item: (_news_or_speech_header(item), _source_update_time(item)), reverse=True)
         pending_revisions = tuple(pending_revisions)
         fresh_deadline = self._monotonic_clock() + self._reassessment_quantum
         pending_turn_taken = False

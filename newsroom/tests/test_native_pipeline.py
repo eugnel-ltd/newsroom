@@ -1619,6 +1619,94 @@ def _quantum_pending_graphiti(pipeline, journal, now):
     return completed, extracted
 
 
+@pytest.mark.parametrize("news_path", ("news", "speeches"))
+def test_pending_current_news_precedes_newer_reference_and_archive_keeps_chunks(
+    tmp_path, monkeypatch, news_path,
+):
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    pipeline._ordinary_profile_pending = False
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+    reference = replace(
+        _native("newer-reference"),
+        canonical_url="https://www.gov.uk/government/publications/register",
+        updated_at="2026-10-06T00:00:00Z",
+    )
+    first = replace(
+        _native("pending-news"), chunk_count=2,
+        canonical_url=f"https://www.gov.uk/government/{news_path}/airport-update",
+        updated_at="2026-09-26T00:00:00Z",
+    )
+    second = replace(first, chunk_ordinal=2, predecessor_ingest_id=first.ingest_id)
+    unknown = replace(
+        _native("unknown-newest"),
+        canonical_url="https://www.gov.uk.evil.test/government/news/update",
+        updated_at="2026-10-07T00:00:00Z",
+    )
+    journal.land((reference,))
+    journal.land((first, second))
+    journal.land((unknown,))
+    _, extracted = _quantum_pending_graphiti(pipeline, journal, now)
+    try:
+        pipeline.tick(cycle_id="pending-current-news")
+        assert extracted == [(first.item_key, 1)]
+        assert pipeline._spill_archive_turn is True
+        pipeline.tick(cycle_id="pending-archive-land")
+        assert extracted == [(first.item_key, 1), (reference.item_key, 1)]
+        assert pipeline._spill_archive_turn is False
+        pipeline.tick(cycle_id="pending-current-news-remainder")
+        assert extracted == [
+            (first.item_key, 1), (reference.item_key, 1), (second.item_key, 2),
+        ]
+        assert journal.current(first.revision_id)["facts"]["graphiti_receipts"] == [
+            {"ingest_id": unit.ingest_id, "state": "GRAPHITI_COMPLETE",
+             "receipt_digest": unit.observation_digest, "reason": None}
+            for unit in (first, second)
+        ]
+        assert set(journal.units) == {reference.revision_id, first.revision_id, unknown.revision_id}
+        assert journal.units[first.revision_id] == (first, second)
+        assert journal.current(unknown.revision_id) == {}
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("archive", (False, True))
+def test_pending_news_priority_keeps_recency_stable_ties_and_unknown_urls(
+    tmp_path, monkeypatch, archive,
+):
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    pipeline._ordinary_profile_pending = False
+    pipeline._spill_archive_turn = archive
+    units = tuple(replace(_native(name), canonical_url=url, updated_at=date) for name, url, date in (
+        ("unknown-land-first", "https://www.gov.uk.evil.test/government/news/update", "2026-10-07T00:00:00Z"),
+        ("reference-land-second", "https://www.gov.uk/government/publications/register", "2026-10-06T00:00:00Z"),
+        ("news-tie-first", "https://www.gov.uk/government/news/update-one", "2026-09-26T00:00:00Z"),
+        ("speech-tie-second", "https://www.gov.uk/government/speeches/update-two", "2026-09-26T00:00:00Z"),
+        ("news-most-recent", "https://www.gov.uk/government/news/update-three", "2026-09-27T00:00:00Z"),
+    ))
+    for unit in units:
+        journal.land((unit,))
+    selected = []
+
+    def graphiti(members, **_request):
+        selected.extend(members)
+        return tuple(NativeGraphitiOutcome(
+            unit.ingest_id, "GRAPHITI_DEFERRED", None, "WORK_QUANTUM_EXHAUSTED",
+        ) for unit in members)
+
+    pipeline._graphiti = NS(advance=graphiti)
+    try:
+        pipeline.tick(cycle_id="pending-stable-current-or-archive")
+        expected = units if archive else (units[4], units[2], units[3], units[0], units[1])
+        assert tuple(selected) == expected
+        assert set(journal.units) == {unit.revision_id for unit in units}
+        assert all(journal.units[unit.revision_id] == (unit,) for unit in units)
+    finally:
+        connection.close()
+
+
 def test_pending_alternates_source_recency_and_land_order_without_dropping_chunks(tmp_path, monkeypatch):
     pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
     now = [0.0]

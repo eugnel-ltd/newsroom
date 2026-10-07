@@ -245,8 +245,9 @@ def resolve_nodes_locally(
             {
                 "resolution": resolution.outcome.value,
                 "resolution_basis": resolution.basis.value,
-                "considered_canonical_entity_ids": list(
-                    resolution.considered_canonical_entity_ids
+                "considered_canonical_entity_count": len(resolution.considered_canonical_entity_ids),
+                "considered_canonical_entity_digest": digest_canonical(
+                    list(resolution.considered_canonical_entity_ids)
                 ),
                 "canonical_identity": (
                     str(selected.uuid)
