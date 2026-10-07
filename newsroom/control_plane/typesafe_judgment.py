@@ -126,7 +126,11 @@ def _answers(value, questions):
             raise ValueError('answer fields/distribution differ')
         projected = {k: _ppm(v) for k, v in probabilities.items()}
         tolerance = Decimal('0.01') if kind == 'choice' else Decimal('0.000001')
-        if abs(sum(Decimal(v) for v in probabilities.values()) - 1) > tolerance:
+        mass = sum(Decimal(v) for v in probabilities.values())
+        if kind == 'choice':
+            # Judge the inclusive rounding boundary at the retained PPM precision.
+            mass = mass.quantize(Decimal('0.000001'), rounding=ROUND_HALF_EVEN)
+        if abs(mass - 1) > tolerance:
             raise ValueError('probabilities do not sum to one')
         result[key] = {'type': kind, 'confidence_ppm': _ppm(answer['confidence']), 'probabilities_ppm': projected}
         if kind == 'choice':

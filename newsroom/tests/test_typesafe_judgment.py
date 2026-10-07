@@ -273,9 +273,9 @@ def _rounded_role_response(value):
 
 
 @contextmanager
-def _reported_old_decoder_failure(tmp_path,monkeypatch,*,failure=ValueError):
+def _reported_old_decoder_failure(tmp_path,monkeypatch,*,failure=ValueError, response=_rounded_role_response):
     from newsroom.control_plane import typesafe_judgment as module
-    with _case(tmp_path,monkeypatch,mutate=_rounded_role_response) as (engine,inputs,usage,calls,raw):
+    with _case(tmp_path,monkeypatch,mutate=response) as (engine,inputs,usage,calls,raw):
         inputs['questions']={'support':{'type':'choice','instructions':'Classify source role.',
             'criteria':{key:key for key in _ROUNDED_ROLES}}}
         # Reproduce the old strict decoder failure without forging durable SQL.
@@ -318,6 +318,23 @@ def test_rounded_reported_failure_is_locally_revalidated_without_rewriting_origi
             engine.read(replace(reference,raw_admission_id=reference.receipt_admission_id),**inputs)
 
 
+def test_float_noisy_reported_failure_revalidates_without_provider_or_terminal_rewrite(tmp_path, monkeypatch):
+    def response(value):
+        raw = _rounded_role_response(value)
+        return raw.replace(b'0.16', b'0.15999999999999999')
+
+    with _reported_old_decoder_failure(tmp_path, monkeypatch, response=response) as (engine, inputs, usage, calls, _, reference):
+        before = usage.terminal(reference.invocation_id)
+        record = engine.read(reference, **inputs)
+        assert record['answers']['support']['probabilities_ppm'] == {
+            'BACKGROUND': 160000, 'MATERIAL': 20000, 'UNCERTAIN': 0, 'SUPPORTING': 810000}
+        assert record['answers']['support']['choice'] == 'SUPPORTING'
+        assert engine.evaluate(**inputs) == reference
+        assert len(calls) == 1
+        assert usage.terminal(reference.invocation_id) == before
+        assert before.outcome == 'TYPESAFE_FAILED'
+
+
 @pytest.mark.parametrize('probabilities',[
     {'BACKGROUND':0.16,'MATERIAL':0.02,'UNCERTAIN':0.0,'SUPPORTING':0.81},
     {'BACKGROUND':0.17,'MATERIAL':0.02,'UNCERTAIN':0.01,'SUPPORTING':0.81},
@@ -328,6 +345,27 @@ def test_choice_supports_inclusive_one_percent_provider_rounding_without_normali
     result=_answers(value,{'support':{'type':'choice','criteria':{key:key for key in probabilities}}})
     assert result['support']['probabilities_ppm']=={key:int(value*1000000)for key,value in probabilities.items()}
     assert sum(result['support']['probabilities_ppm'].values())!=1000000
+
+
+@pytest.mark.parametrize('yes,no', [
+    ('0.98', '0.00999999999999999'),
+    ('0.99', '0.02000000000000001'),
+])
+def test_choice_mass_boundary_uses_retained_ppm_precision(yes, no):
+    from newsroom.control_plane.typesafe_judgment import _answers, _decode
+    raw = ('{"support":{"type":"choice","choice":"yes","confidence":1,'
+           '"probabilities":{"yes":' + yes + ',"no":' + no + '}}}').encode()
+    answers = _answers(_decode(raw), {'support': {'type': 'choice', 'criteria': {'yes': 'Yes', 'no': 'No'}}})
+    assert sum(answers['support']['probabilities_ppm'].values()) in (990000, 1010000)
+
+
+@pytest.mark.parametrize('yes,no', [('0.98', '0.009999'), ('0.99', '0.020001')])
+def test_choice_mass_one_ppm_outside_boundary_remains_rejected(yes, no):
+    from newsroom.control_plane.typesafe_judgment import _answers, _decode
+    raw = ('{"support":{"type":"choice","choice":"yes","confidence":1,'
+           '"probabilities":{"yes":' + yes + ',"no":' + no + '}}}').encode()
+    with pytest.raises(ValueError, match='probabilities do not sum'):
+        _answers(_decode(raw), {'support': {'type': 'choice', 'criteria': {'yes': 'Yes', 'no': 'No'}}})
 
 
 def test_score_and_gross_nonunit_choice_distributions_remain_rejected():
