@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1106,7 +1107,7 @@ def test_direct_fallback_primary_event_authentication_rejects_mutation(
         ModelUsageAdmissionError,
         match="direct fallback primary authority differs",
     ):
-        model_usage_module._require_primary_unavailable_event(
+        model_usage_module._require_open_route_event(
             connection, event_digest,
         )
     connection.close()
@@ -1217,7 +1218,8 @@ def test_required_route_check_reads_only_states_needed_for_the_decision(
 
     class Routes:
         @contextmanager
-        def route_state_snapshot(self):
+        def route_state_snapshot(self, *, graphiti_work=False):
+            assert graphiti_work is True
             scopes.append("entered")
             try:
                 yield self.route_state
@@ -2307,7 +2309,15 @@ def test_typed_fallback_has_a_distinct_identity_and_exact_parent(
             max_tokens=512,
             cursor_runner=lambda _prompt, *, max_tokens: CliExecution(
                 text="malformed",
-                usage={"usage_basis": "UNAVAILABLE"},
+                usage={
+                    "usage_basis": "PROVIDER_REPORTED",
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cached_read_tokens": 0,
+                    "cached_write_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "total_tokens": 12,
+                },
             ),
             grok_runner=lambda _prompt, _schema, *, max_tokens: CliExecution(
                 text='{"edges":[]}',
@@ -3006,15 +3016,11 @@ def test_ingest_zero_proof_validates_rows_excluded_by_tamper(
         ordinal=1,
         semantic="dispatched",
     )
-    for allocation, identity in (
-        (zero, zero_identity),
-        (dispatched, dispatched_identity),
-    ):
-        service.allocate_graphiti_request(
-            allocation,
-            identity=identity,
-            max_distinct_internal_requests=shape.max_distinct_internal_requests,
-        )
+    service.allocate_graphiti_request(
+        zero,
+        identity=zero_identity,
+        max_distinct_internal_requests=shape.max_distinct_internal_requests,
+    )
     service.complete(
         InvocationTerminal.create(
             invocation_id=zero.invocation_id,
@@ -3028,6 +3034,12 @@ def test_ingest_zero_proof_validates_rows_excluded_by_tamper(
             pre_dispatch_zero_proved=True,
             subscription_cli_chat_not_cash_debited=True,
         )
+    )
+    # An authenticated zero-dispatch attempt settles before its successor starts.
+    service.allocate_graphiti_request(
+        dispatched,
+        identity=dispatched_identity,
+        max_distinct_internal_requests=shape.max_distinct_internal_requests,
     )
     service.complete(
         InvocationTerminal.create(
@@ -3137,3 +3149,260 @@ def test_graphiti_attempt_cannot_complete_before_every_leaf_has_a_terminal(
         terminal_at=T0 + timedelta(seconds=4),
         retained_proposal_count=0,
     )
+
+
+def _historical_unknown_graphiti_request(tmp_path, *, native=False):
+    """Use real accounting APIs, not fabricated CURRENT/circuit records."""
+    unit = None
+    if native:
+        from newsroom.tests.test_model_usage_receipts import _land_native_ingest
+
+        unit = _land_native_ingest(tmp_path)
+    service, envelope, policy, shape = _service_fixture(tmp_path)
+    if unit is not None:
+        envelope = WorkEnvelope.create(
+            cycle_id="native-historical-unknown",
+            workload_class=WorkloadClass.GRAPHITI_CHAT_PRIMARY,
+            admitted_at=T0, admission_decision_id=None,
+            candidate_id=None, hypothesis_digest=None, evidence_package_digest=None,
+            ingest_id=unit.ingest_id, graphiti_attempt_id=f"{unit.ingest_id}:1",
+        )
+        service.open_envelope(envelope)
+    allocation, identity = _bound_request(
+        service=service, envelope=envelope, policy=policy, shape=shape,
+        ordinal=1, semantic='historical-unknown',
+        effective_revision_digest=(
+            digest_canonical(asdict(unit.effective_revision)) if unit else None
+        ),
+    )
+    service.allocate_graphiti_request(
+        allocation, identity=identity,
+        max_distinct_internal_requests=shape.max_distinct_internal_requests,
+    )
+    service.observe_transport(
+        invocation_id=allocation.invocation_id, observed_at=allocation.allocated_at,
+        state='DISPATCH_STARTED', evidence_digest=allocation.request_digest,
+    )
+    service.complete(InvocationTerminal.create(
+        invocation_id=allocation.invocation_id, outcome='FAILED',
+        failure_class='MISSING_PROVIDER_TELEMETRY', usage_status=UsageStatus.UNREPORTED,
+        components=UsageComponents(provenance='UNAVAILABLE'),
+        dispatch_at=allocation.allocated_at, completed_at=T0 + timedelta(seconds=2),
+        observed_at=T0 + timedelta(seconds=2), subscription_cli_chat_not_cash_debited=True,
+    ))
+    service.open_route_circuit(
+        route=policy.route, reason='SYSTEMIC_TRANSPORT',
+        invocation_id=allocation.invocation_id, recorded_at=T0 + timedelta(seconds=3),
+    )
+    return service, envelope, policy, shape, allocation, identity
+
+
+def _independent_request(service, policy, shape, *, ingest='fresh-ingest',
+                         attempt=1, cycle='fresh-cycle', root='fresh-root',
+                         effective_revision_digest=None):
+    envelope = WorkEnvelope.create(
+        cycle_id=cycle, workload_class=WorkloadClass.GRAPHITI_CHAT_PRIMARY,
+        admitted_at=T0 + timedelta(seconds=4), admission_decision_id=None,
+        candidate_id=None, hypothesis_digest=None, evidence_package_digest=None,
+        ingest_id=ingest, graphiti_attempt_id=f'{ingest}:{attempt}',
+    )
+    service.open_envelope(envelope)
+    allocation, identity = _bound_request(
+        service=service, envelope=envelope, policy=policy, shape=shape,
+        ordinal=1, semantic=f'{cycle}:{root}',
+        effective_revision_digest=(
+            effective_revision_digest or digest_canonical({'revision': root})
+        ),
+    )
+    return allocation, identity
+
+
+def _original_graphiti_unknown_rows(service, allocation):
+    with sqlite3.connect(service.path) as connection:
+        values = {table: connection.execute(
+            f'SELECT * FROM {table} WHERE invocation_id=?',
+            (allocation.invocation_id,),
+        ).fetchall() for table in (
+            'model_invocation_allocations', 'model_invocation_terminals',
+            'model_provider_telemetry', 'model_transport_observations',
+            'model_invocation_context_observations', 'model_usage_current',
+        )}
+        values['model_work_envelopes'] = connection.execute(
+            'SELECT * FROM model_work_envelopes WHERE envelope_id=?',
+            (allocation.envelope_id,),
+        ).fetchall()
+        values['model_usage_route_circuit_events'] = connection.execute(
+            'SELECT * FROM model_usage_route_circuit_events '
+            'WHERE route=? AND invocation_id=? ORDER BY rowid',
+            (allocation.route, allocation.invocation_id),
+        ).fetchall()
+    return values
+
+
+def test_independent_graphiti_work_preserves_historical_unknown_across_restart(tmp_path):
+    service, old_envelope, policy, shape, old, _ = _historical_unknown_graphiti_request(tmp_path)
+    before = _original_graphiti_unknown_rows(service, old)
+    historical = service.route_state(policy.route)
+    assert historical['state'] == 'OPEN'
+    service = ModelUsageService(service.path)
+    work = service.graphiti_work_route_state(policy.route)
+    assert work['state'] == 'CLOSED'
+    assert work['historical_circuit_state'] == 'OPEN'
+    assert work['availability'] == 'UNOBSERVED'
+    assert service.route_state(policy.route) == historical
+    assert graphiti_required_route_holds(service) == ()
+    fresh, identity = _independent_request(service, policy, shape)
+    service.allocate_graphiti_request(
+        fresh, identity=identity,
+        max_distinct_internal_requests=shape.max_distinct_internal_requests,
+    )
+    service.require_graphiti_dispatch_available(fresh)
+    assert _original_graphiti_unknown_rows(service, old) == before
+    with sqlite3.connect(service.path) as connection:
+        assert connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 2
+        assert connection.execute('SELECT count(*) FROM model_transport_observations WHERE invocation_id=?',
+                                  (fresh.invocation_id,)).fetchone()[0] == 0
+    assert old_envelope.envelope_id != fresh.envelope_id
+
+
+@pytest.mark.parametrize('same_identity', ('ingest', 'effective_root'))
+def test_independent_graphiti_work_rejects_old_identity_despite_new_cycle_attempt(tmp_path, same_identity):
+    service, old_envelope, policy, shape, old, old_identity = _historical_unknown_graphiti_request(tmp_path)
+    before = _original_graphiti_unknown_rows(service, old)
+    fresh, identity = _independent_request(
+        service, policy, shape,
+        ingest=old_envelope.ingest_id if same_identity == 'ingest' else 'renamed-ingest',
+        attempt=2, cycle='renamed-cycle',
+        root='r1' if same_identity == 'effective_root' else 'changed-root',
+    )
+    if same_identity == 'effective_root':
+        assert identity.effective_revision_digest == old_identity.effective_revision_digest
+    with pytest.raises(ModelUsageAdmissionError):
+        service.allocate_graphiti_request(
+            fresh, identity=identity,
+            max_distinct_internal_requests=shape.max_distinct_internal_requests,
+        )
+    assert _original_graphiti_unknown_rows(service, old) == before
+    with sqlite3.connect(service.path) as connection:
+        assert connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('known_cause', ('AUTHENTICATION', 'QUOTA', 'CONFIGURATION', 'CONTEXT_OUTPUT_BREACH'))
+def test_independent_graphiti_work_keeps_known_route_denial(tmp_path, known_cause):
+    service, _, policy, shape, old, _ = _historical_unknown_graphiti_request(tmp_path)
+    service.open_route_circuit(
+        route=policy.route, reason=known_cause, invocation_id=old.invocation_id,
+        recorded_at=T0 + timedelta(seconds=4),
+    )
+    before = _original_graphiti_unknown_rows(service, old)
+    assert service.graphiti_work_route_state(policy.route)['state'] == 'OPEN'
+    assert graphiti_required_route_holds(service)[0]['route'] == policy.route
+    fresh, identity = _independent_request(service, policy, shape)
+    with pytest.raises(ModelUsageAdmissionError):
+        service.allocate_graphiti_request(
+            fresh, identity=identity,
+            max_distinct_internal_requests=shape.max_distinct_internal_requests,
+        )
+    assert _original_graphiti_unknown_rows(service, old) == before
+
+
+def test_graphiti_dispatch_rechecks_route_after_independent_allocation(tmp_path):
+    service, _, policy, shape, old, _ = _historical_unknown_graphiti_request(tmp_path)
+    fresh, identity = _independent_request(service, policy, shape)
+    service.allocate_graphiti_request(
+        fresh, identity=identity,
+        max_distinct_internal_requests=shape.max_distinct_internal_requests,
+    )
+    # Its own active reservation is not an older ambiguous effect.
+    service.require_graphiti_dispatch_available(fresh)
+    service.open_route_circuit(
+        route=policy.route, reason='AUTHENTICATION', invocation_id=old.invocation_id,
+        recorded_at=T0 + timedelta(seconds=5),
+    )
+    with pytest.raises(ModelUsageAdmissionError):
+        service.require_graphiti_dispatch_available(fresh)
+    with sqlite3.connect(service.path) as connection:
+        assert connection.execute('SELECT count(*) FROM model_transport_observations WHERE invocation_id=?',
+                                  (fresh.invocation_id,)).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("superseded_head", "same_identity"),
+    ((False, "ingest"), (True, "ingest"), (True, "effective_root")),
+)
+def test_independent_graphiti_work_preserves_disposed_unknown_sticky_head(
+    tmp_path, superseded_head, same_identity,
+):
+    service, envelope, policy, shape, old, old_identity = _historical_unknown_graphiti_request(
+        tmp_path, native=True,
+    )
+    terminal = service.terminal(old.invocation_id)
+    disposition = service.disposition_native_unreported_subscription_usage(
+        invocation_id=old.invocation_id,
+        expected_terminal_digest=terminal.terminal_digest,
+        expected_allocation_digest=old.canonical_digest,
+        observed_at=T0 + timedelta(seconds=4),
+    )
+    assert disposition["usage_status"] == "ESTIMATED"
+    assert disposition["exact_usage_remains_unknown"] is True
+    assert disposition["unknown_spend_released"] is False
+    before = _original_graphiti_unknown_rows(service, old)
+    assert before["model_usage_current"] == []
+    historical = service.route_state(policy.route)
+    assert historical["state"] == "OPEN"
+    service = ModelUsageService(service.path)
+    admission = service.graphiti_work_route_state(policy.route)
+    assert admission["state"] == "CLOSED"
+    assert admission["historical_circuit_state"] == "OPEN"
+    assert admission["availability"] == "UNOBSERVED"
+    assert service.route_state(policy.route) == historical
+    fresh, identity = _independent_request(service, policy, shape)
+    service.allocate_graphiti_request(
+        fresh, identity=identity,
+        max_distinct_internal_requests=shape.max_distinct_internal_requests,
+    )
+    service.require_graphiti_dispatch_available(fresh)
+    if superseded_head:
+        service.observe_transport(
+            invocation_id=fresh.invocation_id, observed_at=T0 + timedelta(seconds=5),
+            state="DISPATCH_STARTED", evidence_digest=fresh.request_digest,
+        )
+        service.complete(InvocationTerminal.create(
+            invocation_id=fresh.invocation_id, outcome="FAILED",
+            failure_class="MISSING_PROVIDER_TELEMETRY",
+            usage_status=UsageStatus.UNREPORTED,
+            components=UsageComponents(provenance="UNAVAILABLE"),
+            dispatch_at=T0 + timedelta(seconds=5),
+            completed_at=T0 + timedelta(seconds=6),
+            observed_at=T0 + timedelta(seconds=6),
+            subscription_cli_chat_not_cash_debited=True,
+        ))
+        service.open_route_circuit(
+            route=policy.route, reason="SYSTEMIC_TRANSPORT",
+            invocation_id=fresh.invocation_id, recorded_at=T0 + timedelta(seconds=7),
+        )
+        assert service.route_state(policy.route)["invocation_id"] == fresh.invocation_id
+    retry, retry_identity = _independent_request(
+        service, policy, shape,
+        ingest=envelope.ingest_id if same_identity == "ingest" else "renamed-old-ingest",
+        attempt=2, cycle="disposed-old-retry", root="changed-root",
+        effective_revision_digest=(
+            old_identity.effective_revision_digest if same_identity == "effective_root" else None
+        ),
+    )
+    if same_identity == "effective_root":
+        assert retry_identity.effective_revision_digest == old_identity.effective_revision_digest
+    with pytest.raises(ModelUsageAdmissionError):
+        service.allocate_graphiti_request(
+            retry, identity=retry_identity,
+            max_distinct_internal_requests=shape.max_distinct_internal_requests,
+        )
+    assert _original_graphiti_unknown_rows(service, old) == before
+    assert service.terminal(old.invocation_id) == terminal
+    with sqlite3.connect(service.path) as connection:
+        assert connection.execute(
+            "SELECT record_json FROM model_usage_conservative_dispositions "
+            "WHERE invocation_id=?", (old.invocation_id,),
+        ).fetchone()[0] == json.dumps(
+            disposition, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )

@@ -189,7 +189,7 @@ def graphiti_required_route_holds(
     if service is None:
         return ()
     holds = []
-    with service.route_state_snapshot() as route_state:
+    with service.route_state_snapshot(graphiti_work=True) as route_state:
         embedding = route_state(GRAPHITI_EMBEDDING_ROUTE)
         if embedding["state"] == "OPEN":
             holds.append(embedding)
@@ -728,7 +728,7 @@ class GraphitiModelUsageObserver:
             parent_invocation_id=parent_invocation_id,
         )
         self._owner_stop_check()
-        route_circuit_state = str(self._service.route_state(route)["state"])
+        route_circuit_state = str(self._service.graphiti_work_route_state(route)["state"])
         if route_circuit_state != "CLOSED":
             raise ModelUsageAdmissionError("affected route circuit is open")
         identity = GraphitiInternalRequestIdentity.create(
@@ -791,10 +791,7 @@ class GraphitiModelUsageObserver:
                 "Graphiti dispatch deadline expired during local preflight"
             )
         self._owner_stop_check()
-        if self._service.route_state(token.route)["state"] != "CLOSED":
-            raise ModelUsageAdmissionError(
-                "Graphiti route circuit opened during local preflight"
-            )
+        self._service.require_graphiti_dispatch_available(token)
         self._service.observe_transport(
             invocation_id=token.invocation_id,
             observed_at=dispatch_at,
@@ -926,12 +923,12 @@ class GraphitiModelUsageObserver:
         semantic_request_class: str,
         max_tokens: int,
     ) -> bool:
-        """Select Grok only when the retained primary route head is OPEN."""
+        """Select Grok only when the primary is unavailable for independent work."""
 
-        primary = self._service.route_state(GRAPHITI_CHAT_PRIMARY_ROUTE)
+        primary = self._service.graphiti_work_route_state(GRAPHITI_CHAT_PRIMARY_ROUTE)
         if primary.get("state") != "OPEN":
             return False
-        if self._service.route_state(GRAPHITI_CHAT_FALLBACK_ROUTE).get("state") != (
+        if self._service.graphiti_work_route_state(GRAPHITI_CHAT_FALLBACK_ROUTE).get("state") != (
             "CLOSED"
         ):
             return False
