@@ -16,7 +16,7 @@ from pathlib import Path
 from time import perf_counter_ns, process_time_ns
 
 from newsroom.authority import AuthenticationProof, UtcTimestamp
-from newsroom.authority.canonical import digest_canonical
+from newsroom.authority.canonical import digest_bytes, digest_canonical
 from newsroom.authority.neo4j_projection_system import (
     open_native_retrieval_neo4j_resources,
 )

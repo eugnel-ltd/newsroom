@@ -1268,3 +1268,30 @@ def test_combined_licensing_refresh_keeps_independent_portfolio_rights(composed_
     assert len(fixture.observations) >= before
     assert fixture.pipeline._intake._licence.for_source(source_id='HK-02',
         definition_url=SOURCE_URLS['HK-02']).decision == 'PERMITTED'
+
+
+def test_retained_witness_callback_uses_its_real_module_globals():
+    """Do not manufacture canonical helpers in an extracted closure's globals."""
+    import ast
+    from newsroom.control_plane.native_source_qualification_consumer import current_source_passage
+    from newsroom.control_plane.evidence import EvidencePackage
+    from newsroom.authority.canonical import digest_bytes as expected_digest
+    tree=ast.parse(Path(native_composition.__file__).read_text())
+    callback=next(node for node in ast.walk(tree)if isinstance(node,ast.FunctionDef)and node.name=='semantic_witness_disposition_reader')
+    observed=[]
+    candidate=SimpleNamespace(candidate_id='candidate',governing_manifest=SimpleNamespace(hypothesis_id='hypothesis',
+        lead_signal_bindings=(SimpleNamespace(lead_id='lead',signal_id='signal'),)))
+    source=SimpleNamespace(unit=SimpleNamespace(source_id='UK-05',canonical_url='https://www.gov.uk/government/news/fixture',
+        headline='Exact title',body='Exact body'))
+    consumer=SimpleNamespace(read_current_disposition=lambda *args,**kwargs:observed.append((args,kwargs)))
+    # These are the callback's actual lexical cells; digest_bytes is not one.
+    namespace={**vars(native_composition),'current_source_passage':current_source_passage,
+        'qualification_consumer':consumer,'proof':object()}
+    exec(compile(ast.Module(body=[callback],type_ignores=[]),native_composition.__file__,'exec'),namespace)
+    namespace['semantic_witness_disposition_reader'](candidate,(source,))
+    assert len(observed)==1
+    args,kwargs=observed[0];package=args[1]
+    assert type(package)is EvidencePackage
+    assert package.passages==('Exact title\n\nExact body',)
+    assert package.observation_digests==(expected_digest(package.passages[0].encode()),)
+    assert kwargs['source_passages']==package.passages and kwargs['proof']is namespace['proof']
