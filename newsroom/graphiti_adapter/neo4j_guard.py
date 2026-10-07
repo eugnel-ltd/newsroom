@@ -85,6 +85,10 @@ class GuardError(RuntimeError):
     """The proposal generation could not be proved unchanged or recoverable."""
 
 
+class GuardWorkspaceBusy(GuardError):
+    """An active other generation owns the group before this attempt starts."""
+
+
 _OWNED_GUARD_REASON_CODES = {
     "Graphiti identity inventory exceeds its byte bound": "INVENTORY_BYTE_BOUND",
     "Graphiti snapshot coverage count is invalid": "SNAPSHOT_COVERAGE",
@@ -466,6 +470,25 @@ class Neo4jMutationGuard:
                 claim_lease=_MARKER_CLAIM_LEASE)),
         )
         if not records:
+            busy = await self._query(
+                f"""
+                MATCH (g:{_MARKER} {{episode_uuid: $generation_key}})
+                MATCH (owner:{_MARKER} {{episode_uuid: g.owner_marker_uuid}})
+                WHERE g.group_id = $group_id AND owner.group_id = $group_id
+                  AND g.owner_marker_uuid <> $episode_uuid
+                  AND g.snapshot_id = owner.snapshot_id
+                  AND g.claim_token = owner.claim_token
+                  AND owner.state IN {list(_UNRESOLVED_STATES)!r}
+                  AND owner.claim_expires_at > datetime()
+                  AND NOT EXISTS {{ MATCH (own:{_MARKER} {{episode_uuid: $episode_uuid}}) }}
+                  AND NOT EXISTS {{ MATCH (legacy:{_MARKER})
+                      WHERE legacy.state IN {list(_UNRESOLVED_STATES)!r}
+                        AND legacy.snapshot_id = $snapshot_id }}
+                RETURN g.owner_marker_uuid AS busy_marker_uuid
+                """, **self._ownership_parameters(),
+            )
+            if len(busy) == 1 and type(_record_value(busy[0], "busy_marker_uuid")) is str:
+                raise GuardWorkspaceBusy("Graphiti generation is owned by another active attempt")
             raise GuardError("Graphiti generation is owned or has an unresolved legacy marker")
         marker = _record_value(records[0], "marker")
         if not isinstance(marker, dict):

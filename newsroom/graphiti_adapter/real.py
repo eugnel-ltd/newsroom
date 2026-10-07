@@ -100,6 +100,7 @@ from newsroom.graphiti_adapter.neo4j_guard import (
     _OWNED_RECOVERY_PHASES,
     _owned_recovery_guard_reason,
     GuardError,
+    GuardWorkspaceBusy,
     GuardMarker,
     GuardState,
     Neo4jMutationGuard,
@@ -1514,8 +1515,10 @@ class RealGraphitiAdapter:
                         if getattr(validation_usage, field) > getattr(budget, maximum):
                             exceeded.append(field)
                 _LOGGER.warning(
-                    "graphiti_validation phase=%s reason=%s exceeded=%s rollback=%s",
+                    "graphiti_validation phase=%s reason=%s exceeded=%s rollback=%s output_bytes=%s max_output_bytes=%s",
                     validation_phase, reason, ",".join(exceeded) or "NONE", rollback,
+                    None if validation_usage is None else validation_usage.output_bytes,
+                    attempt.extraction_request.budget.max_output_bytes,
                 )
             except Exception:
                 # Observation must not replace the original failure or outcome.
@@ -1848,6 +1851,20 @@ class RealGraphitiAdapter:
             )
         except (BrokerError, GraphitiAdapterContractError):
             raise
+        except GuardWorkspaceBusy:
+            raw = _raw_receipt(
+                attempt, started_at=started_at, telemetry=telemetry,
+                result=None, proposals=(),
+            )
+            raw.pop("raw_output_digest", None)
+            raw.update(dispatch_state="NOT_DISPATCHED", setup_failure="GuardWorkspaceBusy")
+            raw["raw_output_digest"] = digest_bytes(canonical_json_bytes(raw))
+            return produced_extraction(
+                attempt, outcome=ExtractionOutcome.RETRYABLE_FAILURE,
+                failure_code=ExtractionFailureCode.PRODUCER_INTERNAL_ERROR,
+                validation=None, raw=None, proposals=(),
+                embedding_usage=telemetry.embedding_usage, attempt_receipt=raw,
+            )
         except ExtractionContractError:
             produced = validated.get("produced")
             if produced is None:

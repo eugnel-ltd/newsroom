@@ -8,7 +8,7 @@ from typing import Any, Protocol
 
 from newsroom.authority.canonical import digest_canonical
 from newsroom.graphiti_adapter.edge_guard import guard_extracted_edges
-from newsroom.graphiti_adapter.neo4j_guard import GuardState, Neo4jMutationGuard
+from newsroom.graphiti_adapter.neo4j_guard import GuardState, GuardWorkspaceBusy, Neo4jMutationGuard
 
 ResolveNodes = Callable[
     [list[Any]],
@@ -201,6 +201,8 @@ class ExistingGraphitiPipeline:
     async def _prepare_attempt(self) -> Mapping[str, object] | None:
         try:
             marker = await self.guard.begin()
+        except GuardWorkspaceBusy:
+            raise
         except Exception as exc:
             raise CombinedTemporalPipelineError(
                 "combined-temporal journal could not start",

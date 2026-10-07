@@ -141,6 +141,117 @@ def _land_native_ingest(tmp_path: Path):
     return unit
 
 
+def _retain_native_workspace_busy(tmp_path, *, attempts=1, defect=None):
+    from newsroom.control_plane import cycle
+    from newsroom.control_plane.store import reserve_graphiti_spend, record_graphiti_failure
+    from newsroom.tests.test_graphiti_corpus_ingest import _complete
+
+    unit = _land_native_ingest(tmp_path)
+    service = _service(tmp_path)
+    for number in range(1, attempts + 1):
+        current = replace(unit, attempt_number=number)
+        envelope = WorkEnvelope.create(
+            cycle_id=native_graphiti_usage_cycle_id(ingest_id=unit.ingest_id, attempt_number=number),
+            workload_class=WorkloadClass.GRAPHITI_CHAT_PRIMARY,
+            admitted_at=T0, admission_decision_id=None, candidate_id=None,
+            hypothesis_digest=None, evidence_package_digest=None,
+            ingest_id=unit.ingest_id, graphiti_attempt_id=f"{unit.ingest_id}:{number}",
+        )
+        service.open_envelope(envelope)
+        result = replace(
+            _complete(current, proposal_count=0, entity_count=0, relation_count=0),
+            outcome="AMBIGUOUS_EFFECT" if defect == "ambiguous" else "FAILED",
+            failure_code="PRODUCER_INTERNAL_ERROR",
+        )
+        raw = dict(result.raw_receipt)
+        raw.update(dispatch_state="NOT_DISPATCHED", setup_failure=(
+            "GuardError" if defect == "generic" else "GuardWorkspaceBusy"))
+        raw.pop("raw_output_digest", None)
+        raw["raw_output_digest"] = digest_bytes(model_usage_module.canonical_json_bytes(raw))
+        result = replace(result, raw_receipt=raw, receipt_digest=raw["raw_output_digest"])
+        with sqlite3.connect(service.path) as connection:
+            reserve_graphiti_spend(connection, spend_id=f"{unit.ingest_id}:{number}",
+                ingest_id=unit.ingest_id, attempt_number=number, proving_run_id=unit.proving_run_id,
+                generation_id=result.generation_id, reserved_gbp_microunits=1, ceiling_gbp_microunits=None)
+            accounting = cycle._reconcile_result_spend(connection, unit=current, attempt_number=number,
+                result=result, binding_validated=True)
+            if defect == "unknown-spend":
+                accounting.update(status="RESERVED", reused_unresolved_reservation=True)
+            if defect == "chat":
+                result = replace(result, chat_invocations=({"outcome": "UNKNOWN"},))
+            if defect == "embedding":
+                result = replace(result, embedding_usage={"usage_basis": "UNREPORTED", "request_count": 1})
+            receipt, digest = cycle._retain_attempt_receipt(
+                connection, unit=current, result=result,
+                accounting=accounting,
+                dispatch_rights={"source_id": current.source_id},
+            )
+            record_graphiti_failure(connection, ingest_id=unit.ingest_id, source_id=unit.source_id,
+                item_key=unit.item_key, outcome="FAILED", failure_code="PRODUCER_INTERNAL_ERROR")
+            if defect == "missing-ledger":
+                connection.execute("DELETE FROM ledger WHERE kind='GRAPHITI_EVALUATION_ATTEMPT'")
+            if defect == "bad-receipt":
+                connection.execute("UPDATE unpublished_graphiti_attempt_receipts SET receipt_json='{}'")
+        if defect in {"allocated", "transport", "retargeted", "refused"}:
+            selected_envelope = envelope
+            workload = WorkloadClass.GRAPHITI_CHAT_PRIMARY
+            policy = _policy(workload=workload, provider="cursor-agent-cli", route=workload.value,
+                model="composer-2.5", hard_estimate_ceiling_tokens=None)
+            service.register_policy(policy)
+            allocation = _allocation(selected_envelope, policy)
+            if defect == "refused":
+                with service._connection() as connection:
+                    service._retain_graphiti_refusal(connection, allocation=allocation,
+                        identity={"semantic_state_digest": _digest({"request": "refused"}),
+                                  "call_shape_policy_digest": _digest({"shape": "fixture"})},
+                        reason_code="CALL_SHAPE_DRIFT")
+            else:
+                service.allocate(allocation, owner_emergency_stop=False)
+                if defect == "transport":
+                    service.observe_transport(invocation_id=allocation.invocation_id,
+                        observed_at=T0 + timedelta(seconds=2), state="DISPATCH_STARTED",
+                        evidence_digest=_digest({"dispatch": "existing"}))
+                if defect == "retargeted":
+                    other = _envelope(cycle_id="other-cycle", workload=workload,
+                        candidate_id=None, ingest_id="other-ingest")
+                    service.open_envelope(other)
+                    with service._connection() as connection:
+                        connection.execute("UPDATE model_invocation_allocations SET envelope_id=?,cycle_id=?",
+                                           (other.envelope_id, other.cycle_id))
+        service.record_work_outcome(
+            envelope_id=envelope.envelope_id, outcome="GRAPHITI_FAILED",
+            outcome_record_id="wrong" if defect == "work-binding" else digest,
+            payload_digest=None, terminal_at=T0 + timedelta(seconds=number),
+            retained_proposal_count=0,
+        )
+    return service, unit
+
+
+def test_native_busy_no_leaf_receipts_grant_only_authenticated_forward_zero_credit(tmp_path):
+    from newsroom.control_plane import cycle
+    service, unit = _retain_native_workspace_busy(tmp_path, attempts=3)
+    evidence = service.native_graphiti_ingest_retry_evidence_many(
+        failed_attempts={unit.ingest_id: 3}, max_attempts=3,
+    )[unit.ingest_id]
+    assert evidence.attempt_numbers == evidence.zero_dispatch_attempts == (1, 2, 3)
+    assert evidence.unresolved_attempts == evidence.settled_provider_attempts == ()
+    with sqlite3.connect(service.path) as connection:
+        queued = cycle._queue(connection, (unit,), model_usage=service)
+        assert len(queued) == 1 and queued[0][-1].ingest_id == unit.ingest_id
+
+
+@pytest.mark.parametrize("defect", ("ambiguous", "generic", "missing-ledger", "bad-receipt", "work-binding",
+                                   "unknown-spend", "chat", "embedding", "allocated", "transport", "retargeted",
+                                   "refused"))
+def test_native_busy_no_leaf_credit_preserves_unknown_or_unbound_holds(tmp_path, defect):
+    service, unit = _retain_native_workspace_busy(tmp_path, defect=defect)
+    evidence = service.native_graphiti_ingest_retry_evidence_many(
+        failed_attempts={unit.ingest_id: 1}, max_attempts=1,
+    )[unit.ingest_id]
+    assert evidence.zero_dispatch_attempts == evidence.settled_provider_attempts == ()
+    assert evidence.unresolved_attempts == (1,)
+
+
 def _unique_consumption_columns(path: Path) -> set[tuple[str, ...]]:
     connection = sqlite3.connect(path)
     try:

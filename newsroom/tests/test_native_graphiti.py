@@ -90,6 +90,40 @@ def _complete(connection, **kw):
     connection.commit()
 
 
+@pytest.mark.parametrize("cause", ["BrokerError", "GuardWorkspaceBusy"])
+@pytest.mark.parametrize("dispatched", [False, True])
+def test_proved_predispatch_setup_refusal_defers_peers_without_repeating_first(
+    tmp_path, monkeypatch, cause, dispatched,
+):
+    from newsroom.control_plane.store import insert_graphiti_attempt_receipt
+    attempted = []
+
+    def ingest(connection, *, units, defer_before_unit, on_systemic_failure, **_values):
+        for unit in units:
+            if defer_before_unit(unit):
+                continue
+            attempted.append(unit.ingest_id)
+            insert_graphiti_attempt_receipt(connection, ingest_id=unit.ingest_id,
+                attempt_number=1, outcome="FAILED", receipt={
+                    "ingest_id": unit.ingest_id, "attempt_number": 1, "outcome": "FAILED",
+                    "setup_failure": cause, "dispatch_state": "UNKNOWN" if dispatched else "NOT_DISPATCHED",
+                })
+            connection.commit()
+            on_systemic_failure(cause, dispatched)
+
+    processor, connection, _ = _open(tmp_path, monkeypatch, ingest=ingest)
+    units = (_native("busy-first"), _native("deferred-peer"))
+    try:
+        outcomes = processor.advance(units, cycle_id="workspace-busy-forward")
+        assert attempted == [unit.ingest_id for unit in (units if dispatched else units[:1])]
+        if not dispatched:
+            assert outcomes[1].state == "GRAPHITI_DEFERRED"
+            assert outcomes[1].reason == "SYSTEMIC_SETUP_UNAVAILABLE"
+        assert connection.execute("SELECT count(*) FROM unpublished_graphiti_attempt_receipts").fetchone()[0] == len(attempted)
+    finally:
+        connection.close()
+
+
 def test_quantum_defers_only_queued_units_before_rights_spend_or_claim(tmp_path):
     connection = connect(str(tmp_path / "deferred.sqlite3"))
     first = replace(_native("chunks"), chunk_count=2)

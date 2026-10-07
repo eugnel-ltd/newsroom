@@ -46,7 +46,7 @@ EXTRACTED_ENTITIES_SCHEMA = json.dumps({
 
 
 def _cancelled(tmp_path, monkeypatch, *, land=True, native=True, dispatched=True,
-               outcome="CANCELLED", reported=False, connection=None):
+               outcome="CANCELLED", reported=False, connection=None, parented=False):
     monkeypatch.setattr("newsroom.control_plane.graphiti._graphiti_implementation_identity",
                         lambda: ("a" * 40, True))
     path = str(tmp_path / "private.sqlite3")
@@ -66,8 +66,9 @@ def _cancelled(tmp_path, monkeypatch, *, land=True, native=True, dispatched=True
         graphiti_attempt_id=f"{unit.ingest_id}:1",
     )
     usage.open_envelope(envelope)
-    usage.open_route_circuit(route="GRAPHITI_CHAT_PRIMARY", reason="QUOTA",
-                             invocation_id=None, recorded_at=T0 + timedelta(seconds=1))
+    if not parented:
+        usage.open_route_circuit(route="GRAPHITI_CHAT_PRIMARY", reason="QUOTA",
+                                 invocation_id=None, recorded_at=T0 + timedelta(seconds=1))
     observer = GraphitiModelUsageObserver(
         service=usage, envelope=envelope, clock=lambda: T0 + timedelta(seconds=10),
         owner_stop_check=lambda: None, deadline=T0 + timedelta(minutes=3),
@@ -78,7 +79,17 @@ def _cancelled(tmp_path, monkeypatch, *, land=True, native=True, dispatched=True
     )
     request = dict(prompt="source-safe prompt", schema=EXTRACTED_ENTITIES_SCHEMA,
                    semantic_request_class="ExtractedEntities", max_tokens=77)
-    assert observer.use_direct_fallback(**request)
+    primary_receipts = []
+    if parented:
+        primary = observer.before_cli_invocation(provider="cursor-agent-cli", model="composer-2.5", **request)
+        observer.transport_dispatch_started(primary)
+        primary_binding = observer.after_cli_invocation(primary, outcome="MALFORMED_OUTPUT", usage={
+            "usage_basis": "PROVIDER_REPORTED", "input_tokens": 5, "output_tokens": 2,
+            "total_tokens": 7, "cached_read_tokens": 0, "cached_write_tokens": 0, "reasoning_tokens": 0,
+        })
+        primary_receipts.append({**primary_binding, "outcome": "MALFORMED_OUTPUT", "provider": "cursor-agent-cli"})
+    else:
+        assert observer.use_direct_fallback(**request)
     allocation = observer.before_cli_invocation(provider="grok-build-cli", model="grok-4.6", **request)
     if dispatched:
         observer.transport_dispatch_started(allocation)
@@ -91,7 +102,7 @@ def _cancelled(tmp_path, monkeypatch, *, land=True, native=True, dispatched=True
     terminal = usage.terminal(allocation.invocation_id)
     receipt = {
         "ingest_id": unit.ingest_id, "attempt_number": 1, "outcome": "TIMEOUT",
-        "chat_invocations": [{**binding, "outcome": outcome, "provider": "grok-build-cli"}],
+        "chat_invocations": [*primary_receipts, {**binding, "outcome": outcome, "provider": "grok-build-cli"}],
     }
     receipt_digest = insert_graphiti_attempt_receipt(
         connection, ingest_id=unit.ingest_id, attempt_number=1, outcome="TIMEOUT", receipt=receipt,
@@ -318,3 +329,45 @@ def test_fallback_cancellation_does_not_admit_cash_embedding_or_primary_chat(tmp
         assert case.connection.execute("SELECT count(*) FROM model_usage_conservative_dispositions").fetchone() == (0,)
     finally:
         case.connection.close()
+
+
+@pytest.mark.parametrize("outcome", ("CANCELLED", "FAILED", "TIMEOUT"))
+def test_parented_unknown_fallback_is_not_a_global_optional_settlement_failure(tmp_path, monkeypatch, outcome):
+    processor, connection, _ = _open(
+        tmp_path, monkeypatch, ingest=lambda *_a, **_k: pytest.fail("settlement must not dispatch"),
+    )
+    case = _cancelled(tmp_path, monkeypatch, connection=connection, parented=True, outcome=outcome)
+    try:
+        assert case.allocation.parent_invocation_id is not None
+        processor._usage = case.usage
+        processor._clock = lambda: T0 + timedelta(seconds=12)
+        before = _unchanged(case)
+        processor._settle_missing_subscription_usage((case.unit,))
+        assert _unchanged(case) == before
+        assert connection.execute("SELECT count(*) FROM model_usage_conservative_dispositions").fetchone() == (0,)
+        assert case.usage.terminal(case.allocation.invocation_id).usage_status is m.UsageStatus.UNREPORTED
+        assert case.usage.route_state(ROUTE)["state"] == "OPEN"
+        assert case.usage.graphiti_work_route_state(ROUTE)["state"] == "CLOSED"
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("tamper", ("identity", "allocation_header"))
+def test_inapplicable_parented_fallback_still_authenticates_retained_binding(tmp_path, monkeypatch, tamper):
+    processor, connection, _ = _open(
+        tmp_path, monkeypatch, ingest=lambda *_a, **_k: pytest.fail("must not dispatch"),
+    )
+    case = _cancelled(tmp_path, monkeypatch, connection=connection, parented=True)
+    try:
+        processor._usage = case.usage
+        processor._clock = lambda: T0 + timedelta(seconds=12)
+        if tamper == "identity":
+            connection.execute("UPDATE graphiti_internal_requests SET record_json=json_set(record_json,'$.semantic_request_class','changed') WHERE invocation_id=?", (case.allocation.invocation_id,))
+        else:
+            connection.execute("UPDATE model_invocation_allocations SET parent_invocation_id=NULL WHERE invocation_id=?", (case.allocation.invocation_id,))
+        connection.commit()
+        with pytest.raises(m.ModelUsageIntegrityError):
+            processor._settle_missing_subscription_usage((case.unit,))
+        assert connection.execute("SELECT count(*) FROM model_usage_conservative_dispositions").fetchone() == (0,)
+    finally:
+        connection.close()

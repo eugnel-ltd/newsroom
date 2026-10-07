@@ -1625,7 +1625,6 @@ def test_pending_current_news_precedes_newer_reference_and_archive_keeps_chunks(
 ):
     pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
-    pipeline._ordinary_profile_pending = False
     now = [0.0]
     pipeline._monotonic_clock = lambda: now[0]
     reference = replace(
@@ -1677,7 +1676,6 @@ def test_pending_news_priority_keeps_recency_stable_ties_and_unknown_urls(
 ):
     pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
-    pipeline._ordinary_profile_pending = False
     pipeline._spill_archive_turn = archive
     units = tuple(replace(_native(name), canonical_url=url, updated_at=date) for name, url, date in (
         ("unknown-land-first", "https://www.gov.uk.evil.test/government/news/update", "2026-10-07T00:00:00Z"),
@@ -2174,9 +2172,8 @@ def test_distinct_semantic_contract_upgrade_is_scheduled_without_generic_hold_re
     finally:connection.close()
 
 
-def test_ordinary_profile_measures_first_real_hold_turn_only(tmp_path, monkeypatch):
-    import json
-    from newsroom.control_plane.diagnostic_logging import MAX_MESSAGE
+def test_ordinary_turns_do_not_start_a_profiler_or_change_retained_holds(tmp_path, monkeypatch):
+    import cProfile
     pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
     for unit in units:
@@ -2184,83 +2181,20 @@ def test_ordinary_profile_measures_first_real_hold_turn_only(tmp_path, monkeypat
         journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts={
             'graphiti_receipts': [{}], 'reason': 'RETAINED_HOLD', 'acquisition_retryable': False,
         })
-    events = []
-    monkeypatch.setattr(n, 'emit_diagnostic', lambda event, data: events.append((event, data)), raising=False)
+    profiles, events = [], []
+    def create_profile():
+        profiles.append('created')
+        raise RuntimeError('automatic profiling is not ordinary work')
+    monkeypatch.setattr(cProfile, 'Profile', create_profile)
+    monkeypatch.setattr(n, 'emit_diagnostic', lambda event, data: events.append((event, data)))
     try:
         before = {unit.revision_id: journal.summary(unit.revision_id) for unit in units}
         for cycle in ('natural-first', 'natural-second'):
             assert pipeline.tick(cycle_id=cycle).revision_states == {'EVIDENCE_HOLD': 2}
         assert {unit.revision_id: journal.summary(unit.revision_id) for unit in units} == before
         assert not any(kind in {'publish', 'graphiti'} for kind, _ in calls)
-        assert len(events) == 1 and events[0][0] == 'native_ordinary_profile'
-        data = events[0][1]
-        assert data['one_shot'] is True and data['profile_overhead_included'] is True
-        assert data['timing_basis'] == 'ELAPSED_CALL_STATS'
-        assert data['wall_ms'] >= 0 and data['cpu_ms'] >= 0
-        assert data['columns'] == ['module', 'function', 'calls', 'total_ms', 'cumulative_ms']
-        assert 0 < len(data['rows']) <= 15
-        assert len(json.dumps(data, ensure_ascii=False, separators=(',', ':'))) <= MAX_MESSAGE
-        assert all('/' not in row[0] and '\\' not in row[0] and len(row) == 5 for row in data['rows'])
-    finally:
-        connection.close()
-
-
-@pytest.mark.parametrize('failure_at', ('create', 'enable', 'disable', 'stats', 'diagnostic'))
-@pytest.mark.parametrize('business_failure', (False, True))
-def test_ordinary_profile_failure_preserves_single_call_identity(tmp_path, monkeypatch, failure_at, business_failure):
-    pipeline, _journal, connection, _units, _calls, _dispositions = _open(tmp_path, monkeypatch)
-    result, failure, calls, lifecycle = [], VetoError('owner stop'), [], []
-    def advance(revisions, **kwargs):
-        calls.append((revisions, kwargs))
-        if business_failure:
-            raise failure
-        return result
-    class Profile:
-        def enable(self):
-            lifecycle.append('enable')
-            if failure_at == 'enable': raise OSError('optional enable')
-        def disable(self):
-            lifecycle.append('disable')
-            if failure_at == 'disable': raise OSError('optional disable')
-        def getstats(self):
-            lifecycle.append('stats')
-            if failure_at == 'stats': raise OSError('optional stats')
-            return []
-    def create():
-        lifecycle.append('create')
-        if failure_at == 'create': raise OSError('optional creation')
-        return Profile()
-    def emit(*_):
-        if failure_at == 'diagnostic': raise OSError('optional diagnostic')
-    monkeypatch.setattr(n.cProfile, 'Profile', create)
-    monkeypatch.setattr(n, 'emit_diagnostic', emit)
-    pipeline._advance_revisions = advance
-    try:
-        for _ in range(2):
-            if business_failure:
-                with pytest.raises(VetoError) as raised:
-                    pipeline._profiled_advance_revisions(('selected',), work_deadline=42)
-                assert raised.value is failure
-            else:
-                assert pipeline._profiled_advance_revisions(('selected',), work_deadline=42) is result
-        assert calls == [(('selected',), {'work_deadline': 42})] * 2
-        assert lifecycle.count('create') == 1
-        assert lifecycle.count('disable') == (0 if failure_at == 'create' else 1)
-    finally:
-        connection.close()
-
-
-def test_ordinary_profile_does_not_hijack_existing_hook(tmp_path, monkeypatch):
-    pipeline, _journal, connection, _units, _calls, _dispositions = _open(tmp_path, monkeypatch)
-    existing, result = object(), []
-    monkeypatch.setattr(n.sys, 'getprofile', lambda: existing)
-    monkeypatch.setattr(n.cProfile, 'Profile', lambda: pytest.fail('existing profiler must be preserved'))
-    monkeypatch.setattr(n, 'emit_diagnostic', lambda *_: pytest.fail('external profiling is not our observation'))
-    pipeline._advance_revisions = lambda *_, **__: result
-    try:
-        assert pipeline._profiled_advance_revisions((), work_deadline=42) is result
-        assert n.sys.getprofile() is existing
-        assert pipeline._ordinary_profile_pending is False
+        assert profiles == []
+        assert not any(event == 'native_ordinary_profile' for event, _ in events)
     finally:
         connection.close()
 
@@ -2300,7 +2234,6 @@ def test_current_news_semantic_turn_precedes_newer_reference_but_archive_keeps_l
     dispositions[0] = ()
     now, calls = [0.0], []
     pipeline._monotonic_clock = lambda: now[0]
-    pipeline._ordinary_profile_pending = False
     reference = replace(_native('reference'), canonical_url='https://www.gov.uk/government/publications/register',
         updated_at='2026-10-05T00:00:00Z')
     news = replace(_native('news'), canonical_url='https://www.gov.uk' + news_path, updated_at='2026-09-26T00:00:00Z')
@@ -2358,7 +2291,6 @@ def test_news_priority_keeps_unknown_and_prepared_effect_settlement_first(tmp_pa
     pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
     pipeline._spill_archive_turn = archive
-    pipeline._ordinary_profile_pending = False
     news = replace(_native('news-ready'), canonical_url='https://www.gov.uk/government/news/update', updated_at='2026-10-05T00:00:00Z')
     settling = replace(_native('settling-reference'), canonical_url='https://www.gov.uk/government/publications/register', updated_at='2020-01-01T00:00:00Z')
     for unit, stage in ((news, 'CANDIDATE_ADMITTED'), (settling, settlement)):
@@ -2378,7 +2310,6 @@ def test_news_priority_keeps_equal_class_stable_and_archive_land_order(tmp_path,
     pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
     pipeline._spill_archive_turn = archive
-    pipeline._ordinary_profile_pending = False
     units = [replace(_native(name), canonical_url=url, updated_at=date) for name, url, date in (
         ('reference-land-first', 'https://www.gov.uk/government/publications/register', '2026-10-05T00:00:00Z'),
         ('news-land-second', 'https://www.gov.uk/government/news/update-one', '2026-09-26T00:00:00Z'),
