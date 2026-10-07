@@ -823,3 +823,10 @@ def test_retained_source_internal_apostrophes_are_not_quotation_boundaries(span_
     row=next(iter(packed.values()))
     assert row["text"]==view.resolve_range(row["source_range"])[0]
     assert text in row["text"]
+
+
+def test_cross_token_ascii_quotes_are_conservative_packing_boundaries():
+    from newsroom.control_plane.native_assessor_judgments import _packed_support_candidates
+    view,candidates,roles=_packing_inputs(("The label'quoted phrase'word is printed.\nThe service is available.",),['SUPPORTING']*2)
+    packed=_packed_support_candidates(view,candidates,roles)
+    assert len(packed)==2
