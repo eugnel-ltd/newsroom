@@ -253,6 +253,21 @@ class _JournalDriver:
     def apply(self, query, params):
         self.queries.append(query)
         marker = self.markers.get(params.get("episode_uuid"))
+        if "AS busy_marker_uuid" in query:
+            owner_id = self.owner.get("owner_marker_uuid")
+            retained = self.markers.get(owner_id)
+            if (marker is not None or owner_id in (None, params["episode_uuid"])
+                or retained is None or not retained.get("active")
+                or self.owner.get("group_id") != params["group_id"]
+                or retained["group_id"] != params["group_id"]
+                or retained["state"] not in {"SNAPSHOTTING", "PENDING", "ROLLING_BACK", "RECOVERING"}
+                or retained["snapshot_id"] != self.owner.get("snapshot_id")
+                or retained["claim_token"] != self.owner.get("claim_token")
+                or any(item["state"] in {"SNAPSHOTTING", "PENDING", "ROLLING_BACK", "RECOVERING"}
+                       and item["snapshot_id"] == params["snapshot_id"]
+                       for item in self.markers.values())):
+                return []
+            return [{"busy_marker_uuid": owner_id}]
         if "AS marker_episode_uuid" in query:
             retained = self.markers.get(self.owner.get("owner_marker_uuid"))
             if (retained is None or retained.get("active")
@@ -285,7 +300,8 @@ class _JournalDriver:
                     marker.update(state="SNAPSHOTTING", active=True)
                     self.markers[params["episode_uuid"]] = marker
                     self.owner = {"owner_marker_uuid": params["episode_uuid"],
-                                  "snapshot_id": marker["snapshot_id"], "claim_token": marker["claim_token"]}
+                                  "snapshot_id": marker["snapshot_id"], "claim_token": marker["claim_token"],
+                                  "group_id": params["group_id"]}
                 elif (self.owner.get("snapshot_id"), self.owner.get("claim_token")) != (
                     marker["snapshot_id"], marker["claim_token"],
                 ):
@@ -422,6 +438,38 @@ class _JournalGuard(Neo4jMutationGuard):
 def _journal_guard(driver, episode="episode-a"):
     return _JournalGuard(driver, group_id="group-id", episode_uuid=episode,
                          attempt_number=1, input_digest="sha256:" + "0" * 64)
+
+
+@pytest.mark.parametrize("defect", [
+    "expired", "snapshot", "claim", "owner-group", "marker-group", "own-marker", "legacy-own-snapshot",
+])
+def test_busy_classification_never_waives_unproved_or_own_marker(defect):
+    from newsroom.graphiti_adapter.neo4j_guard import GuardWorkspaceBusy
+
+    async def exercise():
+        driver = _JournalDriver()
+        await _journal_guard(driver).begin()
+        if defect == "expired":
+            driver.markers["episode-a"]["active"] = False
+        elif defect == "snapshot":
+            driver.owner["snapshot_id"] = "wrong"
+        elif defect == "claim":
+            driver.owner["claim_token"] = "wrong"
+        elif defect == "owner-group":
+            driver.owner["group_id"] = "wrong"
+        elif defect == "marker-group":
+            driver.markers["episode-a"]["group_id"] = "wrong"
+        else:
+            driver.markers["episode-b" if defect == "own-marker" else "legacy-marker"] = {
+                **driver.markers["episode-a"], "snapshot_id": "episode-b:1",
+            }
+        before = copy.deepcopy((driver.markers, driver.owner))
+        with pytest.raises(GuardError) as raised:
+            await _journal_guard(driver, "episode-b").begin()
+        assert not isinstance(raised.value, GuardWorkspaceBusy)
+        assert (driver.markers, driver.owner) == before
+
+    asyncio.run(exercise())
 
 
 def test_generation_owner_survives_crash_and_expiry_and_blocks_another_episode():

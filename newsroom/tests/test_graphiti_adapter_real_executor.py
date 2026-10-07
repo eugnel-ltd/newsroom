@@ -153,6 +153,70 @@ def _provider_free_pipeline(**values: object) -> object:
     )
 
 
+def test_active_other_generation_refusal_is_predispatch_not_ambiguous(monkeypatch):
+    import copy
+    import newsroom.graphiti_adapter.real as real
+    from newsroom.tests.test_graphiti_guard_snapshot_coverage import (
+        _JournalDriver, _JournalGuard,
+    )
+
+    driver = _JournalDriver()
+    owner = _JournalGuard(
+        driver, group_id=real.GRAPHITI_WORKSPACE_GROUP,
+        episode_uuid="other-active-episode", attempt_number=1,
+        input_digest="sha256:" + "0" * 64,
+    )
+    asyncio.run(owner.begin())
+    before = copy.deepcopy((driver.markers, driver.owner))
+    delegate = SimpleNamespace(
+        client=SimpleNamespace(embeddings=SimpleNamespace(), close=AsyncMock()),
+        config=SimpleNamespace(embedding_model="fixture-model", embedding_dim=2),
+    )
+    closed = []
+
+    class Graphiti:
+        def __init__(self, *_args, **values):
+            self.driver = driver
+            self.clients = SimpleNamespace(
+                llm_client=values["llm_client"], embedder=values["embedder"],
+            )
+
+        async def close(self):
+            closed.append(True)
+
+    runtime = SimpleNamespace(
+        Graphiti=Graphiti, MutationGuard=_JournalGuard,
+        OpenAIEmbedder=lambda **_values: delegate,
+        OpenAIEmbedderConfig=lambda **values: SimpleNamespace(**values),
+        MeteredOpenAIEmbedder=real.MeteredOpenAIEmbedder,
+        IdentityCrossEncoder=lambda: object(), EpisodeType=SimpleNamespace(text="text"),
+        EpisodicNode=lambda **values: SimpleNamespace(**values),
+    )
+    monkeypatch.setattr(real, "_load_graphiti", lambda: runtime)
+    monkeypatch.setattr(real, "openrouter_api_key", lambda: "fixture-dummy")
+    monkeypatch.setattr(real, "neo4j_community_password", lambda: "fixture-dummy")
+    monkeypatch.setattr(real, "build_cli_llm_client", lambda **_: SimpleNamespace(invocations=[]))
+    monkeypatch.setattr(real, "combined_temporal_pipeline_for", _provider_free_pipeline)
+    monkeypatch.setattr(real, "_ensure_episode", lambda **_: pytest.fail("busy generation created business episode"))
+    monkeypatch.setattr(real, "extract_combined_temporal_async", lambda **_: pytest.fail("busy generation dispatched provider"))
+    attempt = evaluation_attempt_for(("A retained source passage.",))
+    produced = RealGraphitiAdapter()._produce(
+        attempt, UtcTimestamp.parse("2026-08-20T00:00:00.000000Z"),
+    )
+    assert produced.outcome is ExtractionOutcome.RETRYABLE_FAILURE
+    assert produced.failure_code is ExtractionFailureCode.PRODUCER_INTERNAL_ERROR
+    receipt = produced.attempt_receipt_value
+    assert receipt["setup_failure"] == "GuardWorkspaceBusy"
+    assert receipt["dispatch_state"] == "NOT_DISPATCHED"
+    assert receipt["chat_invocations"] == []
+    assert receipt["embedding_usage"]["request_count"] == 0
+    assert receipt["proposals"] == []
+    assert (driver.markers, driver.owner) == before
+    assert attempt.episode_uuid not in driver.markers
+    assert closed == [True]
+    delegate.client.close.assert_awaited_once()
+
+
 @pytest.mark.parametrize("stale_owner", (False, True))
 def test_episode_creation_requires_current_generation_owner_before_provider(
     monkeypatch: pytest.MonkeyPatch, stale_owner: bool,
@@ -5740,8 +5804,9 @@ def test_validation_budget_diagnostic_survives_wrapping_without_changing_outcome
         def broken(*args, **kwargs):
             raise RuntimeError("fixture logger failure")
         monkeypatch.setattr(real._LOGGER, "warning", broken)
+    attempt = evaluation_attempt_for(("A retained source passage.",))
     produced = RealGraphitiAdapter()._produce(
-        evaluation_attempt_for(("A retained source passage.",)),
+        attempt,
         UtcTimestamp.parse("2026-08-20T00:00:00.000000Z"),
     )
     assert produced.outcome is (ExtractionOutcome.RETRYABLE_FAILURE if wrapped else ExtractionOutcome.INVALID_OUTPUT)
@@ -5751,6 +5816,10 @@ def test_validation_budget_diagnostic_survives_wrapping_without_changing_outcome
         assert "phase=BUDGET" in records[0]
         assert "reason=BUDGET_EXCEEDED" in records[0]
         assert "exceeded=cost_microunits" in records[0]
+        import re
+        sizes = re.search(r" output_bytes=(\d+) max_output_bytes=(\d+)$", records[0])
+        assert sizes is not None and int(sizes[1]) > 0
+        assert int(sizes[2]) == attempt.extraction_request.budget.max_output_bytes
         assert ("rollback=COMPLETE" if wrapped else "rollback=UNOBSERVED") in records[0]
         assert len(records[0].encode()) <= 300
 

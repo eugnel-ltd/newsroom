@@ -393,7 +393,7 @@ class NativeGraphitiProcessor:
             # The existing ingest boundary settles/authenticates the first
             # result. Only its known global pre-provider credential setup cause
             # defers this operation; unknown/content failures retain their path.
-            if code != "BrokerError" or provider_dispatched or offered_attempt is None:
+            if code not in {"BrokerError", "GuardWorkspaceBusy"} or provider_dispatched or offered_attempt is None:
                 return
             row = self._connection.execute(
                 "SELECT outcome,receipt_digest,receipt_json FROM unpublished_graphiti_attempt_receipts "
@@ -412,7 +412,7 @@ class NativeGraphitiProcessor:
             if (retained_digest == row[1] == actual_digest
                     and (receipt.get("ingest_id"), receipt.get("attempt_number")) == offered_attempt
                     and row[0] == receipt.get("outcome") == "FAILED"
-                    and receipt.get("setup_failure") == "BrokerError"
+                    and receipt.get("setup_failure") == code
                     and receipt.get("dispatch_state") == "NOT_DISPATCHED"):
                 setup_unavailable = True
 
@@ -772,12 +772,17 @@ class NativeGraphitiProcessor:
                 # The usage service independently validates the exact native source,
                 # qualified policy and dispatch. This retains ESTIMATED accounting,
                 # never fabricated telemetry, and does not release a route circuit.
-                self._usage.disposition_native_unreported_subscription_usage(
-                    invocation_id=invocation_id,
-                    expected_terminal_digest=terminal_digest,
-                    expected_allocation_digest=allocation_digest,
-                    observed_at=self._clock(),
-                )
+                try:
+                    self._usage.disposition_native_unreported_subscription_usage(
+                        invocation_id=invocation_id,
+                        expected_terminal_digest=terminal_digest,
+                        expected_allocation_digest=allocation_digest,
+                        observed_at=self._clock(),
+                    )
+                except ModelUsageAdmissionError:
+                    # An optional estimate's unsupported scope is not corruption
+                    # of every other ingest. Retain its original UNKNOWN and HOLD.
+                    continue
             cancelled_fallbacks = self._connection.execute(
                 "SELECT a.invocation_id,a.canonical_digest,t.terminal_digest "
                 "FROM model_work_envelopes e INDEXED BY model_usage_native_graphiti_ingest "
@@ -795,12 +800,17 @@ class NativeGraphitiProcessor:
             ).fetchall()
             for invocation_id, allocation_digest, terminal_digest in cancelled_fallbacks:
                 self._stop_check()
-                self._usage.disposition_native_graphiti_fallback_cancellation(
-                    invocation_id=invocation_id,
-                    expected_terminal_digest=terminal_digest,
-                    expected_allocation_digest=allocation_digest,
-                    observed_at=self._clock(),
-                )
+                try:
+                    self._usage.disposition_native_graphiti_fallback_cancellation(
+                        invocation_id=invocation_id,
+                        expected_terminal_digest=terminal_digest,
+                        expected_allocation_digest=allocation_digest,
+                        observed_at=self._clock(),
+                    )
+                except ModelUsageAdmissionError:
+                    # An optional estimate's unsupported scope is not corruption
+                    # of every other ingest. Retain its original UNKNOWN and HOLD.
+                    continue
             cancelled = self._connection.execute(
                 "SELECT a.invocation_id FROM model_work_envelopes e "
                 "INDEXED BY model_usage_native_graphiti_ingest "

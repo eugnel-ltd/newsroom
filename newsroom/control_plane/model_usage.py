@@ -427,6 +427,16 @@ CREATE TABLE IF NOT EXISTS graphiti_internal_request_refusals(
     FOREIGN KEY(envelope_id) REFERENCES model_work_envelopes(envelope_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 );
+CREATE INDEX IF NOT EXISTS model_usage_allocation_cycle
+ON model_invocation_allocations(cycle_id);
+CREATE INDEX IF NOT EXISTS model_usage_allocation_record_envelope
+ON model_invocation_allocations(json_extract(record_json, '$.envelope_id'));
+CREATE INDEX IF NOT EXISTS model_usage_allocation_record_cycle
+ON model_invocation_allocations(json_extract(record_json, '$.cycle_id'));
+CREATE INDEX IF NOT EXISTS graphiti_request_envelope
+ON graphiti_internal_requests(envelope_id);
+CREATE INDEX IF NOT EXISTS graphiti_refusal_envelope
+ON graphiti_internal_request_refusals(envelope_id);
 CREATE INDEX IF NOT EXISTS model_usage_allocated_at
 ON model_invocation_allocations(allocated_at, invocation_id);
 CREATE INDEX IF NOT EXISTS model_usage_completed_at
@@ -3104,6 +3114,101 @@ def _retain_provider_telemetry(
     return provider_telemetry_digest
 
 
+def _native_workspace_busy_zero(
+    connection: sqlite3.Connection, *, envelope: WorkEnvelope, attempt_number: int,
+) -> bool:
+    """Authenticate one forward controller refusal, never an absent paid receipt."""
+    ingest = envelope.ingest_id
+    if (not ingest or envelope.cycle_id != native_graphiti_usage_cycle_id(
+            ingest_id=ingest, attempt_number=attempt_number)
+        or envelope.graphiti_attempt_id != f"{ingest}:{attempt_number}"
+        or envelope.workload_class is not WorkloadClass.GRAPHITI_CHAT_PRIMARY
+        or any(value is not None for value in (envelope.admission_decision_id, envelope.candidate_id,
+            envelope.hypothesis_digest, envelope.evidence_package_digest))
+        or connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone() is None):
+        return False
+    row = connection.execute(
+        "SELECT outcome,receipt_digest,receipt_json FROM unpublished_graphiti_attempt_receipts "
+        "WHERE ingest_id=? AND attempt_number=?", (ingest, attempt_number),
+    ).fetchone() if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='unpublished_graphiti_attempt_receipts'"
+    ).fetchone() else None
+    if row is None:
+        return False
+    record = _object(row[2]); unsigned = dict(record); digest = unsigned.pop("receipt_digest", None)
+    embedding = record.get("embedding_usage"); accounting = record.get("accounting")
+    if (row[0] != record.get("outcome") or row[0] != "FAILED"
+        or row[1] != digest or digest_bytes(canonical_json_bytes(unsigned)) != digest
+        or record.get("ingest_id") != ingest or record.get("attempt_number") != attempt_number
+        or record.get("provider_attempt_number") != attempt_number
+        or record.get("episode_uuid") != ingest or record.get("profile") != "EVALUATION"
+        or record.get("setup_failure") != "GuardWorkspaceBusy"
+        or record.get("dispatch_state") != "NOT_DISPATCHED"
+        or record.get("failure_code") != "PRODUCER_INTERNAL_ERROR"
+        or any(record.get(key) != [] for key in ("chat_invocations", "entities", "relations", "proposals"))
+        or any(type(record.get(key)) is not int or record[key] != 0 for key in
+               ("proposal_count", "entity_count", "relation_count", "request_tokens", "response_tokens", "cost_microunits"))
+        or type(embedding) is not dict or embedding.get("usage_basis") != "NO_EMBEDDING_CALL"
+        or embedding.get("requests") != [] or any(type(embedding.get(key)) is not int or embedding[key] != 0
+               for key in ("request_count", "embedding_tokens", "cost_usd_microunits"))
+        or type(accounting) is not dict or accounting.get("status") != "RECONCILED"
+        or accounting.get("spend_id") != f"{ingest}:{attempt_number}"
+        or accounting.get("usage_basis") != "NO_EMBEDDING_CALL"
+        or accounting.get("unused_reservation_released") is not True
+        or accounting.get("reused_unresolved_reservation") is True
+        or any(type(accounting.get(key)) is not int or accounting[key] != 0
+               for key in ("actual_usd_microunits", "actual_gbp_microunits"))):
+        return False
+    outcome = connection.execute("SELECT record_json FROM model_work_outcomes WHERE envelope_id=?",
+                                 (envelope.envelope_id,)).fetchone()
+    if outcome is None:
+        return False
+    work = _object(outcome[0])
+    if (work.get("schema_version") != MODEL_USAGE_SCHEMA_VERSION or work.get("outcome") != "GRAPHITI_FAILED"
+        or work.get("envelope_id") != envelope.envelope_id or work.get("outcome_record_id") != digest
+        or work.get("payload_digest") is not None or type(work.get("retained_proposal_count")) is not int
+        or work.get("retained_proposal_count") != 0 or work.get("accepted_provider_attempt_id") is not None):
+        return False
+    if connection.execute(
+        "SELECT 1 FROM model_invocation_allocations WHERE envelope_id=? OR cycle_id=? "
+        "OR json_extract(record_json,'$.envelope_id')=? OR json_extract(record_json,'$.cycle_id')=? "
+        "UNION ALL SELECT 1 FROM graphiti_internal_requests WHERE envelope_id=? OR graphiti_attempt_id=? "
+        "UNION ALL SELECT 1 FROM graphiti_internal_request_refusals WHERE envelope_id=? LIMIT 1",
+        (envelope.envelope_id, envelope.cycle_id, envelope.envelope_id, envelope.cycle_id,
+         envelope.envelope_id, envelope.graphiti_attempt_id, envelope.envelope_id),
+    ).fetchone():
+        return False
+    spend = connection.execute(
+        "SELECT ingest_id,attempt_number,status,usage_basis,actual_usd_microunits,actual_gbp_microunits "
+        "FROM unpublished_graphiti_spend WHERE spend_id=?", (accounting["spend_id"],),
+    ).fetchone()
+    if spend is None or tuple(spend) != (ingest, attempt_number, "RECONCILED", "NO_EMBEDDING_CALL", 0, 0):
+        return False
+    payload = canonical_json_bytes(record)
+    ledger = connection.execute(
+        "SELECT at,payload_json,prev_digest,digest FROM ledger "
+        "WHERE kind='GRAPHITI_EVALUATION_ATTEMPT' AND payload_digest=? LIMIT 2", (digest_bytes(payload),),
+    ).fetchall()
+    if (len(ledger) != 1 or ledger[0][1] != payload.decode()
+        or ledger[0][3] != digest_canonical({"at": ledger[0][0], "kind": "GRAPHITI_EVALUATION_ATTEMPT",
+            "payload_digest": digest_bytes(payload), "prev": ledger[0][2]})):
+        return False
+    unit = _native_landed_source_unit(connection, ingest_id=ingest, revision_id_hint=record.get("revision_id"))
+    if unit is None or unit.authority is None:
+        return False
+    passages = record.get("passages"); body = " ".join(unit.episode_body.split()).encode()
+    if (type(passages) is not list or len(passages) != 1 or type(passages[0]) is not dict
+        or passages[0].get("byte_offset") != 0 or passages[0].get("byte_length") != len(body)
+        or passages[0].get("text_digest") != digest_bytes(body) or passages[0].get("blob_digest") != digest_bytes(body)
+        or passages[0].get("admission_id") != unit.authority.admission_id
+        or passages[0].get("access_decision_id") != unit.authority.access_decision_id
+        or record.get("authority_record_ids") != [str(item["record_id"]) for item in unit.authority.records]):
+        return False
+    return all(record.get(key) == getattr(unit, key) for key in (
+        "source_id", "item_key", "proving_run_id", "observation_digest", "revision_id",
+        "published_at", "updated_at", "observed_at", "chunk_ordinal", "chunk_count", "predecessor_ingest_id"))
+
+
 def _native_immutable_replay_proof(
     connection: sqlite3.Connection,
     *,
@@ -3436,6 +3541,10 @@ class ModelUsageService:
             connection.executescript(model_usage_current.SCHEMA)
             model_usage_current.initialise_empty(connection)
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone():
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS model_usage_graphiti_attempt_payload "
+                    "ON ledger(payload_digest) WHERE kind='GRAPHITI_EVALUATION_ATTEMPT'"
+                )
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS model_usage_native_landed_revision "
                     "ON ledger(kind,json_extract(payload_json,'$.revision_id')) "
@@ -4882,9 +4991,13 @@ class ModelUsageService:
                         continue
                     if not leaves:
                         # A terminal controller refusal has no provider allocation.
-                        # It counts toward raw attempts but is not proof of a zero leaf.
+                        # Only the new authenticated active-other-owner refusal
+                        # supplies structural zero; generic absence stays UNKNOWN.
                         if native_attempts is not None:
-                            unresolved.append(attempt)
+                            if _native_workspace_busy_zero(connection, envelope=envelopes[envelope_id], attempt_number=attempt):
+                                zero.append(attempt)
+                            else:
+                                unresolved.append(attempt)
                         continue
                     attempt_zero = True
                     attempt_dispatched = False
@@ -6074,6 +6187,16 @@ class ModelUsageService:
                 return prior
 
             policy = _policy_for_allocation(connection, allocation)
+            if _native_conservative_subscription_leaf(allocation) is GraphitiLeafClass.FALLBACK:
+                # These estimates are qualified for direct route failover, not
+                # a child of a malformed primary. Leave unsupported work UNKNOWN.
+                _retained_terminal_allocation(connection, invocation_id)
+                identity = _retained_graphiti_request_identity(connection, allocation)
+                if identity is not None and identity.parent_invocation_id is not None:
+                    raise ModelUsageAdmissionError(
+                        "parented fallback is outside direct-failover estimate scope",
+                        reason_code="NATIVE_DISPOSITION_NOT_APPLICABLE",
+                    )
             if cancelled_fallback:
                 authority = _native_graphiti_fallback_cancellation_authority(
                     connection, allocation=allocation, terminal=terminal, policy=policy,
