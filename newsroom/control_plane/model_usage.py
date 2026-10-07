@@ -438,6 +438,8 @@ CREATE INDEX IF NOT EXISTS model_usage_transport_invocation
 ON model_transport_observations(invocation_id, observed_at, observation_digest);
 CREATE INDEX IF NOT EXISTS model_usage_route_state
 ON model_usage_route_circuit_events(route, recorded_at);
+CREATE INDEX IF NOT EXISTS graphiti_request_effective_revision
+ON graphiti_internal_requests(json_extract(record_json, '$.effective_revision_digest'), invocation_id);
 """
 
 
@@ -1680,9 +1682,10 @@ def _retained_graphiti_request_identity(
     return identity
 
 
-def _require_primary_unavailable_event(
+def _require_open_route_event(
     connection: sqlite3.Connection,
     event_digest: str,
+    *, route: str = "GRAPHITI_CHAT_PRIMARY",
 ) -> dict[str, object]:
     row = connection.execute(
         "SELECT route,state,reason,invocation_id,recorded_at,record_json "
@@ -1709,7 +1712,7 @@ def _require_primary_unavailable_event(
             record.get("invocation_id"),
             record.get("recorded_at"),
         )
-        or record.get("route") != "GRAPHITI_CHAT_PRIMARY"
+        or record.get("route") != route
         or record.get("state") != "OPEN"
     ):
         raise ModelUsageAdmissionError(
@@ -1725,7 +1728,7 @@ def _require_direct_fallback_authority(
     event_digest = identity.primary_unavailable_event_digest
     if event_digest is None:
         return
-    _require_primary_unavailable_event(connection, event_digest)
+    _require_open_route_event(connection, event_digest)
     if (
         identity.leaf_class is not GraphitiLeafClass.FALLBACK
         or identity.parent_invocation_id is not None
@@ -4039,7 +4042,10 @@ class ModelUsageService:
                     reason_code=reason_code,
                 )
 
-            self._validate_preflight(connection, allocation, policy)
+            self._require_independent_graphiti_work(connection, allocation, identity)
+            self._validate_preflight(
+                connection, allocation, policy, graphiti_identity=identity,
+            )
             self._insert_allocation(connection, allocation)
             connection.execute(
                 "INSERT INTO graphiti_internal_requests("
@@ -5104,6 +5110,8 @@ class ModelUsageService:
         connection: sqlite3.Connection,
         allocation: InvocationAllocation,
         policy: InvocationEfficiencyPolicy,
+        *,
+        graphiti_identity: GraphitiInternalRequestIdentity | None = None,
     ) -> None:
         manifest: dict[str, object] = {}
         if policy.command_semantic_version != "UNSPECIFIED":
@@ -5251,11 +5259,13 @@ class ModelUsageService:
                 "config identity is outside qualified policy"
             )
         blocking_routes = _usage_blocking_routes(connection)
-        route_state = self._route_state(connection, allocation.route, blocking_routes=blocking_routes)
+        route_reader = self._graphiti_work_route_state if graphiti_identity is not None else self._route_state
+        route_state = route_reader(connection, allocation.route, blocking_routes=blocking_routes)
+        independent_graphiti_work = graphiti_identity is not None and route_state["state"] == "CLOSED"
         independent_timeout_work = self._independent_typesafe_transport_work(
             connection, allocation, envelope, route_state,
         )
-        if _canonical_circuit_route(allocation.route) in blocking_routes and not independent_timeout_work:
+        if _canonical_circuit_route(allocation.route) in blocking_routes and not (independent_timeout_work or independent_graphiti_work):
             raise ModelUsageAdmissionError(
                 "affected route has unresolved usage or a policy breach"
             )
@@ -6937,6 +6947,121 @@ class ModelUsageService:
         finally:
             connection.close()
 
+    def graphiti_work_route_state(self, route: str) -> dict[str, object]:
+        """Admission for independent work; historical usage/circuit truth is retained."""
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN")
+            return self._graphiti_work_route_state(connection, route)
+        finally:
+            connection.close()
+
+    def _graphiti_work_route_state(
+        self, connection: sqlite3.Connection, route: str,
+        *, blocking_routes: set[str] | None = None,
+    ) -> dict[str, object]:
+        state = self._route_state(connection, route, blocking_routes=blocking_routes)
+        if route not in {"GRAPHITI_CHAT_PRIMARY", "GRAPHITI_CHAT_FALLBACK", "GRAPHITI_EMBEDDING"} or state["state"] != "OPEN":
+            return state
+        request_failures = {
+            "MISSING_PROVIDER_TELEMETRY", "UNREPORTED", "AMBIGUOUS", "TIMEOUT",
+            "TimeoutError", "CliTimeoutError", "CANCELLED", "CANCELLATION",
+            "FAILED", "AMBIGUOUS_DISPATCH", "SYSTEMIC_TRANSPORT",
+        }
+        if state.get("reason") not in request_failures or not state.get("event_digest"):
+            return state
+        event = _require_open_route_event(connection, str(state["event_digest"]), route=route)
+        head_id = event.get("invocation_id")
+        if not head_id:
+            return state
+        rows = connection.execute(
+            "SELECT invocation_id,active,unresolved,policy_breach FROM model_usage_current WHERE route=?",
+            (route,),
+        ).fetchall()
+        # A conservative disposition may remove CURRENT debt without changing
+        # the original terminal or the historical OPEN event. Check both.
+        isolated = {head_id}
+        for invocation_id, active, unresolved, breach in rows:
+            if breach:
+                return state
+            if not active:
+                if not unresolved:
+                    return state
+                isolated.add(invocation_id)
+        for invocation_id in isolated:
+            prior, terminal = _retained_terminal_allocation(connection, invocation_id)
+            if (prior.route != route or terminal.policy_breach
+                    or terminal.usage_status not in {UsageStatus.UNREPORTED, UsageStatus.AMBIGUOUS}
+                    or terminal.failure_class not in request_failures):
+                return state
+        # CLOSED describes admission, not provider health or settled old usage.
+        return {**state, "state": "CLOSED", "historical_circuit_state": "OPEN",
+                "reason": "REQUEST_FAILURE_ISOLATED", "availability": "UNOBSERVED"}
+
+    def _require_independent_graphiti_work(
+        self, connection: sqlite3.Connection, allocation: InvocationAllocation,
+        identity: GraphitiInternalRequestIdentity,
+    ) -> None:
+        """An unknown old work identity cannot acquire a new attempt or backend."""
+        rows = connection.execute(
+            "SELECT invocation_id,active,unresolved,policy_breach FROM model_usage_current "
+            "WHERE route IN ('GRAPHITI_CHAT_PRIMARY','GRAPHITI_CHAT_FALLBACK','GRAPHITI_EMBEDDING')"
+        ).fetchall()
+        pending = {row[0]: bool(row[1]) for row in rows}
+        # Lookup this work only. A new route head or a conservative estimate
+        # must not hide an older dispatched UNKNOWN, including a renamed ingest.
+        unknown = connection.execute(
+            "SELECT r.invocation_id FROM graphiti_internal_requests r "
+            "JOIN model_invocation_terminals t USING(invocation_id) "
+            "WHERE json_extract(r.record_json,'$.effective_revision_digest')=? "
+            "AND t.usage_status IN ('UNREPORTED','AMBIGUOUS') UNION "
+            "SELECT a.invocation_id FROM model_work_envelopes e "
+            "JOIN model_invocation_allocations a USING(envelope_id) "
+            "JOIN model_invocation_terminals t USING(invocation_id) "
+            "WHERE e.workload_class='GRAPHITI_CHAT_PRIMARY' "
+            "AND json_extract(e.record_json,'$.ingest_id')=? "
+            "AND t.usage_status IN ('UNREPORTED','AMBIGUOUS')",
+            (identity.effective_revision_digest, identity.ingest_obligation_id),
+        ).fetchall()
+        for (invocation_id,) in unknown:
+            pending.setdefault(invocation_id, False)
+        for invocation_id, active in pending.items():
+            if invocation_id == allocation.invocation_id:
+                continue
+            prior = (
+                model_usage_current._active_allocation(connection, invocation_id) if active
+                else _retained_terminal_allocation(connection, invocation_id)[0]
+            )
+            previous = _retained_graphiti_request_identity(connection, prior)
+            if previous is None:
+                raise ModelUsageAdmissionError("Graphiti unresolved work identity is absent")
+            same_work = (previous.ingest_obligation_id == identity.ingest_obligation_id
+                         or previous.effective_revision_digest == identity.effective_revision_digest)
+            if same_work and (not active or previous.graphiti_attempt_id != identity.graphiti_attempt_id):
+                raise ModelUsageAdmissionError(
+                    "Graphiti work has an active or unresolved prior attempt",
+                    reason_code="GRAPHITI_PRIOR_WORK_UNRESOLVED",
+                )
+
+    def require_graphiti_dispatch_available(self, allocation: InvocationAllocation) -> None:
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN")
+            retained = model_usage_current._active_allocation(connection, allocation.invocation_id)
+            terminal = connection.execute(
+                "SELECT 1 FROM model_invocation_terminals WHERE invocation_id=?", (allocation.invocation_id,),
+            ).fetchone()
+            if retained != allocation or terminal is not None:
+                raise ModelUsageAdmissionError("Graphiti dispatch allocation is not active")
+            identity = _retained_graphiti_request_identity(connection, retained)
+            if identity is None:
+                raise ModelUsageAdmissionError("Graphiti dispatch identity is absent")
+            self._require_independent_graphiti_work(connection, allocation, identity)
+            if self._graphiti_work_route_state(connection, allocation.route)["state"] != "CLOSED":
+                raise ModelUsageAdmissionError("Graphiti route unavailable before dispatch")
+        finally:
+            connection.close()
+
     def route_state(self, route: str) -> dict[str, object]:
         connection = self._connection()
         try:
@@ -6946,15 +7071,16 @@ class ModelUsageService:
             connection.close()
 
     @contextmanager
-    def route_state_snapshot(self) -> Iterator[Callable[[str], dict[str, object]]]:
+    def route_state_snapshot(
+        self, *, graphiti_work: bool = False,
+    ) -> Iterator[Callable[[str], dict[str, object]]]:
         """Authenticate global blockers once for one consistent route decision."""
         connection = self._connection()
         try:
             connection.execute("BEGIN")
             blocking_routes = _usage_blocking_routes(connection)
-            yield lambda route: self._route_state(
-                connection, route, blocking_routes=blocking_routes,
-            )
+            reader = self._graphiti_work_route_state if graphiti_work else self._route_state
+            yield lambda route: reader(connection, route, blocking_routes=blocking_routes)
         finally:
             connection.close()
 
