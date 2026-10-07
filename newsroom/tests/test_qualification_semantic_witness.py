@@ -730,6 +730,6 @@ def test_current_paid_text_projection_matches_the_existing_acquisition_router(ro
         unit.item_key=digest_bytes(b'parent')+'|https://assets.publishing.service.gov.uk/fixture.'+('pdf'if route=='pdf'else'csv')
     elif route=='wrong-host':unit.canonical_url='https://unrelated.invalid/fixture'
     source=SimpleNamespace(unit=unit)
-    if route=='wrong-host':
+    if route in {'wrong-host','weather-hk','weather-uk'}:
         with pytest.raises(ValueError):current_source_passage(source)
-    else:assert current_source_passage(source)==('Exact title\n\nExact body'if route=='govuk'else'Exact body')
+    else:assert current_source_passage(source)=='Exact title\n\nExact body'

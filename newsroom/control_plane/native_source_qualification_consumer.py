@@ -18,12 +18,11 @@ PAID_BINDING_VERSION = 'newsroom.source-qualification-consumer.v1'
 
 def current_source_passage(source):
     """Reproduce the paid text recipe only from an already verified CURRENT Source."""
-    from .native_source_intake import pdf_asset_url, spreadsheet_asset_url
     from .govuk_evidence import _api_url
     unit=source.unit
-    if unit.source_id in {'HK-02','UK-10'} or pdf_asset_url(unit) or spreadsheet_asset_url(unit):
-        return unit.body
-    # This is the existing acquisition router's Content API branch.
+    if unit.source_id in {'HK-02','UK-10'}:
+        raise ValueError('CURRENT weather paid projection is unsupported')
+    # GOV.UK Content API, PDF and spreadsheet acquisitions share this recipe.
     _api_url(unit.canonical_url)
     return unit.headline+'\n\n'+unit.body
 

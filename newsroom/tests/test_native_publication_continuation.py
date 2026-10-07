@@ -1689,7 +1689,7 @@ def test_separate_semantic_continuation_retains_original_interruption_and_never_
             assert result.reason=='SEMANTIC_INTENT_INPUT_CHANGED_HOLD'
             assert len(calls)==1
         else:
-            assert result.state=='ASSESSMENT_INTERRUPTED' and len(calls)==2
+            assert result.reason=='SEMANTIC_ASSESSMENT_ALREADY_ATTEMPTED_HOLD' and len(calls)==1
     elif scenario not in {'eligible','question-upgrade'}:
         assert result.state=='ASSESSMENT_INTERRUPTED' and calls==[]
         assert journal.current(unit.revision_id)['facts']==old
