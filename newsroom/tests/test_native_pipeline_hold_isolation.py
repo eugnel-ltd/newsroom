@@ -226,5 +226,6 @@ def test_owner_stop_and_drain_escape_retained_resume_without_hold_conversion(
     assert NativeRevisionJournal(context.connection).current(context.held.revision_id) == original
     assert not any(call[0] in {"graphiti", "discovery", "publish"} for call in context.calls)
     assert context.calls.count(("resume", context.held.revision_id)) == 1
-    assert context.fresh.revision_id in context.journal.units
+    # Retained work now runs before intake; a stop must prevent new LAND too.
+    assert context.fresh.revision_id not in context.journal.units
     assert context.fresh.revision_id not in {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
