@@ -131,6 +131,15 @@ FACTUAL_CONTRACT_TESTS = tuple("newsroom/tests/" + name for name in (
     "test_increment10_evidence.py", "test_increment10_evidence_read_reuse.py",
     "test_native_publication.py", "test_native_publication_continuation.py",
 ))
+TYPESAFE_ANSWERS_PATH = "newsroom/control_plane/typesafe_judgment.py"
+TYPESAFE_ANSWERS_CHANGED_TESTS = frozenset({"newsroom/tests/test_typesafe_judgment.py"})
+TYPESAFE_ANSWERS_CONTRACT_TESTS = tuple("newsroom/tests/" + name for name in (
+    "test_typesafe_judgment.py", "test_model_usage_typesafe_judgment.py",
+    "test_native_assessor_judgments.py", "test_native_graphiti_judgments.py",
+    "test_native_source_qualification.py", "test_qualification_semantic_witness.py",
+    "test_native_semantic_composition.py", "test_native_context_enrichment.py",
+    "test_native_publication_continuation.py",
+))
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -327,14 +336,19 @@ def _source_body_contract_tests(root, changed, source_paths, base_sha, head_sha)
     return set(SOURCE_BODY_CONTRACT_TESTS)
 
 
-def _factual_data_body(function, module_names):
-    """Inspected factual-helper primitives only; not a generic Python classifier."""
+def _factual_data_body(function, module_names, *, answers=False):
+    """Inspected factual/answer primitives only; not a generic purity classifier."""
     globals_allowed = {"re", "_ENGLISH_MONTHS", "_chinese_integer", "_valid_canonical_date",
                        "_calendar_month_occurs", "_canonical_localised_fact", "int", "str", "tuple", "object", "bool"}
     calls_allowed = globals_allowed - {"re", "_ENGLISH_MONTHS"}
     methods = {"get", "group", "casefold", "istitle", "lower", "replace", "isdigit",
                "startswith", "removesuffix", "strip", "rstrip", "lstrip", "endswith",
                "finditer", "start", "end", "isnumeric"}
+    if answers:
+        globals_allowed = {"_ppm", "Decimal", "ROUND_HALF_EVEN", "type", "dict", "set",
+                           "str", "int", "range", "len", "enumerate", "sum", "abs", "max", "ValueError"}
+        calls_allowed = globals_allowed - {"ROUND_HALF_EVEN"}
+        methods = {"get", "items", "values", "quantize", "update"}
     nodes = tuple(ast.walk(function))
     nested = {node.name for node in nodes if isinstance(node, ast.FunctionDef) and node is not function}
     locals_ = {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
@@ -343,12 +357,24 @@ def _factual_data_body(function, module_names):
             or args & (module_names | globals_allowed | nested)
             or nested & (module_names | globals_allowed)):
         return False
+    if answers:
+        # Only the fresh result map may be mutated; input/global aliases broaden.
+        bindings = [node for node in nodes if isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Store) and node.id == "result"]
+        if len(bindings) != 1 or not any(
+            isinstance(node, ast.Assign) and len(node.targets) == 1
+            and node.targets[0] is bindings[0] and isinstance(node.value, ast.Dict)
+            and not node.value.keys for node in nodes
+        ):
+            return False
     for node in nodes:
+        if answers and isinstance(node, ast.AugAssign):
+            return False  # In-place operators may mutate aliases of input data.
         if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal, ast.ClassDef,
                              ast.AsyncFunctionDef, ast.Lambda, ast.Yield, ast.YieldFrom, ast.Await, ast.With)):
             return False
         if isinstance(node, ast.FunctionDef) and node is not function:
-            if (node.decorator_list or node.args.defaults or any(node.args.kw_defaults)
+            if (answers or node.decorator_list or node.args.defaults or any(node.args.kw_defaults)
                     or node.args.vararg or node.args.kwarg or node.returns
                     or any(arg.annotation for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs))):
                 return False
@@ -356,10 +382,30 @@ def _factual_data_body(function, module_names):
             return False
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("__") and node.value.endswith("__"):
             return False
-        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
             return False
+        if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            target = node.value
+            depth = 1
+            while isinstance(target, ast.Subscript):
+                target = target.value
+                depth += 1
+            if not (answers and isinstance(node.ctx, ast.Store)
+                    and isinstance(target, ast.Name) and target.id == "result" and depth <= 2):
+                return False
+            if depth == 1 and not any(
+                isinstance(item, ast.Assign) and len(item.targets) == 1
+                and item.targets[0] is node and isinstance(item.value, ast.Dict) for item in nodes
+            ):
+                return False
         if isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name) and node.value.id == "re":
+            if answers:
+                local_data = isinstance(node.value, ast.Name) and node.value.id in locals_ | args
+                local_result = (isinstance(node.value, ast.Subscript)
+                                and isinstance(node.value.value, ast.Name) and node.value.value.id == "result")
+                if node.attr not in methods or not (local_result if node.attr == "update" else local_data):
+                    return False
+            elif isinstance(node.value, ast.Name) and node.value.id == "re":
                 if node.attr not in {"compile", "fullmatch", "IGNORECASE"}:
                     return False
             elif node.attr not in methods:
@@ -374,22 +420,30 @@ def _factual_data_body(function, module_names):
 
 
 def _factual_helper_contract_tests(root, changed, source_paths, base_sha, head_sha):
-    if set(source_paths) != {FACTUAL_HELPER_PATH} or any(
-        not _is_documentation(path) and path not in FACTUAL_CHANGED_TESTS | {FACTUAL_HELPER_PATH}
-        for path in changed
+    if set(source_paths) == {FACTUAL_HELPER_PATH}:
+        path, helpers, changed_tests, tests = (FACTUAL_HELPER_PATH, FACTUAL_HELPERS,
+                                              FACTUAL_CHANGED_TESTS, FACTUAL_CONTRACT_TESTS)
+    elif set(source_paths) == {TYPESAFE_ANSWERS_PATH}:
+        path, helpers, changed_tests, tests = (TYPESAFE_ANSWERS_PATH, {"_answers"},
+                                              TYPESAFE_ANSWERS_CHANGED_TESTS, TYPESAFE_ANSWERS_CONTRACT_TESTS)
+    else:
+        return None
+    if any(
+        not _is_documentation(item) and item not in changed_tests | {path}
+        for item in changed
     ):
         return None
-    if any(not (root / path).is_file() or (root / path).is_symlink() for path in FACTUAL_CONTRACT_TESTS):
+    if any(not (root / item).is_file() or (root / item).is_symlink() for item in tests):
         return None
-    modules = _revision_modules(root, FACTUAL_HELPER_PATH, base_sha, head_sha)
+    modules = _revision_modules(root, path, base_sha, head_sha)
     parts = None if modules is None else _unchanged_function_interfaces(modules)
-    if parts is None or not parts[0] <= FACTUAL_HELPERS:
+    if parts is None or not parts[0] <= helpers:
         return None
     module_names = set(_module_declarations(modules[0][1])[0])
-    if any(not _factual_data_body(functions[name], module_names)
+    if any(not _factual_data_body(functions[name], module_names, answers=path == TYPESAFE_ANSWERS_PATH)
            for functions in parts[1:] for name in parts[0]):
         return None
-    return set(FACTUAL_CONTRACT_TESTS)
+    return set(tests)
 
 
 def _module_declarations(tree: ast.Module):
@@ -895,7 +949,9 @@ def select_focus(
         contract_reason = "explicit_source_name_date_body_contract:F2"
         if contract_tests is None:
             contract_tests = _factual_helper_contract_tests(root, changed, source_paths, base_sha, head_sha)
-            contract_reason = "explicit_factual_helper_body_contract:F2"
+            contract_reason = ("explicit_typesafe_answers_body_contract:F2"
+                               if source_paths == [TYPESAFE_ANSWERS_PATH]
+                               else "explicit_factual_helper_body_contract:F2")
         if contract_tests is None:
             discovered, unresolved = _discover_tests(
                 root, source_paths, base_sha=base_sha, head_sha=head_sha

@@ -1210,3 +1210,106 @@ def test_unproved_factual_helper_delta_preserves_normal_discovery(tmp_path, kind
     assert 'newsroom/tests/test_other_neo4j_service.py' in route['selected_service_tests']
     assert 'F3' in route['gates']
     if kind == 'control': assert 'sdlc_control:F2' in route['reasons']
+
+
+_ANSWERS_SOURCE = 'newsroom/control_plane/typesafe_judgment.py'
+_ANSWERS_TESTS = (
+    'test_typesafe_judgment.py', 'test_model_usage_typesafe_judgment.py',
+    'test_native_assessor_judgments.py', 'test_native_graphiti_judgments.py',
+    'test_native_source_qualification.py', 'test_qualification_semantic_witness.py',
+    'test_native_semantic_composition.py', 'test_native_context_enrichment.py',
+    'test_native_publication_continuation.py',
+)
+_ANSWERS_OLD_MASS = '        if abs(sum(Decimal(v) for v in probabilities.values()) - 1) > tolerance:\n'
+_ANSWERS_RETAINED_MASS = (
+    '        mass = sum(Decimal(v) for v in probabilities.values())\n'
+    "        if kind == 'choice':\n"
+    '            # Judge the inclusive rounding boundary at the retained PPM precision.\n'
+    "            mass = mass.quantize(Decimal('0.000001'), rounding=ROUND_HALF_EVEN)\n"
+    '        if abs(mass - 1) > tolerance:\n'
+)
+
+
+def _answers_contract_repo(tmp_path):
+    """Reproduce the cee8788/1c1c2da decoder delta without private Git history."""
+    subprocess.run(('git', 'init', '-q'), cwd=tmp_path, check=True)
+    source = (Path(__file__).parents[2] / _ANSWERS_SOURCE).read_text()
+    before = source.replace(_ANSWERS_RETAINED_MASS, _ANSWERS_OLD_MASS, 1)
+    assert before.count(_ANSWERS_OLD_MASS) == 1
+    after = before.replace(_ANSWERS_OLD_MASS, _ANSWERS_RETAINED_MASS, 1)
+    _write(tmp_path, _ANSWERS_SOURCE, before)
+    for name in _ANSWERS_TESTS:
+        _write(tmp_path, 'newsroom/tests/' + name)
+    _write(tmp_path, 'newsroom/tests/test_other_neo4j_service.py',
+           'from newsroom.control_plane.typesafe_judgment import TypesafeJudgment\n')
+    return after, _commit(tmp_path, 'actual retained-precision decoder baseline')
+
+
+def test_actual_typesafe_precision_delta_uses_decoder_consumer_contract_without_service(tmp_path):
+    source, base = _answers_contract_repo(tmp_path)
+    _write(tmp_path, _ANSWERS_SOURCE, source)
+    test = 'newsroom/tests/test_typesafe_judgment.py'
+    _write(tmp_path, test, '# Inclusive PPM boundary and retained-failure replay regressions.\n')
+    head = _commit(tmp_path, 'actual retained-precision decoder delta')
+    route = selector.select_focus((_ANSWERS_SOURCE, test), repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert route['selected_tests'] == sorted('newsroom/tests/' + name for name in _ANSWERS_TESTS)
+    assert route['selected_service_tests'] == []
+    assert route['gates'] == ['F0', 'F1', 'F2']
+    assert route['full_health_required'] is False
+    assert 'explicit_typesafe_answers_body_contract:F2' in route['reasons']
+
+
+@pytest.mark.parametrize('kind', [
+    'import', 'signature', 'ppm', 'constant', 'schema', 'policy', 'transport', 'class',
+    'unknown-call', 'unknown-method', 'io', 'reflection', 'dunder', 'shadow', 'alias-call', 'nested',
+    'attribute-store', 'input-store', 'input-update', 'result-alias', 'result-child-alias',
+    'nested-output-store', 'inplace', 'unclosed-name',
+    'other-production', 'other-test', 'stateful', 'service', 'control', 'missing-test',
+])
+def test_unproved_typesafe_answers_delta_preserves_normal_discovery(tmp_path, kind):
+    source, base = _answers_contract_repo(tmp_path)
+    marker = 'def _answers(value, questions):\n'
+    paths = [_ANSWERS_SOURCE]
+    if kind == 'import': source = source.replace('import json\n', 'import json\nimport socket\n', 1)
+    elif kind == 'signature': source = source.replace(marker, 'def _answers(value, questions, extra=None):\n', 1)
+    elif kind == 'ppm': source = source.replace('def _ppm(value, *, maximum=1):\n', 'def _ppm(value, *, maximum=2):\n', 1)
+    elif kind == 'constant': source = source.replace('TIMEOUT = 10', 'TIMEOUT = 20', 1)
+    elif kind == 'schema': source = source.replace("'projection': 'integer-ppm-round-half-even'", "'projection': 'changed'", 1)
+    elif kind == 'policy': source = source.replace('max_prompt_bytes=131072', 'max_prompt_bytes=262144', 1)
+    elif kind == 'transport': source = source.replace('return response.status, response.geturl(), response.read(max_bytes + 1)', 'return response.status, response.geturl(), response.read(max_bytes + 2)', 1)
+    elif kind == 'class': source = source.replace("'TYPESAFE_INPUT_BOUND'", "'CHANGED_INPUT_BOUND'", 1)
+    elif kind == 'unknown-call': source = source.replace(marker, marker + '    additional_reader(value)\n', 1)
+    elif kind == 'unknown-method': source = source.replace(marker, marker + '    value.read()\n', 1)
+    elif kind == 'io': source = source.replace(marker, marker + "    open('local-fixture')\n", 1)
+    elif kind == 'reflection': source = source.replace(marker, marker + "    getattr(value, '__class__')\n", 1)
+    elif kind == 'dunder': source = source.replace(marker, marker + "    value['__dict__']\n", 1)
+    elif kind == 'shadow': source = source.replace(marker, marker + '    Decimal = value\n', 1)
+    elif kind == 'alias-call': source = source.replace(marker, marker + '    reader = Decimal\n    reader(value)\n', 1)
+    elif kind == 'nested': source = source.replace(marker, marker + '    def helper():\n        return value\n', 1)
+    elif kind == 'attribute-store': source = source.replace(marker, marker + '    value.changed = 1\n', 1)
+    elif kind == 'input-store': source = source.replace(marker, marker + "    value['changed'] = 1\n", 1)
+    elif kind == 'input-update': source = source.replace(marker, marker + '    value.update(changed=1)\n', 1)
+    elif kind == 'result-alias': source = source.replace(marker, marker + '    result = value\n', 1)
+    elif kind == 'result-child-alias': source = source.replace('    return result\n', "    result['alias'] = value\n    result['alias'].update(changed=1)\n    return result\n", 1)
+    elif kind == 'nested-output-store': source = source.replace('    return result\n', "    result[key]['probabilities_ppm']['changed'] = 1\n    return result\n", 1)
+    elif kind == 'inplace': source = source.replace(marker, marker + '    value += questions\n', 1)
+    elif kind == 'unclosed-name': source = source.replace(marker, marker + '    external_permission\n', 1)
+    elif kind == 'missing-test':
+        missing = 'newsroom/tests/test_native_assessor_judgments.py'
+        (tmp_path / missing).unlink()
+        paths.append(missing)
+    else:
+        extra = {'other-production': 'newsroom/control_plane/native_assessor_judgments.py',
+                 'other-test': 'newsroom/tests/test_native_assessor_judgments.py',
+                 'stateful': 'newsroom/authority/answers_fixture.py',
+                 'service': 'newsroom/projection/neo4j/answers_fixture.py',
+                 'control': 'scripts/sdlc/focus_selector.py'}[kind]
+        paths.append(extra)
+        _write(tmp_path, extra, '# A protected/mixed decoder boundary changed.\n')
+    _write(tmp_path, _ANSWERS_SOURCE, source)
+    head = _commit(tmp_path, 'unqualified decoder delta')
+    route = selector.select_focus(paths, repo_root=tmp_path, base_sha=base, head_sha=head)
+    assert 'explicit_typesafe_answers_body_contract:F2' not in route['reasons']
+    assert 'newsroom/tests/test_other_neo4j_service.py' in route['selected_service_tests']
+    assert 'F3' in route['gates']
+    if kind == 'control': assert 'sdlc_control:F2' in route['reasons']
