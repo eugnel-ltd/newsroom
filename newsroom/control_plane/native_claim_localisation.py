@@ -88,7 +88,7 @@ ALIGNED_SCHEMA_DIGEST = digest_canonical(ALIGNED_SCHEMA)
 _LITERAL_NUMERIC_FORM = re.compile(
     r'[+\-−]?\d+(?:[.,]\d+)*(?:\s*(?:to|至|[-–—/:])\s*\d+(?:[.,]\d+)*)?'
     r'(?:\s*(?:years?|months?|weeks?|days?|hours?|minutes?|million|billion|thousand|'
-    r'小時|分鐘|個月|港元|英鎊|公里|%|％|年|月|日|歲|個|間|所|項|期|次|名|人|座|輛|條|倍|成))?', re.I)
+    r'小時|分鐘|個月|港元|英鎊|公里|%|％|年|月|日|歲|個|間|所|項|期|次|名|人|座|輛|條|倍|成))?(?:半)?', re.I)
 
 
 def _contract(version):
@@ -257,10 +257,13 @@ def _validate_content(renderings, state):
                 for source, target in bound for match in re.finditer(_entity_pattern((source, target)[column]), text))
             if any(right[0] < left[1] for left, right in zip(occurrences, occurrences[1:])):
                 return None
-            for pattern in (_LITERAL_NUMERIC_FORM, _CHINESE_NUMERAL_FACT):
+            for pattern in (_LITERAL_NUMERIC_FORM, re.compile(_CHINESE_NUMERAL_FACT.pattern + r'(?:半)?')):
                 for match in pattern.finditer(text):
-                    if not any(match.start() < end and match.end() > start for start, end, _fact in occurrences):
+                    overlapping = [(start, end) for start, end, _fact in occurrences if match.start() < end and match.end() > start]
+                    if not overlapping:
                         occurrences.append((match.start(), match.end(), ('LITERAL', match.group())))
+                    elif not any(start <= match.start() and match.end() <= end for start, end in overlapping):
+                        return None  # A declared fact cannot cover only part of a literal quantity.
             return tuple(fact for _start, _end, fact in sorted(occurrences))
         source_facts, target_facts = fact_stream(claim['text'], 0), fact_stream(rendered, 1)
         if source_facts is None or target_facts is None or source_facts != target_facts:
@@ -282,9 +285,13 @@ def _validate_content(renderings, state):
             r'﹃([^﹄\n]+)﹄', r'«([^»\n]+)»', r'‹([^›\n]+)›',
             r"(?<![A-Za-z])'([^'\n]+)'(?![A-Za-z])",
         )
+        def quote_input(text):
+            for name in names:
+                text = text.replace(name, re.sub(r"['’]", '_', name))
+            return re.sub(r"(?<=[A-Za-z])['’](?=[A-Za-z])", '_', text)
         def quote_scan(text):
             # Word apostrophes are not quote boundaries; text/keys stay immutable.
-            scanned = re.sub(r"(?<=[A-Za-z])['’](?=[A-Za-z])", '_', text)
+            scanned = quote_input(text)
             matches = [match for pattern in quote_patterns for match in re.finditer(pattern, scanned)]
             quotes = tuple(match.group(1) for match in matches)
             residue = _remove_exact_expressions(scanned, tuple(match.group() for match in matches))
@@ -294,7 +301,7 @@ def _validate_content(renderings, state):
             return quotes, complete
         source_quotes, source_quotes_complete = quote_scan(claim['text'])
         target_quotes, target_quotes_complete = quote_scan(rendered)
-        keys = tuple(re.sub(r"(?<=[A-Za-z])['’](?=[A-Za-z])", '_', key) for key in item['quotation_source_keys'])
+        keys = tuple(quote_input(key) for key in item['quotation_source_keys'])
         if (not target_quotes_complete or (keys and not source_quotes_complete)
                 or any(key not in claim['text'] for key in item['quotation_source_keys'])
                 or any(not any(key in quote for quote in source_quotes) for key in keys)

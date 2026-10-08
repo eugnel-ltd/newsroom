@@ -277,6 +277,29 @@ def test_future_typed_facts_preserve_occurrence_order_and_count(source, rendered
     assert 'LOCALISATION_NUMERIC_HOLD' in held.value.reason_codes
 
 
+@pytest.mark.parametrize('pair', [True, False])
+def test_future_partial_quantity_cannot_erase_unsupported_half_suffix(pair):
+    state = {'claims': {'0': {'text': '計劃為期2年半。', 'entities': [], 'rendering_fragment_count': 1}}}
+    item = {'span_id': '0', 'rendered_assertion_zh_hant_hk_fragments': ['計劃為期2年。'],
+            'factual_localisations': [{'source_lookup_key': '2年', 'rendered_expression': '2年'}] if pair else [], 'quotation_source_keys': []}
+    with pytest.raises(LocalisationHold) as held:
+        module._renderings(canonical_json_bytes({'renderings': [item]}), state, version=module.ALIGNED_VERSION)
+    assert 'LOCALISATION_NUMERIC_HOLD' in held.value.reason_codes
+
+
+@pytest.mark.parametrize('quoted', [False, True])
+def test_future_protected_name_apostrophe_is_not_a_quote_boundary(quoted):
+    name = "Teachers' Pension Scheme"
+    source = f'The provider said "{name}" accepts applications.' if quoted else f'{name} now accepts applications.'
+    state = {'claims': {'0': {'text': source, 'entities': [[name, 'OFFICIAL_TERM']], 'rendering_fragment_count': 2}}}
+    item = {'span_id': '0', 'rendered_assertion_zh_hant_hk_fragments': ['「' if quoted else '', '」現已接受申請。' if quoted else '現已接受申請。'],
+            'factual_localisations': [], 'quotation_source_keys': [name] if quoted else []}
+    raw = canonical_json_bytes({'renderings': [item]})
+    decoded = module._renderings(raw, state, version=module.ALIGNED_VERSION)
+    assert decoded['0'] == {key: value for key, value in item.items() if key != 'span_id'}
+    assert canonical_json_bytes({'renderings': [item]}) == raw
+
+
 @pytest.mark.parametrize('rendered', ['「計劃現已開放。」', '計劃現已「開放。', '計劃現已「開放』。'])
 def test_future_target_quotes_need_complete_supported_source_bindings(rendered):
     state = {'claims': {'0': {'text': 'The scheme is now open.', 'entities': [], 'rendering_fragment_count': 1}}}
