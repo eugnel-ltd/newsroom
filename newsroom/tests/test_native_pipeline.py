@@ -2536,6 +2536,7 @@ def test_recent_incomplete_revision_keeps_priority_over_older_attempt_inventory(
         effective_revision=replace(_native().effective_revision, first_observed_at='2026-10-08T15:56:04Z'))
     for unit in (old, recent):
         journal.land((unit, replace(unit, chunk_ordinal=2, predecessor_ingest_id=unit.ingest_id)))
+    journal = pipeline._journal = NativeRevisionJournal(connection)
     completed, extracted = _quantum_pending_graphiti(pipeline, journal, now)
     for unit, at in ((old, '2026-10-08T21:00:00.000000Z'), (recent, '2026-10-08T21:19:00.000000Z')):
         if unit is old and not old_served:
@@ -2544,7 +2545,6 @@ def test_recent_incomplete_revision_keeps_priority_over_older_attempt_inventory(
         store.insert_graphiti_attempt_receipt(connection, ingest_id=unit.ingest_id, attempt_number=1,
             outcome='COMPLETE', receipt={'ingest_id': unit.ingest_id, 'outcome': 'COMPLETE'})
         completed.add(unit.ingest_id)
-    pipeline._journal = NativeRevisionJournal(connection)
     try:
         pipeline.tick(cycle_id='recent-completion-before-old-history')
         assert extracted == [('recent-incomplete', 2)]
