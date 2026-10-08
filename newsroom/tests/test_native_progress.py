@@ -46,6 +46,34 @@ def test_native_journal_retains_old_binding_on_unchanged_reobservation(tmp_path)
     connection.close()
 
 
+def test_source_header_projects_immutable_content_observation_on_restart(tmp_path, monkeypatch):
+    from dataclasses import FrozenInstanceError
+    from newsroom.control_plane.native_progress import _CurrentUnits, source_header
+
+    connection = connect(str(tmp_path / "source-header.sqlite3"))
+    first = replace(_native("bno-content-change"), chunk_count=2,
+                    canonical_url="https://www.gov.uk/british-national-overseas-bno-visa",
+                    updated_at="2024-10-31T17:00:36Z", observed_at="2026-10-08T15:56:04Z",
+                    effective_revision=replace(_native().effective_revision,
+                                               first_observed_at="2026-10-08T15:56:04Z"))
+    units = (first, replace(first, chunk_ordinal=2, predecessor_ingest_id=first.ingest_id))
+    journal = NativeRevisionJournal(connection)
+    journal.land(units)
+    journal.land(tuple(replace(unit, observed_at="2026-10-09T16:00:00Z") for unit in units))
+    restarted = NativeRevisionJournal(connection)
+    monkeypatch.setattr(_CurrentUnits, "__getitem__", lambda *_: pytest.fail("header selected a body"))
+    try:
+        header = source_header(restarted.units, first.revision_id)
+        assert header.first_observed_at == "2026-10-08T15:56:04Z"
+        assert header.updated_at == "2024-10-31T17:00:36Z"
+        assert header.observed_ats == ("2026-10-08T15:56:04Z",) * 2
+        assert not hasattr(header, "body")
+        with pytest.raises(FrozenInstanceError):
+            header.first_observed_at = "2026-10-09T16:00:00Z"
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize("field", ["headline", "body", "canonical_url"])
 @pytest.mark.parametrize("ordinal", [1, 3])
 def test_native_journal_rechecks_changed_chunk_content_before_reobservation(

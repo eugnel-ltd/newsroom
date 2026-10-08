@@ -27,6 +27,16 @@ from .veto import OperatorDrainRequested, VetoError
 
 def _source_update_time(item: tuple) -> tuple:
     unit = item[1]
+    url = getattr(unit, "canonical_url", None)
+    if (getattr(unit, "definition_version_id", None) and type(url) is str
+            and not any(character.isspace() for character in url)):
+        try:
+            _api_url(url)
+            # GOV.UK public update time is not a content-edition clock. Use
+            # immutable body observation, never refreshed access metadata.
+            return True, UtcTimestamp.parse(getattr(unit, "first_observed_at", None)).value
+        except (TypeError, ValueError):
+            pass
     for value in (unit.updated_at, unit.published_at):
         try:
             return True, UtcTimestamp.parse(value).value
