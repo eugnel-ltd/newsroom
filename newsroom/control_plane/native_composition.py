@@ -414,7 +414,7 @@ def deployed_native_service(args):
             raise ValueError("native assessor profile differs before authority OPEN")
         from .typesafe_judgment import ROUTE as JUDGMENT_ROUTE, SCHEMA_DIGEST as JUDGMENT_SCHEMA
         from .native_claim_localisation import (ROUTE as LOCALISATION_ROUTE,
-            ALIGNED_SCHEMA_DIGEST as LOCALISATION_SCHEMA, ALIGNED_VERSION as LOCALISATION_VERSION)
+            TYPED_SCHEMA_DIGEST as LOCALISATION_SCHEMA, TYPED_VERSION as LOCALISATION_VERSION)
         from . import typesafe_judgment, native_claim_localisation
         from newsroom.authority.canonical import digest_bytes
         from .model_usage import ModelUsageAdmissionError
@@ -834,9 +834,16 @@ def open_native_pipeline(
                 return localiser.read_localisation(reference, request, proof=proof, **{key: binding[key]
                     for key in ('candidate_id', 'hypothesis_digest', 'evidence_package_digest')})
 
+            from .native_claim_localisation import TYPED_VERSION
+            if localisation_policy.prompt_contract_version == TYPED_VERSION:
+                from .evidence import SOURCE_RENDERING_CONTRACT_V2
+                localise_claims.rendering_contract = SOURCE_RENDERING_CONTRACT_V2
+                read_claim_localisation.rendering_contract = SOURCE_RENDERING_CONTRACT_V2
+
             from .native_assessor_judgments import NativeSemanticWitnesses
             semantic_witnesses = NativeSemanticWitnesses(judgments=judgments,
                 candidate_for=runtime.authority.candidate_version, proof=proof, require_current=stop_check)
+            semantic_witnesses.rendering_reader = localiser.read_localisation
             runtime.evidence.semantic_witness_reader = semantic_witnesses.read
             assessor._judgments = NativeAssessorJudgments(judgments=judgments, proof=proof,
                 scope_for=judgment_scope, localise=localise_claims, read_localisation=read_claim_localisation,

@@ -30,6 +30,50 @@ def test_existing_extractor_is_reused_without_a_new_name_registry():
     assert source_term_bindings(body, body, **_scope(body))[0][:2] == ('Home Office', 'SOURCE_LITERAL_NAME')
 
 
+def test_v2_source_literals_preserve_contacts_and_opaque_labels_without_age_inference():
+    from newsroom.control_plane.native_source_term_bindings import VERSION_V2
+    body = 'For post-16 funding contact team.help@education.gov.uk. DfE publishes this form.'
+    assert source_term_bindings(body, body, **_scope(body)) == ()
+    records = source_term_bindings(body, body, **_scope(body), version=VERSION_V2)
+    assert [r[:2] for r in records] == [
+        ('post-16', 'SOURCE_LITERAL_LABEL'), ('team.help@education.gov.uk', 'SOURCE_LITERAL_EMAIL'),
+        ('DfE', 'SOURCE_LITERAL_LABEL')]
+    assert all(body.encode()[start:end].decode() == literal for literal, _, start, end in records)
+    with pytest.raises(ValueError):
+        source_term_bindings(body, body.replace('help', 'HELP'), **_scope(body), version=VERSION_V2)
+    ordinary = 'NO funding is ON hold. Information is provided.'
+    assert source_term_bindings(ordinary, ordinary, **_scope(ordinary), version=VERSION_V2) == ()
+
+
+@pytest.mark.parametrize('damage', [None, 'range', 'source', 'forged-literal'])
+def test_source_literal_projection_uses_bound_range_and_leaves_original_slots_immutable(damage):
+    from copy import deepcopy
+    from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
+    from newsroom.control_plane.native_assessor import _reference_binding
+    from newsroom.control_plane.native_assessor_judgments import source_rendering_projection, original_rendering_slots
+    body = 'Contact team.help@education.gov.uk for post-16 funding.'
+    view = build_lossless_source_view((body,), ('UK-05',))
+    original = {'source_binding': {'current_scope': {'sources': [{'source_id': 'UK-05', 'body': body}]},
+                                  'source_reference_binding': _reference_binding(view)},
+                'claims': {'S1L1': {'source_id': 'UK-05', 'text': body, 'entities': [], 'rendering_fragment_count': 1,
+                                   'source_range': {'first_span_id': 'S1L1', 'last_span_id': 'S1L1'}}}}
+    if damage == 'range': original['claims']['S1L1']['source_range']['last_span_id'] = 'S1L2'
+    if damage == 'source': original['claims']['S1L1']['source_id'] = 'UK-01'
+    if damage == 'forged-literal': original['claims']['S1L1'].update(entities=[['funding', 'SOURCE_LITERAL']], rendering_fragment_count=2)
+    before = deepcopy(original)
+    if damage:
+        with pytest.raises(ValueError): source_rendering_projection(original)
+    else:
+        projected = source_rendering_projection(original)
+        assert projected['claims']['S1L1']['entities'] == [
+            ['team.help@education.gov.uk', 'SOURCE_LITERAL'], ['post-16', 'SOURCE_LITERAL']]
+        assert projected['claims']['S1L1']['rendering_fragment_count'] == 3
+        restored = original_rendering_slots(original['claims']['S1L1'], projected['claims']['S1L1'],
+            {'rendered_assertion_zh_hant_hk_fragments': ['請聯絡', '處理', '資助。']})
+        assert restored['rendered_assertion_zh_hant_hk_fragments'] == ['請聯絡team.help@education.gov.uk處理post-16資助。']
+    assert original == before
+
+
 @pytest.mark.parametrize('body', [
     'NATIONALTITLE\nRANDOM', 'RANDOM is an unsupported isolated label.',
     'The Ambition Institute slogan was discussed.', 'The Government’s Policy title was copied.',

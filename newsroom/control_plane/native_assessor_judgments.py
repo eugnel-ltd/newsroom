@@ -180,7 +180,7 @@ class NativeAssessorJudgments:
             'prior_decision_admission_id':str(result.decision_admission_id),
             'render_provenance':decision['render_provenance']})
 
-    def _finish(self,wire,view,binding,references,judgment_inputs,render_proof,admission_id):
+    def _finish(self,wire,view,binding,references,judgment_inputs,render_proof,admission_id,rendering_reference=None):
         from .native_assessor import NativeAssessmentExecution,_materialise_reference_result,VERSION as CODEC
         _package,receipt=_materialise_reference_result(canonical_json_bytes(wire),view,digest_canonical(binding),CODEC)
         self.require_current()
@@ -188,10 +188,19 @@ class NativeAssessorJudgments:
             'judgments':[{'invocation_id':r.invocation_id,'raw_admission_id':str(r.raw_admission_id),
                 'receipt_admission_id':str(r.receipt_admission_id)}for r in references],
             'render_provenance':render_proof}
+        source_renderings = None
+        if rendering_reference is not None:
+            from .evidence import SOURCE_RENDERING_CONTRACT_V2
+            ref = tuple(sorted({'contract': SOURCE_RENDERING_CONTRACT_V2, 'operation': 'SOURCE_RENDERING',
+                                **rendering_reference}.items()))
+            rows = json.loads(receipt['materialised_text'])['package']['governed_claims']
+            source_renderings = SourceRenderingMetadata(tuple((row['claim_id'], ref) for row in rows))
+            decision['source_renderings'] = [[key, dict(value)] for key, value in source_renderings.references]
         raw=canonical_json_bytes(decision)
         if admission_id is None:
             admission_id=self.judgments.objects.admit(ObjectAdmissionRequest('evidence.record',self._decision_key(binding)),raw,proof=self.proof).admission.admission_id
-        return JudgedAssessment(NativeAssessmentExecution(receipt['materialised_text'],{}),raw,admission_id,tuple(judgment_inputs))
+        return JudgedAssessment(NativeAssessmentExecution(receipt['materialised_text'],{}),raw,admission_id,tuple(judgment_inputs),
+                                source_renderings=source_renderings)
 
     def _assess(self,candidate,base,sources,acquired,*,retained=None,admission_id=None):
         from .native_assessor import NativeAssessmentExecution,_materialise_reference_result,VERSION as CODEC,PROVIDER_SCHEMA
@@ -332,6 +341,7 @@ class NativeAssessorJudgments:
                 if witnesses is not None:
                     qualification.append({'claim_index':index,'test':test,'test_evidence':witnesses})
         if not any(q['claim_index']==0 for q in qualification):return fallback('HEADLINE_QUALIFICATION_UNPROVEN',first,second)
+        rendering_reference = None
         if self.localise and self.read_localisation:
             request={'source_binding':binding,'claims':{identity:render_candidates[identity]for identity in ordered}}
             if retained is None:
@@ -346,6 +356,13 @@ class NativeAssessorJudgments:
             renderings=record['renderings'];render_proof={'mode':'QUALIFIED_LOCALISATION','invocation_id':record['invocation_id'],
                 'terminal_digest':record['terminal_digest'],'raw_admission_id':str(reference.raw_admission_id),
                 'receipt_admission_id':str(reference.receipt_admission_id)}
+            from .native_claim_localisation import TYPED_VERSION
+            if record.get('version') == TYPED_VERSION:
+                if record.get('original_state') != request or record.get('projected_state') != source_rendering_projection(request):
+                    raise ValueError('typed localisation projection differs')
+                renderings = {identity: original_rendering_slots(request['claims'][identity],
+                    record['projected_state']['claims'][identity], renderings[identity]) for identity in ordered}
+                rendering_reference = {key: render_proof[key] for key in ('invocation_id', 'raw_admission_id', 'receipt_admission_id')}
         else:return fallback('QUALIFIED_LOCALISATION_REQUIRED',first,second)
         claims=[{'claim_role':'HEADLINE'if identity==headline else 'SUBSTANTIVE'if roles[identity]['choice']=='MATERIAL'else 'CONTEXT',
             'status':'CONFIRMED_FACT','source_range':render_candidates[identity]['source_range'],
@@ -354,7 +371,8 @@ class NativeAssessorJudgments:
             'quotation_source_keys':renderings[identity].get('quotation_source_keys',[])}for identity in ordered]
         wire={'package':{'select_new_information':True,'governed_claims':claims,'qualification_evidence':qualification,
             'selection_rationale':'Source-bound staged judgment selection.','geography':[],'categories':[],'explicit_exclusions':[]}}
-        return self._finish(wire,view,binding,(first,second),judgment_inputs,render_proof,admission_id)
+        return self._finish(wire,view,binding,(first,second),judgment_inputs,render_proof,admission_id,
+                            rendering_reference=rendering_reference)
 
 
 SEMANTIC_WITNESS_CONSUMER_VERSION = 'newsroom.semantic-witness-consumer.v1'
@@ -389,10 +407,13 @@ class SourceRenderingMetadata:
             source_rendering_reference(ref)
 
 
-def source_rendering_details(claim, body, chronology):
+def source_rendering_details(claim, body, chronology, *, contract=None):
     from .native_source_term_bindings import source_term_bindings, derive_relative_year, VERSION as TERM_VERSION
-    from .evidence import SOURCE_RENDERING_CONTRACT
-    if not SOURCE_RENDERING_CONTRACT.endswith(TERM_VERSION):
+    from .evidence import SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2
+    from .native_source_term_bindings import VERSION_V2
+    contract = SOURCE_RENDERING_CONTRACT if contract is None else contract
+    term_version = VERSION_V2 if contract == SOURCE_RENDERING_CONTRACT_V2 else TERM_VERSION
+    if contract not in {SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2} or not contract.endswith(term_version):
         raise ValueError('Source term consumer identity differs')
     from newsroom.authority.canonical import digest_bytes
     raw, selected = body.encode(), claim.claim.encode()
@@ -400,25 +421,103 @@ def source_rendering_details(claim, body, chronology):
     if start < 0 or raw.find(selected, start + 1) >= 0:
         raise ValueError('Source rendering selected range is ambiguous')
     args = dict(body_digest=digest_bytes(raw),start_byte=start,end_byte=start+len(selected))
-    terms = source_term_bindings(body,claim.claim,**args)
+    terms = source_term_bindings(body,claim.claim,**args, version=term_version)
     year = (derive_relative_year(body,claim.claim,**args,
         publication_time=chronology['published_at'],source_updated_time=chronology['updated_at'])
         if re.search(r'\bnext year\b',claim.claim,re.I) else None)
     return terms, year
 
 
-def source_rendering_names(claim, body):
+def source_rendering_names(claim, body, *, contract=None):
     from .native_source_term_bindings import source_term_bindings
-    from .evidence import bounded_named_entities
+    from .evidence import bounded_named_entities, SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2
+    from .native_source_term_bindings import VERSION, VERSION_V2
+    contract = SOURCE_RENDERING_CONTRACT if contract is None else contract
+    if contract not in {SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2}:
+        raise ValueError('Source rendering contract differs')
     from newsroom.authority.canonical import digest_bytes
     raw, selected = body.encode(), claim.claim.encode()
     start = raw.find(selected)
     if start < 0 or raw.find(selected,start+1) >= 0:
         raise ValueError('Source rendering selected range is ambiguous')
     known = bounded_named_entities(claim.claim,source_context=body)
-    terms = source_term_bindings(body,claim.claim,body_digest=digest_bytes(raw),start_byte=start,end_byte=start+len(selected))
+    terms = source_term_bindings(body,claim.claim,body_digest=digest_bytes(raw),start_byte=start,end_byte=start+len(selected),
+        version=VERSION_V2 if contract == SOURCE_RENDERING_CONTRACT_V2 else VERSION)
     names = {name for name,_kind in known}
     return known | frozenset((name,'SOURCE_LITERAL')for name,_kind,_start,_end in terms if name not in names)
+
+
+def source_rendering_projection(original_state):
+    """New literal slots over the same selected bytes, never a paid view rewrite."""
+    from copy import deepcopy
+    from .native_source_term_bindings import source_term_bindings, VERSION_V2
+    from .evidence import bounded_named_entities
+    from newsroom.authority.canonical import digest_bytes
+    projected = deepcopy(original_state)
+    sources = original_state['source_binding'].get('current_scope', {}).get('sources', ())
+    view = None
+    if sources:
+        view = build_lossless_source_view(tuple(row['body'] for row in sources), tuple(row['source_id'] for row in sources),
+            version=original_state['source_binding'].get('source_reference_binding', {}).get('partition_version',
+                'newsroom.native-assessor-spans.v2'))
+        if original_state['source_binding'].get('source_reference_binding'):
+            from .native_assessor import _reference_binding
+            if _reference_binding(view) != original_state['source_binding']['source_reference_binding']:
+                raise ValueError('Source rendering projection binding differs')
+    for identity, original in original_state['claims'].items():
+        text = original['text']
+        if view is None:
+            terms = source_term_bindings(text, text, body_digest=digest_bytes(text.encode()),
+                start_byte=0, end_byte=len(text.encode()), version=VERSION_V2)
+            if (any(kind == 'SOURCE_LITERAL' for _name, kind in original.get('entities', ()))
+                    or any(name not in {name for name, _kind in original.get('entities', ())} for name, *_ in terms)):
+                raise ValueError('Source rendering projection requires current Source bytes')
+            continue
+        if original.get('source_range'):
+            selected, passage, source_id = view.resolve_range(original['source_range'])
+            if selected != text or source_id != original['source_id']:
+                raise ValueError('Source rendering projection range differs')
+            first = next(segment for segment in view.segments if segment.span_id == original['source_range']['first_span_id'])
+            start = first.start_byte
+        else:
+            matching = [index for index, row in enumerate(sources) if row['source_id'] == original['source_id']]
+            if len(matching) != 1:
+                raise ValueError('Source rendering projection source differs')
+            passage = matching[0]
+            raw = sources[passage]['body'].encode(); start = raw.find(text.encode())
+            if start < 0 or raw.find(text.encode(), start + 1) >= 0:
+                raise ValueError('Source rendering projection selected range is ambiguous')
+        body = sources[passage]['body']
+        from .native_source_term_bindings import VERSION
+        legacy_terms = source_term_bindings(body, text, body_digest=digest_bytes(body.encode()), start_byte=start,
+            end_byte=start+len(text.encode()), version=VERSION)
+        recognised = bounded_named_entities(text, source_context=body)
+        old_literals = {name for name, _kind, _start, _end in legacy_terms}
+        if any((name, kind) not in recognised and not (kind == 'SOURCE_LITERAL' and name in old_literals)
+               for name, kind in original.get('entities', ())):
+            raise ValueError('Source rendering original literal/entity differs')
+        terms = source_term_bindings(body, text, body_digest=digest_bytes(body.encode()), start_byte=start,
+            end_byte=start+len(text.encode()), version=VERSION_V2)
+        kinds = dict(bounded_named_entities(text, source_context=body))
+        entities = [[name, kinds.get(name, 'SOURCE_LITERAL')] for name, _kind, _start, _end in terms]
+        projected['claims'][identity] = {**original, 'entities': entities, 'rendering_fragment_count': len(entities)+1}
+    return projected
+
+
+def original_rendering_slots(original, projected, rendering):
+    """Re-express new slots in the immutable Source codec's original slots."""
+    result = dict(rendering)
+    fragments = rendering['rendered_assertion_zh_hant_hk_fragments']
+    text = fragments[0] + ''.join(name+fragment for (name, _kind), fragment in
+        zip(projected['entities'], fragments[1:], strict=True))
+    restored = []
+    for name, _kind in original['entities']:
+        before, found, text = text.partition(name)
+        if not found:
+            raise ValueError('Source rendering original entity omitted')
+        restored.append(before)
+    result['rendered_assertion_zh_hant_hk_fragments'] = [*restored, text]
+    return result
 
 
 def _semantic_witness_inputs(qualification, claim, package, binding):
@@ -490,6 +589,7 @@ class NativeSemanticWitnesses:
             raise TypeError('concrete semantic witness authority required')
         self.judgments, self.candidate_for, self.proof, self.require_current = judgments, candidate_for, proof, require_current
         self.parent_reader = parent_reader
+        self.rendering_reader = None
 
     def evaluate(self, qualification, claim, package, binding):
         from .evidence import SEMANTIC_WITNESS_CONTRACT
@@ -604,12 +704,14 @@ class NativeSemanticWitnesses:
         return choice == 'YES'
 
     def _read_source_rendering(self, claim, package):
-        from .evidence import source_rendering_reference, _localised_fact_is_bound
+        from .evidence import source_rendering_reference, _localised_fact_is_bound, SOURCE_RENDERING_CONTRACT_V2
         from .native_source_qualification import VERSION as QA_VERSION
         from .native_source_qualification_consumer import NativeQualifiedSourceConsumer
         from newsroom.increment10.evidence import _base_package
         self.require_current()
         value = source_rendering_reference(claim.source_rendering_ref)
+        if value['contract'] == SOURCE_RENDERING_CONTRACT_V2:
+            return self._read_typed_source_rendering(value, claim, package)
         if (getattr(self.parent_reader,'__func__',None) is not NativeQualifiedSourceConsumer.read_semantic_parent
                 or type(getattr(self.parent_reader,'__self__',None)) is not NativeQualifiedSourceConsumer):
             raise ValueError('Source rendering parent reader absent')
@@ -645,6 +747,64 @@ class NativeSemanticWitnesses:
                 or year[:2] not in claim.localised_factual_expressions):
             raise ValueError('Source rendering anchored year omitted')
         return True
+
+
+    def _read_typed_source_rendering(self, value, claim, package):
+        """Authenticate literal/fact rendering only; never certify selection or YES."""
+        from .native_claim_localisation import NativeClaimLocaliser, LocalisationReference, TYPED_VERSION
+        from .evidence import factual_rendering_is_bound_v2
+        from newsroom.increment10.evidence import _base_package
+        if (getattr(self.rendering_reader, '__func__', None) is not NativeClaimLocaliser.read_localisation
+                or type(getattr(self.rendering_reader, '__self__', None)) is not NativeClaimLocaliser):
+            raise ValueError('typed Source rendering reader absent')
+        raw = self.judgments.objects.rehydrate(HydrationRequest(ObjectAdmissionId.parse(value['receipt_admission_id']),
+            'evidence.record'), proof=self.proof).data
+        receipt = json.loads(raw)
+        if canonical_json_bytes(receipt) != raw or receipt.get('version') != TYPED_VERSION:
+            raise ValueError('typed Source rendering receipt differs')
+        state = {'source_binding': receipt['source_binding'], 'claims': receipt['original_claims']}
+        binding = state['source_binding']; base = _base_package(package)
+        current = binding['current_scope']['sources']
+        candidate = self.candidate_for(binding['candidate_version_id'])
+        if (binding['candidate_id'] != base.candidate_id or binding['content_digest'] != base.digest
+                or binding['evidence_package_digest'] != base.digest
+                or candidate.candidate_id != base.candidate_id
+                or candidate.governing_manifest.hypothesis_id != package.hypothesis_id
+                or tuple(row['body'] for row in current) != base.passages
+                or tuple(row['source_id'] for row in current) != base.source_ids):
+            raise ValueError('typed Source rendering complete Source differs')
+        ref = LocalisationReference(value['invocation_id'], ObjectAdmissionId.parse(value['raw_admission_id']),
+                                    ObjectAdmissionId.parse(value['receipt_admission_id']))
+        checked = self.rendering_reader(ref, state, proof=self.proof,
+            **{key: binding[key] for key in ('candidate_id', 'hypothesis_digest', 'evidence_package_digest')})
+        if checked.get('original_state') != state or checked.get('projected_state') != source_rendering_projection(state):
+            raise ValueError('typed Source rendering authenticated projection differs')
+        view = build_lossless_source_view(base.passages, base.source_ids,
+            version=binding.get('source_reference_binding', {}).get('partition_version', 'newsroom.native-assessor-spans.v2'))
+        for identity, selected in state['claims'].items():
+            if selected['text'] != claim.claim or selected['source_id'] != claim.source_ids[0]:
+                continue
+            if selected.get('source_range'):
+                text, passage, source_id = view.resolve_range(selected['source_range'])
+                if text != claim.claim or passage != claim.passage_index or source_id != claim.source_ids[0]:
+                    continue
+            elif current[claim.passage_index]['source_id'] != selected['source_id'] or selected['text'] not in current[claim.passage_index]['body']:
+                continue
+            projected = checked['projected_state']['claims'][identity]; item = checked['renderings'][identity]
+            fragments = item['rendered_assertion_zh_hant_hk_fragments']
+            rendered = fragments[0] + ''.join(name+fragment for (name, _kind), fragment in
+                zip(projected['entities'], fragments[1:], strict=True))
+            expected = frozenset(tuple(entity) for entity in projected['entities'])
+            pairs = tuple((p['source_lookup_key'], p['rendered_expression']) for p in item['factual_localisations'])
+            if (rendered == claim.rendered_assertion_zh_hant_hk
+                    and expected == frozenset((name, kind) for name, kind, _ref in claim.named_entity_evidence)
+                    and pairs == tuple(claim.localised_factual_expressions)
+                    and tuple(item['quotation_source_keys']) == tuple(claim.quotations)
+                    and factual_rendering_is_bound_v2(claim.claim, rendered, pairs,
+                        literals=tuple(name for name, _kind in expected),
+                        derived_pairs=tuple(map(tuple, selected.get('source_derived_facts', ()))))):
+                return True
+        raise ValueError('typed Source rendering claim/literals differ')
 
 
 def semantic_witness_reader_is_bound(reader):

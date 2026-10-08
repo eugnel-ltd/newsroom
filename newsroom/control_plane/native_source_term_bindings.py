@@ -15,6 +15,7 @@ from .evidence import bounded_named_entities, _entity_pattern
 from .native_story_dates import _unquoted
 
 VERSION = "newsroom.native-source-term-bindings.v1"
+VERSION_V2 = "newsroom.native-source-term-bindings.v2"
 
 
 def _selected(body, selected_text, body_digest, start_byte, end_byte):
@@ -35,9 +36,12 @@ def _selected(body, selected_text, body_digest, start_byte, end_byte):
 
 def source_term_bindings(
     body: str, selected_text: str, *, body_digest: str, start_byte: int, end_byte: int,
+    version: str = VERSION,
 ) -> tuple[tuple[str, str, int, int], ...]:
     """Return exact literal-preservation terms, not translations/actor proofs."""
     _prefix, selected = _selected(body, selected_text, body_digest, start_byte, end_byte)
+    if version not in {VERSION, VERSION_V2}:
+        raise ValueError("Source term contract differs")
     names = {(name, "SOURCE_LITERAL_NAME") for name, _kind in
              bounded_named_entities(selected, source_context=body)}
     # Adjuncts require ordinary Source actor syntax, not capitalisation alone.
@@ -56,6 +60,20 @@ def source_term_bindings(
         line = selected[selected.rfind("\n", 0, match.start()) + 1:selected.find("\n", match.end()) if "\n" in selected[match.end():] else len(selected)]
         if re.search(r"[a-z]{2}", line) and len(re.findall(_entity_pattern(literal), body)) >= 2:
             names.add((literal, "SOURCE_LITERAL_ACRONYM"))
+    if version == VERSION_V2:
+        # Exact contact/opaque label preservation is not actor or age authority.
+        email = re.compile(r"(?<![A-Za-z0-9.!#$%&'*+/=?^_`{|}~-])"
+            r"[A-Za-z0-9][A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]*@"
+            r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
+            r"(?![A-Za-z0-9_-])")
+        for pattern, kind in (
+            (email, "SOURCE_LITERAL_EMAIL"),
+            (re.compile(r"(?<![A-Za-z0-9_-])post-[0-9]{1,4}(?![A-Za-z0-9_-])", re.I), "SOURCE_LITERAL_LABEL"),
+            (re.compile(r"(?<![A-Za-z0-9_./-])[A-Z][a-z]+[A-Z][A-Za-z]{0,8}(?![A-Za-z0-9_./-])"), "SOURCE_LITERAL_LABEL"),
+        ):
+            for match in pattern.finditer(selected):
+                if len(match.group()) <= 80:
+                    names.add((match.group(), kind))
     positions = []
     for name, kind in names:
         for match in re.finditer(_entity_pattern(name), selected):

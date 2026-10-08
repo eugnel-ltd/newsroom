@@ -11,6 +11,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
@@ -1303,6 +1304,176 @@ def _localised_fact_is_bound(
     return (source in claim or source in excerpt) and target in rendered
 
 
+_FACT_NUMBER_V2 = r"(?:[+−-]?[0-9]+(?:[.,][0-9]+)*|[零〇一二三四五六七八九十百千萬万億亿兩两]+)"
+_FACT_VALUE_V2 = rf"(?:{_FACT_NUMBER_V2}|one|two|three|four|five|six|seven|eight|nine|ten)"
+_FACT_UNIT_V2 = (r"months?|years?|hours?|minutes?|schools?|hospitals?|clinics?|buses?|roads?|"
+                 r"個月|个月|年|小時|小时|分鐘|分钟|(?:間|间|所|部|輛|辆|條|条)(?:學校|学校|醫院|医院|診所|诊所|巴士|道路)")
+_FACT_QUALIFIER_V2 = (r"only\s+|exactly\s+|at least\s+|at most\s+|more than\s+|less than\s+|up to\s+|"
+                      r"只限|只有|僅限|恰好|至少|最少|不少於|最多|不多於|超過|多於|少於|不足")
+
+
+def canonical_localised_fact_v2(value: str) -> tuple[object, ...] | None:
+    """Closed factual expressions, not a translation or semantic proof."""
+    if type(value) is not str or len(value) > 256:
+        return None
+    value = value.strip()
+    bounds = ((r"only\s+|只限|只有|僅限", "ONLY"),
+              (r"exactly\s+|恰好", "EXACT"),
+              (r"at least\s+|至少|最少|不少於", "GE"),
+              (r"at most\s+|up to\s+|最多|不多於", "LE"),
+              (r"more than\s+|超過|多於", "GT"),
+              (r"less than\s+|少於|不足", "LT"))
+    for prefix, operator in bounds:
+        match = re.fullmatch(rf"(?:{prefix})(.+)", value, re.I)
+        if match:
+            fact = canonical_localised_fact_v2(match.group(1))
+            return ("BOUND", operator, fact) if fact is not None else None
+    if re.fullmatch(r"one of(?: the following roles)?|其中一[個位名項種](?:角色)?", value, re.I):
+        return ("SELECTION", 1)
+    year = re.fullmatch(r"(academic|financial) year\s+([0-9]{4})\s*(?:to|[-–至])\s*([0-9]{4})", value, re.I)
+    if year:
+        return ("YEAR_RANGE", year[1].upper() + "_YEAR", int(year[2]), int(year[3])) if 1 <= int(year[2]) < int(year[3]) <= 9999 else None
+    year = re.fullmatch(r"([0-9]{4})\s*(?:to|[-–至])\s*([0-9]{4})(學年|學年度|財政年度)", value, re.I)
+    if year:
+        return ("YEAR_RANGE", "FINANCIAL_YEAR" if year[3] == "財政年度" else "ACADEMIC_YEAR", int(year[1]), int(year[2])) if 1 <= int(year[1]) < int(year[2]) <= 9999 else None
+    interval = re.fullmatch(rf"({_FACT_NUMBER_V2})\s*(?:to|[-–至])\s*({_FACT_NUMBER_V2})(?:\s*({_FACT_UNIT_V2}))?", value, re.I)
+    if interval:
+        suffix = " " + interval[3] if interval[3] else ""
+        left, right = (canonical_localised_fact_v2(interval[index] + suffix) for index in (1, 2))
+        if left is not None and right is not None and left[:-1] == right[:-1]:
+            return ("RANGE", left, right)
+        return None
+    scalar = re.fullmatch(rf"({_FACT_VALUE_V2})\s*({_FACT_UNIT_V2})", value, re.I)
+    if scalar:
+        words = dict(zip("one two three four five six seven eight nine ten".split(), range(1, 11)))
+        amount = str(words.get(scalar[1].casefold(), scalar[1]))
+        value = amount + (" " if scalar[2].isascii() else "") + scalar[2]
+        if scalar[2].casefold() == "buses":
+            return ("COUNT", "BUS", int(amount)) if amount.isascii() and amount.isdigit() else None
+    existing = _canonical_localised_fact(value)
+    if existing is not None:
+        return existing
+    if re.fullmatch(r"[+−-]?(?:[0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)(?:\.[0-9]+)?", value):
+        number = Decimal(value.replace("−", "-").replace(",", ""))
+        return ("NUMBER", int(number) if number == int(number) else str(number.normalize()))
+    if re.fullmatch(r"[零〇一二三四五六七八九十百千萬万億亿兩两]+", value):
+        number = _chinese_integer(value)
+        if number is not None:
+            return ("NUMBER", number)
+    return None
+
+
+def _factual_occurrences_v2(text: str):
+    # Embedded Chinese numerals in ordinary prose (同一客戶) are not counts.
+    boundary = "A-Za-z0-9_\\u3400-\\u9fff"
+    pattern = rf"(?<![{boundary}]){_FACT_NUMBER_V2}(?![{boundary}])"
+    selection = r"one of(?: the following roles)?|其中一[個位名項種](?:角色)?"
+    interval = rf"{_FACT_NUMBER_V2}\s*(?:to|[-–至])\s*{_FACT_NUMBER_V2}"
+    year = rf"(?:academic|financial) year\s+{interval}|{interval}(?:學年|學年度|財政年度)"
+    quantity = rf"{_FACT_VALUE_V2}\s*(?:{_FACT_UNIT_V2})"
+    month = "|".join(_ENGLISH_MONTHS)
+    date = (rf"[0-9]{{1,2}}\s+(?:{month})(?:\s+[0-9]{{4}})?(?:\s+at\s+[0-9]{{1,2}}:[0-9]{{2}})?|"
+            rf"(?:{_FACT_NUMBER_V2}年)?{_FACT_NUMBER_V2}月{_FACT_NUMBER_V2}(?:日|號|号)"
+            rf"(?:(?:上午|下午)?{_FACT_NUMBER_V2}(?:時|时|點|点|:){_FACT_NUMBER_V2}分?)?")
+    money = rf"(?:£|GBP\s+|HK\$)\s*{_FACT_NUMBER_V2}(?:\s+(?:thousand|million|billion))?|{_FACT_NUMBER_V2}(?:英鎊|港元|元)"
+    calendar_month = rf"(?:{month})(?:\s+[0-9]{{4}})?|(?:{_FACT_NUMBER_V2}年)?{_FACT_NUMBER_V2}月"
+    core = rf"{year}|{interval}(?:\s*(?:{_FACT_UNIT_V2}))?|{date}|{money}|{quantity}|{selection}|{calendar_month}"
+    matches = [*re.finditer(rf"(?<![A-Za-z0-9_])(?:{_FACT_QUALIFIER_V2})?(?:{core})(?![A-Za-z0-9_])", text, re.I), *re.finditer(pattern, text)]
+    # A number cannot stand in for a fraction or an unsupported unit-bearing
+    # expression. Unknown English unit words stay unknown, never inferred.
+    raw = rf"(?<![A-Za-z0-9_])[+−-]?[0-9]+(?:[.,][0-9]+)*(?:/[0-9]+|\s*[A-Za-z]+|\s*(?:%|％|公里|公斤|米|歲|半))?"
+    matches.extend(re.finditer(raw, text))
+    cardinal = (r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+                r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion")
+    matches.extend(re.finditer(rf"(?<![A-Za-z])(?:{cardinal})(?:\s+[A-Za-z]+)?(?![A-Za-z])", text, re.I))
+    matches.extend(re.finditer(rf"{_FACT_NUMBER_V2}(?:個|个|名|間|间|所|輛|辆|部|條|条|項|项|次|人|座|期|倍|成)", text))
+    selected = []
+    for match in sorted(matches, key=lambda item: (-(item.end() - item.start()), item.start())):
+        if not any(match.start() < end and start < match.end() for start, end, _fact in selected):
+            if match.start() and text[match.start()-1] == "同" and match.group().startswith("一"):
+                continue  # 同一 is co-reference, not an asserted cardinality.
+            fact = canonical_localised_fact_v2(match.group())
+            if re.fullmatch(rf"(?:{month})", match.group(), re.I) and not _calendar_month_occurs(match.group(), text):
+                continue
+            if fact and fact[0] == "CALENDAR_MONTH" and not _calendar_month_occurs(match.group(), text):
+                continue
+            if match.start() and text[match.start()-1] in "+−-£$€¥負负" and not match.group().startswith(tuple("+−-")):
+                fact = None
+            selected.append((match.start(), match.end(), fact))
+    for index, character in enumerate(text):
+        if character.isdigit() and not any(start <= index < end for start, end, _fact in selected):
+            selected.append((index, index + 1, None))
+    return tuple(sorted(selected))
+
+
+def localised_fact_is_bound_v2(source, target, claim, excerpt, rendered) -> bool:
+    fact = canonical_localised_fact_v2(source)
+    if fact is None or fact != canonical_localised_fact_v2(target):
+        return False
+    def occurs(expression, text):
+        return any(text[start:end] == expression and item == fact
+                   for start, end, item in _factual_occurrences_v2(text))
+    return (occurs(source, claim) or occurs(source, excerpt)) and occurs(target, rendered)
+
+
+def factual_rendering_is_bound_v2(source, rendered, pairs=(), *, literals=(), derived_pairs=()) -> bool:
+    """Compare ordered complete typed occurrences, never infer source units."""
+    if type(source) is not str or type(rendered) is not str:
+        return False
+    for rows in (pairs, derived_pairs):
+        if not isinstance(rows, (tuple, list)) or any(not isinstance(row, (tuple, list)) or len(row) != 2
+            or any(type(part) is not str or not part.strip() for part in row) for row in rows):
+            return False
+        if len({row[0] for row in rows}) != len(rows) or len({row[1] for row in rows}) != len(rows):
+            return False
+    if not isinstance(literals, (tuple, list)) or any(type(value) is not str or not value.strip() for value in literals) or len(set(literals)) != len(literals):
+        return False
+    original = (source, rendered)
+    masked = [source, rendered]
+    literal_spans = [[], []]
+    for literal in literals:
+        if type(literal) is not str or not literal.strip() or canonical_localised_fact_v2(literal) is not None:
+            return False
+        spans = [tuple(re.finditer(_entity_pattern(literal), text)) for text in original]
+        if not spans[0] or len(spans[0]) != len(spans[1]):
+            return False
+        for column, matches in enumerate(spans):
+            literal_spans[column].extend((match.start(), match.end()) for match in matches)
+    for column, spans in enumerate(literal_spans):
+        for start, end, fact in _factual_occurrences_v2(original[column]):
+            if any(left < end and start < right for left, right in spans) and not any(left <= start and end <= right for left, right in spans):
+                if fact is not None or any(original[column][index].isdigit()
+                    and not any(left <= index < right for left, right in spans) for index in range(start, end)):
+                    return False
+        for start, end in spans:
+            masked[column] = masked[column][:start] + " " * (end-start) + masked[column][end:]
+    source, rendered = masked
+    derived = {tuple(row) for row in derived_pairs}
+    if not derived.issubset({tuple(row) for row in pairs}):
+        return False
+    if any((left, right) not in derived and not localised_fact_is_bound_v2(left, right, source, source, rendered) for left, right in pairs):
+        return False
+    before, after = _factual_occurrences_v2(source), _factual_occurrences_v2(rendered)
+    before, after = list(before), list(after)
+    for left, right in derived:
+        if not re.fullmatch(r"next year", left, re.I) or not re.fullmatch(r"[0-9]{4}年", right) or not 1 <= int(right[:-1]) <= 9999:
+            return False
+        source_matches = tuple(re.finditer(_entity_pattern(left), source))
+        target_matches = tuple(re.finditer(_entity_pattern(right), rendered))
+        if not source_matches or len(source_matches) != len(target_matches):
+            return False
+        for matches, stream in ((source_matches, before), (target_matches, after)):
+            for match in matches:
+                overlapping = [(start, end, fact) for start, end, fact in stream if match.start() < end and start < match.end()]
+                if any(start < match.start() or end > match.end() for start, end, _fact in overlapping):
+                    return False
+                stream[:] = [row for row in stream if row not in overlapping]
+                stream.append((match.start(), match.end(), ("SOURCE_DERIVED_YEAR", int(right[:-1]))))
+        before.sort(); after.sort()
+    return all(item is not None for *_bounds, item in (*before, *after)) and tuple(
+        item for *_bounds, item in before) == tuple(item for *_bounds, item in after)
+
+
 class Evid012QualificationTest(StrEnum):
     LAW_RIGHT_STATUS_POLICY = "LAW_RIGHT_STATUS_POLICY"
     SAFETY_OR_PUBLIC_HEALTH = "SAFETY_OR_PUBLIC_HEALTH"
@@ -1326,6 +1497,7 @@ class ClaimAuthorityClass(StrEnum):
 
 
 SOURCE_RENDERING_CONTRACT = 'newsroom.source-qualified-rendering.v1+newsroom.native-source-term-bindings.v1'
+SOURCE_RENDERING_CONTRACT_V2 = 'newsroom.source-qualified-rendering.v2+newsroom.native-source-term-bindings.v2'
 
 
 def source_rendering_reference(ref):
@@ -1334,7 +1506,8 @@ def source_rendering_reference(ref):
         raise ValueError('Source rendering reference differs')
     value = dict(ref)
     if (len(value) != len(ref) or set(value) != {'contract','operation','invocation_id','raw_admission_id','receipt_admission_id'}
-            or value.get('contract') != SOURCE_RENDERING_CONTRACT or value.get('operation') != 'SOURCE_RENDERING'):
+            or value.get('contract') not in {SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2}
+            or value.get('operation') != 'SOURCE_RENDERING'):
         raise ValueError('Source rendering reference differs')
     semantic_witness_reference(tuple(sorted({**{k:v for k,v in value.items() if k != 'operation'},
         'contract':SEMANTIC_WITNESS_CONTRACT,'question_id':'criterion'}.items())))
@@ -1505,11 +1678,14 @@ class GovernedClaimEvidence:
         localised_targets = tuple(
             target for _source, target in self.localised_factual_expressions
         )
+        fact_is_bound = (localised_fact_is_bound_v2 if self.source_rendering_ref
+            and dict(self.source_rendering_ref)['contract'] == SOURCE_RENDERING_CONTRACT_V2
+            else _localised_fact_is_bound)
         if (
             len(set(localised_sources)) != len(localised_sources)
             or len(set(localised_targets)) != len(localised_targets)
             or any(
-                not _localised_fact_is_bound(
+                not fact_is_bound(
                     source, target, self.claim, self.supporting_excerpt,
                     self.rendered_assertion_zh_hant_hk,
                 ) and not (self.source_rendering_ref
@@ -2478,7 +2654,7 @@ def validate_governed_evidence_records(
             rendered_text = claim.rendered_named_entities[index]
             record = records[record_id]
             entity_policy = record.get("policy_version")
-            if entity_policy not in ({SOURCE_RENDERING_CONTRACT} if entity_type == "SOURCE_LITERAL" and claim.source_rendering_ref
+            if entity_policy not in ({source_rendering_reference(claim.source_rendering_ref)['contract']} if entity_type == "SOURCE_LITERAL" and claim.source_rendering_ref
                     else {NAMED_ENTITY_POLICY_VERSION_V15, NAMED_ENTITY_POLICY_VERSION}):
                 return None
             if record != {
