@@ -16,6 +16,16 @@ def test_unparsed_english_number_words_and_chinese_classifiers_remain_visible():
     assert evidence.factual_rendering_is_bound_v2("the same customer", "同一名客戶")
 
 
+@pytest.mark.parametrize("source,target,literals", (
+    ("The government is proposing to regulate 2 chemicals under UK law.",
+     "政府正提出按UK法律管制2種化學物質。", ("UK",)),
+    ("The box contains 2 samples.", "盒內有2份樣本。", ()),
+))
+def test_arabic_counts_before_ordinary_nouns_keep_number_identity(source, target, literals):
+    assert evidence.factual_rendering_is_bound_v2(source, target, literals=literals)
+    assert not evidence.factual_rendering_is_bound_v2(source, target.replace("2", "3"), literals=literals)
+
+
 @pytest.mark.parametrize("source,target", (
     ("長度三公里。", "長度四公里。"),
     ("兩公斤", "五公斤"),

@@ -20,10 +20,12 @@ from newsroom.tests.test_native_context_materialisation import _case
 
 
 @contextmanager
-def _services(tmp_path,monkeypatch,*,uncertain=False,failed_support=False,timeout=False):
-    original,wire,rendering,binding,view,support,base,source,acquired=_case()
+def _services(tmp_path,monkeypatch,*,uncertain=False,failed_support=False,timeout=False,email=False,localisation_version=None):
+    from newsroom.tests.test_native_context_materialisation import BODY
+    body = BODY.replace('2 chemicals under UK law.', '2 chemicals under UK law; contact help@example.org.') if email else BODY
+    original,wire,rendering,binding,view,support,base,source,acquired=_case(body)
     candidate=N(candidate_id=base.candidate_id,version_id='version',
-        governing_manifest=N(canonical_digest=binding['hypothesis_digest']))
+        governing_manifest=N(canonical_digest=binding['hypothesis_digest'], hypothesis_id=base.hypothesis_id))
     scope={'coverage':'COMPLETE','newness':'KNOWN_CHANGE','prior_scope':None,
         'current_scope':{'sources':[{'source_id':base.source_ids[0],'body':base.passages[0],
             'published_at':acquired.publication_time,'updated_at':acquired.source_updated_time,
@@ -47,6 +49,8 @@ def _services(tmp_path,monkeypatch,*,uncertain=False,failed_support=False,timeou
         return 200,request.full_url,raw
     def runner(prompt):
         local_calls.append(json.loads(prompt))
+        if email:
+            rendering['renderings']['S1L2']['rendered_assertion_zh_hant_hk_fragments'] = ['政府正提出按', '法律管制2種化學物質；請聯絡', '。']
         return NativeAssessmentExecution(canonical_json_bytes({'renderings':[{'span_id':identity,**item} for identity,item in rendering['renderings'].items()]}).decode(),
             {'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':20,'total_tokens':60})
     with open_native_runtime(**_args(tmp_path,monkeypatch))as runtime:
@@ -58,7 +62,8 @@ def _services(tmp_path,monkeypatch,*,uncertain=False,failed_support=False,timeou
             api_key=lambda:'fixture-not-live',source_fence=fence,transport=transport,
             implementation_worktree_clean=True,clock=lambda:datetime(2026,10,5,tzinfo=UTC))
         localiser=NativeClaimLocaliser(usage=usage,objects=runtime.authority.objects,
-            policy=localisation_policy(evidence_digest=digest_bytes(b'qualified fixture'),qualified=True),
+            policy=localisation_policy(evidence_digest=digest_bytes(b'qualified fixture'),qualified=True,
+                **({} if localisation_version is None else {'version': localisation_version})),
             source_fence=fence,runner=runner,implementation_worktree_clean=True,
             clock=lambda:datetime(2026,10,5,tzinfo=UTC))
         consumer=NativeContextEnricher(judgments=judgments,localiser=localiser,
@@ -66,8 +71,9 @@ def _services(tmp_path,monkeypatch,*,uncertain=False,failed_support=False,timeou
         yield consumer,original,candidate,base,source,acquired,scope,usage,calls,local_calls
 
 
-def test_context_accounting_replays_after_get_clock_change_without_new_calls(tmp_path,monkeypatch):
-    with _services(tmp_path,monkeypatch)as(c,original,candidate,base,source,acquired,scope,usage,calls,local):
+@pytest.mark.parametrize('version', ('newsroom.native-claim-localisation.v3', 'newsroom.native-claim-localisation.v4'))
+def test_context_accounting_replays_after_get_clock_change_without_new_calls(tmp_path,monkeypatch,version):
+    with _services(tmp_path,monkeypatch,localisation_version=version)as(c,original,candidate,base,source,acquired,scope,usage,calls,local):
         first=c.enrich(original,candidate,base,(source,),(acquired,),scope=scope)
         assert len(calls)==2 and len(local)==1
         later=deepcopy(scope);later['current_scope']['sources'][0]['retrieved_at']='2026-10-05T20:00:00Z'
@@ -179,3 +185,37 @@ def test_unknown_old_support_never_receives_new_assembled_purpose(tmp_path, monk
         assert len(calls) == 2 and len(local) == 1
         with usage._connection() as db:
             assert db.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 3
+
+
+def test_typed_context_projects_literals_but_keeps_original_codec_and_authenticated_proof(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
+    from newsroom.control_plane.native_assessor_judgments import NativeSemanticWitnesses
+    with _services(tmp_path, monkeypatch, email=True) as (c, original, candidate, base, source, acquired, scope, usage, calls, local):
+        first = c.enrich(original, candidate, base, (source,), (acquired,), scope=scope)
+        witnesses = NativeSemanticWitnesses(judgments=c.judgments, proof=c.proof,
+            candidate_for=lambda _identity: candidate, require_current=lambda: None)
+        witnesses.rendering_reader = c.localiser.read_localisation
+        assessment = AutonomousNativeEvidenceAssessor._validated_execution(first.execution, candidate, base,
+            (source,), (acquired,), source_renderings=first.source_renderings, semantic_witness_reader=witnesses.read)
+        claim = next(row for row in assessment.governed_claims if 'help@example.org' in row.claim)
+        assert 'help@example.org' in claim.named_entities
+        assert any(name == 'help@example.org' and kind == 'SOURCE_LITERAL' for name, kind, _ref in claim.named_entity_evidence)
+        assert c.enrich(original, candidate, base, (source,), (acquired,), scope=scope) == first
+        assert len(local) == 1 and len(calls) == 2
+        assert json.loads(first.execution.text)['package']['governed_claims'][0] == json.loads(original.execution.text)['package']['governed_claims'][0]
+
+
+def test_v4_context_reuses_retained_v3_rendering_without_new_calls(tmp_path, monkeypatch):
+    with _services(tmp_path, monkeypatch, localisation_version='newsroom.native-claim-localisation.v3') as (
+            c, original, candidate, base, source, acquired, scope, usage, calls, local):
+        first = c.enrich(original, candidate, base, (source,), (acquired,), scope=scope)
+        with usage._connection() as db:
+            before = db.execute('SELECT record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()
+        old = c.localiser
+        c.localiser = NativeClaimLocaliser(usage=usage, objects=old.objects,
+            policy=localisation_policy(evidence_digest=digest_bytes(b'qualified v4 fixture'), qualified=True),
+            source_fence=old.fence, runner=old.runner, implementation_worktree_clean=True, clock=old.clock)
+        assert c.enrich(original, candidate, base, (source,), (acquired,), scope=scope) == first
+        assert len(calls) == 2 and len(local) == 1
+        with usage._connection() as db:
+            assert db.execute('SELECT record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall() == before

@@ -1390,12 +1390,15 @@ def _factual_occurrences_v2(text: str):
     calendar_month = rf"(?:{month})(?:\s+[0-9]{{4}})?|(?:{_FACT_NUMBER_V2}年)?{_FACT_NUMBER_V2}月"
     core = rf"{year}|{interval}(?:\s*(?:{_FACT_UNIT_V2}))?|{date}|{money}|{quantity}|{selection}|{calendar_month}"
     matches = [*re.finditer(rf"(?<![A-Za-z0-9_])(?:{_FACT_QUALIFIER_V2})?(?:{core})(?:半)?(?:(?:期限)?內)?(?![A-Za-z0-9_])", text, re.I), *re.finditer(pattern, text)]
-    # A number cannot stand in for a fraction or an unsupported unit-bearing
-    # expression. Unknown English unit words stay unknown, never inferred.
-    raw_unit = r"%|％|公里|公斤|公噸|噸|吨|毫升|米|歲|度|呎|℃|℉|°(?:[CFcf])?|半"
-    raw = rf"(?<![A-Za-z0-9_])[+−-]?[0-9]+(?:[.,][0-9]+)*(?:/[0-9]+|\s*[A-Za-z]+|\s*(?:{raw_unit}))?"
-    matches.extend(re.finditer(raw, text))
-    matches.extend(re.finditer(rf"(?<![A-Za-z0-9_]){_FACT_NUMBER_V2}\s*(?:{raw_unit})", text))
+    # Retain finite unparsed measurement units, not arbitrary following nouns.
+    # Noun fidelity belongs to the separate semantic support check.
+    raw_unit = (r"(?:kg|mg|g|km|cm|mm|m|ml|l|(?:kilo|milli)?grams?|"
+                r"(?:kilo|centi|milli)?met(?:res?|ers?)|(?:milli)?lit(?:res?|ers?)|"
+                r"tonnes?|tons?|degrees?|seconds?|days?|weeks?)(?![A-Za-z])|"
+                r"%|％|公里|公斤|公噸|噸|吨|毫升|米|歲|度|呎|℃|℉|°(?:[CFcf])?|半")
+    raw = rf"(?<![A-Za-z0-9_])[+−-]?[0-9]+(?:[.,][0-9]+)*(?:/[0-9]+|\s*(?:{raw_unit}))?"
+    matches.extend(re.finditer(raw, text, re.I))
+    matches.extend(re.finditer(rf"(?<![A-Za-z0-9_]){_FACT_NUMBER_V2}\s*(?:{raw_unit})", text, re.I))
     cardinal = (r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
                 r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion")
     matches.extend(re.finditer(rf"(?<![A-Za-z])(?:{cardinal})(?:\s+[A-Za-z]+)?(?![A-Za-z])", text, re.I))

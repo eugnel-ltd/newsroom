@@ -2236,7 +2236,7 @@ class AutonomousNativeEvidenceAssessor:
             if type(enriched)is not JudgedAssessment:
                 raise NativeEvidenceHold('CONTEXT_PACKAGE_RESULT_HOLD',source_id)
             return self._validated_execution(enriched.execution,candidate,base,sources,acquired,
-                semantic_witnesses=original.semantic_witnesses, source_renderings=original.source_renderings,
+                semantic_witnesses=original.semantic_witnesses, source_renderings=enriched.source_renderings,
                 semantic_witness_reader=getattr(self._judgments,'semantic_witness_reader',None))
         if qualification_cached_only:
             from .native_assessor_judgments import JudgedAssessment
