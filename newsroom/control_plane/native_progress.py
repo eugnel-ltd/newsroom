@@ -155,6 +155,7 @@ class NativeSourceHeader:
     updated_at: str | None
     observed_ats: tuple[str, ...]
     unit_index: tuple[tuple[str, str], ...]
+    first_observed_at: str | None = None
 
 
 def _source_header(units: tuple[CorpusIngestUnit, ...]) -> NativeSourceHeader:
@@ -165,6 +166,7 @@ def _source_header(units: tuple[CorpusIngestUnit, ...]) -> NativeSourceHeader:
         first.published_at, first.updated_at, tuple(unit.observed_at for unit in units),
         tuple((unit.ingest_id, digest_bytes(canonical_json_bytes(asdict(unit.effective_revision))))
               for unit in units),
+        first.effective_revision.first_observed_at,
     )
 
 

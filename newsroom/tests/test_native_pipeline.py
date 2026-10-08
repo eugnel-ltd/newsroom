@@ -1709,6 +1709,108 @@ def _quantum_pending_graphiti(pipeline, journal, now):
     return completed, extracted
 
 
+def test_pending_govuk_new_body_precedes_187_newer_public_dates_and_keeps_archive_turn(
+    tmp_path, monkeypatch,
+):
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+    dispositions[0] = ()
+    older = tuple(replace(
+        _native(f"older-observed-{index}"), canonical_url=f"https://www.gov.uk/guidance/older-{index}",
+        updated_at="2026-10-08T15:26:08Z", observed_at="2026-10-08T15:31:12Z",
+        effective_revision=replace(_native().effective_revision,
+                                   first_observed_at="2026-10-08T15:31:12Z"),
+    ) for index in range(187))
+    first = replace(
+        _native("bno-new-body"), canonical_url="https://www.gov.uk/british-national-overseas-bno-visa",
+        published_at="2021-01-31T09:00:01Z", updated_at="2024-10-31T17:00:36Z",
+        chunk_count=5, observed_at="2026-10-08T15:56:04.717599Z",
+        effective_revision=replace(_native().effective_revision,
+                                   first_observed_at="2026-10-08T15:56:04.717599Z"),
+    )
+    chunks = [first]
+    for ordinal in range(2, 6):
+        chunks.append(replace(first, chunk_ordinal=ordinal, predecessor_ingest_id=chunks[-1].ingest_id))
+    for unit in older:
+        journal.land((unit,))
+    journal.land(tuple(chunks))
+    _, extracted = _quantum_pending_graphiti(pipeline, journal, now)
+    try:
+        pipeline.tick(cycle_id="bno-current-content-change")
+        assert extracted == [(first.item_key, 1)]
+        assert pipeline._spill_archive_turn is True
+        # An access/metadata-only re-observation is not a new content arrival.
+        dispositions[0] = (NS(source_id=older[0].source_id, status="READY", reason_code="UNCHANGED",
+                              units=(replace(older[0], observed_at="2026-10-09T16:00:00Z"),)),)
+        pipeline.tick(cycle_id="bno-archive-land-order")
+        assert extracted == [(first.item_key, 1), (older[0].item_key, 1)]
+        assert pipeline._spill_archive_turn is False
+        pipeline._journal = NativeRevisionJournal(connection)
+        pipeline.tick(cycle_id="bno-current-after-restart-projection")
+        assert extracted == [(first.item_key, 1), (older[0].item_key, 1), (first.item_key, 2)]
+        assert journal.units[first.revision_id] == tuple(chunks)
+        assert journal.units[older[0].revision_id] == (older[0],)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("phase", ("ordinary", "ready_spill"))
+def test_governed_govuk_content_recency_reaches_existing_downstream_callers(
+    tmp_path, monkeypatch, phase,
+):
+    if phase == "ready_spill":
+        pipeline, journal, connection, calls, _ = _overrunning_ready_spill(tmp_path, monkeypatch)
+    else:
+        pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
+        dispositions[0] = ()
+    units = tuple(replace(
+        _native(name), canonical_url=f"https://www.gov.uk/guidance/{name}", updated_at=updated,
+        effective_revision=replace(_native().effective_revision, first_observed_at=observed),
+    ) for name, updated, observed in (
+        ("older-content", "2026-10-08T15:26:08Z", "2026-10-08T15:31:12Z"),
+        ("new-body", "2024-10-31T17:00:36Z", "2026-10-08T15:56:04Z"),
+    ))
+    for unit in units:
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage="GRAPHITI_COMPLETE" if phase == "ready_spill" else "CANDIDATE_ADMITTED",
+                        facts={"graphiti_receipts": [{}], **(
+                            {"candidate_version_id": "candidate:" + unit.item_key} if phase == "ordinary" else {}
+                        )})
+    try:
+        pipeline.tick(cycle_id=f"govuk-content-recency-{phase}")
+        assert [revision for kind, revision in calls if kind == "publish"] == (
+            [units[1].revision_id] if phase == "ready_spill" else [units[1].revision_id, units[0].revision_id]
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("url,version,first_observed,expected", (
+    ("https://www.gov.uk/guidance/material", "governed", "2026-10-08T15:56:04Z", "2026-10-08T15:56:04Z"),
+    ("https://www.gov.uk/guidance/material", "governed", None, "2024-10-31T17:00:36Z"),
+    ("https://www.gov.uk/guidance/material", "governed", "malformed", "2024-10-31T17:00:36Z"),
+    ("https://www.gov.uk/guidance/material", None, "2026-10-08T15:56:04Z", "2024-10-31T17:00:36Z"),
+    ("https://weather.metoffice.gov.uk/forecast", "governed", "2026-10-08T15:56:04Z", "2024-10-31T17:00:36Z"),
+    ("https://www.gov.uk.evil.test/guidance/material", "governed", "2026-10-08T15:56:04Z", "2024-10-31T17:00:36Z"),
+    ("https://www.gov.uk/guidance/material?query=1", "governed", "2026-10-08T15:56:04Z", "2024-10-31T17:00:36Z"),
+))
+def test_content_recency_is_governed_govuk_metadata_with_legacy_and_weather_fallback(
+    url, version, first_observed, expected,
+):
+    from newsroom.control_plane.native_progress import NativeSourceHeader
+
+    header = NativeSourceHeader("UK-01", "item", "headline", url, version, "2021-01-31T09:00:01Z",
+                                "2024-10-31T17:00:36Z", ("2026-10-09T16:00:00Z",), ())
+    # Old positional header consumers still use the default/fallback contract.
+    assert n._source_update_time(("revision", header)) == (True, UtcTimestamp.parse("2024-10-31T17:00:36Z").value)
+    current = replace(header, first_observed_at=first_observed)
+    assert n._source_update_time(("revision", current)) == (True, UtcTimestamp.parse(expected).value)
+    assert n._source_update_time(("revision", replace(current, observed_ats=("2026-10-10T17:00:00Z",)))) == (
+        True, UtcTimestamp.parse(expected).value,
+    )
+
+
 @pytest.mark.parametrize("news_path", ("news", "speeches"))
 def test_pending_current_news_precedes_newer_reference_and_archive_keeps_chunks(
     tmp_path, monkeypatch, news_path,
@@ -1767,7 +1869,8 @@ def test_pending_news_priority_keeps_recency_stable_ties_and_unknown_urls(
     pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
     pipeline._spill_archive_turn = archive
-    units = tuple(replace(_native(name), canonical_url=url, updated_at=date) for name, url, date in (
+    units = tuple(replace(_native(name), canonical_url=url, updated_at=date,
+                          effective_revision=replace(_native().effective_revision, first_observed_at=date)) for name, url, date in (
         ("unknown-land-first", "https://www.gov.uk.evil.test/government/news/update", "2026-10-07T00:00:00Z"),
         ("reference-land-second", "https://www.gov.uk/government/publications/register", "2026-10-06T00:00:00Z"),
         ("news-tie-first", "https://www.gov.uk/government/news/update-one", "2026-09-26T00:00:00Z"),
@@ -2400,7 +2503,8 @@ def test_news_priority_keeps_equal_class_stable_and_archive_land_order(tmp_path,
     pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
     pipeline._spill_archive_turn = archive
-    units = [replace(_native(name), canonical_url=url, updated_at=date) for name, url, date in (
+    units = [replace(_native(name), canonical_url=url, updated_at=date,
+                     effective_revision=replace(_native().effective_revision, first_observed_at=date)) for name, url, date in (
         ('reference-land-first', 'https://www.gov.uk/government/publications/register', '2026-10-05T00:00:00Z'),
         ('news-land-second', 'https://www.gov.uk/government/news/update-one', '2026-09-26T00:00:00Z'),
         ('speech-land-third', 'https://www.gov.uk/government/speeches/update-two', '2026-09-26T00:00:00Z'),
