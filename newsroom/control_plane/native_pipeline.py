@@ -233,7 +233,7 @@ class NativePipeline:
         ]
         # Reuse one current/archive preference for pending and ready work.
         # Archive turns keep LAND order so later arrivals cannot starve history.
-        if not self._spill_archive_turn:
+        if pending_revisions and not self._spill_archive_turn:
             pending_revisions.sort(key=lambda item: (_news_or_speech_header(item), _source_update_time(item)), reverse=True)
             # Rotate retained chunk frontiers within the existing news tier.
             # Unserved/tied revisions retain the initial source-recency order.
