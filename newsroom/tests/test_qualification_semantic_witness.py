@@ -602,7 +602,8 @@ def test_consumer_stamp_revalidation_keeps_existing_paid_purposes(tmp_path,monke
             assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
 
 
-def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_path,monkeypatch):
+@pytest.mark.parametrize('failure_kind', ['semantic', 'qualification', 'timeout'])
+def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_path,monkeypatch,failure_kind):
     import sqlite3
     from newsroom.control_plane.native_publication import NativePublicationContinuation
     from newsroom.control_plane.native_progress import NativeRevisionJournal
@@ -619,11 +620,18 @@ def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_p
         intent={'contract':contract,'input_digest':'sha256:'+'a'*64,'origin_invocation_id':'retained-original'}
         facts={'candidate_id':c.candidate_id,'candidate_version_id':c.version_id,'graphiti_receipts':[{}],
             'intake_receipt_id':'retained-intake','semantic_assessment_intent':intent,
-            'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.replace('consumer.v2','consumer.v1'),
-            'retained_qualification_checked_contract':ASSESSMENT_CONTRACT_VERSION.replace('consumer.v2','consumer.v1'),
+            'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.replace('source-qualification-consumer.v3','source-qualification-consumer.v1'),
+            'retained_qualification_checked_contract':ASSESSMENT_CONTRACT_VERSION.replace('source-qualification-consumer.v3','source-qualification-consumer.v1'),
             'reason':'SEMANTIC_INTENT_INPUT_CHANGED_HOLD','failure_class':'ValueError','acquisition_retryable':False,
             'assessment_started_at':'retained-start','acquisition_attempt_count':2,'semantic_acquisition_attempt_count':2}
-        journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+        stage = 'EVIDENCE_HOLD'
+        if failure_kind != 'semantic':
+            facts.pop('semantic_assessment_intent')
+            facts.pop('retained_qualification_checked_contract')
+            facts['reason'] = 'ACQUISITION_RESULT_NOT_RETAINED'
+            facts['failure_class'] = 'QualificationHold' if failure_kind == 'qualification' else 'CliTimeoutError'
+            stage = 'ASSESSMENT_INTERRUPTED'
+        journal.advance(unit.revision_id,stage=stage,facts=facts)
         class CandidateAuthority(_Authority):
             def candidate_version(self,_version):return c
         requests=[]
@@ -647,7 +655,13 @@ def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_p
         try:
             continuation.advance(revision_id=unit.revision_id,candidate_version_id=c.version_id)
             after=journal.current(unit.revision_id)['facts']
-            assert after['semantic_assessment_intent']==intent and after['assessment_started_at']=='retained-start'
+            if failure_kind == 'timeout':
+                assert not requests and len(qa) == 1
+                assert after['failure_class'] == 'CliTimeoutError'
+                assert 'retained_qualification_checked_contract' not in after
+                return
+            assert after.get('semantic_assessment_intent') == (intent if failure_kind == 'semantic' else None)
+            assert after['assessment_started_at']=='retained-start'
             assert after['retained_qualification_checked_contract']==ASSESSMENT_CONTRACT_VERSION
             assert len(requests)==1 and runtime.publication.calls==0
             continuation.advance(revision_id=unit.revision_id,candidate_version_id=c.version_id)
