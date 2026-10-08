@@ -11,7 +11,7 @@ from .native_assessor import NativeAssessmentExecution
 from .native_assessor_spans import build_lossless_source_view
 from .native_source_qualification import QualificationHold, QualificationReference, _materialisation
 
-CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v3'
+CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v4'
 # Pure consumer repairs never reopen an identical paid witness/render purpose.
 PAID_BINDING_VERSION = 'newsroom.source-qualification-consumer.v1'
 

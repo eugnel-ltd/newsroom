@@ -602,7 +602,7 @@ def test_consumer_stamp_revalidation_keeps_existing_paid_purposes(tmp_path,monke
             assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()==pins
 
 
-@pytest.mark.parametrize('failure_kind', ['semantic', 'qualification', 'timeout'])
+@pytest.mark.parametrize('failure_kind', ['semantic', 'qualification', 'localisation', 'timeout'])
 def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_path,monkeypatch,failure_kind):
     import sqlite3
     from newsroom.control_plane.native_publication import NativePublicationContinuation
@@ -620,8 +620,8 @@ def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_p
         intent={'contract':contract,'input_digest':'sha256:'+'a'*64,'origin_invocation_id':'retained-original'}
         facts={'candidate_id':c.candidate_id,'candidate_version_id':c.version_id,'graphiti_receipts':[{}],
             'intake_receipt_id':'retained-intake','semantic_assessment_intent':intent,
-            'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.replace('source-qualification-consumer.v3','source-qualification-consumer.v1'),
-            'retained_qualification_checked_contract':ASSESSMENT_CONTRACT_VERSION.replace('source-qualification-consumer.v3','source-qualification-consumer.v1'),
+            'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.replace('source-qualification-consumer.v4','source-qualification-consumer.v1'),
+            'retained_qualification_checked_contract':ASSESSMENT_CONTRACT_VERSION.replace('source-qualification-consumer.v4','source-qualification-consumer.v1'),
             'reason':'SEMANTIC_INTENT_INPUT_CHANGED_HOLD','failure_class':'ValueError','acquisition_retryable':False,
             'assessment_started_at':'retained-start','acquisition_attempt_count':2,'semantic_acquisition_attempt_count':2}
         stage = 'EVIDENCE_HOLD'
@@ -629,7 +629,7 @@ def test_valueerror_journal_reentry_reads_reported_qa_before_first_witness(tmp_p
             facts.pop('semantic_assessment_intent')
             facts.pop('retained_qualification_checked_contract')
             facts['reason'] = 'ACQUISITION_RESULT_NOT_RETAINED'
-            facts['failure_class'] = 'QualificationHold' if failure_kind == 'qualification' else 'CliTimeoutError'
+            facts['failure_class'] = {'qualification': 'QualificationHold', 'localisation': 'LocalisationHold'}.get(failure_kind, 'CliTimeoutError')
             stage = 'ASSESSMENT_INTERRUPTED'
         journal.advance(unit.revision_id,stage=stage,facts=facts)
         class CandidateAuthority(_Authority):

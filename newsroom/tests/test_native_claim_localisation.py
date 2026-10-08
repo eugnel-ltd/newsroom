@@ -372,3 +372,141 @@ def test_recomputed_legacy_policy_breach_cannot_grant_repair_credit(tmp_path, mo
         with pytest.raises(LocalisationHold):
             _localiser(usage, runtime, fence, runner).localise(state, **scope)
         assert calls == []
+
+
+@contextmanager
+def _retained_slot_alias_failure(tmp_path, monkeypatch, *, runtime_failure=False):
+    """Record the original strict decoder through real accounting and CAS APIs."""
+    args, usage, state, runner, fence, calls = case(tmp_path, monkeypatch)
+    state['claims'] = {'0': {**state['claims']['S1L1'], 'source_range': {
+        'first_span_id': 'S1L1', 'last_span_id': 'S1L1'}}}
+    decoder = module._renderings
+
+    def original_decoder(raw, input_state, *, version=module.VERSION):
+        if version == module.VERSION:
+            returned = {row['span_id'] for row in json.loads(raw)['renderings']}
+            if returned != set(input_state['claims']):
+                if runtime_failure:
+                    raise RuntimeError('Original runtime decoder failure')
+                raise LocalisationHold('LOCALISATION_SPAN_PARTITION_HOLD')
+        return decoder(raw, input_state, version=version)
+
+    with open_native_runtime(**args) as runtime:
+        localiser = _localiser(usage, runtime, fence, runner)
+        scope = _scope(runtime)
+        with monkeypatch.context() as previous:
+            previous.setattr(module, '_renderings', original_decoder)
+            with pytest.raises(RuntimeError if runtime_failure else LocalisationHold):
+                localiser.localise(state, **scope)
+        with sqlite3.connect(usage.path) as connection:
+            invocation = connection.execute('SELECT invocation_id FROM model_invocation_allocations').fetchone()[0]
+        reference = localiser._reference(invocation, proof=runtime.proof)
+        yield localiser, usage, state, scope, reference, runtime, calls
+
+
+def test_reported_slot_alias_failure_revalidates_same_paid_raw_without_redispatch(tmp_path, monkeypatch):
+    with _retained_slot_alias_failure(tmp_path, monkeypatch) as (
+            localiser, usage, state, scope, reference, runtime, calls):
+        terminal = usage.terminal(reference.invocation_id)
+        assert terminal.outcome == 'LOCALISATION_FAILED'
+        assert terminal.failure_class == 'LocalisationHold'
+        assert terminal.usage_status.value == 'REPORTED'
+        before = runtime.authority.objects.rehydrate(HydrationRequest(
+            reference.raw_admission_id, 'evidence.record'), proof=runtime.proof).data
+        assert localiser.localise(state, **scope) == reference
+        record = localiser.read_localisation(reference, state, **scope)
+        assert record['outcome'] == 'LOCALISATION_FAILED'
+        assert record['renderings']['0']['rendered_assertion_zh_hant_hk_fragments'] == ['計劃現已接受申請。']
+        assert record['consumer_revalidation'] == {
+            'consumer_contract': module.CONSUMER_VERSION,
+            'original_outcome': 'LOCALISATION_FAILED',
+            'original_terminal_digest': terminal.terminal_digest,
+            'raw_response_digest': digest_bytes(before),
+            'source_span_aliases': {'S1L1': '0'},
+        }
+        assert usage.terminal(reference.invocation_id) == terminal
+        assert runtime.authority.objects.rehydrate(HydrationRequest(
+            reference.raw_admission_id, 'evidence.record'), proof=runtime.proof).data == before
+        assert len(calls) == 1
+        with sqlite3.connect(usage.path) as connection:
+            assert connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('condition', ['single_alias', 'direct', 'multi_span', 'duplicate_alias',
+                                     'mixed_collision', 'duplicate_output', 'unknown', 'fragment_count', 'byte_bound'])
+def test_source_span_aliases_preserve_exact_partition_and_existing_shape_guards(condition):
+    from copy import deepcopy
+    claim = {'text': 'The scheme is now open.', 'entities': [], 'rendering_fragment_count': 1,
+             'source_range': {'first_span_id': 'S1L1', 'last_span_id': 'S1L1'}}
+    state = {'claims': {'0': claim}}
+    item = {'span_id': 'S1L1', 'rendered_assertion_zh_hant_hk_fragments': ['計劃現已接受申請。'],
+            'factual_localisations': [], 'quotation_source_keys': []}
+    value = {'renderings': [item]}
+    if condition == 'direct':
+        item['span_id'] = '0'
+    elif condition == 'multi_span':
+        claim['source_range']['last_span_id'] = 'S1L2'
+    elif condition == 'duplicate_alias':
+        state['claims']['1'] = deepcopy(claim)
+        value['renderings'].append({**deepcopy(item), 'span_id': '1'})
+    elif condition == 'mixed_collision':
+        state['claims']['S1L1'] = {**deepcopy(claim), 'source_range': {
+            'first_span_id': 'S1L2', 'last_span_id': 'S1L2'}}
+        value['renderings'].append({**deepcopy(item), 'span_id': 'S1L2'})
+    elif condition == 'duplicate_output':
+        value['renderings'].append({**deepcopy(item), 'span_id': '0'})
+    elif condition == 'unknown':
+        item['span_id'] = 'S1L9'
+    elif condition == 'fragment_count':
+        item['rendered_assertion_zh_hant_hk_fragments'].append('多餘片段。')
+    elif condition == 'byte_bound':
+        item['quotation_source_keys'] = ['中' * 86]
+    if condition in {'single_alias', 'direct'}:
+        assert module._renderings(canonical_json_bytes(value), state) == {
+            '0': {key: value for key, value in item.items() if key != 'span_id'}}
+    else:
+        with pytest.raises(LocalisationHold):
+            module._renderings(canonical_json_bytes(value), state)
+
+
+@pytest.mark.parametrize('corruption', ['claim', 'scope', 'raw_admission', 'receipt', 'recomputed_breach'])
+def test_failed_alias_revalidation_authenticates_original_input_raw_and_usage(tmp_path, monkeypatch, corruption):
+    from copy import deepcopy
+    from dataclasses import replace
+    with _retained_slot_alias_failure(tmp_path, monkeypatch) as (
+            localiser, usage, state, scope, reference, runtime, calls):
+        terminal = usage.terminal(reference.invocation_id)
+        if corruption == 'claim':
+            state = deepcopy(state)
+            state['claims']['0']['text'] = 'A different assertion.'
+        elif corruption == 'scope':
+            scope = {**scope, 'candidate_id': 'other-candidate'}
+        elif corruption == 'raw_admission':
+            other = runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.record', 'other-rendering'),
+                canonical_json_bytes({'renderings': []}), proof=runtime.proof).admission
+            reference = replace(reference, raw_admission_id=other.admission_id)
+        elif corruption == 'receipt':
+            receipt = json.loads(runtime.authority.objects.rehydrate(HydrationRequest(
+                reference.receipt_admission_id, 'evidence.record'), proof=runtime.proof).data)
+            receipt['raw_digest'] = digest_bytes(b'not the original rendering')
+            other = runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.record', 'other-rendering-receipt'),
+                canonical_json_bytes(receipt), proof=runtime.proof).admission
+            reference = replace(reference, receipt_admission_id=other.admission_id)
+        else:
+            monkeypatch.setattr(ModelUsageService, '_validate_terminal',
+                                staticmethod(lambda *_a, **_k: 'MAX_TOTAL_TOKENS_EXCEEDED'))
+        with pytest.raises(LocalisationHold):
+            localiser.read_localisation(reference, state, **scope)
+        assert len(calls) == 1
+        assert usage.terminal(terminal.invocation_id) == terminal
+
+
+def test_reported_runtime_failure_is_not_source_span_alias_revalidation_credit(tmp_path, monkeypatch):
+    with _retained_slot_alias_failure(tmp_path, monkeypatch, runtime_failure=True) as (
+            localiser, usage, state, scope, reference, _runtime, calls):
+        terminal = usage.terminal(reference.invocation_id)
+        assert terminal.usage_status.value == 'REPORTED'
+        assert terminal.failure_class == 'RuntimeError'
+        with pytest.raises(LocalisationHold, match='REPLAY_BINDING'):
+            localiser.read_localisation(reference, state, **scope)
+        assert len(calls) == 1 and usage.terminal(reference.invocation_id) == terminal

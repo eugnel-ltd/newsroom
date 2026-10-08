@@ -1560,12 +1560,12 @@ def test_known_qualification_consumer_resume_never_restarts_semantic_input(tmp_p
     journal = NativeRevisionJournal(connection)
     journal.land((unit,))
     contract='newsroom.native-assessor-judgments.v2+newsroom.native-source-qualification.v2'
-    current='newsroom.native-evidence-assessor.v23+source-qualification-consumer.v3'
+    current='newsroom.native-evidence-assessor.v23+source-qualification-consumer.v4'
     intent={'contract':contract,'input_digest':_DIGEST,'origin_invocation_id':'original-unknown',
             'origin_journal':{'reason':'ACQUISITION_RESULT_NOT_RETAINED'}}
     facts={'candidate_id':'candidate','candidate_version_id':'candidate-version',
         'graphiti_receipts':[{}],'intake_receipt_id':'existing-intake',
-        'semantic_assessment_intent':intent,'assessment_contract_version':current.replace('source-qualification-consumer.v3','source-qualification-consumer.v1'),
+        'semantic_assessment_intent':intent,'assessment_contract_version':current.replace('source-qualification-consumer.v4','source-qualification-consumer.v1'),
         'reason':'ACQUISITION_RESULT_NOT_RETAINED','failure_class':'EvidencePackageError',
         'assessment_started_at':'2026-10-05T07:33:07Z',
         'semantic_acquisition_attempt_count':2,'acquisition_attempt_count':3}
@@ -1925,7 +1925,7 @@ def test_semantic_witness_disposition_is_retained_without_retry_or_free_text(tmp
         intent={'contract':contract,'input_digest':_DIGEST,'origin_invocation_id':'protected-original'}
         facts={'candidate_id':p.candidate_id,'candidate_version_id':'candidate-version','graphiti_receipts':[{}],
             'intake_receipt_id':'protected-intake','semantic_assessment_intent':intent,
-            'assessment_contract_version':current.replace('source-qualification-consumer.v3','source-qualification-consumer.v1'),
+            'assessment_contract_version':current.replace('source-qualification-consumer.v4','source-qualification-consumer.v1'),
             'reason':'SEMANTIC_INTENT_INPUT_CHANGED_HOLD','failure_class':'ValueError','assessment_started_at':'protected-start'}
         journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
         class CurrentCandidate(_Authority):
