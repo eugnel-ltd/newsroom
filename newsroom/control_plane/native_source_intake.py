@@ -537,16 +537,22 @@ class NativeSourceIntake:
                     document.body_text, canonical_root,
                     _utc(document.publication), _utc(document.updated), document.body_text,
                 )
-                units = self._retain_item(
-                    source_id, definition_id, version_id, version, item, root_digest,
-                    _utc(retrieved), rights.record_id,
-                )
             except (TypeError, ValueError, KeyError, UnicodeError):
                 return NativeSourceDisposition(
                     source_id, "HOLD", "MULTIPART_COVERAGE_INCOMPLETE", (),
                     str(admission), str(access.access_decision_id),
                     tuple(observations),
                 )
+            # A complete guide can still fail retention; that is not missing parts.
+            try:
+                units = self._retain_item(
+                    source_id, definition_id, version_id, version, item, root_digest,
+                    _utc(retrieved), rights.record_id,
+                )
+            except NativeSourceIntakeHold as exc:
+                self._observe_poll_failure(source_id, 'ROOT_POLL', exc)
+                return NativeSourceDisposition(source_id, 'HOLD', exc.reason_code, (),
+                    str(admission), str(access.access_decision_id), tuple(observations))
             return NativeSourceDisposition(
                 source_id, "READY", "GOVERNED_REVISIONS_RETAINED", units,
                 str(admission), str(access.access_decision_id),
@@ -849,22 +855,40 @@ class NativeSourceIntake:
             headline=item.headline, body=body, canonical_url=item.canonical_url
         )
         latest = self._sources.latest_revision(item_id, proof=self._proof)
-        native_revision_token = item.updated_at
-        if (
-            native_revision_token is not None
-            and latest is not None
-            and latest.request.source_native_revision_token == native_revision_token
-            and latest.request.permitted_state_digest != revision_digest
-        ):
-            raise NativeSourceIntakeHold("SOURCE_NATIVE_REVISION_CONFLICT")
+        # GOV.UK publisher timestamps are metadata, not immutable edition IDs.
+        govuk = source_id in SUPPORTED
+        native_revision_token = None if govuk else item.updated_at
+        if (not govuk and native_revision_token is not None and latest is not None
+                and latest.request.source_native_revision_token == native_revision_token
+                and latest.request.permitted_state_digest != revision_digest):
+            raise NativeSourceIntakeHold('SOURCE_NATIVE_REVISION_CONFLICT')
         revision_id = deterministic_uuid4(
             SourceRevisionId, namespace=f"{VERSION}:revision",
             semantic_value=[str(item_id), native_revision_token, revision_digest],
         )
-        try:
-            retained_revision = self._sources.revision(revision_id, proof=self._proof)
-        except LookupError:
-            retained_revision = None
+        retained_revision = None
+        if govuk and latest is not None and latest.request.permitted_state_digest == revision_digest:
+            retained_revision = latest
+            revision_id = latest.request.revision_id
+        else:
+            if govuk:
+                # Authenticate this item's immutable metadata chain, never its
+                # bodies. Incoming timestamps cannot identify older legacy states.
+                cursor = latest
+                while cursor is not None:
+                    if cursor.request.item_id != item_id:
+                        raise NativeSourceIntakeHold('SOURCE_RETAINED_REVISION_BINDING_HOLD')
+                    if cursor.request.permitted_state_digest == revision_digest:
+                        raise NativeSourceIntakeHold('SOURCE_OBSERVED_STATE_REVERSION_HOLD')
+                    prior = cursor.request.prior_revision_id
+                    cursor = None if prior is None else self._sources.revision(prior, proof=self._proof)
+            try:
+                retained_revision = self._sources.revision(revision_id, proof=self._proof)
+            except LookupError:
+                retained_revision = None
+            if retained_revision is not None and govuk:
+                # Never promote an older retained state as CURRENT.
+                raise NativeSourceIntakeHold('SOURCE_OBSERVED_STATE_REVERSION_HOLD')
         replay = retained_revision is not None
         first_observed = (
             retained_revision.request.observed_at.to_text() if replay else observed_at
@@ -873,12 +897,18 @@ class NativeSourceIntake:
             retained_revision.request.prior_revision_id if replay
             else None if latest is None else latest.request.revision_id
         )
-        revision_request = SourceRevisionRequest(
+        revision_request = retained_revision.request if replay and govuk else SourceRevisionRequest(
             revision_id, item_id, version_id, prior_revision_id,
             native_revision_token, revision_digest, version.revision_policy,
             VERSION, self._source_time(item.published_at), self._source_time(item.updated_at),
             UtcTimestamp.parse(first_observed), f"native-source-revision:{revision_id}",
         )
+        retained = self._retained_units.get(str(revision_id), self._pending_units.get(str(revision_id)))
+        if replay and govuk:
+            # Fresh metadata remains in the retained raw observation. Keep the
+            # original revision/representation and paid corpus purposes exact.
+            item = replace(item, published_at=revision_request.source_published_time.value,
+                           updated_at=revision_request.source_updated_time.value)
         representation_digest = representation_digest_for(
             source_id=source_id, item_key=item.item_key, revision_digest=revision_digest,
             published_at=item.published_at, updated_at=item.updated_at,
@@ -896,7 +926,6 @@ class NativeSourceIntake:
             fields_digest, representation_digest, UtcTimestamp.parse(first_observed),
             f"native-source-representation:{representation_id}",
         )
-        retained = self._retained_units.get(str(revision_id), self._pending_units.get(str(revision_id)))
         if retained is not None:
             # Polling already checked the current definition/rights and fetched
             # the complete bytes. Reuse the journal's original chunk receipts,
@@ -1152,8 +1181,14 @@ def native_evidence_sources(
                 matches = (
                     document.title == unit.headline
                     and document.body_text == unit.body
-                    and _utc(document.publication) == unit.published_at
-                    and _utc(document.updated) == unit.updated_at
+                    # Corpus identities retain their original source chronology.
+                    # Current API metadata is independently acquired for current
+                    # editorial scope; it never rewrites a retained paid purpose.
+                    and ((unit.published_at == revision.request.source_published_time.value
+                          and unit.updated_at == revision.request.source_updated_time.value)
+                         if unit.source_id in SUPPORTED else
+                         (_utc(document.publication) == unit.published_at
+                          and _utc(document.updated) == unit.updated_at))
                 )
         except GovUkContentHold as exc:
             raise hold(exc.reason_code) from None

@@ -290,7 +290,7 @@ def test_same_poll_alias_does_not_skip_current_parent_checks(
         assert _evidence(case, result)
 
 
-def test_same_poll_alias_keeps_native_revision_conflict_fail_closed(tmp_path, monkeypatch):
+def test_same_poll_alias_retains_distinct_observed_states_at_the_same_public_time(tmp_path, monkeypatch):
     with _case(tmp_path, monkeypatch) as case:
         case.bodies[SOURCE_URLS["UK-01"]] = _feed(*PARENTS)
         fetch = case.intake._fetch
@@ -302,18 +302,23 @@ def test_same_poll_alias_keeps_native_revision_conflict_fail_closed(tmp_path, mo
             if url == CHILD_API:
                 child_reads += 1
                 if child_reads == 2:
-                    raw = _document(path=CHILD, body="Conflicting bytes at the same native revision token.")
+                    raw = _document(path=CHILD, body="Changed content at the same publisher update timestamp.")
             return status, raw
 
         case.intake._fetch = changing_child
         result = case.intake.poll()[0]
-        assert result.status == "HOLD"
-        assert len(result.units) == 1
-        assert result.item_holds == ((CANONICAL, "SOURCE_NATIVE_REVISION_CONFLICT"),)
-        # The current conflict is admitted but never selected as evidence;
-        # the completed revision and both observed parent inventories remain.
-        assert len(result.observations) == 4
-        assert _evidence(case, result)
+        assert result.status == "READY"
+        assert len(result.units) == 2 and not result.item_holds
+        first, second = result.units
+        assert first.item_key == second.item_key and first.updated_at == second.updated_at
+        assert first.revision_id != second.revision_id
+        revision = case.runtime.authority.sources.revision(SourceRevisionId.parse(second.revision_id), proof=case.runtime.proof)
+        assert revision.request.source_native_revision_token is None
+        assert str(revision.request.prior_revision_id) == first.revision_id
+        # Both complete observations are retained, without pretending the
+        # publisher timestamp identifies one unique edition.
+        assert len(result.observations) == 5
+        assert len(_evidence(case, result)) == 2
 
 
 def test_current_rights_and_second_parent_veto_still_precede_alias_reuse(tmp_path, monkeypatch):

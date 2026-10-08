@@ -130,6 +130,31 @@ def _guide():
     }).encode()
 
 
+def _seed_legacy_bno_revision(runtime, definition_id, raw):
+    """Retain the genuine old timestamp-based request, without changing its IDs."""
+    from newsroom.checks import deterministic_uuid4
+    from newsroom.authority.types import UtcTimestamp
+    from newsroom.sources import SourceItemRequest, SourceItemIdentityKind, IdentityComponent, SourceRevisionRequest, SourceTime
+    from newsroom.control_plane.govuk_evidence import parse_govuk_content_document, _utc
+    from newsroom.graphiti_adapter.identity import content_digest
+    from newsroom.control_plane.native_source_intake import VERSION
+    current = runtime.authority.sources.current_summary(definition_id, proof=runtime.proof)
+    version = runtime.authority.sources.version_details(current.version_id, proof=runtime.proof).request
+    path = '/british-national-overseas-bno-visa'
+    document = parse_govuk_content_document('https://www.gov.uk'+path, raw, retrieved_at=datetime(2026, 9, 8, 12, tzinfo=UTC))
+    item_id = deterministic_uuid4(SourceItemId, namespace=f'{VERSION}:item', semantic_value=[str(current.version_id), 'UK-02', path])
+    runtime.authority.sources.register_item(SourceItemRequest(item_id, definition_id, current.version_id,
+        SourceItemIdentityKind.COMPOSITE, version.item_identity_policy, path,
+        (IdentityComponent('item_key', path), IdentityComponent('source_id', 'UK-02')), (), f'native-source-item:{item_id}'), proof=runtime.proof)
+    digest = content_digest(headline=document.title, body=document.body_text, canonical_url='https://www.gov.uk'+path)
+    token = _utc(document.updated)
+    revision_id = deterministic_uuid4(SourceRevisionId, namespace=f'{VERSION}:revision', semantic_value=[str(item_id), token, digest])
+    request = SourceRevisionRequest(revision_id, item_id, current.version_id, None, token, digest,
+        version.revision_policy, VERSION, SourceTime.exact(UtcTimestamp.parse(_utc(document.publication))),
+        SourceTime.exact(UtcTimestamp.parse(token)), UtcTimestamp.parse('2026-09-08T12:00:00.000000Z'), f'native-source-revision:{revision_id}')
+    return runtime.authority.sources.record_revision(request, proof=runtime.proof)
+
+
 def _manual():
     return json.dumps({
         "base_path": "/guidance/immigration-rules", "locale": "en",
@@ -326,16 +351,10 @@ def test_native_source_poll_retains_real_lineage_replay_and_all_dispositions(
 
         page[0] = _document(updated="2026-09-08T14:00:00Z")
         instant[0] = datetime(2026, 9, 8, 15, tzinfo=UTC)
-        returned = intake.poll()[0].units[0]
-        assert returned.authority.revision_id not in {
-            old_revision, changed.authority.revision_id,
-        }
-        returned_revision = runtime.authority.sources.revision(
-            SourceRevisionId.parse(returned.authority.revision_id), proof=runtime.proof
-        )
-        assert str(returned_revision.request.prior_revision_id) == changed.authority.revision_id
-        assert returned.revision_digest == unit.revision_digest
-        assert returned_revision.request.observed_at.to_text() == "2026-09-08T15:00:00.000000Z"
+        returned = intake.poll()[0]
+        assert returned.status == 'HOLD' and not returned.units
+        assert returned.item_holds == (('https://www.gov.uk/item-1', 'SOURCE_OBSERVED_STATE_REVERSION_HOLD'),)
+        assert runtime.authority.sources.latest_revision(retained.request.item_id, proof=runtime.proof) == retained
         assert fences == [
             item
             for _ in range(5)
@@ -344,17 +363,22 @@ def test_native_source_poll_retains_real_lineage_replay_and_all_dispositions(
                 ("UK-01", "https://www.gov.uk/api/content/item-1"),
             )
         ]
-        # A new source version with unchanged text is still observed now; it
-        # must not borrow the preceding version's observation timestamp.
-        page[0] = _document(updated="2026-09-08T16:00:00Z")
+        # Metadata-only observations do not create a new source edition or ingest.
+        page[0] = _document(body='A changed complete document.', updated="2026-09-08T16:00:00Z")
         instant[0] = datetime(2026, 9, 8, 17, tzinfo=UTC)
         metadata_only = intake.poll()[0].units[0]
         metadata_revision = runtime.authority.sources.revision(
             SourceRevisionId.parse(metadata_only.authority.revision_id), proof=runtime.proof
         )
-        assert str(metadata_revision.request.prior_revision_id) == returned.authority.revision_id
-        assert metadata_revision.request.observed_at.to_text() == "2026-09-08T17:00:00.000000Z"
-        assert metadata_only.revision_digest == returned.revision_digest
+        assert metadata_only.ingest_id == changed.ingest_id
+        assert metadata_only.effective_revision == changed.effective_revision
+        assert metadata_only.authority.revision_id == changed.authority.revision_id
+        assert metadata_only.body == changed.body
+        assert metadata_only.updated_at == changed.updated_at
+        assert metadata_revision.request == retained.request
+        assert native_evidence_sources(units=(metadata_only,), sources=runtime.authority.sources,
+            objects=runtime.authority.objects, observations={row[1]: row for row in intake.poll()[0].observations},
+            licence=_licence(), proof=runtime.proof)
 
 
 def test_native_source_reobservation_reuses_journal_units_after_current_checks(tmp_path, monkeypatch):
@@ -436,7 +460,7 @@ def test_native_source_reobservation_reuses_journal_units_after_current_checks(t
         assert len(fetched) == before
 
 
-def test_native_source_poll_holds_oversize_and_duplicate_native_revision(tmp_path, monkeypatch):
+def test_native_source_poll_recognises_same_time_content_changes_and_holds_oversize(tmp_path, monkeypatch):
     args = _args(tmp_path, monkeypatch)
     args["principal_id"] = OPERATOR_PRINCIPAL_ID
     args["authority_domain"] = OPERATOR_AUTHORITY_DOMAIN
@@ -456,12 +480,9 @@ def test_native_source_poll_holds_oversize_and_duplicate_native_revision(tmp_pat
 
         page[0] = _document(body="Different bytes.")
         duplicate = intake.poll()[0]
-        assert duplicate.status == "HOLD"
-        assert duplicate.reason_code == "SOURCE_ITEMS_HELD"
-        assert duplicate.item_holds == ((
-            "https://www.gov.uk/item-1", "SOURCE_NATIVE_REVISION_CONFLICT",
-        ),)
-        assert not duplicate.units
+        assert duplicate.status == "READY"
+        assert duplicate.units[0].body == 'Different bytes.'
+        assert not duplicate.item_holds
 
         page[0] = b"x" * (MAX_BODY_BYTES + 1)
         oversized_page = intake.poll()[0]
@@ -584,6 +605,186 @@ def test_native_bno_guide_retains_all_nine_parts_as_one_revision(tmp_path, monke
         assert all(f"Part {number}\nComplete guide text {number}." in text
                    for number in range(1, 10))
         assert len({unit.authority.revision_id for unit in disposition.units}) == 1
+
+
+def test_bno_changed_content_at_same_public_updated_time_is_an_observed_revision(tmp_path, monkeypatch):
+    """Reproduce the retained complete nine-part guide's three real insertions."""
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    old = json.loads(_guide())
+    old['public_updated_at'] = '2024-10-31T17:00:36+00:00'
+    old['updated_at'] = '2026-09-02T16:04:42+01:00'
+    page = [canonical_json_bytes(old)]
+    retained = {}
+    with open_native_runtime(**args) as runtime:
+        definition_id = _seed_missing(runtime, 'UK-02')
+        legacy = _seed_legacy_bno_revision(runtime, definition_id, page[0])
+        intake = NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-02': definition_id},
+            licence=_licence(), dispatch_fence=lambda *_: nullcontext(), retained_units=retained,
+            fetch=lambda _: (200, page[0]), clock=lambda: datetime(2026, 9, 8, 12, tzinfo=UTC))
+        first = intake.poll()[SOURCE_IDS.index('UK-02')]
+        assert first.status == 'READY'
+        assert first.units[0].authority.revision_id == str(legacy.request.revision_id)
+        retained[first.units[0].revision_id] = first.units
+        new = json.loads(page[0])
+        new['updated_at'] = '2026-10-08T00:01:05+01:00'
+        insertions = (
+            'If you’re under 18 when you apply, you do not need to have spent 5 continuous years in the UK. You can apply for settlement once your parents become eligible.',
+            'Your application will be refused if you apply earlier.',
+            'Do not wait until your current visa expires before you apply. If your visa expires before you can apply for indefinite leave to remain, you’ll need to renew it first.',
+        )
+        for part, text in zip(new['details']['parts'][-3:], insertions, strict=True):
+            part['body'] += f'<p>{text}</p>'
+        page[0] = canonical_json_bytes(new)
+        changed = intake.poll()[SOURCE_IDS.index('UK-02')]
+        assert changed.status == 'READY', changed
+        assert len(changed.observations) == 1
+        unit = changed.units[0]
+        assert unit.revision_digest != first.units[0].revision_digest
+        assert all(text in ' '.join(unit.body.split()) for text in insertions)
+        revision = runtime.authority.sources.revision(SourceRevisionId.parse(unit.authority.revision_id), proof=runtime.proof)
+        assert revision.request.source_native_revision_token is None
+        assert str(revision.request.prior_revision_id) == first.units[0].authority.revision_id
+        assert unit.updated_at == first.units[0].updated_at
+
+
+def test_bno_metadata_only_observation_preserves_legacy_ingest_and_fresh_acquisition_times(tmp_path, monkeypatch):
+    from newsroom.control_plane.govuk_evidence import GovUkEvidenceAcquisition, POLICY_DIGEST as TRANSPORT_POLICY
+    from newsroom.control_plane.native_evidence import EvidenceAcquisitionRequest
+    from newsroom.tests.test_govuk_evidence import Response
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    page = [_guide()]; retained = {}; instant = [datetime(2026, 9, 8, 13, tzinfo=UTC)]
+    with open_native_runtime(**args) as runtime:
+        definition_id = _seed_missing(runtime, 'UK-02')
+        legacy = _seed_legacy_bno_revision(runtime, definition_id, page[0])
+        intake = NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-02': definition_id}, licence=_licence(),
+            dispatch_fence=lambda *_: nullcontext(), retained_units=retained,
+            fetch=lambda _: (200, page[0]), clock=lambda: instant[0])
+        first = intake.poll()[SOURCE_IDS.index('UK-02')]
+        retained[first.units[0].revision_id] = first.units
+        changed = json.loads(page[0]); changed['public_updated_at'] = '2026-09-08T14:00:00Z'; changed['publishing_request_id'] = 'metadata-only-observation'
+        page[0] = canonical_json_bytes(changed)
+        instant[0] = datetime(2026, 9, 8, 15, tzinfo=UTC)
+        replay = intake.poll()[SOURCE_IDS.index('UK-02')]
+        assert replay.status == 'READY' and replay.units == first.units, replay
+        assert replay.observations[0][1] == digest_bytes(page[0]) != first.observations[0][1]
+        observations = {row[1]: row for row in (*first.observations, *replay.observations)}
+        evidence = native_evidence_sources(units=replay.units, sources=runtime.authority.sources,
+            objects=runtime.authority.objects, observations=observations, licence=_licence(), proof=runtime.proof)
+        assert len(evidence) == 1
+        for forged in (replace(replay.units[0], updated_at='2026-09-08T14:00:00.000000Z'),
+                       replace(replay.units[0], body='Different canonical content.')):
+            with pytest.raises(NativeEvidenceHold, match='NATIVE_SOURCE_AUTHORITY_HOLD'):
+                native_evidence_sources(units=(forged,), sources=runtime.authority.sources,
+                    objects=runtime.authority.objects, observations=observations, licence=_licence(), proof=runtime.proof)
+        assert runtime.authority.sources.latest_revision(legacy.request.item_id, proof=runtime.proof).request == legacy.request
+        with sqlite3.connect(args['authority_path']) as connection:
+            assert connection.execute('SELECT count(*) FROM source_revisions').fetchone()[0] == 1
+        version = evidence[0].source_version
+        unit = evidence[0].unit
+        request = EvidenceAcquisitionRequest(unit.source_id, unit.authority.definition_id,
+            unit.authority.definition_version_id, version.canonical_digest, unit.authority.revision_id,
+            unit.canonical_url, TRANSPORT_POLICY)
+        class Opener:
+            def open(self, http_request, timeout):
+                return Response(page[0], http_request.full_url)
+        monkeypatch.setattr('urllib.request.build_opener', lambda *_args: Opener())
+        acquired = GovUkEvidenceAcquisition(sources=runtime.authority.sources, proof=runtime.proof,
+            dispatch_fence=lambda _request: nullcontext(), clock=lambda: datetime(2026, 9, 8, 15, tzinfo=UTC))(request)
+        assert acquired.outcome == 'COMPLETE'
+        assert acquired.source_updated_time == '2026-09-08T14:00:00.000000Z' != unit.updated_at
+        assert acquired.body.decode() == unit.headline+'\n\n'+unit.body
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('new_public_time', [False, True])
+def test_bno_historical_return_never_promotes_old_body_as_current(tmp_path, monkeypatch, legacy, new_public_time):
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    original = _guide(); page = [original]; retained = {}
+    with open_native_runtime(**args) as runtime:
+        definition_id = _seed_missing(runtime, 'UK-02')
+        if legacy:
+            _seed_legacy_bno_revision(runtime, definition_id, original)
+        intake = NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-02': definition_id}, licence=_licence(),
+            dispatch_fence=lambda *_: nullcontext(), retained_units=retained,
+            fetch=lambda _: (200, page[0]), clock=lambda: datetime(2026, 9, 8, 13, tzinfo=UTC))
+        first = intake.poll()[SOURCE_IDS.index('UK-02')]
+        retained[first.units[0].revision_id] = first.units
+        changed = json.loads(original); changed['details']['parts'][0]['body'] += '<p>A confirmed new process.</p>'
+        page[0] = canonical_json_bytes(changed)
+        new = intake.poll()[SOURCE_IDS.index('UK-02')]
+        assert new.status == 'READY'
+        retained[new.units[0].revision_id] = new.units
+        returned_raw = json.loads(original)
+        if new_public_time:
+            returned_raw['public_updated_at'] = '2026-09-08T12:00:00Z'
+        page[0] = canonical_json_bytes(returned_raw)
+        returned = intake.poll()[SOURCE_IDS.index('UK-02')]
+        assert returned.status == 'HOLD' and returned.reason_code == 'SOURCE_OBSERVED_STATE_REVERSION_HOLD'
+        assert not returned.units and len(returned.observations) == 1
+        head = runtime.authority.sources.latest_revision(SourceItemId.parse(new.units[0].authority.item_id), proof=runtime.proof)
+        assert str(head.request.revision_id) == new.units[0].authority.revision_id
+        with sqlite3.connect(args['authority_path']) as connection:
+            assert connection.execute('SELECT count(*) FROM source_revisions').fetchone()[0] == 2
+
+
+def test_generic_source_native_edition_token_uniqueness_remains_enforced(tmp_path, monkeypatch):
+    from newsroom.sources import SourceSemanticCollision
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    with open_native_runtime(**args) as runtime:
+        legacy = _seed_legacy_bno_revision(runtime, _seed_missing(runtime, 'UK-02'), _guide())
+        edition_id = SourceRevisionId.new()
+        edition = replace(legacy.request, revision_id=edition_id, prior_revision_id=legacy.request.revision_id,
+            source_native_revision_token='publisher-edition-1', permitted_state_digest=digest_bytes(b'new edition'),
+            idempotency_key=f'edition:{edition_id}')
+        runtime.authority.sources.record_revision(edition, proof=runtime.proof)
+        duplicate_id = SourceRevisionId.new()
+        duplicate = replace(edition, revision_id=duplicate_id, prior_revision_id=edition_id,
+            permitted_state_digest=digest_bytes(b'different bytes at same edition'), idempotency_key=f'edition:{duplicate_id}')
+        with pytest.raises(SourceSemanticCollision, match='source-native revision token'):
+            runtime.authority.sources.record_revision(duplicate, proof=runtime.proof)
+
+
+def test_bno_retention_failures_are_not_reported_as_missing_parts(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_source_intake import NativeSourceIntakeHold
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    with open_native_runtime(**args) as runtime:
+        intake = NativeSourceIntake(sources=runtime.authority.sources, objects=runtime.authority.objects,
+            proof=runtime.proof, definition_ids={'UK-02': _seed_missing(runtime, 'UK-02')}, licence=_licence(),
+            dispatch_fence=lambda *_: nullcontext(), fetch=lambda _: (200, _guide()),
+            clock=lambda: datetime(2026, 9, 8, 13, tzinfo=UTC))
+        def denied(*_args, **_kwargs):
+            raise NativeSourceIntakeHold('SOURCE_RETAINED_REVISION_BINDING_HOLD')
+        monkeypatch.setattr(intake, '_retain_item', denied)
+        result = intake.poll()[SOURCE_IDS.index('UK-02')]
+        assert result.reason_code == 'SOURCE_RETAINED_REVISION_BINDING_HOLD'
+        assert len(result.observations) == 1 and not result.units
+
+
+def test_weather_callback_keeps_existing_non_govuk_timestamp_token_policy(tmp_path, monkeypatch):
+    from newsroom.tests.test_native_weather_sources import _poll
+    from newsroom.tests.test_native_weather_evidence import HKO_RAW, _portfolio
+    args = _args(tmp_path, monkeypatch)
+    args.update(principal_id=OPERATOR_PRINCIPAL_ID, authority_domain=OPERATOR_AUTHORITY_DOMAIN)
+    with open_native_runtime(**args) as runtime:
+        intake, first = _poll(runtime, 'HK-02', HKO_RAW, _portfolio(runtime, monkeypatch), [])
+        warning = next(unit for unit in first.units if unit.item_key != 'current-warning-summary')
+        revision = runtime.authority.sources.revision(SourceRevisionId.parse(warning.revision_id), proof=runtime.proof)
+        assert revision.request.source_native_revision_token == warning.updated_at
+        changed = json.loads(HKO_RAW)
+        changed[warning.item_key]['additional_field'] = 'Different body with unchanged warning update.'
+        intake._fetch = lambda _url: (200, canonical_json_bytes(changed))
+        held = intake._poll_one('HK-02')
+        assert held.status == 'HOLD'
+        assert any(reason == 'SOURCE_NATIVE_REVISION_CONFLICT' for _url, reason in held.item_holds)
+        assert runtime.authority.sources.latest_revision(revision.request.item_id, proof=runtime.proof).request == revision.request
 
 
 def test_native_manual_retains_every_section_and_root_inventory(tmp_path, monkeypatch):
@@ -1583,7 +1784,7 @@ def test_manual_child_updates_keep_namespace_and_current_coverage(tmp_path, monk
                 updated="2026-09-08T13:00:00Z" if change == "updated" else "2026-09-08T11:00:00Z",
             )
         result = intake.poll()[0]
-        if change == "updated":
+        if change in {"updated", "conflict"}:
             assert result.status == "READY" and len(result.units) == 1
             new = result.units[0]
             assert new.item_key == old.item_key
@@ -1591,9 +1792,6 @@ def test_manual_child_updates_keep_namespace_and_current_coverage(tmp_path, monk
             assert new.revision_id != old.revision_id and new.ingest_id != old.ingest_id
             revision = runtime.authority.sources.revision(SourceRevisionId.parse(new.revision_id), proof=runtime.proof)
             assert str(revision.request.prior_revision_id) == old.revision_id
-        elif change == "conflict":
-            assert result.units == ()
-            assert result.item_holds == ((old.canonical_url, "SOURCE_NATIVE_REVISION_CONFLICT"),)
         else:
             assert not any(unit.canonical_url == old.canonical_url for unit in result.units)
             assert fetched.count(child_url) == 1
