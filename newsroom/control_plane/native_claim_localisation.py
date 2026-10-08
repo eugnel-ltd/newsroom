@@ -24,6 +24,7 @@ from .writer import _run_grok_json, CONT_DISABLED_CAPABILITIES, _grok_command_fl
 
 LEGACY_VERSION = 'newsroom.native-claim-localisation.v1'
 VERSION = 'newsroom.native-claim-localisation.v2'
+ALIGNED_VERSION = 'newsroom.native-claim-localisation.v3'
 CONSUMER_VERSION = 'newsroom.native-claim-localisation-consumer.v1'
 ROUTE = 'NATIVE_CLAIM_LOCALISATION'
 MODEL = 'grok-4.7'
@@ -56,6 +57,49 @@ SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['renderi
     'properties': {'renderings': {'type': 'array', 'minItems': 1, 'maxItems': 32, 'items': ENTRY}}}
 SCHEMA_DIGEST = digest_canonical(SCHEMA)
 
+# v1/v2 producer bytes and paid-purpose readers remain frozen above.
+ALIGNED_SYSTEM = (
+    'Render only the supplied exact source assertions in natural Hong Kong Traditional Chinese. '
+    'Never select news or add facts, names, numbers, attribution, negation or modality. '
+    'Return one array entry per claims dictionary key, using that key as span_id, not its source_range. '
+    'Return exactly entities+1 fragments; the application inserts the original ordered names. '
+    'Never repeat those names in fragments; translate ordinary prose into Traditional Chinese. '
+    'factual_localisations contains ONLY equivalent exact supported numeric/date expressions, '
+    'never a glossary or ordinary sentence translation. Supported forms are full calendar dates/months, '
+    'hours/minutes, calendar months/years, counts of schools/hospitals/clinics/buses/roads, '
+    'and sterling or Hong Kong dollar amounts. Source keys and rendered expressions must occur '
+    'verbatim in their respective assertions and be at most 256 UTF-8 bytes. '
+    'Do not change precision, currency, units or value. Preserve unsupported factual forms literally; '
+    'do not invent equivalences for ages or academic-year ranges. Only source_derived_facts supplied '
+    'by the application may resolve an otherwise unsupported relative calendar year. '
+    'Use [] when there is no supported localisation or attributed source quotation. '
+    'quotation_source_keys contains only exact source quotations. Return only the supplied JSON schema.'
+)
+ALIGNED_SCHEMA = json.loads(canonical_json_bytes(SCHEMA))
+_aligned_fields = ALIGNED_SCHEMA['properties']['renderings']['items']['properties']
+_aligned_fields['span_id']['minLength'] = 1
+_aligned_fields['factual_localisations']['uniqueItems'] = True
+for _field in _aligned_fields['factual_localisations']['items']['properties'].values():
+    _field['minLength'] = 1
+_aligned_fields['factual_localisations']['description'] = 'Equivalent supported exact facts only; no glossary.'
+_aligned_fields['quotation_source_keys']['uniqueItems'] = True
+_aligned_fields['quotation_source_keys']['items']['minLength'] = 1
+ALIGNED_SCHEMA_DIGEST = digest_canonical(ALIGNED_SCHEMA)
+_LITERAL_NUMERIC_FORM = re.compile(
+    r'[+\-−]?\d+(?:[.,]\d+)*(?:\s*(?:to|至|[-–—/:])\s*\d+(?:[.,]\d+)*)?'
+    r'(?:\s*(?:years?|months?|weeks?|days?|hours?|minutes?|million|billion|thousand|'
+    r'小時|分鐘|個月|港元|英鎊|公里|%|％|年|月|日|歲|個|間|所|項|期|次|名|人|座|輛|條|倍|成))?', re.I)
+
+
+def _contract(version):
+    if version == LEGACY_VERSION:
+        return LEGACY_SCHEMA, LEGACY_SYSTEM
+    if version == VERSION:
+        return SCHEMA, SYSTEM
+    if version == ALIGNED_VERSION:
+        return ALIGNED_SCHEMA, ALIGNED_SYSTEM
+    raise LocalisationHold('LOCALISATION_REPLAY_VERSION_HOLD')
+
 
 class LocalisationHold(ValueError):
     pass
@@ -68,16 +112,19 @@ class LocalisationReference:
     receipt_admission_id: ObjectAdmissionId
 
 
-def localisation_policy(*, evidence_digest, qualified):
-    return InvocationEfficiencyPolicy.create(policy_id=VERSION, version=VERSION,
+def localisation_policy(*, evidence_digest, qualified, version=ALIGNED_VERSION):
+    schema, _system = _contract(version)
+    if version not in {VERSION, ALIGNED_VERSION}:
+        raise LocalisationHold('LOCALISATION_POLICY_HOLD')
+    return InvocationEfficiencyPolicy.create(policy_id=version, version=version,
         workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR, provider='grok-build-cli', route=ROUTE,
         model=MODEL, reasoning='high', one_turn=True, exact_input=True, skills_enabled=False,
-        tools_enabled=False, mcp_enabled=False, prior_message_count=0, command_semantic_version=VERSION,
-        command_flags=COMMAND_FLAGS, context_manifest_schema_version=VERSION,
+        tools_enabled=False, mcp_enabled=False, prior_message_count=0, command_semantic_version=version,
+        command_flags=COMMAND_FLAGS, context_manifest_schema_version=version,
         disabled_capabilities=CONT_DISABLED_CAPABILITIES, implementation_revision=digest_bytes(Path(__file__).read_bytes()),
         max_prompt_bytes=131072, max_context_tokens=500000, max_output_tokens=None, max_total_tokens=300000,
-        prompt_contract_version=VERSION, output_schema_digest=SCHEMA_DIGEST,
-        allowed_context_identities=(VERSION,), allowed_config_identities=(VERSION,),
+        prompt_contract_version=version, output_schema_digest=digest_canonical(schema),
+        allowed_context_identities=(version,), allowed_config_identities=(version,),
         hard_estimate_ceiling_tokens=300000, evidence_digest=evidence_digest, qualified=qualified)
 
 
@@ -93,6 +140,13 @@ def _prompt(state, *, version=VERSION):
             raise LocalisationHold('LOCALISATION_CLAIM_INPUT_HOLD')
         if len(claim.get('entities', ())) >= 65 or claim.get('rendering_fragment_count') != len(claim.get('entities', ())) + 1:
             raise LocalisationHold('LOCALISATION_FRAGMENT_INVENTORY_HOLD')
+        if version == ALIGNED_VERSION and any(
+                type(entity) not in {tuple, list} or len(entity) != 2
+                or any(type(part) is not str or not part.strip() for part in entity)
+                or len(entity[0]) > 80 or entity[0] == claim['text'] or entity[0] not in claim['text']
+                or entity[1] not in {'PERSON', 'ORGANISATION', 'PLACE', 'OFFICIAL_TITLE', 'OFFICIAL_TERM', 'PRODUCT', 'SOURCE_LITERAL'}
+                for entity in claim.get('entities', ())):
+            raise LocalisationHold('LOCALISATION_ENTITY_INPUT_HOLD')
     # Authority, rights and caller IDs stay in the local manifest, not the model prompt.
     return canonical_json_bytes({'contract': version, 'claims': claims}).decode()
 
@@ -118,7 +172,7 @@ def _source_span_aliases(state):
 
 def _renderings(raw, state, *, version=VERSION):
     value = json.loads(raw.decode(), object_pairs_hook=_unique_object)
-    validate(value, LEGACY_SCHEMA if version == LEGACY_VERSION else SCHEMA)
+    validate(value, _contract(version)[0])
     if version == LEGACY_VERSION:
         renderings = value['renderings']
     else:
@@ -128,7 +182,7 @@ def _renderings(raw, state, *, version=VERSION):
             if identity in renderings:
                 raise LocalisationHold('LOCALISATION_DUPLICATE_SPAN_HOLD')
             renderings[identity] = {key: value for key, value in item.items() if key != 'span_id'}
-        if set(renderings) != set(state['claims']):
+        if version == VERSION and set(renderings) != set(state['claims']):
             aliases = _source_span_aliases(state)
             mapped = {}
             for identity, item in renderings.items():
@@ -148,7 +202,77 @@ def _renderings(raw, state, *, version=VERSION):
                 *(pair['source_lookup_key'] for pair in item['factual_localisations']),
                 *(pair['rendered_expression'] for pair in item['factual_localisations']))):
             raise LocalisationHold('LOCALISATION_SOURCE_KEY_BOUND_HOLD')
+    if version == ALIGNED_VERSION:
+        _validate_content(renderings, state)
     return renderings
+
+
+def _validate_content(renderings, state):
+    """Complete deterministic claim boundary, not translation semantic proof."""
+    from types import SimpleNamespace
+    from .admission import _valid_zh_hant_hk_rendering
+    from .evidence import _localised_fact_is_bound, _entity_pattern, rendered_named_entities
+    from .writer import (_remove_exact_expressions, _unicode_number_relations,
+        _currency_relations, _unicode_currency_relations,
+        _signed_number_relations, _CHINESE_NUMERAL_FACT, _RELATIVE_TIME_FACT)
+    reasons = set()
+    for identity, item in renderings.items():
+        claim = state['claims'][identity]
+        names = tuple(name for name, _kind in claim.get('entities', ()))
+        fragments = item['rendered_assertion_zh_hant_hk_fragments']
+        rendered = fragments[0] + ''.join(name + fragment for name, fragment in zip(names, fragments[1:], strict=True))
+        if not _valid_zh_hant_hk_rendering(SimpleNamespace(claim=claim['text'], supporting_excerpt=claim['text'],
+                rendered_assertion_zh_hant_hk=rendered, named_entities=names)):
+            reasons.add('LOCALISATION_LANGUAGE_HOLD')
+        entities = frozenset(tuple(entity) for entity in claim.get('entities', ()))
+        if (any(name not in claim['text'] for name in names) or rendered_named_entities(rendered, entities) != entities
+                or any(re.search(_entity_pattern(name), fragment) for name in names for fragment in fragments)):
+            reasons.add('LOCALISATION_ENTITY_HOLD')
+        pairs = [(pair['source_lookup_key'], pair['rendered_expression']) for pair in item['factual_localisations']]
+        derived = None
+        if claim.get('source_derived_facts'):
+            from .native_assessor_judgments import source_rendering_details
+            try:
+                current = state['source_binding']['current_scope']['sources']
+                source = next(row for row in current if row['source_id'] == claim['source_id'])
+                _terms, year = source_rendering_details(SimpleNamespace(claim=claim['text']), source['body'], source)
+                if year is None or claim['source_derived_facts'] != [list(year[:2])]:
+                    raise ValueError('Source derivation differs')
+                derived = year[:2]
+            except (KeyError, ValueError, StopIteration):
+                reasons.add('LOCALISATION_DERIVED_FACT_HOLD')
+        bound = [(source, target) for source, target in pairs
+            if _localised_fact_is_bound(source, target, claim['text'], claim['text'], rendered)
+            or (derived == (source, target) and source in claim['text'] and target in rendered)]
+        if (len({source for source, _target in pairs}) != len(pairs)
+                or len({target for _source, target in pairs}) != len(pairs)
+                or len(bound) != len(pairs)):
+            reasons.add('LOCALISATION_FACT_EQUIVALENCE_HOLD')
+        if derived is not None and derived not in bound:
+            reasons.add('LOCALISATION_DERIVED_FACT_HOLD')
+        source_residue = _remove_exact_expressions(claim['text'], (*names, *(source for source, _target in bound)))
+        target_residue = _remove_exact_expressions(rendered, (*names, *(target for _source, target in bound)))
+        # Reuse number/unit primitives, not the offline exact-copy writer gate.
+        if (any(check(source_residue) != check(target_residue) for check in (
+                _unicode_number_relations,
+                _currency_relations, _unicode_currency_relations, _signed_number_relations))
+                or _LITERAL_NUMERIC_FORM.findall(source_residue) != _LITERAL_NUMERIC_FORM.findall(target_residue)
+                or _CHINESE_NUMERAL_FACT.findall(source_residue) != _CHINESE_NUMERAL_FACT.findall(target_residue)
+                or [match.group().casefold() for match in _RELATIVE_TIME_FACT.finditer(source_residue)] !=
+                   [match.group().casefold() for match in _RELATIVE_TIME_FACT.finditer(target_residue)]):
+            reasons.add('LOCALISATION_NUMERIC_HOLD')
+        quoted = tuple(match.group(1) for pattern in (
+            r'"([^"\n]+)"', r'“([^”\n]+)”', r'「([^」\n]+)」', r'『([^』\n]+)』',
+            r'‘([^’\n]+)’', r'〝([^〞\n]+)〞', r'﹁([^﹂\n]+)﹂', r'❝([^❞\n]+)❞',
+            r'﹃([^﹄\n]+)﹄', r'«([^»\n]+)»', r'‹([^›\n]+)›',
+            r"(?<![A-Za-z])'([^'\n]+)'(?![A-Za-z])",
+        ) for match in re.finditer(pattern, claim['text']))
+        if any(not any(key in quote for quote in quoted) for key in item['quotation_source_keys']):
+            reasons.add('LOCALISATION_QUOTATION_HOLD')
+    if reasons:
+        error = LocalisationHold('LOCALISATION_CONTENT_CONTRACT_HOLD')
+        error.reason_codes = tuple(sorted(reasons))
+        raise error
 
 
 def _failure_diagnostic(error):
@@ -167,33 +291,39 @@ def _failure_diagnostic(error):
             'LOCALISATION_FRAGMENT_COUNT_HOLD', 'LOCALISATION_SOURCE_KEY_BOUND_HOLD',
             'LOCALISATION_RESULT_BOUND_HOLD'}:
         result['reason'] = str(error)
+    elif isinstance(error, LocalisationHold) and str(error) == 'LOCALISATION_CONTENT_CONTRACT_HOLD':
+        result['reason'] = str(error)
+        result['reason_codes'] = list(getattr(error, 'reason_codes', ()))
     return result
 
 
 class NativeClaimLocaliser:
     def __init__(self, *, usage: ModelUsageService, objects, policy, source_fence, runner=None,
                  implementation_worktree_clean=False, clock=lambda: datetime.now(UTC)):
+        schema, system = _contract(policy.prompt_contract_version)
         if (not policy.qualified or (policy.provider, policy.route, policy.model, policy.reasoning)
-                != ('grok-build-cli', ROUTE, MODEL, 'high') or policy.output_schema_digest != SCHEMA_DIGEST
-                or policy.prompt_contract_version != VERSION or implementation_worktree_clean is not True
+                != ('grok-build-cli', ROUTE, MODEL, 'high') or policy.output_schema_digest != digest_canonical(schema)
+                or policy.prompt_contract_version not in {VERSION, ALIGNED_VERSION} or implementation_worktree_clean is not True
                 or policy.implementation_revision != digest_bytes(Path(__file__).read_bytes())):
             raise LocalisationHold('LOCALISATION_POLICY_HOLD')
         usage.register_policy(policy)
         self.usage, self.objects, self.policy, self.fence, self.clock = usage, objects, policy, source_fence, clock
         self.implementation_worktree_clean = implementation_worktree_clean
-        self.runner = runner or (lambda prompt: _run_grok_json(prompt, schema=SCHEMA,
-            system_instruction=SYSTEM, temporary_prefix='newsroom-claim-localisation-',
+        self.runner = runner or (lambda prompt: _run_grok_json(prompt, schema=schema,
+            system_instruction=system, temporary_prefix='newsroom-claim-localisation-',
             reasoning_effort='high', model=MODEL))
 
     def _input(self, state, *, candidate_id, hypothesis_digest, evidence_package_digest,
-               version=VERSION, repair_of=None):
+               version=None, repair_of=None):
+        version = version or self.policy.prompt_contract_version
         prompt = _prompt(state, version=version)
         if len(prompt.encode()) > self.policy.max_prompt_bytes:
             raise LocalisationHold('LOCALISATION_INPUT_BOUND_HOLD')
         snapshot = {'state': state, 'candidate_id': candidate_id, 'hypothesis_digest': hypothesis_digest,
                     'evidence_package_digest': evidence_package_digest}
         digest = digest_canonical(snapshot)
-        purpose = 'claim-localisation:' if version == LEGACY_VERSION else 'claim-localisation-v2:'
+        purpose = ('claim-localisation:' if version == LEGACY_VERSION else
+                   'claim-localisation-v3:' if version == ALIGNED_VERSION else 'claim-localisation-v2:')
         if repair_of is not None:
             purpose = 'claim-localisation-v2-repair:'+repair_of+':'
         envelope = WorkEnvelope.create(cycle_id=purpose+digest,
@@ -201,13 +331,16 @@ class NativeClaimLocaliser:
             candidate_id=candidate_id, hypothesis_digest=hypothesis_digest,
             evidence_package_digest=evidence_package_digest, ingest_id=None, graphiti_attempt_id=None)
         p = self.policy
-        manifest = dict(schema_version=VERSION, provider=p.provider, route=ROUTE, model=MODEL, reasoning='high',
-            command_semantic_version=VERSION, command_flags=list(p.command_flags), disabled_capabilities=list(p.disabled_capabilities),
+        manifest_version = ALIGNED_VERSION if version == ALIGNED_VERSION else VERSION
+        schema, system = _contract(manifest_version)
+        schema_digest = digest_canonical(schema)
+        manifest = dict(schema_version=manifest_version, provider=p.provider, route=ROUTE, model=MODEL, reasoning='high',
+            command_semantic_version=manifest_version, command_flags=list(p.command_flags), disabled_capabilities=list(p.disabled_capabilities),
             implementation_revision=p.implementation_revision, implementation_worktree_clean=self.implementation_worktree_clean,
-            prompt_contract_version=VERSION, prompt_bytes=len(prompt.encode()), prompt_digest=digest_bytes(prompt.encode()),
-            schema_digest=SCHEMA_DIGEST, output_schema_digest=SCHEMA_DIGEST, system_digest=digest_bytes(SYSTEM.encode()),
+            prompt_contract_version=manifest_version, prompt_bytes=len(prompt.encode()), prompt_digest=digest_bytes(prompt.encode()),
+            schema_digest=schema_digest, output_schema_digest=schema_digest, system_digest=digest_bytes(system.encode()),
             evidence_package_digest=evidence_package_digest, evidence_package_bytes=len(canonical_json_bytes(snapshot)),
-            context_identity=VERSION, config_identity=VERSION, one_turn=True, exact_input=True, skills_enabled=False,
+            context_identity=manifest_version, config_identity=manifest_version, one_turn=True, exact_input=True, skills_enabled=False,
             tools_enabled=False, mcp_enabled=False, prior_message_count=0, skill_count=0, tool_count=0, mcp_server_count=0,
             mcp_tool_count=0, source_snapshot_digest=digest)
         manifest['request_digest'] = digest_canonical({k: manifest[k] for k in ('provider', 'route', 'model', 'reasoning',
@@ -242,11 +375,11 @@ class NativeClaimLocaliser:
             manifest = json.loads(row[3])
             unsigned = {key: value for key, value in manifest.items() if key != 'context_manifest_digest'}
             version = allocation.prompt_contract_version
-            system = LEGACY_SYSTEM if version == LEGACY_VERSION else SYSTEM
+            system = _contract(version)[1]
             if (tuple(row[:3]) != (manifest.get('provider'), manifest.get('route'), manifest.get('evidence_package_digest'))
                     or manifest.get('evidence_package_digest') != expected_snapshot['evidence_package_digest']
                     or manifest.get('source_snapshot_digest') != digest_canonical(expected_snapshot)
-                    or version not in {LEGACY_VERSION, VERSION}
+                    or version not in {LEGACY_VERSION, VERSION, ALIGNED_VERSION}
                     or manifest.get('context_manifest_digest') != allocation.context_manifest_digest
                     or digest_canonical(unsigned) != allocation.context_manifest_digest
                     or manifest.get('system_digest') != digest_bytes(system.encode())
@@ -269,6 +402,14 @@ class NativeClaimLocaliser:
             admitted.admission.admission_id)
 
     def localise(self, state, *, proof, **scope):
+        version = self.policy.prompt_contract_version
+        if version == ALIGNED_VERSION:
+            # A future producer is not retry credit for any older paid purpose.
+            for old_version in (LEGACY_VERSION, VERSION):
+                old_prompt, _, old_envelope, _ = self._input(state, version=old_version, **scope)
+                if _retained_allocation(self.usage, envelope=old_envelope,
+                        prompt_digest=digest_bytes(old_prompt.encode()), policy=self.policy) is not None:
+                    raise LocalisationHold('LOCALISATION_PRIOR_CONTRACT_HOLD')
         # A version upgrade is not a retry credit for unknown, active or breached old work.
         legacy_prompt, _, legacy_envelope, _ = self._input(state, version=LEGACY_VERSION, **scope)
         legacy = _retained_allocation(self.usage, envelope=legacy_envelope,
@@ -312,10 +453,10 @@ class NativeClaimLocaliser:
         self.usage.retain_context_manifest(manifest)
         allocation = InvocationAllocation.create(envelope_id=envelope.envelope_id, cycle_id=envelope.cycle_id,
             leaf_ordinal=1, workload_class=self.policy.workload_class, invocation_policy_digest=self.policy.canonical_digest,
-            provider=self.policy.provider, route=ROUTE, model=MODEL, reasoning='high', prompt_contract_version=VERSION,
+            provider=self.policy.provider, route=ROUTE, model=MODEL, reasoning='high', prompt_contract_version=version,
             prompt_bytes=len(prompt.encode()), prompt_digest=digest_bytes(prompt.encode()), request_digest=manifest['request_digest'],
-            output_schema_digest=SCHEMA_DIGEST, max_output_tokens=None, context_manifest_digest=manifest['context_manifest_digest'],
-            context_identity=VERSION, config_identity=VERSION, one_turn=True, exact_input=True, skills_enabled=False,
+            output_schema_digest=self.policy.output_schema_digest, max_output_tokens=None, context_manifest_digest=manifest['context_manifest_digest'],
+            context_identity=version, config_identity=version, one_turn=True, exact_input=True, skills_enabled=False,
             tools_enabled=False, mcp_enabled=False, prior_message_count=0, allocated_at=self.clock(),
             recovery_deadline_at=self.clock()+timedelta(seconds=305), parent_invocation_id=None)
         self.usage.allocate(allocation, owner_emergency_stop=False)
@@ -332,7 +473,7 @@ class NativeClaimLocaliser:
             raw = execution.text.encode()
             if len(raw) > 262144:
                 raise LocalisationHold('LOCALISATION_RESULT_BOUND_HOLD')
-            _renderings(raw, state)
+            _renderings(raw, state, version=version)
         except BaseException as error:
             failure = error
         _complete_writer_usage(self.usage, allocation, outcome='LOCALISATION_COMPLETE' if failure is None else 'LOCALISATION_FAILED',
@@ -345,11 +486,11 @@ class NativeClaimLocaliser:
             with self.fence(state['source_binding'], proof):
                 raw_admission = self.objects.admit(ObjectAdmissionRequest('evidence.record',
                     'claim-localisation-raw:'+allocation.invocation_id), raw, proof=proof).admission
-                receipt = {'version': VERSION, 'invocation_id': allocation.invocation_id,
+                receipt = {'version': version, 'invocation_id': allocation.invocation_id,
                     'allocation_digest': allocation.canonical_digest, 'terminal_digest': terminal.terminal_digest,
                     'source_snapshot_digest': snapshot, 'source_binding': state['source_binding'],
                     'raw_admission_id': str(raw_admission.admission_id), 'raw_digest': digest_bytes(raw),
-                    'schema_digest': SCHEMA_DIGEST, 'outcome': terminal.outcome, 'repair_of': repair_of,
+                    'schema_digest': self.policy.output_schema_digest, 'outcome': terminal.outcome, 'repair_of': repair_of,
                     'diagnostic': None if failure is None else _failure_diagnostic(failure)}
                 admitted = self.objects.admit(ObjectAdmissionRequest('evidence.record',
                     'claim-localisation-receipt:'+allocation.invocation_id),
@@ -370,12 +511,12 @@ class NativeClaimLocaliser:
             receipt_raw = self.objects.rehydrate(HydrationRequest(reference.receipt_admission_id, 'evidence.record'), proof=proof).data
         receipt = json.loads(receipt_raw)
         version = receipt.get('version')
-        if version not in {LEGACY_VERSION, VERSION}:
+        if version not in {LEGACY_VERSION, VERSION, ALIGNED_VERSION}:
             raise LocalisationHold('LOCALISATION_REPLAY_VERSION_HOLD')
         repair_of = receipt.get('repair_of') if version == VERSION else None
         _prompt_value, snapshot, envelope, _manifest = self._input(state, version=version,
             repair_of=repair_of, **scope)
-        schema_digest = LEGACY_SCHEMA_DIGEST if version == LEGACY_VERSION else SCHEMA_DIGEST
+        schema_digest = digest_canonical(_contract(version)[0])
         revalidate = (version == VERSION and terminal.outcome == 'LOCALISATION_FAILED'
             and terminal.failure_class == 'LocalisationHold'
             and receipt.get('diagnostic') == {'failure_class': 'LocalisationHold',
@@ -386,7 +527,7 @@ class NativeClaimLocaliser:
                 or allocation.route != ROUTE or allocation.provider != 'grok-build-cli'
                 or policy.prompt_contract_version != version or policy.output_schema_digest != schema_digest
                 or allocation.prompt_contract_version != version or allocation.output_schema_digest != schema_digest
-                or (version == VERSION and (receipt.get('schema_digest') != schema_digest
+                or (version != LEGACY_VERSION and (receipt.get('schema_digest') != schema_digest
                     or receipt.get('outcome') != expected_outcome or (not revalidate and receipt.get('diagnostic') is not None)))
                 or terminal is None or terminal.outcome != expected_outcome or terminal.usage_status is not UsageStatus.REPORTED
                 or terminal.policy_breach or receipt['invocation_id'] != reference.invocation_id
