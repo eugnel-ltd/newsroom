@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -33,6 +34,7 @@ from newsroom.graphiti_adapter.combined_temporal_runtime import (
     resolve_nodes_with_optional_embeddings,
 )
 from newsroom.graphiti_adapter.evaluation_packet import GRAPHITI_CORE_RELEASE
+from newsroom.graphiti_adapter.donor_store import InMemoryDonorStore
 from newsroom.graphiti_adapter.neo4j_guard import GuardState
 from newsroom.graphiti_adapter.deterministic_sidecar import (
     AuthorityRecordRef,
@@ -278,6 +280,192 @@ def test_invalid_compact_output_fails_before_graph_effect_without_redispatch() -
     assert leaf.outcome is CombinedTemporalOutcome.TERMINAL_ATTEMPT_FAILURE
     assert leaf.graph_effect_attempted is False
     assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize("stage", ("TRANSPORT", "TYPED_VERIFIER", "PIPELINE"))
+@pytest.mark.parametrize("with_identity", (False, True))
+@pytest.mark.parametrize("broken_sink", (False, True))
+def test_failure_diagnostic_exposes_only_bounded_stage_and_final_code_site(
+    monkeypatch, stage, with_identity, broken_sink,
+) -> None:
+    case = fixture("pair-current")
+    secret = "TOKEN_PRIVATE_SOURCE_MODEL_OUTPUT_" + case.revision.body
+    error = (CombinedTemporalPipelineError(
+        secret, graph_effect_attempted=False, rollback_completed=False,
+    ) if stage == "PIPELINE" else RuntimeError(secret))
+    events = []
+    raised_at = []
+    def sink(event, data):
+        events.append((event, data))
+        if broken_sink:
+            raise OSError("diagnostic sink full: TOKEN_PRIVATE")
+
+    monkeypatch.setattr("newsroom.control_plane.diagnostic_logging.emit_diagnostic", sink)
+
+    def fail():
+        raised_at.append(sys._getframe().f_lineno + 1)
+        raise error
+
+    class FailingTransport(_Transport):
+        async def generate_response(self, **kwargs):
+            if stage == "TRANSPORT":
+                self.calls.append(kwargs)
+                fail()
+            return await super().generate_response(**kwargs)
+
+    class RecordingPipeline(_Pipeline):
+        failed_receipts = []
+
+        async def _execute(self, **kwargs):
+            if stage == "PIPELINE":
+                fail()
+            return await super()._execute(**kwargs)
+
+        async def _complete_failure(self, receipt):
+            self.failed_receipts.append(dict(receipt))
+            return await super()._complete_failure(receipt)
+
+    transport = FailingTransport(case.gold)
+    pipeline = RecordingPipeline()
+
+    def verify(**kwargs):
+        if stage == "TYPED_VERIFIER":
+            fail()
+
+    leaf = asyncio.run(extract_combined_temporal_async(
+        case.revision, transport=transport, pipeline=pipeline,
+        donor_store=InMemoryDonorStore() if with_identity else None,
+        typed_proposal_verifier=verify,
+    ))
+
+    assert leaf.outcome is CombinedTemporalOutcome.TERMINAL_ATTEMPT_FAILURE
+    assert leaf.failure_code is CombinedTemporalFailureCode.PIPELINE_FAILED
+    assert leaf.graph_effect_attempted is False
+    assert leaf.journal_skipped is False
+    assert leaf.rollback_skipped is True
+    assert leaf.token_usage == {"basis": "UNMEASURED"}
+    assert leaf.provider_cost is None
+    assert len(leaf.transport_calls) == (0 if stage == "TRANSPORT" else 1)
+    assert len(transport.calls) == len(pipeline.failed_receipts) == 1
+    expected = {
+        "stage": stage,
+        "exception_class": "CombinedTemporalPipelineError" if stage == "PIPELINE" else "RuntimeError",
+        "file": "test_graphiti_combined_temporal_runtime.py",
+        "function": "fail", "line": raised_at[0],
+    }
+    if with_identity:
+        identity = pipeline.failed_receipts[0]["request_identity_digest"]
+        assert identity.startswith("sha256:") and len(identity) == 71
+        expected["request_identity_digest"] = identity
+    assert events == [("graphiti_combined_temporal_failure", expected)]
+    assert len(canonical_json_bytes(events)) < 2048
+    assert secret not in str(events)
+    assert case.revision.body not in str(events)
+    assert "/Users/" not in str(events)
+    assert not {"stage", "exception_class", "file", "function", "line"}.intersection(
+        pipeline.failed_receipts[0]
+    )
+
+
+def test_failure_diagnostic_bounds_names_and_discards_path_directories(monkeypatch):
+    case = fixture("pair-current")
+    secret = "TOKEN_PRIVATE_SOURCE_MODEL_OUTPUT"
+    basename = "module_" + "x" * 300 + ".py"
+    function_name = "fail_" + "y" * 300
+    class_name = "Failure" + "z" * 300
+    error = type(class_name, (RuntimeError,), {})(secret)
+    events = []
+    monkeypatch.setattr(
+        "newsroom.control_plane.diagnostic_logging.emit_diagnostic",
+        lambda event, data: events.append((event, data)),
+    )
+
+    def fail():
+        raise error
+
+    fail.__code__ = fail.__code__.replace(
+        co_filename="C:\\private\\" + secret + "\\" + basename, co_name=function_name,
+    )
+
+    class FailingTransport(_Transport):
+        async def generate_response(self, **kwargs):
+            fail()
+
+    leaf = asyncio.run(extract_combined_temporal_async(
+        case.revision, transport=FailingTransport(case.gold), pipeline=_Pipeline(),
+    ))
+    assert leaf.failure_code is CombinedTemporalFailureCode.PIPELINE_FAILED
+    event, data = events[0]
+    assert event == "graphiti_combined_temporal_failure"
+    assert data == {
+        "stage": "TRANSPORT", "exception_class": class_name[:128],
+        "file": basename[:128], "function": function_name[:128],
+        "line": fail.__code__.co_firstlineno + 1,
+    }
+    assert type(data["line"]) is int and data["line"] > 0
+    assert len(canonical_json_bytes(events)) < 2048
+    assert secret not in str(events)
+    assert "C:" not in str(events) and "private" not in str(events)
+
+
+@pytest.mark.parametrize("broken_sink", (False, True))
+def test_wrapped_pipeline_diagnostic_retains_one_explicit_cause_site_only(
+    monkeypatch, broken_sink,
+):
+    case = fixture("pair-current")
+    secret = "TOKEN_PRIVATE_SOURCE_MODEL_OUTPUT_" + case.revision.body
+    events, cause_lines, outer_lines, failed_receipts = [], [], [], []
+
+    def sink(event, data):
+        events.append((event, data))
+        if broken_sink:
+            raise OSError("diagnostic sink full: " + secret)
+
+    monkeypatch.setattr("newsroom.control_plane.diagnostic_logging.emit_diagnostic", sink)
+
+    def fail_original():
+        cause_lines.append(sys._getframe().f_lineno + 1)
+        raise ValueError(secret) from RuntimeError("DEEP_CAUSE_TOKEN_PRIVATE")
+
+    fail_original.__code__ = fail_original.__code__.replace(
+        co_filename="C:\\private\\TOKEN_DIRECTORY\\original_pipeline.py",
+    )
+
+    class WrappedPipeline(_Pipeline):
+        async def _execute(self, **kwargs):
+            try:
+                fail_original()
+            except ValueError as exc:
+                outer_lines.append(sys._getframe().f_lineno + 1)
+                raise CombinedTemporalPipelineError(
+                    secret, graph_effect_attempted=False, rollback_completed=False,
+                ) from exc
+
+        async def _complete_failure(self, receipt):
+            failed_receipts.append(dict(receipt))
+            return await super()._complete_failure(receipt)
+
+    transport = _Transport(case.gold)
+    leaf = asyncio.run(extract_combined_temporal_async(
+        case.revision, transport=transport, pipeline=WrappedPipeline(),
+    ))
+    assert leaf.outcome is CombinedTemporalOutcome.TERMINAL_ATTEMPT_FAILURE
+    assert leaf.failure_code is CombinedTemporalFailureCode.PIPELINE_FAILED
+    assert leaf.graph_effect_attempted is False
+    assert leaf.journal_skipped is False and leaf.rollback_skipped is True
+    assert leaf.token_usage == {"basis": "UNMEASURED"} and leaf.provider_cost is None
+    assert len(transport.calls) == len(failed_receipts) == 1
+    assert events == [("graphiti_combined_temporal_failure", {
+        "stage": "PIPELINE", "exception_class": "CombinedTemporalPipelineError",
+        "file": "test_graphiti_combined_temporal_runtime.py",
+        "function": "_execute", "line": outer_lines[0],
+        "cause_exception_class": "ValueError", "cause_file": "original_pipeline.py",
+        "cause_function": "fail_original", "cause_line": cause_lines[0],
+    })]
+    assert len(canonical_json_bytes(events)) < 2048
+    assert secret not in str(events) and "TOKEN_DIRECTORY" not in str(events)
+    assert "DEEP_CAUSE" not in str(events) and "C:" not in str(events)
+    assert not any(key.startswith("cause_") for key in failed_receipts[0])
 
 
 def test_pre_effect_pipeline_failure_completes_the_pending_journal() -> None:

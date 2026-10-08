@@ -78,6 +78,35 @@ _VERIFIER_FAILURE_REASONS = frozenset({
 })
 
 
+def _observe_runtime_failure(stage: str, error: Exception, identity_digest: object) -> None:
+    """Optional scalar code-site evidence, never provider text or work authority."""
+    try:
+        from newsroom.control_plane.diagnostic_logging import emit_diagnostic
+
+        data = {"stage": stage}
+        # One explicit wrapped cause only; never traverse context or a cause chain.
+        for prefix, failure in (("", error), ("cause_", error.__cause__)):
+            if failure is None:
+                continue
+            data[prefix + "exception_class"] = type(failure).__name__[:128]
+            point = failure.__traceback__
+            while point is not None and point.tb_next is not None:
+                point = point.tb_next
+            if point is not None:
+                code = point.tb_frame.f_code
+                data.update({
+                    prefix + "file": code.co_filename.replace("\\", "/").rsplit("/", 1)[-1][:128],
+                    prefix + "function": code.co_name[:128], prefix + "line": point.tb_lineno,
+                })
+            point = None
+        if identity_digest is not None:
+            validate_sha256_digest(identity_digest)
+            data["request_identity_digest"] = identity_digest
+        emit_diagnostic("graphiti_combined_temporal_failure", data)
+    except Exception:
+        pass
+
+
 def _verification_failure_evidence(error: Exception) -> dict[str, object] | None:
     """Retain only the fixed error carrier, never exception/provider text."""
     reason = getattr(error, "reason_code", None)
@@ -455,7 +484,8 @@ async def extract_combined_temporal_async(
                 ],
             }
         )
-    except Exception:
+    except Exception as exc:
+        _observe_runtime_failure("TRANSPORT", exc, receipt.get("request_identity_digest"))
         return await _complete_failure(
             pipeline,
             prompt,
@@ -565,6 +595,7 @@ async def extract_combined_temporal_async(
                 digest_canonical(retained_verification)
                 receipt["typed_proposal_verification"] = retained_verification
         except Exception as exc:
+            _observe_runtime_failure("TYPED_VERIFIER", exc, receipt.get("request_identity_digest"))
             failure_evidence = _verification_failure_evidence(exc)
             if failure_evidence is not None:
                 receipt["typed_proposal_verification"] = failure_evidence
@@ -581,6 +612,7 @@ async def extract_combined_temporal_async(
         )
     except CombinedTemporalPipelineError as exc:
         if not exc.graph_effect_attempted and not exc.rollback_completed:
+            _observe_runtime_failure("PIPELINE", exc, receipt.get("request_identity_digest"))
             return await _complete_failure(
                 pipeline,
                 prompt,
