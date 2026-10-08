@@ -385,3 +385,131 @@ def test_known_qualification_reader_denies_ambiguous_candidate_leaves(tmp_path,m
         with pytest.raises(QualificationHold,match='ABSENT_OR_AMBIGUOUS'):
             read_current_result(qualifier,candidate,base,(source,),(fresh,),scope=scope,proof=consumer.proof)
         assert len(calls)==len(jev_calls)==1
+
+
+@contextmanager
+def _retained_closed_recipe(tmp_path, monkeypatch, recipe):
+    from newsroom.tests.test_native_assessor_judgments import (
+        _case as typed_case, _first_publication, _localiser,
+    )
+    from newsroom.control_plane.native_assessor_judgments import JudgmentFallback
+
+    def answers(value):
+        for key, answer in value.items():
+            if ((recipe == 'witness_missing' and key.endswith('_source_lookup_key'))
+                    or (recipe == 'announcement' and key.endswith(':announced_event'))):
+                choice = 'NONE' if recipe == 'witness_missing' else 'NO'
+                answer.update(choice=choice, probabilities={c: int(c == choice)
+                              for c in answer['probabilities']})
+
+    kwargs = dict(source_id='UK-03', answer_change=answers)
+    if recipe == 'coverage':
+        kwargs['body'] = ('The authority confirms a material policy change '
+                          + 'for affected residents ' * 16 + '.\nSupporting details apply.')
+    with typed_case(tmp_path, monkeypatch, **kwargs) as (
+            consumer, service, candidate, base, source, acquired, usage, jev_calls):
+        scope = {'coverage': 'COMPLETE', 'newness': 'KNOWN_CHANGE',
+                 'prior_scope': {'revision_digest': digest_bytes(b'prior')},
+                 'current_scope': {'sources': [{'source_id': source.unit.source_id,
+                     'body': base.passages[0], 'published_at': acquired.publication_time,
+                     'updated_at': acquired.source_updated_time,
+                     'retrieved_at': acquired.retrieval_time}]}}
+        if recipe == 'announcement':
+            _first_publication(consumer, source, acquired)
+            declared = consumer.scope_for(candidate, base, (source,), (acquired,))
+            scope.update(newness=declared['newness'], prior_scope=declared['prior_scope'],
+                         first_publication=declared['first_publication'])
+        consumer.scope_for = lambda *_: scope
+        local_calls = []
+        if recipe == 'typed_output':
+            _localiser(consumer, service, usage, candidate, base, local_calls)
+            judged = consumer.assess(candidate, base, (source,), (acquired,))
+            fallback = consumer.validation_failure(judged, candidate, base,
+                (source,), (acquired,), 'TYPED_OUTPUT_CONTRACT_UNPROVEN')
+        else:
+            fallback = consumer.assess(candidate, base, (source,), (acquired,))
+        assert isinstance(fallback, JudgmentFallback)
+        expected = {'coverage': 'QUALIFICATION_WITNESS_COVERAGE_UNPROVEN',
+                    'witness_missing': 'QUALIFICATION_WITNESS_MISSING',
+                    'announcement': 'FIRST_PUBLICATION_ANNOUNCEMENT_UNPROVEN',
+                    'typed_output': 'MATERIALISATION_VALIDATION_FAILED'}
+        assert fallback.reason == expected[recipe]
+        calls = []
+
+        def runner(prompt):
+            calls.append(prompt)
+            return NativeAssessmentExecution(canonical_json_bytes(WIRE).decode(),
+                {'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 40,
+                 'output_tokens': 10, 'total_tokens': 50})
+
+        qualifier = NativeSourceQualifier(usage=usage, objects=service.objects,
+            policy=qualification_policy(evidence_digest=digest_bytes(b'closed recipe fixture'),
+                                        qualified=True),
+            source_fence=service.fence, judgments=service, runner=runner,
+            implementation_worktree_clean=True, clock=lambda: NOW)
+        original = qualifier.assess(candidate, base, (source,), (acquired,), fallback,
+                                    scope=scope, proof=consumer.proof)
+        yield qualifier, consumer, candidate, base, source, acquired, scope, original, usage, calls, jev_calls, local_calls
+
+
+@pytest.mark.parametrize('recipe', ['coverage', 'witness_missing', 'announcement', 'typed_output'])
+def test_known_closed_qualification_recipes_replay_exact_original_without_dispatch(
+        tmp_path, monkeypatch, recipe):
+    from newsroom.control_plane.native_source_qualification_replay import (
+        original_qualification_state, read_current_result,
+    )
+    with _retained_closed_recipe(tmp_path, monkeypatch, recipe) as (
+            qualifier, consumer, candidate, base, source, acquired, scope, original,
+            usage, calls, jev_calls, local_calls):
+        binding = json.loads(original.decision_record)['source_binding']
+        before = (len(calls), len(jev_calls), len(local_calls))
+        with sqlite3.connect(usage.path) as db:
+            retained = db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals '
+                                  'ORDER BY invocation_id').fetchall()
+        state = original_qualification_state(qualifier, candidate, base, binding,
+                                             proof=consumer.proof)
+        prompt, _, _, _ = qualifier._input(state, **_ids(state))
+        assert prompt == calls[0]
+        assert read_current_result(qualifier, candidate, base, (source,), (acquired,),
+                                   scope=scope, proof=consumer.proof) == original
+        assert (len(calls), len(jev_calls), len(local_calls)) == before
+        with sqlite3.connect(usage.path) as db:
+            assert db.execute('SELECT invocation_id,record_json FROM model_invocation_terminals '
+                              'ORDER BY invocation_id').fetchall() == retained
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'duplicate', 'swapped_receipt', 'source', 'inventory'])
+def test_closed_recipe_replay_denies_missing_ambiguous_or_tampered_prior_evidence(
+        tmp_path, monkeypatch, mutation):
+    from copy import deepcopy
+    from newsroom.authority import ObjectAdmissionId
+    from newsroom.control_plane.native_source_qualification import QualificationReference
+    from newsroom.control_plane.native_source_qualification_replay import original_qualification_state
+    from newsroom.control_plane.typesafe_judgment import TypesafeJudgmentError
+
+    with _retained_closed_recipe(tmp_path, monkeypatch, 'witness_missing') as (
+            qualifier, consumer, candidate, base, _source, _acquired, _scope, original,
+            usage, calls, jev_calls, local_calls):
+        decision = json.loads(original.decision_record)
+        binding = deepcopy(decision['source_binding'])
+        refs = binding['prior_judgments']
+        if mutation == 'missing':
+            refs.pop()
+        elif mutation == 'duplicate':
+            refs[1] = deepcopy(refs[0])
+        elif mutation == 'swapped_receipt':
+            refs[0]['receipt_admission_id'] = refs[1]['receipt_admission_id']
+        elif mutation == 'source':
+            binding['current_scope']['sources'][0]['body'] = 'Changed source bytes.'
+        else:
+            binding['failure_inventory'][0]['question_id'] = 'not-the-original-question'
+        before = (len(calls), len(jev_calls), len(local_calls))
+        parent = decision['qualification_reference']
+        reference = QualificationReference(parent['invocation_id'],
+            ObjectAdmissionId.parse(parent['raw_admission_id']),
+            ObjectAdmissionId.parse(parent['receipt_admission_id']))
+        with pytest.raises((QualificationHold, TypesafeJudgmentError, ValueError)):
+            state = original_qualification_state(qualifier, candidate, base, binding,
+                                                 proof=consumer.proof)
+            qualifier.read_qualification(reference, state, proof=consumer.proof, **_ids(state))
+        assert (len(calls), len(jev_calls), len(local_calls)) == before

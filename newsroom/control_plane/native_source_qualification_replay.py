@@ -12,10 +12,9 @@ from .native_assessor import NativeAssessmentExecution
 from .native_assessor_spans import build_lossless_source_view
 
 def read_current_result(qualifier, candidate, base, sources, acquired, *, scope, proof):
-    """Read one proved original role/input-bound result; never allocate or call."""
+    """Read one proved original retained result; never allocate or call."""
     from copy import deepcopy
-    from .native_assessor_judgments import NativeAssessorJudgments, JudgedAssessment, source_role_questions, VERSION as JUDGMENT_VERSION
-    from .typesafe_judgment import JudgmentReference
+    from .native_assessor_judgments import NativeAssessorJudgments, JudgedAssessment
     if (base.source_ids != tuple(source.unit.source_id for source in sources)
             or base.passages != tuple(item.body.decode('utf-8') for item in acquired)):
         raise QualificationHold('QUALIFICATION_ACQUIRED_BYTES_HOLD')
@@ -80,7 +79,10 @@ def read_current_result(qualifier, candidate, base, sources, acquired, *, scope,
 
 def original_qualification_state(qualifier, candidate, base, binding, *, proof):
     """Reconstruct the supported original paid recipe, with no producer dispatch."""
+    import re
     from .native_assessor_judgments import source_role_questions, VERSION as JUDGMENT_VERSION
+    from .qualification_rubrics import witness_inventory, question as qualification_question
+    from .native_assessor import PROVIDER_SCHEMA
     from .typesafe_judgment import JudgmentReference
     view = build_lossless_source_view(base.passages, base.source_ids)
     from .native_assessor import _reference_binding
@@ -100,9 +102,26 @@ def original_qualification_state(qualifier, candidate, base, binding, *, proof):
                 if key not in {'qualification_contract','prior_judgments','failure_inventory'}}
     refs=binding.get('prior_judgments',[])
     inventory=binding.get('failure_inventory')
-    if (binding.get('qualification_contract')!=VERSION or len(refs)!=1
-            or type(inventory)is not list or len(inventory)!=1
-            or inventory[0].get('stage')!='SELECTED_QUALIFICATION' or inventory[0].get('reason')!='INPUT_BOUND'):
+    if (binding.get('qualification_contract')!=VERSION or type(refs)is not list
+            or len(refs)not in {1,2} or type(inventory)is not list or len(inventory)!=1
+            or type(inventory[0])is not dict
+            or any(type(row)is not dict or set(row)!={'invocation_id','raw_admission_id','receipt_admission_id'}
+                   or any(type(value)is not str for value in row.values())for row in refs)
+            or len({row['invocation_id']for row in refs})!=len(refs)):
+        raise QualificationHold('QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED')
+    failure=inventory[0]
+    if failure=={'stage':'SELECTED_QUALIFICATION','reason':'INPUT_BOUND'} and len(refs)==1:
+        reason='JUDGMENT_INPUT_BOUND'
+    elif failure=={'reason':'QUALIFICATION_WITNESS_COVERAGE_UNPROVEN'} and len(refs)==1:
+        reason='QUALIFICATION_WITNESS_COVERAGE_UNPROVEN'
+    elif failure=={'reason':'FIRST_PUBLICATION_ANNOUNCEMENT_UNPROVEN'} and len(refs)==2:
+        reason='FIRST_PUBLICATION_ANNOUNCEMENT_UNPROVEN'
+    elif failure=={'reason':'TYPED_OUTPUT_CONTRACT_UNPROVEN'} and len(refs)==2:
+        reason='MATERIALISATION_VALIDATION_FAILED'
+    elif (set(failure)=={'question_id','reason'} and failure['reason']=='NONE'
+            and type(failure['question_id'])is str and len(refs)==2):
+        reason='QUALIFICATION_WITNESS_MISSING'
+    else:
         raise QualificationHold('QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED')
     candidates={segment.span_id:{'source_id':segment.source_id,
         'text':segment.text.encode('utf-8')[:segment.content_end_byte-segment.start_byte].decode('utf-8'),
@@ -112,17 +131,54 @@ def original_qualification_state(qualifier, candidate, base, binding, *, proof):
     if binding['newness']=='SOURCE_DECLARED_FIRST_PUBLICATION':
         role_state['publication_basis']={'mode':binding['newness'],
             'published_at':{row['source_id']:row['first_published_at']for row in binding['first_publication']}}
-    ref=JudgmentReference(refs[0]['invocation_id'],ObjectAdmissionId.parse(refs[0]['raw_admission_id']),ObjectAdmissionId.parse(refs[0]['receipt_admission_id']))
-    questions=source_role_questions(candidates)
-    role=qualifier.judgments.read(ref,state=role_state,questions=questions,source_binding=original,
-        caller_identity='NATIVE_ASSESSOR',cycle_id=digest_canonical([JUDGMENT_VERSION,'SOURCE_ROLES',original,role_state,questions]),
-        candidate_id=candidate.candidate_id,hypothesis_digest=ids['hypothesis_digest'],proof=proof)
+    def read_batch(row, phase, state, questions):
+        ref=JudgmentReference(row['invocation_id'],ObjectAdmissionId.parse(row['raw_admission_id']),
+                              ObjectAdmissionId.parse(row['receipt_admission_id']))
+        record=qualifier.judgments.read(ref,state=state,questions=questions,source_binding=original,
+            caller_identity='NATIVE_ASSESSOR',cycle_id=digest_canonical([JUDGMENT_VERSION,phase,original,state,questions]),
+            candidate_id=candidate.candidate_id,hypothesis_digest=ids['hypothesis_digest'],proof=proof)
+        return {'questions':questions,'answers':record['answers'],'outcome':record['outcome']}
+    judgments=[read_batch(refs[0],'SOURCE_ROLES',role_state,source_role_questions(candidates))]
+    if len(refs)==2:
+        material=[identity for identity,answer in judgments[0]['answers'].items()
+                  if answer['choice']=='MATERIAL']
+        witnesses=witness_inventory(view)
+        selected_state={**role_state,'witness_inventory':witnesses}
+        variants=PROVIDER_SCHEMA['properties']['package']['properties']['qualification_evidence']['items']['oneOf']
+        rules={v['properties']['test']['const']:v['properties']['test_evidence']['properties']for v in variants}
+        questions={'headline':{'type':'choice','instructions':'Choose the strongest material headline; use UNCERTAIN for unresolved support.',
+            'criteria':{**{identity:candidates[identity]['text']for identity in material},'UNCERTAIN':'Unresolved headline.'}}}
+        # Reproduce the frozen selected-batch recipe; the authenticated reader
+        # checks its original state/question snapshots before exposing answers.
+        for identity in material:
+            if binding['newness']=='SOURCE_DECLARED_FIRST_PUBLICATION':
+                questions[identity+':announced_event']={'type':'choice','instructions':
+                    f'Does exact span {identity} affirm a newly announced event or official action at the source-declared first publication? '
+                    'No prior baseline exists: do not infer comparative change, novelty from fetched/updated time, or in-force status from a future announcement.',
+                    'criteria':{'YES':'Source affirms a newly announced material event/action, with exact modality and timing.',
+                        'NO':'Only administrative metadata, older/background facts or an amendment needing an unavailable comparison.',
+                        'UNCERTAIN':'Newly announced status is not established.'}}
+            for test,fields in rules.items():
+                prefix=identity+':'+test
+                questions[prefix]=qualification_question(identity,test,fields)
+                for field,schema in fields.items():
+                    if 'enum'in schema:
+                        choices={value:value for value in schema['enum']}
+                    elif field.endswith('_source_lookup_key'):
+                        choices={key:value['text']for key,value in witnesses[identity]['candidates'].items()}
+                    elif field=='duration_minutes':
+                        choices={m.group(1):m.group(1)for m in re.finditer(r'(?<![\d.,])([0-9]+)\s*(?:minutes?|mins?|分鐘)(?![A-Za-z])',candidates[identity]['text'],re.I)}
+                    else:
+                        continue
+                    questions[prefix+':'+field]={'type':'choice','instructions':f'For {identity}/{test}, select source-supported {field}; NONE if not established.',
+                        'criteria':{**choices,'NONE':'No established value.'}}
+        judgments.append(read_batch(refs[1],'SELECTED_QUALIFICATION',selected_state,questions))
     source_rows=binding['current_scope']['sources']
     state={'source_binding':binding,'source_view':{'passages':list(base.passages),'source_ids':list(base.source_ids),
         'sources':[{'source_id':row['source_id'],'publication_time':row['published_at'],
             'source_updated_time':row['updated_at'],'retrieval_time':row['retrieved_at'],
             'segments':[{**segment.request_record(),'rendering_fragment_count':len(segment.entities)+1}
                 for segment in view.segments if segment.source_id==row['source_id']]}for row in source_rows]},
-        'issue':{'reason':'JUDGMENT_INPUT_BOUND','failed_questions':inventory,'newness':binding['newness'],'prior_scope':binding['prior_scope']},
-        'judgments':[{'questions':questions,'answers':role['answers'],'outcome':role['outcome']}]}
+        'issue':{'reason':reason,'failed_questions':inventory,'newness':binding['newness'],'prior_scope':binding['prior_scope']},
+        'judgments':judgments}
     return state

@@ -1395,19 +1395,26 @@ class NativePublicationContinuation:
         semantic_intent = facts.get('semantic_assessment_intent')
         retained_semantic_consumer = (
             not context_only
-            and type(semantic_intent) is dict
-            and semantic_intent.get('contract') == self._semantic_intent_contract
-            and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED' and facts.get('failure_class') == 'EvidencePackageError'
-                 or progress.get('stage') == 'EVIDENCE_HOLD'
-                 and (facts.get('reason') == 'SEMANTIC_INTENT_INPUT_CHANGED_HOLD' and facts.get('failure_class') in {'EvidencePackageError','ValueError'}
-                      or facts.get('reason') == 'ASSESSOR_RENDERING_CONTRACT_HOLD'))
+            and (
+                type(semantic_intent) is dict
+                and semantic_intent.get('contract') == self._semantic_intent_contract
+                and (progress.get('stage') == 'ASSESSMENT_INTERRUPTED' and facts.get('failure_class') == 'EvidencePackageError'
+                     or progress.get('stage') == 'EVIDENCE_HOLD'
+                     and (facts.get('reason') == 'SEMANTIC_INTENT_INPUT_CHANGED_HOLD' and facts.get('failure_class') in {'EvidencePackageError','ValueError'}
+                          or facts.get('reason') == 'ASSESSOR_RENDERING_CONTRACT_HOLD'))
+                # Re-enter only the authenticated retained-result reader after a
+                # consumer repair, never the qualification producer or a timeout.
+                or semantic_intent is None
+                and progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
+                and facts.get('reason') == 'ACQUISITION_RESULT_NOT_RETAINED'
+                and facts.get('failure_class') == 'QualificationHold'
+            )
             and same_assessment_producer(facts.get('assessment_contract_version'), self._assessment_contract_version)
             and facts.get('assessment_contract_version') != self._assessment_contract_version
             and facts.get('retained_qualification_checked_contract') != self._assessment_contract_version
             and bool(facts.get('graphiti_receipts')) and bool(facts.get('intake_receipt_id'))
             and not any(facts.get(key) for key in ('package_admission_id', 'editorial_decision',
-                'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id'))
-        )
+                'publication_started_at', 'publication_event_id', 'delivery_attempt_event_id')))
         if (self._semantic_origin_failure is not None and not context_only
                 and not retained_semantic_consumer
                 and facts.get('graphiti_receipts') and facts.get('intake_receipt_id')
