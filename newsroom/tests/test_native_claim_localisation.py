@@ -263,6 +263,44 @@ def test_future_unsupported_or_changed_facts_are_never_dropped_as_glossary(sourc
     assert 'LOCALISATION_FACT_EQUIVALENCE_HOLD' in held.value.reason_codes
 
 
+@pytest.mark.parametrize(('source', 'rendered', 'pairs'), [
+    ('The course lasts 2 years and the other course lasts 3 years.', '甲課程為期3年，乙課程為期2年。', [('2 years', '2年'), ('3 years', '3年')]),
+    ('The course lasts 2 years.', '課程為期2年，適用期亦為2年。', [('2 years', '2年')]),
+    ('Funding is £20 million and the loan is £30 million.', '資助為三千萬英鎊，貸款為二千萬英鎊。', [('£20 million', '二千萬英鎊'), ('£30 million', '三千萬英鎊')]),
+])
+def test_future_typed_facts_preserve_occurrence_order_and_count(source, rendered, pairs):
+    state = {'claims': {'0': {'text': source, 'entities': [], 'rendering_fragment_count': 1}}}
+    item = {'span_id': '0', 'rendered_assertion_zh_hant_hk_fragments': [rendered],
+            'factual_localisations': [{'source_lookup_key': source, 'rendered_expression': target} for source, target in pairs], 'quotation_source_keys': []}
+    with pytest.raises(LocalisationHold) as held:
+        module._renderings(canonical_json_bytes({'renderings': [item]}), state, version=module.ALIGNED_VERSION)
+    assert 'LOCALISATION_NUMERIC_HOLD' in held.value.reason_codes
+
+
+@pytest.mark.parametrize('rendered', ['「計劃現已開放。」', '計劃現已「開放。', '計劃現已「開放』。'])
+def test_future_target_quotes_need_complete_supported_source_bindings(rendered):
+    state = {'claims': {'0': {'text': 'The scheme is now open.', 'entities': [], 'rendering_fragment_count': 1}}}
+    item = {'span_id': '0', 'rendered_assertion_zh_hant_hk_fragments': [rendered],
+            'factual_localisations': [], 'quotation_source_keys': []}
+    with pytest.raises(LocalisationHold) as held:
+        module._renderings(canonical_json_bytes({'renderings': [item]}), state, version=module.ALIGNED_VERSION)
+    assert 'LOCALISATION_QUOTATION_HOLD' in held.value.reason_codes
+
+
+@pytest.mark.parametrize('quoted', ['限期', '限期已更改。'])
+def test_future_target_quote_must_be_completely_bound_not_a_partial_key(quoted):
+    state = {'claims': {'0': {'text': 'Home Office said "限期已更改。"', 'entities': [['Home Office', 'ORGANISATION']], 'rendering_fragment_count': 2}}}
+    item = {'span_id': '0', 'rendered_assertion_zh_hant_hk_fragments': ['', f'表示「{quoted}」。'],
+            'factual_localisations': [], 'quotation_source_keys': ['限期已更改。']}
+    raw = canonical_json_bytes({'renderings': [item]})
+    if quoted == '限期':
+        with pytest.raises(LocalisationHold) as held:
+            module._renderings(raw, state, version=module.ALIGNED_VERSION)
+        assert 'LOCALISATION_QUOTATION_HOLD' in held.value.reason_codes
+    else:
+        assert module._renderings(raw, state, version=module.ALIGNED_VERSION)['0']['quotation_source_keys'] == ['限期已更改。']
+
+
 @pytest.mark.parametrize('capability', [None, 'terms', 'year'])
 def test_future_renderer_reaches_governed_materialisation_and_admission_contract(tmp_path, monkeypatch, capability):
     from dataclasses import replace
@@ -431,23 +469,30 @@ def test_authenticated_v1_success_is_read_and_reused_without_new_dispatch(tmp_pa
         assert usage.terminal(allocation.invocation_id).outcome == 'LOCALISATION_COMPLETE'
 
 
-@pytest.mark.parametrize('condition', ['complete', 'reported-failure', 'unknown', 'active'])
+@pytest.mark.parametrize('condition', ['complete', 'reported-failure', 'unknown', 'active', 'known-NO'])
 def test_future_contract_never_reopens_an_older_paid_purpose(tmp_path, monkeypatch, condition):
     args, usage, state, runner, fence, calls = case(tmp_path, monkeypatch)
     with open_native_runtime(**args) as runtime:
         scope = _scope(runtime)
         old, reference = _legacy_result(usage, runtime, state, scope,
             outcome='LOCALISATION_COMPLETE' if condition == 'complete' else 'LOCALISATION_FAILED',
-            failure_class=None if condition == 'complete' else 'ValidationError',
+            failure_class=None if condition == 'complete' else 'QUALIFICATION_NO' if condition == 'known-NO' else 'ValidationError',
             reported=condition != 'unknown', active=condition == 'active')
         before = usage.terminal(old.invocation_id)
         future = NativeClaimLocaliser(usage=usage, objects=runtime.authority.objects,
             policy=localisation_policy(evidence_digest=digest_bytes(b'future fixture'), qualified=True),
             source_fence=fence, runner=runner, implementation_worktree_clean=True, clock=lambda: NOW)
-        with pytest.raises(LocalisationHold, match='PRIOR_CONTRACT'):
-            future.localise(state, **scope)
         if reference is not None:
-            assert future.read_localisation(reference, state, **scope)['version'] == module.LEGACY_VERSION
+            before_raw = runtime.authority.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'), proof=runtime.proof).data
+            for _ in range(2):
+                # Both ordinary consumers obtain a reference before calling the reader.
+                selected = future.localise(state, **scope)
+                assert selected == reference
+                assert future.read_localisation(selected, state, **scope)['version'] == module.LEGACY_VERSION
+            assert runtime.authority.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'), proof=runtime.proof).data == before_raw
+        else:
+            with pytest.raises(LocalisationHold):
+                future.localise(state, **scope)
         assert calls == [] and usage.terminal(old.invocation_id) == before
         with sqlite3.connect(usage.path) as connection:
             assert connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 1
@@ -478,13 +523,88 @@ def test_future_contract_keeps_v2_paid_work_and_original_reader(tmp_path, monkey
         future = NativeClaimLocaliser(usage=usage, objects=runtime.authority.objects,
             policy=localisation_policy(evidence_digest=digest_bytes(b'future fixture'), qualified=True),
             source_fence=fence, runner=runner, implementation_worktree_clean=True, clock=lambda: NOW)
-        with pytest.raises(LocalisationHold, match='PRIOR_CONTRACT'):
-            future.localise(state, **scope)
         if condition == 'complete':
-            assert future.read_localisation(reference, state, **scope)['version'] == module.VERSION
+            before_raw = runtime.authority.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'), proof=runtime.proof).data
+            for _ in range(2):
+                selected = future.localise(state, **scope)
+                assert selected == reference
+                assert future.read_localisation(selected, state, **scope)['version'] == module.VERSION
+            assert runtime.authority.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'), proof=runtime.proof).data == before_raw
+        else:
+            with pytest.raises(LocalisationHold):
+                future.localise(state, **scope)
         assert len(calls) == 1 and usage.terminal(invocation) == before
         with sqlite3.connect(usage.path) as connection:
             assert connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('fault', [None, 'missing-repair', 'missing-receipt', 'ancestor-breach'])
+def test_future_callback_reuses_only_existing_authenticated_v2_repair_lineage(tmp_path, monkeypatch, fault):
+    args, usage, state, runner, fence, calls = case(tmp_path, monkeypatch)
+    with open_native_runtime(**args) as runtime:
+        scope = _scope(runtime)
+        ancestor, _ = _legacy_result(usage, runtime, state, scope,
+            outcome='LOCALISATION_FAILED', failure_class='ValidationError')
+        reference = None
+        if fault != 'missing-repair':
+            old = _localiser(usage, runtime, fence, runner)
+            if fault == 'missing-receipt':
+                # Reproduce a crash after a settled COMPLETE and raw CAS write.
+                original_admit = type(runtime.authority.objects).admit
+                def interrupted_admit(self, request, *args, **kwargs):
+                    if request.idempotency_key.startswith('claim-localisation-receipt:'):
+                        raise RuntimeError('synthetic receipt-write interruption')
+                    return original_admit(self, request, *args, **kwargs)
+                with monkeypatch.context() as interrupted:
+                    interrupted.setattr(type(runtime.authority.objects), 'admit', interrupted_admit)
+                    with pytest.raises(RuntimeError, match='receipt-write'):
+                        old.localise(state, **scope)
+            else:
+                reference = old.localise(state, **scope)
+                assert old.read_localisation(reference, state, **scope)['repair_of'] == ancestor.invocation_id
+        with sqlite3.connect(usage.path) as connection:
+            before = tuple(connection.execute('SELECT record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall())
+            allocation_count = connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0]
+        future = NativeClaimLocaliser(usage=usage, objects=runtime.authority.objects,
+            policy=localisation_policy(evidence_digest=digest_bytes(b'future fixture'), qualified=True),
+            source_fence=fence, runner=lambda _prompt: pytest.fail('historical work dispatched again'),
+            implementation_worktree_clean=True, clock=lambda: NOW)
+        if fault == 'ancestor-breach':
+            monkeypatch.setattr(ModelUsageService, '_validate_terminal', staticmethod(lambda *_args, **_kwargs: 'MAX_TOTAL_TOKENS_EXCEEDED'))
+        if fault is None:
+            before_raw = runtime.authority.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'), proof=runtime.proof).data
+            for _ in range(2):
+                selected = future.localise(state, **scope)
+                assert selected == reference
+                assert future.read_localisation(selected, state, **scope)['repair_of'] == ancestor.invocation_id
+            assert runtime.authority.objects.rehydrate(HydrationRequest(reference.raw_admission_id, 'evidence.record'), proof=runtime.proof).data == before_raw
+        else:
+            with pytest.raises(LocalisationHold):
+                future.localise(state, **scope)
+        with sqlite3.connect(usage.path) as connection:
+            assert tuple(connection.execute('SELECT record_json FROM model_invocation_terminals ORDER BY invocation_id').fetchall()) == before
+            assert connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == allocation_count
+        assert len(calls) == int(fault != 'missing-repair')
+
+
+def test_sourceqa_ordinary_callbacks_reuse_v2_success_under_a_v3_policy(tmp_path, monkeypatch):
+    from newsroom.tests.test_qualification_semantic_witness import _selected_qualification_case
+    policy_factory = module.localisation_policy
+    monkeypatch.setattr(module, 'localisation_policy', lambda **kwargs: policy_factory(version=module.VERSION, **kwargs))
+    with _selected_qualification_case(tmp_path, monkeypatch, malformed_rendering=True) as (
+            consumer, verifier, original, candidate, base, source, acquired, _scope, proof, usage, qa, jev, render):
+        selected = consumer.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        future = NativeClaimLocaliser(usage=usage, objects=consumer.objects,
+            policy=policy_factory(evidence_digest=digest_bytes(b'future fixture'), qualified=True),
+            source_fence=consumer.qualifier.fence, runner=lambda _prompt: pytest.fail('cached localisation was redispatched'),
+            implementation_worktree_clean=True, clock=lambda: NOW)
+        scope = dict(candidate_id=candidate.candidate_id, hypothesis_digest=candidate.governing_manifest.canonical_digest,
+                     evidence_package_digest=base.digest, proof=proof)
+        consumer.localise = lambda request: future.localise(request, **scope)
+        consumer.read_localisation = lambda reference, request: future.read_localisation(reference, request, **scope)
+        monkeypatch.setattr(module, '_validate_content', lambda *_args: pytest.fail('v3 producer checks retroactively applied'))
+        assert consumer.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof) == selected
+        assert len(qa) == 1 and len(jev) == 2 and len(render) == 1
 
 
 def test_reported_v1_schema_failure_has_one_distinct_v2_repair_and_keeps_old_accounting(tmp_path, monkeypatch):

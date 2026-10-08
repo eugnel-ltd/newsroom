@@ -211,10 +211,11 @@ def _validate_content(renderings, state):
     """Complete deterministic claim boundary, not translation semantic proof."""
     from types import SimpleNamespace
     from .admission import _valid_zh_hant_hk_rendering
-    from .evidence import _localised_fact_is_bound, _entity_pattern, rendered_named_entities
+    from .evidence import _localised_fact_is_bound, _canonical_localised_fact, _entity_pattern, rendered_named_entities
     from .writer import (_remove_exact_expressions, _unicode_number_relations,
         _currency_relations, _unicode_currency_relations,
-        _signed_number_relations, _CHINESE_NUMERAL_FACT, _RELATIVE_TIME_FACT)
+        _signed_number_relations, _CHINESE_NUMERAL_FACT, _RELATIVE_TIME_FACT,
+        _unicode_quoted_contents, _unicode_quotes_are_balanced, _has_unicode_quote_delimiter)
     reasons = set()
     for identity, item in renderings.items():
         claim = state['claims'][identity]
@@ -250,6 +251,20 @@ def _validate_content(renderings, state):
             reasons.add('LOCALISATION_FACT_EQUIVALENCE_HOLD')
         if derived is not None and derived not in bound:
             reasons.add('LOCALISATION_DERIVED_FACT_HOLD')
+        def fact_stream(text, column):
+            text = _remove_exact_expressions(text, names)
+            occurrences = sorted((match.start(), match.end(), _canonical_localised_fact(source) or ('SOURCE_DERIVED_YEAR', target))
+                for source, target in bound for match in re.finditer(_entity_pattern((source, target)[column]), text))
+            if any(right[0] < left[1] for left, right in zip(occurrences, occurrences[1:])):
+                return None
+            for pattern in (_LITERAL_NUMERIC_FORM, _CHINESE_NUMERAL_FACT):
+                for match in pattern.finditer(text):
+                    if not any(match.start() < end and match.end() > start for start, end, _fact in occurrences):
+                        occurrences.append((match.start(), match.end(), ('LITERAL', match.group())))
+            return tuple(fact for _start, _end, fact in sorted(occurrences))
+        source_facts, target_facts = fact_stream(claim['text'], 0), fact_stream(rendered, 1)
+        if source_facts is None or target_facts is None or source_facts != target_facts:
+            reasons.add('LOCALISATION_NUMERIC_HOLD')
         source_residue = _remove_exact_expressions(claim['text'], (*names, *(source for source, _target in bound)))
         target_residue = _remove_exact_expressions(rendered, (*names, *(target for _source, target in bound)))
         # Reuse number/unit primitives, not the offline exact-copy writer gate.
@@ -261,13 +276,31 @@ def _validate_content(renderings, state):
                 or [match.group().casefold() for match in _RELATIVE_TIME_FACT.finditer(source_residue)] !=
                    [match.group().casefold() for match in _RELATIVE_TIME_FACT.finditer(target_residue)]):
             reasons.add('LOCALISATION_NUMERIC_HOLD')
-        quoted = tuple(match.group(1) for pattern in (
+        quote_patterns = (
             r'"([^"\n]+)"', r'“([^”\n]+)”', r'「([^」\n]+)」', r'『([^』\n]+)』',
             r'‘([^’\n]+)’', r'〝([^〞\n]+)〞', r'﹁([^﹂\n]+)﹂', r'❝([^❞\n]+)❞',
             r'﹃([^﹄\n]+)﹄', r'«([^»\n]+)»', r'‹([^›\n]+)›',
             r"(?<![A-Za-z])'([^'\n]+)'(?![A-Za-z])",
-        ) for match in re.finditer(pattern, claim['text']))
-        if any(not any(key in quote for quote in quoted) for key in item['quotation_source_keys']):
+        )
+        def quote_scan(text):
+            # Word apostrophes are not quote boundaries; text/keys stay immutable.
+            scanned = re.sub(r"(?<=[A-Za-z])['’](?=[A-Za-z])", '_', text)
+            matches = [match for pattern in quote_patterns for match in re.finditer(pattern, scanned)]
+            quotes = tuple(match.group(1) for match in matches)
+            residue = _remove_exact_expressions(scanned, tuple(match.group() for match in matches))
+            complete = (_unicode_quotes_are_balanced(scanned)
+                and all(value in quotes for value in _unicode_quoted_contents(scanned))
+                and not any(char in "'「」『』〝〞﹁﹂﹃﹄" or _has_unicode_quote_delimiter(char) for char in residue))
+            return quotes, complete
+        source_quotes, source_quotes_complete = quote_scan(claim['text'])
+        target_quotes, target_quotes_complete = quote_scan(rendered)
+        keys = tuple(re.sub(r"(?<=[A-Za-z])['’](?=[A-Za-z])", '_', key) for key in item['quotation_source_keys'])
+        if (not target_quotes_complete or (keys and not source_quotes_complete)
+                or any(key not in claim['text'] for key in item['quotation_source_keys'])
+                or any(not any(key in quote for quote in source_quotes) for key in keys)
+                or any(not any(quote in source for source in source_quotes)
+                    or any(char.isalnum() for char in _remove_exact_expressions(quote, keys))
+                    for quote in target_quotes)):
             reasons.add('LOCALISATION_QUOTATION_HOLD')
     if reasons:
         error = LocalisationHold('LOCALISATION_CONTENT_CONTRACT_HOLD')
@@ -403,13 +436,6 @@ class NativeClaimLocaliser:
 
     def localise(self, state, *, proof, **scope):
         version = self.policy.prompt_contract_version
-        if version == ALIGNED_VERSION:
-            # A future producer is not retry credit for any older paid purpose.
-            for old_version in (LEGACY_VERSION, VERSION):
-                old_prompt, _, old_envelope, _ = self._input(state, version=old_version, **scope)
-                if _retained_allocation(self.usage, envelope=old_envelope,
-                        prompt_digest=digest_bytes(old_prompt.encode()), policy=self.policy) is not None:
-                    raise LocalisationHold('LOCALISATION_PRIOR_CONTRACT_HOLD')
         # A version upgrade is not a retry credit for unknown, active or breached old work.
         legacy_prompt, _, legacy_envelope, _ = self._input(state, version=LEGACY_VERSION, **scope)
         legacy = _retained_allocation(self.usage, envelope=legacy_envelope,
@@ -442,6 +468,22 @@ class NativeClaimLocaliser:
                     requested_max_output_tokens=allocation.max_output_tokens) is not None:
                 raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
             repair_of = legacy.invocation_id
+        if version == ALIGNED_VERSION:
+            # Reuse authenticated old successes, including an already-paid v2
+            # repair. A missing/failed repair never grants a new v3 purpose.
+            old_prompt, _, old_envelope, _ = self._input(state, version=VERSION, repair_of=repair_of, **scope)
+            old = _retained_allocation(self.usage, envelope=old_envelope,
+                prompt_digest=digest_bytes(old_prompt.encode()), policy=self.policy)
+            if old is not None:
+                _allocation, old_terminal, _policy = self._terminal(old.invocation_id, expected_snapshot={
+                    'state': state, **{key: scope[key] for key in ('candidate_id', 'hypothesis_digest', 'evidence_package_digest')}})
+                if old_terminal.outcome != 'LOCALISATION_COMPLETE':
+                    raise LocalisationHold('LOCALISATION_PRIOR_CONTRACT_HOLD')
+                reference = self._reference(old.invocation_id, proof=proof)
+                self.read_localisation(reference, state, proof=proof, **scope)
+                return reference
+            if repair_of is not None:
+                raise LocalisationHold('LOCALISATION_PRIOR_RESULT_UNAVAILABLE')
         prompt, snapshot, envelope, manifest = self._input(state, repair_of=repair_of, **scope)
         prior = _retained_allocation(self.usage, envelope=envelope,
             prompt_digest=digest_bytes(prompt.encode()), policy=self.policy)
