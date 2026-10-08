@@ -1309,7 +1309,8 @@ _FACT_VALUE_V2 = rf"(?:{_FACT_NUMBER_V2}|one|two|three|four|five|six|seven|eight
 _FACT_UNIT_V2 = (r"months?|years?|hours?|minutes?|schools?|hospitals?|clinics?|buses?|roads?|"
                  r"個月|个月|年|小時|小时|分鐘|分钟|(?:間|间|所|部|輛|辆|條|条)(?:學校|学校|醫院|医院|診所|诊所|巴士|道路)")
 _FACT_QUALIFIER_V2 = (r"only\s+|exactly\s+|at least\s+|at most\s+|more than\s+|less than\s+|up to\s+|"
-                      r"只限|只有|僅限|恰好|至少|最少|不少於|最多|不多於|超過|多於|少於|不足")
+                      r"about\s+|approximately\s+|around\s+|within\s+|"
+                      r"只限|只有|僅限|恰好|至少|最少|不少於|最多|不多於|超過|多於|少於|不足|大約|約")
 
 
 def canonical_localised_fact_v2(value: str) -> tuple[object, ...] | None:
@@ -1322,12 +1323,20 @@ def canonical_localised_fact_v2(value: str) -> tuple[object, ...] | None:
               (r"at least\s+|至少|最少|不少於", "GE"),
               (r"at most\s+|up to\s+|最多|不多於", "LE"),
               (r"more than\s+|超過|多於", "GT"),
-              (r"less than\s+|少於|不足", "LT"))
+              (r"less than\s+|少於|不足", "LT"),
+              (r"about\s+|approximately\s+|around\s+|大約|約", "APPROX"),
+              (r"within\s+", "WITHIN"))
     for prefix, operator in bounds:
         match = re.fullmatch(rf"(?:{prefix})(.+)", value, re.I)
         if match:
             fact = canonical_localised_fact_v2(match.group(1))
+            if operator == "WITHIN" and fact is not None and not fact[0].startswith("DURATION_"):
+                return None
             return ("BOUND", operator, fact) if fact is not None else None
+    deadline = re.fullmatch(r"(.+?)(?:期限)?內", value)
+    if deadline:
+        fact = canonical_localised_fact_v2(deadline[1])
+        return ("BOUND", "WITHIN", fact) if fact is not None and fact[0].startswith("DURATION_") else None
     if re.fullmatch(r"one of(?: the following roles)?|其中一[個位名項種](?:角色)?", value, re.I):
         return ("SELECTION", 1)
     year = re.fullmatch(r"(academic|financial) year\s+([0-9]{4})\s*(?:to|[-–至])\s*([0-9]{4})", value, re.I)
@@ -1364,7 +1373,9 @@ def canonical_localised_fact_v2(value: str) -> tuple[object, ...] | None:
 
 
 def _factual_occurrences_v2(text: str):
-    # Embedded Chinese numerals in ordinary prose (同一客戶) are not counts.
+    from .writer import _RELATIVE_TIME_FACT
+
+    # Same-customer co-reference (同一客戶) is not an asserted count.
     boundary = "A-Za-z0-9_\\u3400-\\u9fff"
     pattern = rf"(?<![{boundary}]){_FACT_NUMBER_V2}(?![{boundary}])"
     selection = r"one of(?: the following roles)?|其中一[個位名項種](?:角色)?"
@@ -1378,15 +1389,21 @@ def _factual_occurrences_v2(text: str):
     money = rf"(?:£|GBP\s+|HK\$)\s*{_FACT_NUMBER_V2}(?:\s+(?:thousand|million|billion))?|{_FACT_NUMBER_V2}(?:英鎊|港元|元)"
     calendar_month = rf"(?:{month})(?:\s+[0-9]{{4}})?|(?:{_FACT_NUMBER_V2}年)?{_FACT_NUMBER_V2}月"
     core = rf"{year}|{interval}(?:\s*(?:{_FACT_UNIT_V2}))?|{date}|{money}|{quantity}|{selection}|{calendar_month}"
-    matches = [*re.finditer(rf"(?<![A-Za-z0-9_])(?:{_FACT_QUALIFIER_V2})?(?:{core})(?![A-Za-z0-9_])", text, re.I), *re.finditer(pattern, text)]
+    matches = [*re.finditer(rf"(?<![A-Za-z0-9_])(?:{_FACT_QUALIFIER_V2})?(?:{core})(?:半)?(?:(?:期限)?內)?(?![A-Za-z0-9_])", text, re.I), *re.finditer(pattern, text)]
     # A number cannot stand in for a fraction or an unsupported unit-bearing
     # expression. Unknown English unit words stay unknown, never inferred.
-    raw = rf"(?<![A-Za-z0-9_])[+−-]?[0-9]+(?:[.,][0-9]+)*(?:/[0-9]+|\s*[A-Za-z]+|\s*(?:%|％|公里|公斤|米|歲|半))?"
+    raw_unit = r"%|％|公里|公斤|公噸|噸|吨|毫升|米|歲|度|呎|℃|℉|°(?:[CFcf])?|半"
+    raw = rf"(?<![A-Za-z0-9_])[+−-]?[0-9]+(?:[.,][0-9]+)*(?:/[0-9]+|\s*[A-Za-z]+|\s*(?:{raw_unit}))?"
     matches.extend(re.finditer(raw, text))
+    matches.extend(re.finditer(rf"(?<![A-Za-z0-9_]){_FACT_NUMBER_V2}\s*(?:{raw_unit})", text))
     cardinal = (r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
                 r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion")
     matches.extend(re.finditer(rf"(?<![A-Za-z])(?:{cardinal})(?:\s+[A-Za-z]+)?(?![A-Za-z])", text, re.I))
     matches.extend(re.finditer(rf"{_FACT_NUMBER_V2}(?:個|个|名|間|间|所|輛|辆|部|條|条|項|项|次|人|座|期|倍|成)", text))
+    # Reuse the finite legacy lexicon, but retain unparsed relative facts as
+    # unknowns. Only supplied derivation may replace a complete next-year span.
+    matches.extend(_RELATIVE_TIME_FACT.finditer(text))
+    matches.extend(re.finditer(r"[上下本]個月|明天|昨天", text))
     selected = []
     for match in sorted(matches, key=lambda item: (-(item.end() - item.start()), item.start())):
         if not any(match.start() < end and start < match.end() for start, end, _fact in selected):
@@ -1401,7 +1418,11 @@ def _factual_occurrences_v2(text: str):
                 fact = None
             selected.append((match.start(), match.end(), fact))
     for index, character in enumerate(text):
-        if character.isdigit() and not any(start <= index < end for start, end, _fact in selected):
+        if character == "一" and index and text[index - 1] == "同":
+            continue  # Preserve only the explicit 同一 co-reference exemption.
+        # Han/financial numerals must not disappear merely because a unit or
+        # fraction form is outside the closed grammar. No value is inferred.
+        if character.isnumeric() and not any(start <= index < end for start, end, _fact in selected):
             selected.append((index, index + 1, None))
     return tuple(sorted(selected))
 
@@ -1442,7 +1463,7 @@ def factual_rendering_is_bound_v2(source, rendered, pairs=(), *, literals=(), de
     for column, spans in enumerate(literal_spans):
         for start, end, fact in _factual_occurrences_v2(original[column]):
             if any(left < end and start < right for left, right in spans) and not any(left <= start and end <= right for left, right in spans):
-                if fact is not None or any(original[column][index].isdigit()
+                if fact is not None or any((original[column][index].isnumeric() or original[column][index] == "半")
                     and not any(left <= index < right for left, right in spans) for index in range(start, end)):
                     return False
         for start, end in spans:

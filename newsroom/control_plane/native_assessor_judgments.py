@@ -768,8 +768,10 @@ class NativeSemanticWitnesses:
         candidate = self.candidate_for(binding['candidate_version_id'])
         if (binding['candidate_id'] != base.candidate_id or binding['content_digest'] != base.digest
                 or binding['evidence_package_digest'] != base.digest
+                or candidate.version_id != binding['candidate_version_id']
                 or candidate.candidate_id != base.candidate_id
                 or candidate.governing_manifest.hypothesis_id != package.hypothesis_id
+                or candidate.governing_manifest.canonical_digest != binding.get('hypothesis_digest')
                 or tuple(row['body'] for row in current) != base.passages
                 or tuple(row['source_id'] for row in current) != base.source_ids):
             raise ValueError('typed Source rendering complete Source differs')

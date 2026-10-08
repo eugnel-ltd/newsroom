@@ -14,7 +14,7 @@ from .native_source_qualification import QualificationHold, QualificationReferen
 CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v4'
 # Pure consumer repairs never reopen an identical paid witness/render purpose.
 PAID_BINDING_VERSION = 'newsroom.source-qualification-consumer.v1'
-TYPED_CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v2'
+TYPED_CONSUMER_VERSION = 'newsroom.source-qualification-typed-rendering-consumer.v1'
 
 
 def current_source_passage(source):

@@ -329,6 +329,53 @@ def test_selected_sourceqa_composes_authenticated_witness_then_optional_renderin
             assert db.execute("SELECT COUNT(*)FROM model_invocation_allocations WHERE route='NATIVE_SOURCE_QUALIFICATION'").fetchone()[0]==1
 
 
+def test_typed_consumer_keeps_deployed_v2_object_distinct_without_paid_redispatch(tmp_path,monkeypatch):
+    import sqlite3
+    from newsroom.authority import HydrationRequest, ObjectAdmissionRequest
+    from newsroom.authority.canonical import digest_canonical
+    from newsroom.control_plane import native_source_qualification_consumer as consumer_module
+    with _selected_qualification_case(tmp_path,monkeypatch,fault='email',typed_rendering=True)as(q,w,original,c,b,s,a,scope,proof,usage,qa,jev,render):
+        original_bytes=original.decision_record
+        legacy_version='newsroom.source-qualification-consumer.v2'
+        # The deployed v2 composition predates typed literal rendering, but its
+        # retained object and paid witness still belong to this exact parent.
+        with monkeypatch.context()as historical:
+            historical.setattr(consumer_module,'CONSUMER_VERSION',legacy_version)
+            historical.delattr(q.localise,'rendering_contract')
+            legacy=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        legacy_bytes=legacy.decision_record
+        legacy_decision=json.loads(legacy_bytes)
+        parent=legacy_decision['qualification_reference']
+        assert legacy_decision['consumer_contract']==legacy_version
+        assert len(qa)==1 and len(jev)==2 and render==[]
+
+        typed=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        typed_decision=json.loads(typed.decision_record)
+        assert typed_decision['consumer_contract']==consumer_module.TYPED_CONSUMER_VERSION
+        assert typed_decision['qualification_reference']==parent
+        typed_contact=json.loads(typed.execution.text)['package']['governed_claims'][2]['rendered_assertion_zh_hant_hk']
+        legacy_contact=json.loads(legacy.execution.text)['package']['governed_claims'][2]['rendered_assertion_zh_hant_hk']
+        assert 'contact.help@education.gov.uk' in typed_contact
+        assert 'contact.help@education.gov.uk' not in legacy_contact
+        legacy_key='source-qualification-consumer:'+digest_canonical([legacy_version,parent])
+        typed_key='source-qualification-consumer:'+digest_canonical([consumer_module.TYPED_CONSUMER_VERSION,parent])
+        assert typed_key!=legacy_key
+        legacy_admission=q.objects.committed_admission(ObjectAdmissionRequest('evidence.record',legacy_key),proof=proof).admission
+        typed_admission=q.objects.committed_admission(ObjectAdmissionRequest('evidence.record',typed_key),proof=proof).admission
+        assert legacy_admission.admission_id==legacy.decision_admission_id
+        assert typed_admission.admission_id==typed.decision_admission_id
+        assert typed_admission.admission_id!=legacy_admission.admission_id
+        assert q.objects.rehydrate(HydrationRequest(legacy_admission.admission_id,'evidence.record'),proof=proof).data==legacy_bytes
+        assert q.objects.rehydrate(HydrationRequest(typed_admission.admission_id,'evidence.record'),proof=proof).data==typed.decision_record
+        query=('SELECT a.invocation_id,a.record_json,t.record_json FROM model_invocation_allocations a '
+            'LEFT JOIN model_invocation_terminals t USING(invocation_id) ORDER BY a.invocation_id')
+        with sqlite3.connect(usage.path)as db:pins=db.execute(query).fetchall()
+        assert q.compose_selected(original,c,b,(s,),(a,),proof=proof)==typed
+        assert len(qa)==1 and len(jev)==2 and len(render)==1
+        with sqlite3.connect(usage.path)as db:assert db.execute(query).fetchall()==pins
+        assert original.decision_record==original_bytes and legacy.decision_record==legacy_bytes
+
+
 def test_semantic_parent_forgery_denies_before_new_witness_or_rendering(tmp_path,monkeypatch):
     with _selected_qualification_case(tmp_path,monkeypatch)as(q,w,old,c,b,s,a,scope,proof,usage,qa,jev,render):
         value=json.loads(old.decision_record)
@@ -441,6 +488,28 @@ def test_source_rendering_capabilities_are_source_bound_and_reauthenticated(tmp_
         forged_ref=tuple((key,'sha256:'+'0'*64)if key=='invocation_id'else(key,value)for key,value in affected[0].source_rendering_ref)
         with pytest.raises(ValueError):w.read(None,replace(affected[0],source_rendering_ref=forged_ref),result)
         assert read_current_result(q,c,b,(s,),(a,),scope=scope,proof=proof)==selected
+        assert len(qa)==1 and len(jev)==2 and len(render)==1
+
+
+@pytest.mark.parametrize('drift',['candidate-version','hypothesis-digest'])
+def test_typed_source_rendering_rejects_current_candidate_identity_drift(tmp_path,monkeypatch,drift):
+    from newsroom.control_plane.admission import source_rendering_is_admitted
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
+    with _selected_qualification_case(tmp_path,monkeypatch,fault='email',typed_rendering=True)as(q,w,original,c,b,s,a,scope,proof,usage,qa,jev,render):
+        selected=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        assessment=AutonomousNativeEvidenceAssessor._validated_execution(selected.execution,c,b,(s,),(a,),
+            semantic_witnesses=selected.semantic_witnesses,source_renderings=selected.source_renderings,semantic_witness_reader=w.read)
+        package=replace(b,governed_claims=assessment.governed_claims,qualification_evidence=assessment.qualification_evidence,
+            substantive_new_information=assessment.substantive_new_information)
+        claim=package.governed_claims[2]
+        assert claim.source_rendering_ref and source_rendering_is_admitted(claim,package,semantic_witness_reader=w.read)
+        with monkeypatch.context()as changed:
+            if drift=='candidate-version':changed.setattr(c,'version_id','different-current-candidate-version')
+            else:changed.setattr(c.governing_manifest,'canonical_digest',digest_bytes(b'different-current-manifest'))
+            assert c.candidate_id==package.candidate_id and c.governing_manifest.hypothesis_id==package.hypothesis_id
+            with pytest.raises(ValueError,match='typed Source rendering complete Source differs'):
+                source_rendering_is_admitted(claim,package,semantic_witness_reader=w.read)
+        assert source_rendering_is_admitted(claim,package,semantic_witness_reader=w.read)
         assert len(qa)==1 and len(jev)==2 and len(render)==1
 
 

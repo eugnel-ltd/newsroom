@@ -1452,6 +1452,11 @@ def validate_writer_copy(
         for _source, target in numeric_localisations[claim.claim_id]
         for number in re.findall(r"\d+(?:[.,]\d+)*(?:%|％)?", target)
     )
+    governed_numbers.update(
+        number for claim in package.governed_claims
+        if typed_numeric_relations[claim.claim_id] is True
+        for number in re.findall(r"\d+(?:[.,]\d+)*(?:%|％)?", claim.rendered_assertion_zh_hant_hk)
+    )
     draft_numeric_expressions = {
         match.group(0)
         for pattern in numeric_expression_patterns

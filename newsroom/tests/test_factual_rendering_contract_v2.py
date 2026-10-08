@@ -16,6 +16,43 @@ def test_unparsed_english_number_words_and_chinese_classifiers_remain_visible():
     assert evidence.factual_rendering_is_bound_v2("the same customer", "同一名客戶")
 
 
+@pytest.mark.parametrize("source,target", (
+    ("長度三公里。", "長度四公里。"),
+    ("兩公斤", "五公斤"),
+    ("壹佰元", "貳佰元"),
+    ("三分之二", "三分之一"),
+))
+def test_unsupported_han_numerical_forms_never_become_empty_fact_streams(source, target):
+    check = evidence.factual_rendering_is_bound_v2
+    assert not check(source, target)
+    # Unknown forms remain a hold even when their literal text is unchanged.
+    assert not check(source, source)
+    assert not check(target, target)
+
+
+def test_same_customer_exemption_does_not_hide_a_separate_han_quantity():
+    check = evidence.factual_rendering_is_bound_v2
+    assert check("The same customer waits 2 hours.", "同一名客戶等候120分鐘。")
+    assert not check("同一客戶購買兩公斤。", "同一客戶購買五公斤。")
+    assert not check("同一客戶購買兩公斤。", "同一客戶購買。")
+    assert not check("同一客戶購買。", "同一客戶購買兩公斤。")
+
+
+def test_source_literal_masking_preserves_financial_glyphs_but_not_other_quantities():
+    check = evidence.factual_rendering_is_bound_v2
+    source, target = "Contact 壹佰集團.", "請聯絡壹佰集團。"
+    assert not check(source, target)
+    assert check(source, target, literals=("壹佰集團",))
+    assert not check(source, "請聯絡貳佰集團。", literals=("壹佰集團",))
+    assert not check(source, "請聯絡。", literals=("壹佰集團",))
+    assert not check("壹佰集團購買兩公斤。", "壹佰集團購買五公斤。", literals=("壹佰集團",))
+
+
+@pytest.mark.parametrize("text,literal", (("兩公斤", "公斤"), ("兩年半", "半")))
+def test_literal_masking_cannot_strip_a_suffix_from_an_uncovered_han_quantity(text, literal):
+    assert not evidence.factual_rendering_is_bound_v2(text, text, literals=(literal,))
+
+
 def test_one_of_is_selection_and_preserves_qualifiers():
     check = evidence.factual_rendering_is_bound_v2
     assert check("one of the following roles", "其中一個角色")
@@ -72,11 +109,69 @@ def test_embedded_units_and_explicit_bounds_are_not_erased_or_inferred():
     assert not check("6 months", "六年")
 
 
+@pytest.mark.parametrize("source,target", (
+    ("about 6 months", "六個月"),
+    ("approximately 6 months", "六個月"),
+    ("6 months", "約六個月"),
+    ("within 6 months", "六個月"),
+    ("around 6 months", "六個月"),
+))
+def test_approximation_and_deadline_qualifiers_are_never_erased_or_added(source, target):
+    assert not evidence.factual_rendering_is_bound_v2(source, target)
+
+
+@pytest.mark.parametrize("source,target", (
+    ("about 6 months", "約六個月"),
+    ("approximately 6 months", "約六個月"),
+    ("around 6 months", "約六個月"),
+    ("within 6 months", "六個月內"),
+    ("within 6 months", "六個月期限內"),
+))
+def test_approximation_and_deadline_pairs_bind_the_complete_qualified_occurrence(source, target):
+    assert evidence.localised_fact_is_bound_v2(source, target, source, source, target)
+    assert evidence.factual_rendering_is_bound_v2(source, target, ((source, target),))
+
+
+def test_qualified_occurrences_keep_their_operator_value_and_lookup_boundary():
+    check = evidence.factual_rendering_is_bound_v2
+    assert not check("6 months", "六個月期限內")
+    assert not check("about 6 months", "約七個月")
+    assert not check("within 6 months", "最多六個月")
+    assert not check("within 6 months", "約六個月")
+    for source, target in (("about 6 months", "約六個月"), ("within 6 months", "六個月期限內")):
+        assert not evidence.localised_fact_is_bound_v2("6 months", "六個月", source, source, target)
+        assert not check(source, target, (("6 months", "六個月"),))
+    assert not check("about 6 months", "六個月", literals=("about",))
+
+
 def test_partial_quantity_key_and_unknown_units_are_not_laundered():
     assert not evidence.localised_fact_is_bound_v2("£2", "二英鎊", "£2 million", "£2 million", "二英鎊")
     assert not evidence.factual_rendering_is_bound_v2("2 kg", "2 m", (("2", "2"),))
     assert not evidence.factual_rendering_is_bound_v2("-2", "2", (("2", "2"),))
     assert not evidence.factual_rendering_is_bound_v2("1/2", "1", (("1", "1"),))
+
+
+@pytest.mark.parametrize("source,target", (
+    ("2 years", "兩年半"),
+    ("2°C", "華氏2度"),
+    ("2噸", "2毫升"),
+    ("2度", "2呎"),
+))
+def test_unsupported_suffixes_and_units_do_not_become_shorter_known_facts(source, target):
+    assert not evidence.factual_rendering_is_bound_v2(source, target)
+    assert not evidence.factual_rendering_is_bound_v2(target, target)
+    assert not evidence.factual_rendering_is_bound_v2(source, target, (("2", "2"),))
+
+
+@pytest.mark.parametrize("source,target", (
+    ("next year", "下個月"),
+    ("yesterday", "明天"),
+))
+def test_uncertified_relative_time_never_becomes_empty_fact_streams(source, target):
+    assert not evidence.factual_rendering_is_bound_v2(source, target)
+    assert not evidence.factual_rendering_is_bound_v2(source, source)
+    assert not evidence.factual_rendering_is_bound_v2(target, target)
+    assert not evidence.factual_rendering_is_bound_v2("The scheme is open.", target)
 
 
 def test_opaque_literals_and_certified_derived_year_pairs():
@@ -103,6 +198,10 @@ def test_opaque_literals_and_certified_derived_year_pairs():
 
 def test_modal_may_is_not_a_calendar_month():
     assert evidence.factual_rendering_is_bound_v2("The customer may apply.", "客戶可以申請。")
+
+
+def test_semiconductors_are_ordinary_prose_not_a_half_quantity():
+    assert evidence.factual_rendering_is_bound_v2("The scheme supports semiconductors.", "計劃支援半導體。")
 
 
 def _reference(contract):

@@ -63,3 +63,46 @@ def test_v3_reported_content_failure_is_not_v4_retry_credit(tmp_path, monkeypatc
             assert connection.execute('SELECT count(*) FROM model_invocation_allocations').fetchone()[0] == 1
             assert connection.execute('SELECT * FROM model_invocation_terminals').fetchall() == before
         assert len(calls) == 1
+
+
+@pytest.mark.parametrize('source,rendered,accepted', (
+    ('The scheme supports semiconductors.', '計劃支援半導體。', True),
+    ('The scheme lasts about 6 months.', '計劃為期六個月。', False),
+    ('The scheme lasts around 6 months.', '計劃為期六個月。', False),
+    ('The scheme lasts 6 months.', '計劃為期約六個月。', False),
+    ('The scheme lasts about 6 months.', '計劃為期約六個月。', True),
+    ('The scheme lasts 2 years.', '計劃為期兩年半。', False),
+    ('The temperature is 2°C.', '氣溫為華氏2度。', False),
+    ('容量為2噸。', '容量為2毫升。', False),
+    ('The scheme begins next year.', '計劃下個月開始。', False),
+    ('The scheme opened yesterday.', '計劃明天推出。', False),
+))
+def test_v4_rendering_boundary_preserves_complete_facts(source, rendered, accepted):
+    import json
+    state = {'source_binding': {'content_digest': digest_bytes(source.encode())},
+             'claims': {'S1L1': {'source_id': 'fixture', 'text': source,
+                                'entities': [], 'rendering_fragment_count': 1}}}
+    raw = json.dumps({'renderings': [{'span_id': 'S1L1',
+        'rendered_assertion_zh_hant_hk_fragments': [rendered],
+        'factual_localisations': [], 'quotation_source_keys': []}]}).encode()
+    if accepted:
+        assert m._renderings(raw, state, version=m.TYPED_VERSION)
+    else:
+        with pytest.raises(m.LocalisationHold, match='LOCALISATION_CONTENT_CONTRACT_HOLD') as caught:
+            m._renderings(raw, state, version=m.TYPED_VERSION)
+        assert 'LOCALISATION_NUMERIC_HOLD' in caught.value.reason_codes
+
+
+def test_v4_rendering_keeps_source_derived_next_year():
+    import json
+    source = 'The scheme begins next year.'
+    state = {'source_binding': {'content_digest': digest_bytes(source.encode()),
+        'current_scope': {'sources': [{'source_id': 'fixture', 'body': source,
+            'published_at': '2026-10-08T12:00:00Z', 'updated_at': '2026-10-08T12:00:00Z'}]}},
+        'claims': {'S1L1': {'source_id': 'fixture', 'text': source, 'entities': [],
+            'rendering_fragment_count': 1, 'source_derived_facts': [['next year', '2027年']]}}}
+    raw = json.dumps({'renderings': [{'span_id': 'S1L1',
+        'rendered_assertion_zh_hant_hk_fragments': ['計劃於2027年開始。'],
+        'factual_localisations': [{'source_lookup_key': 'next year', 'rendered_expression': '2027年'}],
+        'quotation_source_keys': []}]}).encode()
+    assert m._renderings(raw, state, version=m.TYPED_VERSION)
