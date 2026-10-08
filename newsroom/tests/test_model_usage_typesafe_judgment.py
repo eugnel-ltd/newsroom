@@ -351,3 +351,29 @@ def test_extra_bound_native_cycle_keeps_generic_observer_contract(tmp_path, monk
     with pytest.raises(ModelUsageIntegrityError, match='generic extra-binding fixture'):
         _retry_observer(usage, extra_bindings={field: value})
     assert calls == [{'ingest_id': 'ingest-1', 'before_attempt_number': 2}]
+
+
+@pytest.mark.parametrize('changed_contract', [None, 'max_total_tokens', 'command_flags', 'allowed_context_identities'])
+def test_localisation_software_upgrade_selects_latest_only_for_identical_contract(tmp_path, changed_contract):
+    from newsroom.control_plane.native_claim_localisation import localisation_policy, ROUTE, MODEL, SCHEMA_DIGEST
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError
+    usage = ModelUsageService(str(tmp_path / 'localisation-policies.sqlite3'))
+    old = localisation_policy(evidence_digest=digest_bytes(b'old proof'), qualified=True)
+    values = {**asdict(old), 'implementation_revision': digest_bytes(b'new implementation'),
+              'evidence_digest': digest_bytes(b'new proof')}
+    if changed_contract == 'max_total_tokens':
+        values[changed_contract] -= 1
+    elif changed_contract == 'command_flags':
+        values[changed_contract] = (*values[changed_contract], 'CHANGED_CONTRACT')
+    elif changed_contract == 'allowed_context_identities':
+        values[changed_contract] = (*values[changed_contract], 'CHANGED_CONTEXT')
+    new = InvocationEfficiencyPolicy.create(**values)
+    usage.register_policy(old)
+    usage.register_policy(new)
+    query = dict(workload_class=old.workload_class, provider='grok-build-cli', route=ROUTE,
+                 model=MODEL, reasoning='high', output_schema_digest=SCHEMA_DIGEST)
+    if changed_contract is None:
+        assert usage.qualified_policy(**query) == new
+    else:
+        with pytest.raises(ModelUsageAdmissionError, match='absent or ambiguous'):
+            usage.qualified_policy(**query)
