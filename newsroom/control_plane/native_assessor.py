@@ -2236,7 +2236,7 @@ class AutonomousNativeEvidenceAssessor:
             if type(enriched)is not JudgedAssessment:
                 raise NativeEvidenceHold('CONTEXT_PACKAGE_RESULT_HOLD',source_id)
             return self._validated_execution(enriched.execution,candidate,base,sources,acquired,
-                semantic_witnesses=original.semantic_witnesses, source_renderings=original.source_renderings,
+                semantic_witnesses=original.semantic_witnesses, source_renderings=enriched.source_renderings,
                 semantic_witness_reader=getattr(self._judgments,'semantic_witness_reader',None))
         if qualification_cached_only:
             from .native_assessor_judgments import JudgedAssessment
@@ -2664,7 +2664,8 @@ class AutonomousNativeEvidenceAssessor:
                     "assessment named entities differ from source evidence"
                 )
             if claim_id in rendering_refs:
-                claim_entities = source_rendering_names(SimpleNamespace(claim=claim_text),source_contexts[0])
+                claim_entities = source_rendering_names(SimpleNamespace(claim=claim_text),source_contexts[0],
+                    contract=dict(rendering_refs[claim_id])['contract'])
             named_entities = tuple(sorted(claim_entities))
             if rendered_named_entities(
                 rendered, frozenset(named_entities)
@@ -2907,7 +2908,7 @@ class AutonomousNativeEvidenceAssessor:
                 "rendered_span_digest": digest_bytes(
                     claim.rendered_named_entities[index].encode()
                 ),
-                "policy_version": (SOURCE_RENDERING_CONTRACT
+                "policy_version": (dict(claim.source_rendering_ref)['contract']
                     if entity_type == 'SOURCE_LITERAL' else NAMED_ENTITY_POLICY_VERSION),
                 "evidence_span_digest": digest_bytes(text.encode()),
                 "source_record_ids": list(claim.source_record_ids),

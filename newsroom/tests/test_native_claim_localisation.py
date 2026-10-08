@@ -22,8 +22,8 @@ NOW = datetime(2026, 10, 5, tzinfo=UTC)
 
 def test_future_policy_is_default_but_original_producer_bytes_stay_frozen():
     policy = localisation_policy(evidence_digest=digest_bytes(b'future fixture'), qualified=True)
-    assert policy.prompt_contract_version == module.ALIGNED_VERSION
-    assert policy.output_schema_digest == module.ALIGNED_SCHEMA_DIGEST
+    assert policy.prompt_contract_version == module.TYPED_VERSION
+    assert policy.output_schema_digest == module.TYPED_SCHEMA_DIGEST
     assert digest_bytes(module.LEGACY_SYSTEM.encode()) == 'sha256:cc606db25532f5bd68ecab110e4ba8bf7a5a241dd9e23b8e362d5542ea4cb60c'
     assert digest_bytes(module.SYSTEM.encode()) == 'sha256:9e97c3ae97211f9443de1182d8a0cabf489f3e85bcf0096d16c894da085f0588'
     assert module.LEGACY_SCHEMA_DIGEST == 'sha256:3039378d8ca625fa3c8bec97e4c89e63e4d2265b4282574cdf9dcda2400976d0'
@@ -334,7 +334,7 @@ def test_future_renderer_reaches_governed_materialisation_and_admission_contract
     from newsroom.control_plane.evidence import EvidenceGateEvidence, validate_governed_evidence_records
 
     original_policy = module.localisation_policy
-    monkeypatch.setattr(module, 'localisation_policy', lambda **kwargs: original_policy(version=module.ALIGNED_VERSION, **kwargs))
+    monkeypatch.setattr(module, 'localisation_policy', lambda **kwargs: original_policy(**{**kwargs, 'version': module.ALIGNED_VERSION}))
     with _selected_qualification_case(tmp_path, monkeypatch, malformed_rendering=True, fault=capability) as (
             consumer, verifier, original, candidate, base, source, acquired, _scope, proof, usage, qa, jev, render):
         selected = consumer.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
@@ -613,7 +613,7 @@ def test_future_callback_reuses_only_existing_authenticated_v2_repair_lineage(tm
 def test_sourceqa_ordinary_callbacks_reuse_v2_success_under_a_v3_policy(tmp_path, monkeypatch):
     from newsroom.tests.test_qualification_semantic_witness import _selected_qualification_case
     policy_factory = module.localisation_policy
-    monkeypatch.setattr(module, 'localisation_policy', lambda **kwargs: policy_factory(version=module.VERSION, **kwargs))
+    monkeypatch.setattr(module, 'localisation_policy', lambda **kwargs: policy_factory(**{**kwargs, 'version': module.VERSION}))
     with _selected_qualification_case(tmp_path, monkeypatch, malformed_rendering=True) as (
             consumer, verifier, original, candidate, base, source, acquired, _scope, proof, usage, qa, jev, render):
         selected = consumer.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)

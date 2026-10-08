@@ -44,7 +44,7 @@ def _case(tmp_path, monkeypatch, *, answer_change=None, source_id="HK-fixture", 
         admission=runtime.authority.objects.admit(ObjectAdmissionRequest('evidence.source','chinese-source'),body.encode(),proof=runtime.proof).admission
         source,acquired=_source(body.encode(),admission.admission_id,source_id)
         base=EvidencePackage(candidate_id='candidate-fixture',hypothesis_id='hypothesis-fixture',signal_ids=('signal-fixture',),lead_ids=('lead-fixture',),source_ids=(source_id,),observation_digests=(digest_bytes(body.encode()),),passages=(body,))
-        candidate=SimpleNamespace(candidate_id=base.candidate_id,version_id='candidate-version',canonical_bytes=canonical_json_bytes({'candidate':'fixture'}),governing_manifest=SimpleNamespace(canonical_digest=digest_bytes(b'hypothesis'),canonical_bytes=canonical_json_bytes({'hypothesis':'fixture'})))
+        candidate=SimpleNamespace(candidate_id=base.candidate_id,version_id='candidate-version',canonical_bytes=canonical_json_bytes({'candidate':'fixture'}),governing_manifest=SimpleNamespace(hypothesis_id=base.hypothesis_id,canonical_digest=digest_bytes(b'hypothesis'),canonical_bytes=canonical_json_bytes({'hypothesis':'fixture'})))
         def transport(request,**_kw):
             value=json.loads(request.data);calls.append(value);answers={}
             for key,q in value['questions'].items():
@@ -157,7 +157,7 @@ def test_current_rights_hold_denies_before_judgment_call(tmp_path,monkeypatch):
 
 
 def _localiser(consumer,service,usage,candidate,base,calls):
-    from newsroom.control_plane.native_claim_localisation import NativeClaimLocaliser, localisation_policy
+    from newsroom.control_plane.native_claim_localisation import NativeClaimLocaliser, localisation_policy, ALIGNED_VERSION
     from newsroom.control_plane.writer import WriterCliExecution
     scope=dict(candidate_id=candidate.candidate_id,hypothesis_digest=candidate.governing_manifest.canonical_digest,evidence_package_digest=base.digest,proof=consumer.proof)
     def runner(prompt):
@@ -168,7 +168,7 @@ def _localiser(consumer,service,usage,candidate,base,calls):
             {'span_id':'S1L2','rendered_assertion_zh_hant_hk_fragments':['住戶屬於此政策的適用對象。'],'factual_localisations':[],'quotation_source_keys':[]}] }).decode(),
             {'usage_basis':'PROVIDER_REPORTED','input_tokens':100,'output_tokens':30,'cached_read_tokens':0,'cached_write_tokens':0,'reasoning_tokens':0,'context_tokens':100,'total_tokens':130})
     localiser=NativeClaimLocaliser(usage=usage,objects=service.objects,
-        policy=localisation_policy(evidence_digest=digest_bytes(b'qualified-localisation-fixture'),qualified=True),source_fence=service.fence,runner=runner,implementation_worktree_clean=True,clock=lambda:datetime(2026,10,4,tzinfo=UTC))
+        policy=localisation_policy(evidence_digest=digest_bytes(b'qualified-localisation-fixture'),qualified=True,version=ALIGNED_VERSION),source_fence=service.fence,runner=runner,implementation_worktree_clean=True,clock=lambda:datetime(2026,10,4,tzinfo=UTC))
     consumer.localise=lambda request:localiser.localise(request,**scope)
     consumer.read_localisation=lambda reference,request:localiser.read_localisation(reference,request,**scope)
     return localiser,scope
@@ -196,9 +196,60 @@ def test_fresh_actual_consumer_uses_qualified_rendering_and_current_validator(tm
         assert record['render_provenance']['mode']=='QUALIFIED_LOCALISATION'
 
 
+@pytest.mark.parametrize('damage', [None, 'missing-reader', 'email', 'source-body', 'reference'])
+def test_direct_jev_v4_literal_proof_reaches_governed_admission_without_english_allowlist(tmp_path, monkeypatch, damage):
+    from newsroom.control_plane.native_claim_localisation import NativeClaimLocaliser, localisation_policy
+    from newsroom.control_plane.native_assessor_judgments import NativeSemanticWitnesses
+    from newsroom.control_plane.admission import source_rendering_is_admitted, _admitted_claim_names
+    from newsroom.control_plane.writer import WriterCliExecution
+    body = '當局現時推出新政策。\nUse the same customer help email address contact.help@education.gov.uk for post-16 funding.'
+    with _case(tmp_path, monkeypatch, body=body) as (consumer, service, candidate, base, source, acquired, usage, calls):
+        consumer.scope_for = lambda *_: {'coverage': 'COMPLETE', 'newness': 'KNOWN_CHANGE', 'prior_scope': None,
+            'current_scope': {'sources': [{'source_id': source.unit.source_id, 'body': body,
+                'published_at': '2026-10-04T00:00:00Z', 'updated_at': '2026-10-04T00:00:00Z'}]}}
+        render_calls = []
+        def runner(prompt):
+            claims = json.loads(prompt)['claims']; render_calls.append(claims)
+            assert claims['S1L2']['entities'] == [['contact.help@education.gov.uk', 'SOURCE_LITERAL'], ['post-16', 'SOURCE_LITERAL']]
+            return WriterCliExecution(canonical_json_bytes({'renderings': [
+                {'span_id': 'S1L1', 'rendered_assertion_zh_hant_hk_fragments': ['當局現時推出的是新政策。'], 'factual_localisations': [], 'quotation_source_keys': []},
+                {'span_id': 'S1L2', 'rendered_assertion_zh_hant_hk_fragments': ['請使用同一客戶支援電郵地址', '處理', '資助。'], 'factual_localisations': [], 'quotation_source_keys': []}]}).decode(),
+                {'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 100, 'output_tokens': 30, 'total_tokens': 130})
+        localiser = NativeClaimLocaliser(usage=usage, objects=service.objects,
+            policy=localisation_policy(evidence_digest=digest_bytes(b'v4 literal fixture'), qualified=True),
+            source_fence=service.fence, runner=runner, implementation_worktree_clean=True,
+            clock=lambda: datetime(2026, 10, 4, tzinfo=UTC))
+        scope = dict(candidate_id=candidate.candidate_id, hypothesis_digest=candidate.governing_manifest.canonical_digest,
+                     evidence_package_digest=base.digest, proof=consumer.proof)
+        consumer.localise = lambda state: localiser.localise(state, **scope)
+        consumer.read_localisation = lambda ref, state: localiser.read_localisation(ref, state, **scope)
+        result = consumer.assess(candidate, base, (source,), (acquired,))
+        verifier = NativeSemanticWitnesses(judgments=service, candidate_for=lambda _: candidate, proof=consumer.proof,
+                                           require_current=lambda: None)
+        verifier.rendering_reader = localiser.read_localisation
+        validated = AutonomousNativeEvidenceAssessor._validated_execution(result.execution, candidate, base, (source,), (acquired,),
+            source_renderings=result.source_renderings, semantic_witness_reader=verifier.read)
+        package = replace(base, governed_claims=validated.governed_claims, qualification_evidence=validated.qualification_evidence,
+                          substantive_new_information=validated.substantive_new_information)
+        claim = package.governed_claims[1]
+        assert claim.named_entities == ('contact.help@education.gov.uk', 'post-16')
+        assert _admitted_claim_names(claim, package) == frozenset((name, 'SOURCE_LITERAL') for name in claim.named_entities)
+        if damage == 'missing-reader': verifier.rendering_reader = None
+        elif damage == 'email':
+            claim = replace(claim, rendered_assertion_zh_hant_hk=claim.rendered_assertion_zh_hant_hk.replace('contact.help', 'contact.HELP'))
+        elif damage == 'source-body': package = replace(package, passages=(body+' Changed.',))
+        elif damage == 'reference': claim = replace(claim, source_rendering_ref=tuple((k, digest_bytes(b'forged')) if k == 'invocation_id' else (k, v) for k, v in claim.source_rendering_ref))
+        if damage:
+            with pytest.raises(ValueError): verifier.read(None, claim, package)
+        else:
+            assert source_rendering_is_admitted(claim, package, semantic_witness_reader=verifier.read)
+            assert consumer.read(result.decision_admission_id, candidate, base, (source,), (acquired,)) == result
+        assert len(calls) == 2 and len(render_calls) == 1
+
+
 def test_lossless_supporting_ranges_keep_full_roles_and_material_qualification(tmp_path,monkeypatch):
     from newsroom.control_plane.native_assessor_spans import build_lossless_source_view
-    from newsroom.control_plane.native_claim_localisation import NativeClaimLocaliser,localisation_policy
+    from newsroom.control_plane.native_claim_localisation import NativeClaimLocaliser,localisation_policy,ALIGNED_VERSION
     from newsroom.control_plane.writer import WriterCliExecution
     material={1:'當局現時推出新政策。',16:'當局現時推出教育新政策。',32:'當局現時推出醫療新政策。'}
     body='\n'.join(material.get(i,f'第{i}項政策適用於住戶。')if i<46 else '行政分隔。'for i in range(1,48))
@@ -219,7 +270,7 @@ def test_lossless_supporting_ranges_keep_full_roles_and_material_qualification(t
                 'rendered_assertion_zh_hant_hk_fragments':[row['text'].replace('適用於住戶','以住戶為適用對象').replace('當局現時推出','當局現時推出的是')],
                 'factual_localisations':[],'quotation_source_keys':[]}for key,row in claims.items()]}).decode(),
                 {'usage_basis':'PROVIDER_REPORTED','input_tokens':100,'output_tokens':30,'total_tokens':130})
-        localiser=NativeClaimLocaliser(usage=usage,objects=service.objects,policy=localisation_policy(evidence_digest=digest_bytes(b'packing fixture'),qualified=True),
+        localiser=NativeClaimLocaliser(usage=usage,objects=service.objects,policy=localisation_policy(evidence_digest=digest_bytes(b'packing fixture'),qualified=True,version=ALIGNED_VERSION),
             source_fence=service.fence,runner=runner,implementation_worktree_clean=True,clock=lambda:datetime(2026,10,4,tzinfo=UTC))
         scope=dict(candidate_id=candidate.candidate_id,hypothesis_digest=candidate.governing_manifest.canonical_digest,evidence_package_digest=base.digest,proof=consumer.proof)
         consumer.localise=lambda request:localiser.localise(request,**scope)

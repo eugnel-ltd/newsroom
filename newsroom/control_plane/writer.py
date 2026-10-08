@@ -411,6 +411,17 @@ def _writer_numeric_localisations(claim: GovernedClaimEvidence) -> tuple[tuple[s
     return pairs
 
 
+def _typed_claim_numeric_relation(claim: GovernedClaimEvidence) -> bool | None:
+    """Opt-in fact fidelity; the SourceRendering parent is admitted separately."""
+    from .evidence import SOURCE_RENDERING_CONTRACT_V2, factual_rendering_is_bound_v2
+    if dict(claim.source_rendering_ref or ()).get('contract') != SOURCE_RENDERING_CONTRACT_V2:
+        return None
+    derived = tuple((source, target) for source, target in claim.localised_factual_expressions
+                    if re.fullmatch(r'next year', source, re.I) and re.fullmatch(r'[0-9]{4}年', target))
+    return factual_rendering_is_bound_v2(claim.claim, claim.rendered_assertion_zh_hant_hk,
+        claim.localised_factual_expressions, literals=claim.named_entities, derived_pairs=derived)
+
+
 def _numeric_han_context(text: str) -> str:
     match = re.search(
         r"\d|[零〇一二三四五六七八九十百千萬万億亿兆兩两壹貳贰參叁肆伍陸陆"
@@ -1355,6 +1366,8 @@ def validate_writer_copy(
         claim.claim_id: _writer_numeric_localisations(claim)
         for claim in package.governed_claims
     }
+    typed_numeric_relations = {claim.claim_id: _typed_claim_numeric_relation(claim)
+                               for claim in package.governed_claims}
     approved_numeric_expressions = tuple(
         match.group(0)
         for claim in package.governed_claims
@@ -1367,6 +1380,14 @@ def validate_writer_copy(
         for _source, target in numeric_localisations[claim.claim_id]
         for pattern in numeric_expression_patterns
         for match in pattern.finditer(target)
+    )
+    # A v2 rendering's surface numerals/idioms are allowed only after its exact
+    # source-to-rendered typed facts pass; unrelated draft numbers still fail.
+    approved_numeric_expressions += tuple(
+        match.group(0) for claim in package.governed_claims
+        if typed_numeric_relations[claim.claim_id] is True
+        for pattern in numeric_expression_patterns
+        for match in pattern.finditer(claim.rendered_assertion_zh_hant_hk)
     )
     approved_overlap = (
         tuple(
@@ -1431,12 +1452,19 @@ def validate_writer_copy(
         for _source, target in numeric_localisations[claim.claim_id]
         for number in re.findall(r"\d+(?:[.,]\d+)*(?:%|％)?", target)
     )
+    governed_numbers.update(
+        number for claim in package.governed_claims
+        if typed_numeric_relations[claim.claim_id] is True
+        for number in re.findall(r"\d+(?:[.,]\d+)*(?:%|％)?", claim.rendered_assertion_zh_hant_hk)
+    )
     draft_numeric_expressions = {
         match.group(0)
         for pattern in numeric_expression_patterns
         for match in pattern.finditer(text)
     }
     claim_numeric_relations = all(
+        typed_numeric_relations[claim.claim_id]
+        if typed_numeric_relations[claim.claim_id] is not None else (
         _quantified_relations(source_without_localised)
         == _quantified_relations(rendered_without_localised)
         and _number_adjacent_han_relations(source_without_localised)
@@ -1458,7 +1486,7 @@ def validate_writer_copy(
         == tuple(
             match.group(0)
             for match in _CHINESE_NUMERAL_FACT.finditer(rendered_without_localised)
-        )
+        ))
         for claim in package.governed_claims
         for source_without_localised, rendered_without_localised in (
             (

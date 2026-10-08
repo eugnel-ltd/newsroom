@@ -18,6 +18,21 @@ from .native_source_qualification import VERSION as QUALIFICATION_VERSION
 VERSION = 'newsroom.native-context-materialisation.v3'
 
 
+def context_renderings(receipt):
+    """Adapt authenticated v4 slots without rewriting its retained receipt."""
+    from .native_claim_localisation import TYPED_VERSION
+    from .native_assessor_judgments import original_rendering_slots, source_rendering_projection
+    if receipt.get('version') != TYPED_VERSION:
+        return receipt['renderings']
+    original = receipt['original_state']
+    projected = receipt['projected_state']
+    if (original['source_binding'] != receipt['source_binding']
+            or projected != source_rendering_projection(original)):
+        raise ContextCompositionError('CONTEXT_LOCALISATION_PROJECTION_BINDING')
+    return {identity: original_rendering_slots(original['claims'][identity],
+        projected['claims'][identity], rendering) for identity, rendering in receipt['renderings'].items()}
+
+
 # Advisory prose is not a typed numeric/date/unit substitution. Keep anything
 # possibly factual for the original strict validator, rather than certifying it.
 _FACTUAL_EXPRESSION_TOKEN = re.compile(
@@ -156,6 +171,7 @@ def compose_context_execution(original, context_wire, localisation_receipt, *, b
     by_range = {canonical_json_bytes(value): identity for identity, value in ranges.items()}
     if len(by_range) != len(ranges):
         raise ContextCompositionError('CONTEXT_DUPLICATE_RANGE')
+    adapted_renderings = context_renderings(localisation_receipt)
     included = set()
     for claim in claims:
         identity = by_range.get(canonical_json_bytes(claim['source_range']))
@@ -165,9 +181,9 @@ def compose_context_execution(original, context_wire, localisation_receipt, *, b
         included.add(identity)
         rendering = {key: claim[key] for key in ('rendered_assertion_zh_hant_hk_fragments',
                      'factual_localisations', 'quotation_source_keys')}
-        if localisation_receipt.get('renderings', {}).get(identity) != rendering:
+        if adapted_renderings.get(identity) != rendering:
             raise ContextCompositionError('CONTEXT_LOCALISATION_WIRE_BINDING')
-    if set(localisation_receipt.get('renderings', {})) != included:
+    if set(adapted_renderings) != included:
         raise ContextCompositionError('CONTEXT_LOCALISATION_INVENTORY')
     context, context_receipt = _materialise_reference_result(canonical_json_bytes(wire), view,
                                                           digest_canonical(binding), CODEC)

@@ -25,6 +25,7 @@ from .writer import _run_grok_json, CONT_DISABLED_CAPABILITIES, _grok_command_fl
 LEGACY_VERSION = 'newsroom.native-claim-localisation.v1'
 VERSION = 'newsroom.native-claim-localisation.v2'
 ALIGNED_VERSION = 'newsroom.native-claim-localisation.v3'
+TYPED_VERSION = 'newsroom.native-claim-localisation.v4'
 CONSUMER_VERSION = 'newsroom.native-claim-localisation-consumer.v1'
 ROUTE = 'NATIVE_CLAIM_LOCALISATION'
 MODEL = 'grok-4.7'
@@ -85,6 +86,42 @@ _aligned_fields['factual_localisations']['description'] = 'Equivalent supported 
 _aligned_fields['quotation_source_keys']['uniqueItems'] = True
 _aligned_fields['quotation_source_keys']['items']['minLength'] = 1
 ALIGNED_SCHEMA_DIGEST = digest_canonical(ALIGNED_SCHEMA)
+# The earlier producer bytes remain replayable; v4 changes only future rendering.
+TYPED_SYSTEM = (
+    'Render only the supplied selected Source assertions in natural Hong Kong Traditional Chinese. '
+    'Never choose different facts or change attribution, negation, modality, values or units. '
+    'Use the exact claims dictionary keys as span_id. Return exactly entities+1 fragments; '
+    'the application inserts the supplied ordered literal/entity slots. Never repeat them in fragments. '
+    'Translate ordinary English; preserve exact source email addresses and opaque labels only through '
+    'the supplied slots. Do not interpret an opaque post-N label as a negative number or an age bound. '
+    'factual_localisations is only for exact equivalent supported facts, never a glossary. '
+    'Use full unit-labelled Source lookup keys for academic-year and financial-year ranges, '
+    'and render their numeric endpoints in Chinese with 至, preserving both bounds and the kind of year. '
+    'Plain numeric ranges may retain no additional inferred unit. Preserve quantity order, count, '
+    'precision, signs and qualifiers. A same-customer phrase is not a quantity; one-of role membership '
+    'must preserve its selection meaning. If a selection pair is emitted, use the complete matched '
+    'phrases (one of the following roles / 其中一個角色), not shorter lookup keys. '
+    'Only supplied source_derived_facts may resolve a relative year. '
+    'Render attributed speech indirectly in Chinese without introducing quotation marks; retain the '
+    'speaker and meaning. Any retained quotation must be exact Source literal text with complete '
+    'verbatim quotation_source_keys. Never put scare quotes around an unquoted Source term. '
+    'Use empty arrays when no supported factual localisation or literal quotation applies. '
+    'All lookup keys are exact Source fragments of at most 256 UTF-8 bytes. Return only the JSON schema.'
+)
+TYPED_SCHEMA = json.loads(canonical_json_bytes(ALIGNED_SCHEMA))
+TYPED_SCHEMA['properties']['renderings']['items']['properties']['factual_localisations']['description'] = (
+    'Typed equivalent quantities, complete ranges or bounded selection membership; no ordinary prose glossary.'
+)
+TYPED_SCHEMA_DIGEST = digest_canonical(TYPED_SCHEMA)
+
+
+def _project_state(state, version):
+    if version != TYPED_VERSION:
+        return state
+    from .native_assessor_judgments import source_rendering_projection
+    return source_rendering_projection(state)
+
+
 _LITERAL_NUMERIC_FORM = re.compile(
     r'[+\-−]?\d+(?:[.,]\d+)*(?:\s*(?:to|至|[-–—/:])\s*\d+(?:[.,]\d+)*)?'
     r'(?:\s*(?:years?|months?|weeks?|days?|hours?|minutes?|million|billion|thousand|'
@@ -98,6 +135,8 @@ def _contract(version):
         return SCHEMA, SYSTEM
     if version == ALIGNED_VERSION:
         return ALIGNED_SCHEMA, ALIGNED_SYSTEM
+    if version == TYPED_VERSION:
+        return TYPED_SCHEMA, TYPED_SYSTEM
     raise LocalisationHold('LOCALISATION_REPLAY_VERSION_HOLD')
 
 
@@ -112,9 +151,9 @@ class LocalisationReference:
     receipt_admission_id: ObjectAdmissionId
 
 
-def localisation_policy(*, evidence_digest, qualified, version=ALIGNED_VERSION):
+def localisation_policy(*, evidence_digest, qualified, version=TYPED_VERSION):
     schema, _system = _contract(version)
-    if version not in {VERSION, ALIGNED_VERSION}:
+    if version not in {VERSION, ALIGNED_VERSION, TYPED_VERSION}:
         raise LocalisationHold('LOCALISATION_POLICY_HOLD')
     return InvocationEfficiencyPolicy.create(policy_id=version, version=version,
         workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR, provider='grok-build-cli', route=ROUTE,
@@ -129,6 +168,7 @@ def localisation_policy(*, evidence_digest, qualified, version=ALIGNED_VERSION):
 
 
 def _prompt(state, *, version=VERSION):
+    state = _project_state(state, version)
     if type(state) is not dict or set(state) != {'source_binding', 'claims'}:
         raise LocalisationHold('LOCALISATION_INPUT_HOLD')
     validate_sha256_digest(state['source_binding']['content_digest'])
@@ -140,7 +180,7 @@ def _prompt(state, *, version=VERSION):
             raise LocalisationHold('LOCALISATION_CLAIM_INPUT_HOLD')
         if len(claim.get('entities', ())) >= 65 or claim.get('rendering_fragment_count') != len(claim.get('entities', ())) + 1:
             raise LocalisationHold('LOCALISATION_FRAGMENT_INVENTORY_HOLD')
-        if version == ALIGNED_VERSION and any(
+        if version in {ALIGNED_VERSION, TYPED_VERSION} and any(
                 type(entity) not in {tuple, list} or len(entity) != 2
                 or any(type(part) is not str or not part.strip() for part in entity)
                 or len(entity[0]) > 80 or entity[0] == claim['text'] or entity[0] not in claim['text']
@@ -171,6 +211,7 @@ def _source_span_aliases(state):
 
 
 def _renderings(raw, state, *, version=VERSION):
+    state = _project_state(state, version)
     value = json.loads(raw.decode(), object_pairs_hook=_unique_object)
     validate(value, _contract(version)[0])
     if version == LEGACY_VERSION:
@@ -202,12 +243,12 @@ def _renderings(raw, state, *, version=VERSION):
                 *(pair['source_lookup_key'] for pair in item['factual_localisations']),
                 *(pair['rendered_expression'] for pair in item['factual_localisations']))):
             raise LocalisationHold('LOCALISATION_SOURCE_KEY_BOUND_HOLD')
-    if version == ALIGNED_VERSION:
-        _validate_content(renderings, state)
+    if version in {ALIGNED_VERSION, TYPED_VERSION}:
+        _validate_content(renderings, state, version=version)
     return renderings
 
 
-def _validate_content(renderings, state):
+def _validate_content(renderings, state, *, version=ALIGNED_VERSION):
     """Complete deterministic claim boundary, not translation semantic proof."""
     from types import SimpleNamespace
     from .admission import _valid_zh_hant_hk_rendering
@@ -216,6 +257,11 @@ def _validate_content(renderings, state):
         _currency_relations, _unicode_currency_relations,
         _signed_number_relations, _CHINESE_NUMERAL_FACT, _RELATIVE_TIME_FACT,
         _unicode_quoted_contents, _unicode_quotes_are_balanced, _has_unicode_quote_delimiter)
+    if version == TYPED_VERSION:
+        from .evidence import localised_fact_is_bound_v2, factual_rendering_is_bound_v2
+        fact_is_bound = localised_fact_is_bound_v2
+    else:
+        fact_is_bound = _localised_fact_is_bound
     reasons = set()
     for identity, item in renderings.items():
         claim = state['claims'][identity]
@@ -243,7 +289,7 @@ def _validate_content(renderings, state):
             except (KeyError, ValueError, StopIteration):
                 reasons.add('LOCALISATION_DERIVED_FACT_HOLD')
         bound = [(source, target) for source, target in pairs
-            if _localised_fact_is_bound(source, target, claim['text'], claim['text'], rendered)
+            if fact_is_bound(source, target, claim['text'], claim['text'], rendered)
             or (derived == (source, target) and source in claim['text'] and target in rendered)]
         if (len({source for source, _target in pairs}) != len(pairs)
                 or len({target for _source, target in pairs}) != len(pairs)
@@ -251,34 +297,39 @@ def _validate_content(renderings, state):
             reasons.add('LOCALISATION_FACT_EQUIVALENCE_HOLD')
         if derived is not None and derived not in bound:
             reasons.add('LOCALISATION_DERIVED_FACT_HOLD')
-        def fact_stream(text, column):
-            text = _remove_exact_expressions(text, names)
-            occurrences = sorted((match.start(), match.end(), _canonical_localised_fact(source) or ('SOURCE_DERIVED_YEAR', target))
-                for source, target in bound for match in re.finditer(_entity_pattern((source, target)[column]), text))
-            if any(right[0] < left[1] for left, right in zip(occurrences, occurrences[1:])):
-                return None
-            for pattern in (_LITERAL_NUMERIC_FORM, re.compile(_CHINESE_NUMERAL_FACT.pattern + r'(?:半)?')):
-                for match in pattern.finditer(text):
-                    overlapping = [(start, end) for start, end, _fact in occurrences if match.start() < end and match.end() > start]
-                    if not overlapping:
-                        occurrences.append((match.start(), match.end(), ('LITERAL', match.group())))
-                    elif not any(start <= match.start() and match.end() <= end for start, end in overlapping):
-                        return None  # A declared fact cannot cover only part of a literal quantity.
-            return tuple(fact for _start, _end, fact in sorted(occurrences))
-        source_facts, target_facts = fact_stream(claim['text'], 0), fact_stream(rendered, 1)
-        if source_facts is None or target_facts is None or source_facts != target_facts:
-            reasons.add('LOCALISATION_NUMERIC_HOLD')
-        source_residue = _remove_exact_expressions(claim['text'], (*names, *(source for source, _target in bound)))
-        target_residue = _remove_exact_expressions(rendered, (*names, *(target for _source, target in bound)))
-        # Reuse number/unit primitives, not the offline exact-copy writer gate.
-        if (any(check(source_residue) != check(target_residue) for check in (
-                _unicode_number_relations,
-                _currency_relations, _unicode_currency_relations, _signed_number_relations))
-                or _LITERAL_NUMERIC_FORM.findall(source_residue) != _LITERAL_NUMERIC_FORM.findall(target_residue)
-                or _CHINESE_NUMERAL_FACT.findall(source_residue) != _CHINESE_NUMERAL_FACT.findall(target_residue)
-                or [match.group().casefold() for match in _RELATIVE_TIME_FACT.finditer(source_residue)] !=
-                   [match.group().casefold() for match in _RELATIVE_TIME_FACT.finditer(target_residue)]):
-            reasons.add('LOCALISATION_NUMERIC_HOLD')
+        if version == TYPED_VERSION:
+            if not factual_rendering_is_bound_v2(claim['text'], rendered, pairs,
+                    literals=names, derived_pairs=() if derived is None else (derived,)):
+                reasons.add('LOCALISATION_NUMERIC_HOLD')
+        else:
+            def fact_stream(text, column):
+                text = _remove_exact_expressions(text, names)
+                occurrences = sorted((match.start(), match.end(), _canonical_localised_fact(source) or ('SOURCE_DERIVED_YEAR', target))
+                    for source, target in bound for match in re.finditer(_entity_pattern((source, target)[column]), text))
+                if any(right[0] < left[1] for left, right in zip(occurrences, occurrences[1:])):
+                    return None
+                for pattern in (_LITERAL_NUMERIC_FORM, re.compile(_CHINESE_NUMERAL_FACT.pattern + r'(?:半)?')):
+                    for match in pattern.finditer(text):
+                        overlapping = [(start, end) for start, end, _fact in occurrences if match.start() < end and match.end() > start]
+                        if not overlapping:
+                            occurrences.append((match.start(), match.end(), ('LITERAL', match.group())))
+                        elif not any(start <= match.start() and match.end() <= end for start, end in overlapping):
+                            return None  # A declared fact cannot cover only part of a literal quantity.
+                return tuple(fact for _start, _end, fact in sorted(occurrences))
+            source_facts, target_facts = fact_stream(claim['text'], 0), fact_stream(rendered, 1)
+            if source_facts is None or target_facts is None or source_facts != target_facts:
+                reasons.add('LOCALISATION_NUMERIC_HOLD')
+            source_residue = _remove_exact_expressions(claim['text'], (*names, *(source for source, _target in bound)))
+            target_residue = _remove_exact_expressions(rendered, (*names, *(target for _source, target in bound)))
+            # Reuse number/unit primitives, not the offline exact-copy writer gate.
+            if (any(check(source_residue) != check(target_residue) for check in (
+                    _unicode_number_relations,
+                    _currency_relations, _unicode_currency_relations, _signed_number_relations))
+                    or _LITERAL_NUMERIC_FORM.findall(source_residue) != _LITERAL_NUMERIC_FORM.findall(target_residue)
+                    or _CHINESE_NUMERAL_FACT.findall(source_residue) != _CHINESE_NUMERAL_FACT.findall(target_residue)
+                    or [match.group().casefold() for match in _RELATIVE_TIME_FACT.finditer(source_residue)] !=
+                       [match.group().casefold() for match in _RELATIVE_TIME_FACT.finditer(target_residue)]):
+                reasons.add('LOCALISATION_NUMERIC_HOLD')
         quote_patterns = (
             r'"([^"\n]+)"', r'“([^”\n]+)”', r'「([^」\n]+)」', r'『([^』\n]+)』',
             r'‘([^’\n]+)’', r'〝([^〞\n]+)〞', r'﹁([^﹂\n]+)﹂', r'❝([^❞\n]+)❞',
@@ -343,7 +394,7 @@ class NativeClaimLocaliser:
         schema, system = _contract(policy.prompt_contract_version)
         if (not policy.qualified or (policy.provider, policy.route, policy.model, policy.reasoning)
                 != ('grok-build-cli', ROUTE, MODEL, 'high') or policy.output_schema_digest != digest_canonical(schema)
-                or policy.prompt_contract_version not in {VERSION, ALIGNED_VERSION} or implementation_worktree_clean is not True
+                or policy.prompt_contract_version not in {VERSION, ALIGNED_VERSION, TYPED_VERSION} or implementation_worktree_clean is not True
                 or policy.implementation_revision != digest_bytes(Path(__file__).read_bytes())):
             raise LocalisationHold('LOCALISATION_POLICY_HOLD')
         usage.register_policy(policy)
@@ -363,6 +414,7 @@ class NativeClaimLocaliser:
                     'evidence_package_digest': evidence_package_digest}
         digest = digest_canonical(snapshot)
         purpose = ('claim-localisation:' if version == LEGACY_VERSION else
+                   'claim-localisation-v4:' if version == TYPED_VERSION else
                    'claim-localisation-v3:' if version == ALIGNED_VERSION else 'claim-localisation-v2:')
         if repair_of is not None:
             purpose = 'claim-localisation-v2-repair:'+repair_of+':'
@@ -371,7 +423,7 @@ class NativeClaimLocaliser:
             candidate_id=candidate_id, hypothesis_digest=hypothesis_digest,
             evidence_package_digest=evidence_package_digest, ingest_id=None, graphiti_attempt_id=None)
         p = self.policy
-        manifest_version = ALIGNED_VERSION if version == ALIGNED_VERSION else VERSION
+        manifest_version = version if version in {ALIGNED_VERSION, TYPED_VERSION} else VERSION
         schema, system = _contract(manifest_version)
         schema_digest = digest_canonical(schema)
         manifest = dict(schema_version=manifest_version, provider=p.provider, route=ROUTE, model=MODEL, reasoning='high',
@@ -419,7 +471,7 @@ class NativeClaimLocaliser:
             if (tuple(row[:3]) != (manifest.get('provider'), manifest.get('route'), manifest.get('evidence_package_digest'))
                     or manifest.get('evidence_package_digest') != expected_snapshot['evidence_package_digest']
                     or manifest.get('source_snapshot_digest') != digest_canonical(expected_snapshot)
-                    or version not in {LEGACY_VERSION, VERSION, ALIGNED_VERSION}
+                    or version not in {LEGACY_VERSION, VERSION, ALIGNED_VERSION, TYPED_VERSION}
                     or manifest.get('context_manifest_digest') != allocation.context_manifest_digest
                     or digest_canonical(unsigned) != allocation.context_manifest_digest
                     or manifest.get('system_digest') != digest_bytes(system.encode())
@@ -475,7 +527,7 @@ class NativeClaimLocaliser:
                     requested_max_output_tokens=allocation.max_output_tokens) is not None:
                 raise LocalisationHold('LOCALISATION_LEGACY_FAILURE_HOLD')
             repair_of = legacy.invocation_id
-        if version == ALIGNED_VERSION:
+        if version in {ALIGNED_VERSION, TYPED_VERSION}:
             # Reuse authenticated old successes, including an already-paid v2
             # repair. A missing/failed repair never grants a new v3 purpose.
             old_prompt, _, old_envelope, _ = self._input(state, version=VERSION, repair_of=repair_of, **scope)
@@ -491,6 +543,19 @@ class NativeClaimLocaliser:
                 return reference
             if repair_of is not None:
                 raise LocalisationHold('LOCALISATION_PRIOR_RESULT_UNAVAILABLE')
+        if version == TYPED_VERSION:
+            # Original input, before literal projection, remains the old paid purpose.
+            old_prompt, _, old_envelope, _ = self._input(state, version=ALIGNED_VERSION, **scope)
+            old = _retained_allocation(self.usage, envelope=old_envelope,
+                prompt_digest=digest_bytes(old_prompt.encode()), policy=self.policy)
+            if old is not None:
+                _allocation, terminal, _policy = self._terminal(old.invocation_id, expected_snapshot={
+                    'state': state, **{key: scope[key] for key in ('candidate_id', 'hypothesis_digest', 'evidence_package_digest')}})
+                if terminal.outcome != 'LOCALISATION_COMPLETE':
+                    raise LocalisationHold('LOCALISATION_PRIOR_CONTRACT_HOLD')
+                reference = self._reference(old.invocation_id, proof=proof)
+                self.read_localisation(reference, state, proof=proof, **scope)
+                return reference
         prompt, snapshot, envelope, manifest = self._input(state, repair_of=repair_of, **scope)
         prior = _retained_allocation(self.usage, envelope=envelope,
             prompt_digest=digest_bytes(prompt.encode()), policy=self.policy)
@@ -541,6 +606,8 @@ class NativeClaimLocaliser:
                     'raw_admission_id': str(raw_admission.admission_id), 'raw_digest': digest_bytes(raw),
                     'schema_digest': self.policy.output_schema_digest, 'outcome': terminal.outcome, 'repair_of': repair_of,
                     'diagnostic': None if failure is None else _failure_diagnostic(failure)}
+                if version == TYPED_VERSION:
+                    receipt['original_claims'] = state['claims']
                 admitted = self.objects.admit(ObjectAdmissionRequest('evidence.record',
                     'claim-localisation-receipt:'+allocation.invocation_id),
                     canonical_json_bytes(receipt), proof=proof).admission
@@ -560,7 +627,7 @@ class NativeClaimLocaliser:
             receipt_raw = self.objects.rehydrate(HydrationRequest(reference.receipt_admission_id, 'evidence.record'), proof=proof).data
         receipt = json.loads(receipt_raw)
         version = receipt.get('version')
-        if version not in {LEGACY_VERSION, VERSION, ALIGNED_VERSION}:
+        if version not in {LEGACY_VERSION, VERSION, ALIGNED_VERSION, TYPED_VERSION}:
             raise LocalisationHold('LOCALISATION_REPLAY_VERSION_HOLD')
         repair_of = receipt.get('repair_of') if version == VERSION else None
         _prompt_value, snapshot, envelope, _manifest = self._input(state, version=version,
@@ -582,6 +649,7 @@ class NativeClaimLocaliser:
                 or terminal.policy_breach or receipt['invocation_id'] != reference.invocation_id
                 or receipt['allocation_digest'] != allocation.canonical_digest or receipt['terminal_digest'] != terminal.terminal_digest
                 or receipt['source_snapshot_digest'] != snapshot or receipt['source_binding'] != state['source_binding']
+                or (version == TYPED_VERSION and receipt.get('original_claims') != state['claims'])
                 or receipt['raw_admission_id'] != str(reference.raw_admission_id) or receipt['raw_digest'] != digest_bytes(raw)):
             raise LocalisationHold('LOCALISATION_REPLAY_BINDING_HOLD')
         renderings = _renderings(raw, state, version=version)
@@ -605,5 +673,9 @@ class NativeClaimLocaliser:
             revalidation['consumer_revalidation'] = {'consumer_contract': CONSUMER_VERSION,
                 'original_outcome': terminal.outcome, 'original_terminal_digest': terminal.terminal_digest,
                 'raw_response_digest': digest_bytes(raw), 'source_span_aliases': applied}
-        return {**receipt, **revalidation, 'renderings': renderings,
+        original = ({'source_binding': receipt['source_binding'], 'claims': receipt['original_claims']}
+                    if version == TYPED_VERSION else None)
+        projection = ({'original_state': original, 'projected_state': _project_state(original, version)}
+                      if original is not None else {})
+        return {**receipt, **revalidation, **projection, 'renderings': renderings,
                 'receipt_admission_id': str(reference.receipt_admission_id)}

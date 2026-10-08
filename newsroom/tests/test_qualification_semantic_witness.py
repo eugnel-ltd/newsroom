@@ -144,7 +144,7 @@ def test_semantic_witness_negative_boundaries_are_fail_closed(tmp_path,monkeypat
 
 
 @contextmanager
-def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False, title_body_layout=False):
+def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False, title_body_layout=False, typed_rendering=False):
     """Genuine disposable QA/TypeSafe/localiser ledgers and CAS; synthetic answers."""
     from newsroom.tests.test_native_assessor_judgments import _case as typed_case
     from newsroom.control_plane.native_assessor_judgments import JudgmentFallback
@@ -161,10 +161,13 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         'quoted-terms':'Schools now receive SEND training.',
         'year':'Schools will receive fully funded education materials next year.'}.get(fault,
         'Schools now receive fully funded practical education materials.')
-    supporting = ('The SEND programme is delivered by Ambition Institute and charity Dingley’s Promise.'
+    supporting = ('Use the same customer help email address contact.help@education.gov.uk for post-16 funding.'
+        if fault == 'email' else 'The SEND programme is delivered by Ambition Institute and charity Dingley’s Promise.'
         if fault=='terms' else 'The SEND programme is delivered by charity Dingley’s Promise, under the name “Dingley’s Promise”.'
         if fault=='quoted-terms' else 'The materials are now available to households.')
     body=headline+('\n\n'if title_body_layout else'\n')+supporting
+    if fault == 'email':
+        body = headline + '\nHouseholds now receive fully funded education materials.\n' + supporting
     with typed_case(tmp_path,monkeypatch,max_prompt_bytes=7000,body=body) as (consumer,service,candidate,base,source,acquired,usage,jev_calls):
         if candidate_binding is not None:
             candidate=candidate_binding
@@ -202,13 +205,24 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
                         answer['probabilities']={role:int(role==choice)for role in json.loads(request.data)['questions'][key]['criteria']}
                 return status,url,json.dumps(value).encode()
             service.transport=roles_with_separator
+        if fault == 'email':
+            original_transport = service.transport
+            def email_context_roles(request, **kwargs):
+                status, url, raw = original_transport(request, **kwargs)
+                value = json.loads(raw)
+                if 'S1L3' in value['answers']:
+                    answer = value['answers']['S1L3']; answer['choice'] = 'SUPPORTING'
+                    answer['probabilities'] = {role: int(role == 'SUPPORTING')
+                        for role in json.loads(request.data)['questions']['S1L3']['criteria']}
+                return status, url, json.dumps(value).encode()
+            service.transport = email_context_roles
         fallback=consumer.assess(candidate,base,(source,),(acquired,))
         assert isinstance(fallback,JudgmentFallback) and fallback.reason=='JUDGMENT_INPUT_BOUND',fallback
         wire={'package':{'select_new_information':True,'governed_claims':[
             {'claim_role':role,'status':'CONFIRMED_FACT','source_range':{'first_span_id':span,'last_span_id':span},
              'rendered_assertion_zh_hant_hk_fragments':[render], 'factual_localisations':[],'quotation_source_keys':[]}
             for role,span,render in [('HEADLINE','S1L1','Teaching materials available.' if malformed_rendering else '學校現時獲提供全額資助嘅實用教育教材。'),
-                                    ('SUBSTANTIVE','S1L3'if title_body_layout else'S1L2','教材現時可供家庭使用。')]],
+                                    ('CONTEXT' if fault == 'email' else 'SUBSTANTIVE','S1L3'if title_body_layout else'S1L2','教材現時可供家庭使用。')]],
             'qualification_evidence':[{'test':'HOUSEHOLD_PRACTICAL_EFFECT','claim_index':0,
                 'test_evidence':{'domain':'EDUCATION','event_polarity':'AFFIRMED','effect_relation':'MATERIAL_PRACTICAL_EFFECT',
                     'material_relation_span_source_lookup_key':body.split('\n')[0], 'practical_effect_source_lookup_key':body.split('\n')[0]}}],
@@ -216,6 +230,13 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         if fault=='qa-NO':
             from newsroom.tests.test_native_source_qualification import WIRE
             wire=WIRE
+        if fault == 'email':
+            contact = wire['package']['governed_claims'][1]
+            contact['source_range'] = {'first_span_id': 'S1L3', 'last_span_id': 'S1L3'}
+            wire['package']['governed_claims'].insert(1, {'claim_role': 'SUBSTANTIVE', 'status': 'CONFIRMED_FACT',
+                'source_range': {'first_span_id': 'S1L2', 'last_span_id': 'S1L2'},
+                'rendered_assertion_zh_hant_hk_fragments': ['住戶現時獲提供全額資助嘅教育教材。'],
+                'factual_localisations': [], 'quotation_source_keys': []})
         if fault=='quoted-terms':
             acquired.publisher='Dingley’s Promise'
             wire['package']['governed_claims'][1]['quotation_source_keys']=['Dingley’s Promise']
@@ -235,6 +256,14 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         service.transport=transport
         def render_runner(prompt):
             render_calls.append(prompt)
+            if fault == 'email':
+                requested = json.loads(prompt)['claims']
+                assert requested['2']['entities'] == [['contact.help@education.gov.uk', 'SOURCE_LITERAL'], ['post-16', 'SOURCE_LITERAL']]
+                return WriterCliExecution(json.dumps({'renderings': [
+                    {'span_id': '0', 'rendered_assertion_zh_hant_hk_fragments': ['學校現時獲提供全額資助嘅實用教育教材。'], 'factual_localisations': [], 'quotation_source_keys': []},
+                    {'span_id': '1', 'rendered_assertion_zh_hant_hk_fragments': ['住戶現時獲提供全額資助嘅教育教材。'], 'factual_localisations': [], 'quotation_source_keys': []},
+                    {'span_id': '2', 'rendered_assertion_zh_hant_hk_fragments': ['請使用同一客戶支援電郵地址', '處理', '資助。'], 'factual_localisations': [], 'quotation_source_keys': []}]}, ensure_ascii=False),
+                    {'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 40, 'output_tokens': 10, 'total_tokens': 50})
             if fault in {'terms','year','quoted-terms'}:
                 requested=json.loads(prompt)['claims']
                 rows=[]
@@ -253,8 +282,10 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
                  'factual_localisations':[],'quotation_source_keys':[]}for i,render in enumerate(
                     ('學校現時獲提供全額資助嘅實用教育教材。','教材現時可供家庭使用。'))]},ensure_ascii=False),
                 {'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':10,'total_tokens':50})
+        from newsroom.control_plane.native_claim_localisation import ALIGNED_VERSION, TYPED_VERSION
         localiser=NativeClaimLocaliser(usage=usage,objects=service.objects,policy=localisation_policy(
-            evidence_digest=digest_bytes(b'synthetic qualified localiser'),qualified=True),source_fence=service.fence,
+            evidence_digest=digest_bytes(b'synthetic qualified localiser'),qualified=True,
+            version=TYPED_VERSION if typed_rendering else ALIGNED_VERSION),source_fence=service.fence,
             runner=render_runner,implementation_worktree_clean=True,clock=lambda:datetime(2026,10,5,tzinfo=UTC))
         identities=dict(candidate_id=candidate.candidate_id,hypothesis_digest=candidate.governing_manifest.canonical_digest,
             evidence_package_digest=base.digest,proof=consumer.proof)
@@ -268,6 +299,10 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
             localise=lambda request:localiser.localise(request,**identities),
             read_localisation=lambda reference,request:localiser.read_localisation(reference,request,**identities))
         witness.parent_reader=post.read_semantic_parent
+        if typed_rendering:
+            from newsroom.control_plane.evidence import SOURCE_RENDERING_CONTRACT_V2
+            post.localise.rendering_contract = SOURCE_RENDERING_CONTRACT_V2
+            witness.rendering_reader = localiser.read_localisation
         yield post,witness,original,candidate,base,source,acquired,scope,consumer.proof,usage,qa_calls,jev_calls,render_calls
 
 
@@ -292,6 +327,53 @@ def test_selected_sourceqa_composes_authenticated_witness_then_optional_renderin
         import sqlite3
         with sqlite3.connect(usage.path)as db:
             assert db.execute("SELECT COUNT(*)FROM model_invocation_allocations WHERE route='NATIVE_SOURCE_QUALIFICATION'").fetchone()[0]==1
+
+
+def test_typed_consumer_keeps_deployed_v2_object_distinct_without_paid_redispatch(tmp_path,monkeypatch):
+    import sqlite3
+    from newsroom.authority import HydrationRequest, ObjectAdmissionRequest
+    from newsroom.authority.canonical import digest_canonical
+    from newsroom.control_plane import native_source_qualification_consumer as consumer_module
+    with _selected_qualification_case(tmp_path,monkeypatch,fault='email',typed_rendering=True)as(q,w,original,c,b,s,a,scope,proof,usage,qa,jev,render):
+        original_bytes=original.decision_record
+        legacy_version='newsroom.source-qualification-consumer.v2'
+        # The deployed v2 composition predates typed literal rendering, but its
+        # retained object and paid witness still belong to this exact parent.
+        with monkeypatch.context()as historical:
+            historical.setattr(consumer_module,'CONSUMER_VERSION',legacy_version)
+            historical.delattr(q.localise,'rendering_contract')
+            legacy=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        legacy_bytes=legacy.decision_record
+        legacy_decision=json.loads(legacy_bytes)
+        parent=legacy_decision['qualification_reference']
+        assert legacy_decision['consumer_contract']==legacy_version
+        assert len(qa)==1 and len(jev)==2 and render==[]
+
+        typed=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        typed_decision=json.loads(typed.decision_record)
+        assert typed_decision['consumer_contract']==consumer_module.TYPED_CONSUMER_VERSION
+        assert typed_decision['qualification_reference']==parent
+        typed_contact=json.loads(typed.execution.text)['package']['governed_claims'][2]['rendered_assertion_zh_hant_hk']
+        legacy_contact=json.loads(legacy.execution.text)['package']['governed_claims'][2]['rendered_assertion_zh_hant_hk']
+        assert 'contact.help@education.gov.uk' in typed_contact
+        assert 'contact.help@education.gov.uk' not in legacy_contact
+        legacy_key='source-qualification-consumer:'+digest_canonical([legacy_version,parent])
+        typed_key='source-qualification-consumer:'+digest_canonical([consumer_module.TYPED_CONSUMER_VERSION,parent])
+        assert typed_key!=legacy_key
+        legacy_admission=q.objects.committed_admission(ObjectAdmissionRequest('evidence.record',legacy_key),proof=proof).admission
+        typed_admission=q.objects.committed_admission(ObjectAdmissionRequest('evidence.record',typed_key),proof=proof).admission
+        assert legacy_admission.admission_id==legacy.decision_admission_id
+        assert typed_admission.admission_id==typed.decision_admission_id
+        assert typed_admission.admission_id!=legacy_admission.admission_id
+        assert q.objects.rehydrate(HydrationRequest(legacy_admission.admission_id,'evidence.record'),proof=proof).data==legacy_bytes
+        assert q.objects.rehydrate(HydrationRequest(typed_admission.admission_id,'evidence.record'),proof=proof).data==typed.decision_record
+        query=('SELECT a.invocation_id,a.record_json,t.record_json FROM model_invocation_allocations a '
+            'LEFT JOIN model_invocation_terminals t USING(invocation_id) ORDER BY a.invocation_id')
+        with sqlite3.connect(usage.path)as db:pins=db.execute(query).fetchall()
+        assert q.compose_selected(original,c,b,(s,),(a,),proof=proof)==typed
+        assert len(qa)==1 and len(jev)==2 and len(render)==1
+        with sqlite3.connect(usage.path)as db:assert db.execute(query).fetchall()==pins
+        assert original.decision_record==original_bytes and legacy.decision_record==legacy_bytes
 
 
 def test_semantic_parent_forgery_denies_before_new_witness_or_rendering(tmp_path,monkeypatch):
@@ -409,7 +491,29 @@ def test_source_rendering_capabilities_are_source_bound_and_reauthenticated(tmp_
         assert len(qa)==1 and len(jev)==2 and len(render)==1
 
 
-@pytest.mark.parametrize('capability',['terms','year'])
+@pytest.mark.parametrize('drift',['candidate-version','hypothesis-digest'])
+def test_typed_source_rendering_rejects_current_candidate_identity_drift(tmp_path,monkeypatch,drift):
+    from newsroom.control_plane.admission import source_rendering_is_admitted
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
+    with _selected_qualification_case(tmp_path,monkeypatch,fault='email',typed_rendering=True)as(q,w,original,c,b,s,a,scope,proof,usage,qa,jev,render):
+        selected=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
+        assessment=AutonomousNativeEvidenceAssessor._validated_execution(selected.execution,c,b,(s,),(a,),
+            semantic_witnesses=selected.semantic_witnesses,source_renderings=selected.source_renderings,semantic_witness_reader=w.read)
+        package=replace(b,governed_claims=assessment.governed_claims,qualification_evidence=assessment.qualification_evidence,
+            substantive_new_information=assessment.substantive_new_information)
+        claim=package.governed_claims[2]
+        assert claim.source_rendering_ref and source_rendering_is_admitted(claim,package,semantic_witness_reader=w.read)
+        with monkeypatch.context()as changed:
+            if drift=='candidate-version':changed.setattr(c,'version_id','different-current-candidate-version')
+            else:changed.setattr(c.governing_manifest,'canonical_digest',digest_bytes(b'different-current-manifest'))
+            assert c.candidate_id==package.candidate_id and c.governing_manifest.hypothesis_id==package.hypothesis_id
+            with pytest.raises(ValueError,match='typed Source rendering complete Source differs'):
+                source_rendering_is_admitted(claim,package,semantic_witness_reader=w.read)
+        assert source_rendering_is_admitted(claim,package,semantic_witness_reader=w.read)
+        assert len(qa)==1 and len(jev)==2 and len(render)==1
+
+
+@pytest.mark.parametrize('capability',['terms','year','email'])
 def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path,monkeypatch,capability):
     from newsroom.tests.test_increment10_editorial import _open_editorial_system,_evidence_facade,_native,_decision,_record_decision
     from newsroom.tests.test_increment10_ingress import _candidate,_receive
@@ -425,7 +529,8 @@ def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path
     connection,port,candidate=_candidate(candidate_path)
     ingress=open_evidence_intake_ingress(tmp_path/'selected-ingress.sqlite3')
     ack=_receive(ingress,connection,port,candidate,request_id='typed-rendering')
-    with _selected_qualification_case(tmp_path,monkeypatch,malformed_rendering=True,fault=capability,candidate_binding=candidate)as(q,w,old,c,b,s,a,scope,auth,usage,qa,jev,render):
+    with _selected_qualification_case(tmp_path,monkeypatch,malformed_rendering=True,fault=capability,candidate_binding=candidate,
+                                      typed_rendering=capability == 'email')as(q,w,old,c,b,s,a,scope,auth,usage,qa,jev,render):
         original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=auth)
         selected=q.compose_selected(original,c,b,(s,),(a,),proof=auth)
         assessment=AutonomousNativeEvidenceAssessor._validated_execution(selected.execution,c,b,(s,),(a,),

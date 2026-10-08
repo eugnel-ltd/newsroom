@@ -14,6 +14,7 @@ from .native_source_qualification import QualificationHold, QualificationReferen
 CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v4'
 # Pure consumer repairs never reopen an identical paid witness/render purpose.
 PAID_BINDING_VERSION = 'newsroom.source-qualification-consumer.v1'
+TYPED_CONSUMER_VERSION = 'newsroom.source-qualification-typed-rendering-consumer.v1'
 
 
 def current_source_passage(source):
@@ -102,9 +103,10 @@ class NativeQualifiedSourceConsumer:
         from types import SimpleNamespace
         from .native_assessor import _qualification_record_id, _reference_binding, _document
         from .native_assessor_judgments import (JudgedAssessment, SemanticWitnessMetadata, SourceRenderingMetadata,
-            source_rendering_details, source_rendering_names)
+            source_rendering_details, source_rendering_names, source_rendering_projection, original_rendering_slots)
         from .evidence import (QualificationEvidence, Evid012QualificationTest, bounded_named_entities,
-            _canonical_localised_fact, SOURCE_RENDERING_CONTRACT)
+            _canonical_localised_fact, SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2,
+            _localised_fact_is_bound)
         from .admission import _qualification_relation_is_proven
         import re
         decision = json.loads(original.decision_record)
@@ -138,6 +140,8 @@ class NativeQualifiedSourceConsumer:
         # or rendering. Deny impossible current capabilities before any render fee.
         derived = {}
         rendering_sources = []
+        typed_capable = getattr(self.localise, 'rendering_contract', None) == SOURCE_RENDERING_CONTRACT_V2
+        needs_typed = False
         for claim in claims.values():
             body = base.passages[claim.passage_index]
             try:
@@ -145,7 +149,18 @@ class NativeQualifiedSourceConsumer:
             except ValueError as exc:
                 raise QualificationHold('QUALIFICATION_SOURCE_RENDERING_UNPROVEN') from exc
             names = source_rendering_names(claim,body)
-            recognised = {name for name,_kind in names}
+            typed_names = source_rendering_names(claim, body, contract=SOURCE_RENDERING_CONTRACT_V2) if typed_capable else names
+            recognised = {name for name,_kind in typed_names}
+            if typed_capable:
+                from .writer import _CHINESE_NUMERAL_FACT, _remove_exact_expressions
+                pairs = tuple(map(tuple, claim.localised_factual_expressions))
+                source_residue = _remove_exact_expressions(claim.claim, tuple(name for name, _kind in names) + tuple(p[0] for p in pairs))
+                target_residue = _remove_exact_expressions(claim.rendered_assertion_zh_hant_hk,
+                    tuple(name for name, _kind in names) + tuple(p[1] for p in pairs))
+                needs_typed |= (typed_names != names
+                    or _CHINESE_NUMERAL_FACT.findall(source_residue) != _CHINESE_NUMERAL_FACT.findall(target_residue)
+                    or any(not _localised_fact_is_bound(source, target, claim.claim, claim.supporting_excerpt,
+                        claim.rendered_assertion_zh_hant_hk) for source, target in pairs))
             if any(token not in recognised for token in re.findall(r'\b[A-Z]{2,}\b', claim.claim)):
                 raise QualificationHold('QUALIFICATION_TYPED_ACTOR_UNSUPPORTED')
             for money in re.findall(r'£[0-9][0-9,.]*(?:\s+(?:million|billion|thousand))?',claim.claim,re.I):
@@ -162,9 +177,11 @@ class NativeQualifiedSourceConsumer:
             named_entities=tuple(name for name,_kind in derived[claim.claim_id][2])))
             and (derived[claim.claim_id][1] is None or derived[claim.claim_id][1][:2] in
                  tuple(map(tuple,claim.localised_factual_expressions)))for claim in claims.values())
+        valid_rendering = valid_rendering and not needs_typed
         if not witnesses and not rendering_sources and valid_rendering:
             return original
         rendering_ref = None
+        consumer_version = CONSUMER_VERSION
         if not valid_rendering:
             if self.localise is None or self.read_localisation is None:
                 raise QualificationHold('QUALIFICATION_RENDERING_UNAVAILABLE')
@@ -185,8 +202,23 @@ class NativeQualifiedSourceConsumer:
             rendered = self.read_localisation(rendering_ref, request)
             if rendered.get('source_binding') != request['source_binding'] or set(rendered.get('renderings', {})) != set(selected):
                 raise QualificationHold('QUALIFICATION_RENDERING_BINDING_HOLD')
+            from .native_claim_localisation import TYPED_VERSION
+            typed_result = rendered.get('version') == TYPED_VERSION
+            if typed_result:
+                if rendered.get('original_state') != request or rendered.get('projected_state') != source_rendering_projection(request):
+                    raise QualificationHold('QUALIFICATION_RENDERING_BINDING_HOLD')
+                consumer_version = TYPED_CONSUMER_VERSION
+                reference = tuple(sorted({'contract': SOURCE_RENDERING_CONTRACT_V2, 'operation': 'SOURCE_RENDERING',
+                    'invocation_id': rendering_ref.invocation_id, 'raw_admission_id': str(rendering_ref.raw_admission_id),
+                    'receipt_admission_id': str(rendering_ref.receipt_admission_id)}.items()))
+                rendering_sources = [(claim.claim_id, reference) for claim in claims.values()]
             for index, wire_claim in enumerate(raw_wire['package']['governed_claims']):
                 result = dict(rendered['renderings'][str(index)])
+                if typed_result:
+                    result = original_rendering_slots({'entities': decision['materialisation_receipt']['claim_entity_order'][index]},
+                        rendered['projected_state']['claims'][str(index)], result)
+                    wire_claim.update(result)
+                    continue
                 fragments = result['rendered_assertion_zh_hant_hk_fragments']
                 terms = selected[str(index)]['entities']
                 text = fragments[0] + ''.join(name+fragment for (name,_kind),fragment in zip(terms,fragments[1:],strict=True))
@@ -204,14 +236,14 @@ class NativeQualifiedSourceConsumer:
                 'source_view':{'passages':list(base.passages),'source_ids':list(base.source_ids)}})
         else:
             materialisation = decision['materialisation_receipt']
-        composed = {**decision, 'consumer_contract':CONSUMER_VERSION, 'materialisation_receipt':materialisation,
+        composed = {**decision, 'consumer_contract':consumer_version, 'materialisation_receipt':materialisation,
             'semantic_witnesses':[[list(key),dict(ref)]for key,ref in witnesses],
             'source_renderings':[[key,dict(ref)]for key,ref in rendering_sources],
             **({'rendering_reference':{'invocation_id':rendering_ref.invocation_id,
                 'raw_admission_id':str(rendering_ref.raw_admission_id),'receipt_admission_id':str(rendering_ref.receipt_admission_id)}}if rendering_ref else {})}
         raw = canonical_json_bytes(composed)
         admitted = self.objects.admit(ObjectAdmissionRequest('evidence.record',
-            'source-qualification-consumer:'+digest_canonical([CONSUMER_VERSION, decision['qualification_reference']])), raw, proof=proof).admission
+            'source-qualification-consumer:'+digest_canonical([consumer_version, decision['qualification_reference']])), raw, proof=proof).admission
         return JudgedAssessment(NativeAssessmentExecution(materialisation['materialised_text'], {}), raw, admitted.admission_id,
             semantic_witnesses=SemanticWitnessMetadata(tuple(witnesses)),
             source_renderings=SourceRenderingMetadata(tuple(rendering_sources)))

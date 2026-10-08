@@ -135,9 +135,11 @@ class NativeContextEnricher:
         self.require_current()
         rendering_ref=self.localiser.localise(localisation_input,proof=self.proof,**identities)
         rendering=self.localiser.read_localisation(rendering_ref,localisation_input,proof=self.proof,**identities)
+        from .native_context_materialisation import context_renderings
+        renderings = context_renderings(rendering)
         wire={'package':{'select_new_information':False,'governed_claims':[
             {'claim_role':'CONTEXT','status':'CONFIRMED_FACT','source_range':item['source_range'],
-                **rendering['renderings'][identity]}for identity,item in selected.items()],
+                **renderings[identity]}for identity,item in selected.items()],
             'qualification_evidence':[],'selection_rationale':'Source-bound supporting context.',
             'geography':[],'categories':[],'explicit_exclusions':[]}}
         from .native_assessor import _materialise_reference_result, VERSION as CODEC
@@ -145,7 +147,7 @@ class NativeContextEnricher:
             digest_canonical(context_binding), CODEC)
         assertions = {identity: claim['rendered_assertion_zh_hant_hk']
             for identity, claim in zip(selected, materialised['package']['governed_claims'], strict=True)}
-        verification_state={**public,'selected':selected,'renderings':rendering['renderings'],
+        verification_state={**public,'selected':selected,'renderings':renderings,
             'rendered_assertions':assertions,'support_contract':SUPPORT_CONTRACT}
 
         criteria={'support':'The exact complete Source supports the asserted context, not an inferred fact.',
@@ -157,7 +159,7 @@ class NativeContextEnricher:
                 ('UNSUPPORTED'if kind=='support'else'NO'):'Contradicted, changed or unsupported.','UNCERTAIN':'Unresolved.'}}
             for identity in selected for kind,instruction in criteria.items()}
         # A new input contract is not credit to repeat an unknown old batch.
-        legacy_state={**public,'selected':selected,'renderings':rendering['renderings']}
+        legacy_state={**public,'selected':selected,'renderings':renderings}
         legacy_checks=deepcopy(checks)
         for identity in selected:
             legacy_checks[identity+':entities']['instructions']=(
@@ -187,7 +189,21 @@ class NativeContextEnricher:
             'support_reference':_reference(support_ref),
             'localisation_reference':_reference(rendering_ref),
             'composition':composition,'execution':json.loads(execution.text)}
+        from .native_claim_localisation import TYPED_VERSION
+        from .native_assessor_judgments import SourceRenderingMetadata
+        source_renderings = original.source_renderings
+        if rendering.get('version') == TYPED_VERSION:
+            from .evidence import SOURCE_RENDERING_CONTRACT_V2
+            ref = tuple(sorted({'contract': SOURCE_RENDERING_CONTRACT_V2,
+                'operation': 'SOURCE_RENDERING', **_reference(rendering_ref)}.items()))
+            original_ids = {row['claim_id'] for row in json.loads(original.execution.text)['package']['governed_claims']}
+            context_refs = tuple((row['claim_id'], ref) for row in record['execution']['package']['governed_claims']
+                                 if row['claim_id'] not in original_ids)
+            source_renderings = SourceRenderingMetadata(
+                (() if source_renderings is None else source_renderings.references) + context_refs)
+            record['source_renderings'] = [[key, dict(value)] for key, value in source_renderings.references]
         self.require_current()
         admitted=self.objects.admit(ObjectAdmissionRequest('evidence.record',
             'native-context-package:'+digest_canonical(record)),canonical_json_bytes(record),proof=self.proof).admission
-        return JudgedAssessment(execution,canonical_json_bytes(record),admitted.admission_id)
+        return JudgedAssessment(execution,canonical_json_bytes(record),admitted.admission_id,
+            semantic_witnesses=original.semantic_witnesses, source_renderings=source_renderings)

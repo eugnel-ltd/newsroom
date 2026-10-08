@@ -691,7 +691,8 @@ def source_rendering_is_admitted(claim, package, *, semantic_witness_reader=None
 def _admitted_claim_names(claim, package):
     if claim.source_rendering_ref:
         from .native_assessor_judgments import source_rendering_names
-        return source_rendering_names(claim, package.passages[claim.passage_index])
+        return source_rendering_names(claim, package.passages[claim.passage_index],
+            contract=dict(claim.source_rendering_ref)['contract'])
     return bounded_named_entities(claim.claim, source_context=package.passages[claim.passage_index])
 
 
