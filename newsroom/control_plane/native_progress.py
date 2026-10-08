@@ -545,19 +545,6 @@ class NativeRevisionJournal:
         record = self._records.get(revision_id)
         return None if record is None else record.ordinal
 
-    def graphiti_last_served(self, revisions: tuple[tuple[str, NativeSourceHeader], ...]) -> dict[str, str]:
-        """Read indexed attempt times for selected headers, never bodies or receipts."""
-        served = {}
-        for revision_id, header in revisions:
-            ingests = tuple(ingest for ingest, _digest in header.unit_index)
-            row = self._connection.execute(
-                'SELECT MAX(at) FROM unpublished_graphiti_attempt_receipts WHERE ingest_id IN ('
-                + ','.join('?' for _ in ingests) + ')', ingests,
-            ).fetchone()
-            if row[0] is not None:
-                served[revision_id] = row[0]
-        return served
-
     def summary(self, revision_id: str) -> dict:
         """Return detached inline continuation metadata, never a full pair."""
         logical = self._summaries.get(revision_id)
