@@ -408,10 +408,11 @@ def test_observed_corporate_report_exposes_its_html_child_inventory():
     assert caught.value.child_items[0] == (child["url"], child["title"])
 
 
+@pytest.mark.parametrize("document_type", ["regulation", "decision", "impact_assessment", "research"])
 @pytest.mark.parametrize("binary", [False, True])
-def test_observed_regulation_exposes_its_exact_attachment_inventory(binary):
+def test_observed_regulation_exposes_its_exact_attachment_inventory(binary, document_type):
     value = _dfe_correspondence_shape()
-    value["document_type"] = "regulation"
+    value["document_type"] = document_type
     if binary:
         value["details"]["attachments"] = [{
             "attachment_type": "file",
@@ -431,9 +432,11 @@ def test_observed_regulation_exposes_its_exact_attachment_inventory(binary):
     assert caught.value.unsupported_attachments == (expected if binary else ())
 
 
+@pytest.mark.parametrize("document_type", ["correspondence", "decision", "impact_assessment", "research"])
 @pytest.mark.parametrize("mutation", ["schema", "body", "attachments", "duplicate"])
-def test_correspondence_hold_never_masks_invalid_metadata(mutation):
+def test_correspondence_hold_never_masks_invalid_metadata(mutation, document_type):
     value = _dfe_correspondence_shape()
+    value["document_type"] = document_type
     if mutation == "schema":
         value["schema_name"] = "unknown"
     elif mutation == "body":
