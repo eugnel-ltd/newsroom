@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
+import re
 from pathlib import Path
 import sqlite3
 
@@ -23,6 +24,7 @@ from .writer import _run_grok_json, CONT_DISABLED_CAPABILITIES, _grok_command_fl
 
 LEGACY_VERSION = 'newsroom.native-claim-localisation.v1'
 VERSION = 'newsroom.native-claim-localisation.v2'
+CONSUMER_VERSION = 'newsroom.native-claim-localisation-consumer.v1'
 ROUTE = 'NATIVE_CLAIM_LOCALISATION'
 MODEL = 'grok-4.7'
 COMMAND_FLAGS = _grok_command_flags('high', model=MODEL)
@@ -95,6 +97,25 @@ def _prompt(state, *, version=VERSION):
     return canonical_json_bytes({'contract': version, 'claims': claims}).decode()
 
 
+def _source_span_aliases(state):
+    """Only an unambiguous single Source span may identify a rendering slot."""
+    aliases = {}
+    for identity, claim in state['claims'].items():
+        source_range = claim.get('source_range')
+        if type(source_range) is not dict or set(source_range) != {'first_span_id', 'last_span_id'}:
+            continue
+        span = source_range['first_span_id']
+        if (span != source_range['last_span_id'] or type(span) is not str
+                or re.fullmatch(r'S[1-9][0-9]*L[1-9][0-9]*', span) is None):
+            continue
+        if span == identity:
+            continue
+        if span in aliases or span in state['claims']:
+            raise LocalisationHold('LOCALISATION_SPAN_PARTITION_HOLD')
+        aliases[span] = identity
+    return aliases
+
+
 def _renderings(raw, state, *, version=VERSION):
     value = json.loads(raw.decode(), object_pairs_hook=_unique_object)
     validate(value, LEGACY_SCHEMA if version == LEGACY_VERSION else SCHEMA)
@@ -107,6 +128,15 @@ def _renderings(raw, state, *, version=VERSION):
             if identity in renderings:
                 raise LocalisationHold('LOCALISATION_DUPLICATE_SPAN_HOLD')
             renderings[identity] = {key: value for key, value in item.items() if key != 'span_id'}
+        if set(renderings) != set(state['claims']):
+            aliases = _source_span_aliases(state)
+            mapped = {}
+            for identity, item in renderings.items():
+                slot = aliases.get(identity, identity)
+                if slot in mapped:
+                    raise LocalisationHold('LOCALISATION_DUPLICATE_SPAN_HOLD')
+                mapped[slot] = item
+            renderings = mapped
     if set(renderings) != set(state['claims']):
         raise LocalisationHold('LOCALISATION_SPAN_PARTITION_HOLD')
     for identity, item in renderings.items():
@@ -346,17 +376,44 @@ class NativeClaimLocaliser:
         _prompt_value, snapshot, envelope, _manifest = self._input(state, version=version,
             repair_of=repair_of, **scope)
         schema_digest = LEGACY_SCHEMA_DIGEST if version == LEGACY_VERSION else SCHEMA_DIGEST
+        revalidate = (version == VERSION and terminal.outcome == 'LOCALISATION_FAILED'
+            and terminal.failure_class == 'LocalisationHold'
+            and receipt.get('diagnostic') == {'failure_class': 'LocalisationHold',
+                                             'reason': 'LOCALISATION_SPAN_PARTITION_HOLD'})
+        expected_outcome = 'LOCALISATION_FAILED' if revalidate else 'LOCALISATION_COMPLETE'
         if (canonical_json_bytes(receipt) != receipt_raw or not policy.qualified
                 or allocation.envelope_id != envelope.envelope_id or allocation.prompt_digest != digest_bytes(_prompt_value.encode())
                 or allocation.route != ROUTE or allocation.provider != 'grok-build-cli'
                 or policy.prompt_contract_version != version or policy.output_schema_digest != schema_digest
                 or allocation.prompt_contract_version != version or allocation.output_schema_digest != schema_digest
                 or (version == VERSION and (receipt.get('schema_digest') != schema_digest
-                    or receipt.get('outcome') != 'LOCALISATION_COMPLETE' or receipt.get('diagnostic') is not None))
-                or terminal is None or terminal.outcome != 'LOCALISATION_COMPLETE' or terminal.usage_status is not UsageStatus.REPORTED
+                    or receipt.get('outcome') != expected_outcome or (not revalidate and receipt.get('diagnostic') is not None)))
+                or terminal is None or terminal.outcome != expected_outcome or terminal.usage_status is not UsageStatus.REPORTED
                 or terminal.policy_breach or receipt['invocation_id'] != reference.invocation_id
                 or receipt['allocation_digest'] != allocation.canonical_digest or receipt['terminal_digest'] != terminal.terminal_digest
                 or receipt['source_snapshot_digest'] != snapshot or receipt['source_binding'] != state['source_binding']
                 or receipt['raw_admission_id'] != str(reference.raw_admission_id) or receipt['raw_digest'] != digest_bytes(raw)):
             raise LocalisationHold('LOCALISATION_REPLAY_BINDING_HOLD')
-        return {**receipt, 'renderings': _renderings(raw, state, version=version), 'receipt_admission_id': str(reference.receipt_admission_id)}
+        renderings = _renderings(raw, state, version=version)
+        revalidation = {}
+        if revalidate:
+            aliases = _source_span_aliases(state)
+            applied = {item['span_id']: aliases[item['span_id']]
+                       for item in json.loads(raw)['renderings'] if item['span_id'] in aliases}
+            if (not applied or len(raw) > 262144 or terminal.pre_dispatch_zero_proved
+                    or terminal.dispatch_at is None or terminal.components.provenance != 'PROVIDER_REPORTED'
+                    or ModelUsageService._validate_terminal(terminal, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+                        policy, requested_max_output_tokens=allocation.max_output_tokens) is not None):
+                raise LocalisationHold('LOCALISATION_REPLAY_USAGE_HOLD')
+            with sqlite3.connect(Path(self.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as connection:
+                if not _has_exact_dispatch(connection, terminal):
+                    raise LocalisationHold('LOCALISATION_REPLAY_USAGE_HOLD')
+                dispatches = connection.execute('SELECT observed_at,evidence_digest FROM model_transport_observations '
+                    "WHERE invocation_id=? AND state='DISPATCH_STARTED'", (allocation.invocation_id,)).fetchall()
+                if len(dispatches) != 1 or tuple(dispatches[0]) != (_utc_text(terminal.dispatch_at), allocation.request_digest):
+                    raise LocalisationHold('LOCALISATION_REPLAY_USAGE_HOLD')
+            revalidation['consumer_revalidation'] = {'consumer_contract': CONSUMER_VERSION,
+                'original_outcome': terminal.outcome, 'original_terminal_digest': terminal.terminal_digest,
+                'raw_response_digest': digest_bytes(raw), 'source_span_aliases': applied}
+        return {**receipt, **revalidation, 'renderings': renderings,
+                'receipt_admission_id': str(reference.receipt_admission_id)}

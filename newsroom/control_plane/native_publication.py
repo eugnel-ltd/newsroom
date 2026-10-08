@@ -1407,7 +1407,7 @@ class NativePublicationContinuation:
                 or semantic_intent is None
                 and progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
                 and facts.get('reason') == 'ACQUISITION_RESULT_NOT_RETAINED'
-                and facts.get('failure_class') == 'QualificationHold'
+                and facts.get('failure_class') in {'QualificationHold', 'LocalisationHold'}
             )
             and same_assessment_producer(facts.get('assessment_contract_version'), self._assessment_contract_version)
             and facts.get('assessment_contract_version') != self._assessment_contract_version
