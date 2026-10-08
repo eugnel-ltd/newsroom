@@ -1709,108 +1709,6 @@ def _quantum_pending_graphiti(pipeline, journal, now):
     return completed, extracted
 
 
-def test_current_frontiers_rotate_after_retained_service_and_journal_reopen(tmp_path, monkeypatch):
-    from newsroom.control_plane.store import insert_graphiti_attempt_receipt
-
-    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
-    dispositions[0] = ()
-    now = [0.0]
-    pipeline._monotonic_clock = lambda: now[0]
-    chains = []
-    for name, observed in (
-        ("archive", "2026-10-08T06:34:00Z"),
-        ("high-ranked-multichunk", "2026-10-08T16:18:00Z"),
-        ("bno-like-unstarted", "2026-10-08T15:56:04Z"),
-    ):
-        first = replace(_native(name), chunk_count=9,
-            canonical_url=f"https://www.gov.uk/guidance/{name}",
-            effective_revision=replace(_native().effective_revision, first_observed_at=observed))
-        chunks = [first]
-        for ordinal in range(2, 10):
-            chunks.append(replace(first, chunk_ordinal=ordinal, predecessor_ingest_id=chunks[-1].ingest_id))
-        journal.land(tuple(chunks))
-        chains.append(tuple(chunks))
-    completed, extracted = _quantum_pending_graphiti(pipeline, journal, now)
-    graphiti = pipeline._graphiti.advance
-
-    def retain_service(selected, **request):
-        before = set(completed)
-        outcomes = graphiti(selected, **request)
-        for unit in selected:
-            if unit.ingest_id in completed - before:
-                assert unit.predecessor_ingest_id is None or unit.predecessor_ingest_id in before
-                insert_graphiti_attempt_receipt(connection, ingest_id=unit.ingest_id, attempt_number=1,
-                    outcome="COMPLETE", receipt={"ingest_id": unit.ingest_id, "outcome": "COMPLETE"})
-        return outcomes
-
-    pipeline._graphiti = NS(advance=retain_service)
-    try:
-        expected = [("high-ranked-multichunk", 1), ("archive", 1), ("bno-like-unstarted", 1),
-                    ("archive", 2), ("high-ranked-multichunk", 2), ("archive", 3), ("bno-like-unstarted", 2)]
-        for index in range(7):
-            if index == 2:
-                pipeline._journal = NativeRevisionJournal(connection)
-            pipeline.tick(cycle_id=f"retained-frontier-turn-{index}")
-            assert extracted == expected[:index + 1]
-            assert pipeline._spill_archive_turn is (index % 2 == 0)
-        assert now[0] == 7 * 301
-        assert connection.execute("SELECT count(*) FROM unpublished_graphiti_attempt_receipts").fetchone()[0] == 7
-        assert all(pipeline._journal.units[chain[0].revision_id] == chain for chain in chains)
-    finally:
-        connection.close()
-
-
-@pytest.mark.parametrize("archive", (False, True))
-def test_retained_frontier_fairness_keeps_news_tier_and_reads_only_selected_metadata(tmp_path, monkeypatch, archive):
-    import sqlite3
-    from newsroom.control_plane import store
-    from newsroom.control_plane.native_progress import source_header
-
-    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
-    dispositions[0] = ()
-    pipeline._spill_archive_turn = archive
-    now = [0.0]
-    pipeline._monotonic_clock = lambda: now[0]
-    reference = replace(_native("unserved-reference"), updated_at="2026-10-08T17:00:00Z",
-                        canonical_url="https://www.gov.uk/government/publications/newer-reference")
-    news = replace(_native("recently-served-news"), chunk_count=2, updated_at="2026-10-08T16:00:00Z",
-                   canonical_url="https://www.gov.uk/government/news/new-material")
-    news_next = replace(news, chunk_ordinal=2, predecessor_ingest_id=news.ingest_id)
-    speech = replace(_native("least-recently-served-speech"), chunk_count=2, updated_at="2026-10-08T15:00:00Z",
-                     canonical_url="https://www.gov.uk/government/speeches/earlier-material")
-    speech_next = replace(speech, chunk_ordinal=2, predecessor_ingest_id=speech.ingest_id)
-    for units in ((reference,), (news, news_next), (speech, speech_next)):
-        journal.land(units)
-    for unit, attempt, at in ((news, 1, "2026-10-08T18:00:00.000000Z"),
-                             (speech, 1, "2026-10-08T18:00:01.000000Z"),
-                             (news, 2, "2026-10-08T18:00:02.000000Z"),
-                             (_native("unrelated-history"), 1, "2026-10-08T18:00:03.000000Z")):
-        monkeypatch.setattr(store, "_now", lambda: at)
-        store.insert_graphiti_attempt_receipt(connection, ingest_id=unit.ingest_id, attempt_number=attempt,
-            outcome="COMPLETE", receipt={"ingest_id": unit.ingest_id, "outcome": "COMPLETE"})
-    headers = tuple((unit.revision_id, source_header(journal.units, unit.revision_id)) for unit in (news, speech))
-    before = connection.total_changes
-    connection.set_authorizer(lambda operation, _table, column, *_rest:
-        sqlite3.SQLITE_DENY if operation == sqlite3.SQLITE_READ and column in {"receipt_json", "content_json"}
-        else sqlite3.SQLITE_OK)
-    try:
-        assert journal.graphiti_last_served(headers) == {
-            news.revision_id: "2026-10-08T18:00:02.000000Z",
-            speech.revision_id: "2026-10-08T18:00:01.000000Z",
-        }
-        assert connection.total_changes == before
-    finally:
-        connection.set_authorizer(None)
-    completed, extracted = _quantum_pending_graphiti(pipeline, journal, now)
-    completed.update((news.ingest_id, speech.ingest_id))
-    try:
-        pipeline.tick(cycle_id="retained-news-tier-or-archive")
-        # Current fairness stays inside the news tier; archive remains LAND/FIFO.
-        assert extracted == ([(reference.item_key, 1)] if archive else [(speech.item_key, 2)])
-    finally:
-        connection.close()
-
-
 def test_pending_govuk_new_body_precedes_187_newer_public_dates_and_keeps_archive_turn(
     tmp_path, monkeypatch,
 ):
@@ -2621,3 +2519,36 @@ def test_news_priority_keeps_equal_class_stable_and_archive_land_order(tmp_path,
         assert selected==[unit.revision_id for unit in (units if archive else (units[3],units[1],units[2],units[0]))]
         assert set(journal.units)=={unit.revision_id for unit in units}
     finally:connection.close()
+
+
+@pytest.mark.parametrize('old_served', (False, True))
+def test_recent_incomplete_revision_keeps_priority_over_older_attempt_inventory(tmp_path, monkeypatch, old_served):
+    from newsroom.control_plane import store
+    pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+    old = replace(_native('old-reference'), chunk_count=2,
+        canonical_url='https://www.gov.uk/guidance/old-reference',
+        effective_revision=replace(_native().effective_revision, first_observed_at='2026-09-08T06:34:00Z'))
+    recent = replace(_native('recent-incomplete'), chunk_count=2,
+        canonical_url='https://www.gov.uk/guidance/recent-incomplete',
+        effective_revision=replace(_native().effective_revision, first_observed_at='2026-10-08T15:56:04Z'))
+    for unit in (old, recent):
+        journal.land((unit, replace(unit, chunk_ordinal=2, predecessor_ingest_id=unit.ingest_id)))
+    completed, extracted = _quantum_pending_graphiti(pipeline, journal, now)
+    for unit, at in ((old, '2026-10-08T21:00:00.000000Z'), (recent, '2026-10-08T21:19:00.000000Z')):
+        if unit is old and not old_served:
+            continue
+        monkeypatch.setattr(store, '_now', lambda: at)
+        store.insert_graphiti_attempt_receipt(connection, ingest_id=unit.ingest_id, attempt_number=1,
+            outcome='COMPLETE', receipt={'ingest_id': unit.ingest_id, 'outcome': 'COMPLETE'})
+        completed.add(unit.ingest_id)
+    pipeline._journal = NativeRevisionJournal(connection)
+    try:
+        pipeline.tick(cycle_id='recent-completion-before-old-history')
+        assert extracted == [('recent-incomplete', 2)]
+        pipeline.tick(cycle_id='archive-still-has-its-turn')
+        assert extracted[-1] == ('old-reference', 2 if old_served else 1)
+    finally:
+        connection.close()

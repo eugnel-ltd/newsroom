@@ -235,10 +235,6 @@ class NativePipeline:
         # Archive turns keep LAND order so later arrivals cannot starve history.
         if pending_revisions and not self._spill_archive_turn:
             pending_revisions.sort(key=lambda item: (_news_or_speech_header(item), _source_update_time(item)), reverse=True)
-            # Rotate retained chunk frontiers within the existing news tier.
-            # Unserved/tied revisions retain the initial source-recency order.
-            served = self._journal.graphiti_last_served(tuple(pending_revisions))
-            pending_revisions.sort(key=lambda item: (not _news_or_speech_header(item), served.get(item[0], '')))
         pending_revisions = tuple(pending_revisions)
         fresh_deadline = self._monotonic_clock() + self._reassessment_quantum
         pending_turn_taken = False
