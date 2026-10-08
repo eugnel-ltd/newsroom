@@ -381,3 +381,23 @@ def test_first_historical_land_is_future_identity_without_rewriting_three_old_al
         assert tuple(case.runtime.authority.sources.revision(
             SourceRevisionId.parse(unit.authority.revision_id), proof=case.runtime.proof,
         ) for unit in original_units) == revisions
+
+
+def test_pending_alias_lookup_does_not_rehash_chunk_bodies(tmp_path, monkeypatch):
+    from newsroom.control_plane.corpus import CorpusIngestUnit
+    from newsroom.control_plane.items import SourceItem
+
+    with _case(tmp_path, monkeypatch) as case:
+        case.bodies[SOURCE_URLS['UK-01']] = _feed(PARENTS[0])
+        retained = case.intake.poll()[0].units
+        assert retained and case.intake._pending_units
+        item = SourceItem('UK-01', TAG_KEY, 'Feed alias', 'Feed alias', CANONICAL)
+        version = retained[0].authority.definition_version_id
+
+        def unexpected_hash(_unit):
+            pytest.fail('alias lookup must not hash or rechunk retained bodies')
+
+        monkeypatch.setattr(CorpusIngestUnit, 'ingest_id', property(unexpected_hash))
+        assert case.intake._manual_item_key('UK-01', version, item) == retained[0].item_key
+        assert case.intake._manual_item_key('UK-02', version, item) == TAG_KEY
+        assert case.intake._manual_item_key('UK-01', 'another-version', item) == TAG_KEY

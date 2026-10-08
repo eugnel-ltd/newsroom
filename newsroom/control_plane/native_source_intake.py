@@ -816,10 +816,16 @@ class NativeSourceIntake:
             return item.item_key
         # First journal LAND wins, then the first successful retention this poll.
         # Keep that exact namespace and its original ancestry proof.
-        for unit in chain(iter_source_headers(self._retained_units),
-                          iter_source_headers(self._pending_units)):
+        # Pending tuples already share one Source identity. Constructing a full
+        # header here needlessly rehashes every chunk body for every alias lookup.
+        candidates = chain(
+            ((header, header.definition_version_id) for header in iter_source_headers(self._retained_units)),
+            ((units[0], None if units[0].authority is None else units[0].authority.definition_version_id)
+             for units in self._pending_units.values()),
+        )
+        for unit, definition_version in candidates:
             if (unit.source_id == source_id
-                    and unit.definition_version_id == str(version_id)
+                    and definition_version == str(version_id)
                     and unit.canonical_url == item.canonical_url
                     and self._govuk_item_path(unit) == path):
                 return unit.item_key

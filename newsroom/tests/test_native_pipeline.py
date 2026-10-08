@@ -177,17 +177,107 @@ def test_native_pipeline_continues_multiple_revisions_and_skips_acknowledged(tmp
         connection.close()
 
 
-def test_current_output_restoration_runs_once_after_canonical_landing_before_provider_work(tmp_path,monkeypatch):
+@pytest.mark.parametrize("intake_failure", (False, True))
+def test_retained_candidate_continues_before_slow_intake_and_new_work_keeps_its_turn(
+    tmp_path, monkeypatch, intake_failure,
+):
+    pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
+    retained, fresh = units
+    journal.land((retained,))
+    journal.advance(retained.revision_id, stage="CANDIDATE_ADMITTED", facts={
+        "graphiti_receipts": [{"retained": True}], "candidate_version_id": "candidate:one",
+    })
+    now = [0.0]
+    pipeline._monotonic_clock = lambda: now[0]
+
+    def poll():
+        calls.append(("poll", "current"))
+        # Assert the durable consumer result at intake entry, not after its
+        # whole-source barrier returns. A real poll overran this quantum by 29m.
+        assert journal.current(retained.revision_id)["stage"] == "ACKNOWLEDGED"
+        now[0] += 1_778
+        if intake_failure:
+            raise RuntimeError("source intake failed after retained continuation")
+        return dispositions[0]  # Re-observe retained work alongside a fresh revision.
+
+    pipeline._intake = NS(poll=poll)
+    try:
+        if intake_failure:
+            with pytest.raises(RuntimeError, match="source intake failed"):
+                pipeline.tick(cycle_id="retained-before-failed-intake")
+            assert set(journal.units) == {retained.revision_id}
+            assert not any(kind == "graphiti" for kind, _ in calls)
+        else:
+            report = pipeline.tick(cycle_id="retained-before-slow-intake")
+            assert report.revision_states == {"ACKNOWLEDGED": 2}
+            assert calls.count(("graphiti", fresh.item_key)) == 1
+            assert calls.count(("publish", fresh.revision_id)) == 1
+            assert set(journal.units) == {retained.revision_id, fresh.revision_id}
+        assert calls.count(("publish", retained.revision_id)) == 1
+        assert calls.count(("poll", "current")) == 1
+        assert calls[:3] == [("rights", "current"), ("publish", retained.revision_id), ("poll", "current")]
+        assert NativeRevisionJournal(connection).current(retained.revision_id)["stage"] == "ACKNOWLEDGED"
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("signal", ("stop", "drain"))
+def test_rights_refresh_stop_or_drain_prevents_retained_work_and_source_poll(tmp_path, monkeypatch, signal):
+    pipeline, journal, connection, units, calls, _ = _open(tmp_path, monkeypatch)
+    unit = units[0]
+    journal.land((unit,))
+    journal.advance(unit.revision_id, stage="CANDIDATE_ADMITTED", facts={
+        "graphiti_receipts": [{"retained": True}], "candidate_version_id": "candidate:one",
+    })
+    signalled = [False]
+    def refresh():
+        calls.append(("rights", "current"))
+        signalled[0] = True
+    def check():
+        if signalled[0] and signal == "stop":
+            raise VetoError("owner stop after current rights")
+    pipeline._refresh_rights = refresh
+    pipeline._check = check
+    pipeline._operator_drain_requested = lambda: signalled[0] and signal == "drain"
+    pipeline._intake = NS(poll=lambda: pytest.fail("stopped tick polled sources"))
+    try:
+        with pytest.raises(VetoError if signal == "stop" else OperatorDrainRequested):
+            pipeline.tick(cycle_id="rights-before-retained-stop")
+        assert calls == [("rights", "current")]
+        assert journal.current(unit.revision_id)["stage"] == "CANDIDATE_ADMITTED"
+    finally:
+        connection.close()
+
+
+def test_current_output_restoration_precedes_retained_copy_correction_and_fresh_intake(tmp_path,monkeypatch):
     pipeline,journal,connection,units,calls,dispositions = _open(tmp_path,monkeypatch)
+    retained, fresh = units
+    journal.land((retained,))
+    journal.advance(retained.revision_id, stage='ACKNOWLEDGED', facts={
+        'graphiti_receipts': [{'retained': True}], 'candidate_version_id': 'candidate:one',
+    })
     def restore():
-        assert set(journal.units)=={unit.revision_id for unit in units}
+        assert set(journal.units)=={retained.revision_id}
         calls.append(('restore','current'))
     pipeline._publish.restore_current_output = restore
+    pipeline._publish.copy_correction_due = lambda facts: True
+    original_advance, original_poll = pipeline._publish.advance, pipeline._intake.poll
+    def advance(**kwargs):
+        assert ('restore','current') in calls
+        return original_advance(**kwargs)
+    def poll():
+        calls.append(('poll','current'))
+        return original_poll()
+    pipeline._publish.advance = advance
+    pipeline._intake = NS(poll=poll)
     try:
         pipeline.tick(cycle_id='current-output-restoration')
         assert calls.count(('restore','current'))==1
-        assert calls.index(('rights','current'))<calls.index(('restore','current'))
-        assert calls.index(('restore','current'))<next(index for index,item in enumerate(calls)if item[0]=='graphiti')
+        assert calls[:4] == [('rights','current'), ('restore','current'),
+                            ('publish',retained.revision_id), ('poll','current')]
+        assert calls.count(('publish',retained.revision_id)) == 1
+        assert calls.count(('graphiti',fresh.item_key)) == 1
+        assert calls.count(('publish',fresh.revision_id)) == 1
     finally:
         connection.close()
 
@@ -1058,8 +1148,8 @@ def test_ordinary_downstream_quantum_preserves_next_revision_until_next_poll(tmp
         assert journal.current(units[1].revision_id) == previous
         pipeline.tick(cycle_id="second")
         assert [call for call in calls if call[0] in {"poll", "publish"}] == [
-            ("poll", "current"), ("publish", units[0].revision_id),
-            ("poll", "current"), ("publish", units[1].revision_id),
+            ("publish", units[0].revision_id), ("poll", "current"),
+            ("publish", units[1].revision_id), ("poll", "current"),
         ]
     finally:
         connection.close()
@@ -1272,9 +1362,9 @@ def test_unknown_settlement_keeps_priority_but_defers_next_unit_after_quantum(tm
         pipeline.tick(cycle_id="next-continuation")
         assert now[0] == 903
         assert [call for call in calls if call[0] in {"poll", "settle"}] == [
-            ("poll", "current"), ("settle", units[0].revision_id),
-            ("poll", "current"), ("settle", units[0].revision_id),
-            ("poll", "current"), ("settle", units[1].revision_id),
+            ("settle", units[0].revision_id), ("poll", "current"),
+            ("settle", units[0].revision_id), ("poll", "current"),
+            ("settle", units[1].revision_id), ("poll", "current"),
         ]
         assert journal.current(ordinary.revision_id) == previous[ordinary.revision_id]
         assert journal.current(units[1].revision_id) == previous[units[1].revision_id]

@@ -134,33 +134,25 @@ class NativePipeline:
             self._refresh_rights()
         self._check()
         self._drain_between_work()
-        with _native_phase("SOURCE_POLL", cycle_id=cycle_id, cohort_count=1):
-            dispositions = self._intake.poll()
-        self._journal.sources(dispositions)
-        grouped = defaultdict(list)
-        for disposition in dispositions:
-            for unit in disposition.units:
-                grouped[unit.revision_id].append(unit)
-        for revision_id, units in grouped.items():
-            self._journal.land(tuple(units))
-        self._drain_between_work()
         restore = getattr(self._publish, 'restore_current_output', None)
         if callable(restore):
             with _native_phase('RESTORE_CURRENT_OUTPUT', cycle_id=cycle_id,
                                cohort_count=len(self._journal.units)):
                 restore()
             self._drain_between_work()
-
         with _native_phase("CLASSIFY", cycle_id=cycle_id, cohort_count=len(self._journal.units)):
             # Fixed disjoint cohorts attempt each revision at most once per tick.
-            # Retained downstream work must not wait behind fresh model requests.
-            ordinary, reassessments, pending_revisions = [], [], []
+            # Retained downstream work must not wait behind whole-source intake
+            # or fresh model requests. Current rights were refreshed above.
+            ordinary, reassessments = [], []
+            downstream_revisions = set()
             for revision_id in self._journal.units:
                 previous = self._journal.summary(revision_id)
                 facts = previous.get("facts", {})
                 if not facts.get("graphiti_receipts"):
-                    cohort = pending_revisions
-                elif previous.get("stage") == "EVIDENCE_HOLD" and self._semantic_upgrade_due(facts):
+                    continue
+                downstream_revisions.add(revision_id)
+                if previous.get("stage") == "EVIDENCE_HOLD" and self._semantic_upgrade_due(facts):
                     cohort = ordinary
                 elif previous.get("stage") == "EVIDENCE_HOLD" and assessment_revalidation_due(
                     facts, self._assessment_contract_version,
@@ -209,6 +201,26 @@ class NativePipeline:
             for revision, previous in ordinary_before.items()
         )
         self._drain_between_work()
+        self._check()
+        with _native_phase("SOURCE_POLL", cycle_id=cycle_id, cohort_count=1):
+            dispositions = self._intake.poll()
+        self._journal.sources(dispositions)
+        grouped = defaultdict(list)
+        for disposition in dispositions:
+            for unit in disposition.units:
+                grouped[unit.revision_id].append(unit)
+        for revision_id, units in grouped.items():
+            self._journal.land(tuple(units))
+        self._drain_between_work()
+        # Include newly landed revisions in this tick's complete Graphiti cohort,
+        # but never give a tick-start downstream revision a second turn after
+        # ordinary recovery changed its stage or retained receipt inventory.
+        pending_revisions = [
+            (revision_id, source_header(self._journal.units, revision_id))
+            for revision_id in self._journal.units
+            if revision_id not in downstream_revisions
+            and not self._journal.summary(revision_id).get("facts", {}).get("graphiti_receipts")
+        ]
         # Reuse one current/archive preference for pending and ready work.
         # Archive turns keep LAND order so later arrivals cannot starve history.
         if not self._spill_archive_turn:
