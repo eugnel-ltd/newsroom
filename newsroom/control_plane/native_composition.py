@@ -413,7 +413,8 @@ def deployed_native_service(args):
         ):
             raise ValueError("native assessor profile differs before authority OPEN")
         from .typesafe_judgment import ROUTE as JUDGMENT_ROUTE, SCHEMA_DIGEST as JUDGMENT_SCHEMA
-        from .native_claim_localisation import ROUTE as LOCALISATION_ROUTE, SCHEMA_DIGEST as LOCALISATION_SCHEMA
+        from .native_claim_localisation import (ROUTE as LOCALISATION_ROUTE,
+            ALIGNED_SCHEMA_DIGEST as LOCALISATION_SCHEMA, ALIGNED_VERSION as LOCALISATION_VERSION)
         from . import typesafe_judgment, native_claim_localisation
         from newsroom.authority.canonical import digest_bytes
         from .model_usage import ModelUsageAdmissionError
@@ -427,6 +428,7 @@ def deployed_native_service(args):
                     implementation_revision=digest_bytes(Path(typesafe_judgment.__file__).read_bytes()))
                 rendering_policy = usage.qualified_policy(workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
                     provider='grok-build-cli', route=LOCALISATION_ROUTE, model='grok-4.7', reasoning='high',
+                    config_identity=LOCALISATION_VERSION,
                     output_schema_digest=LOCALISATION_SCHEMA,
                     implementation_revision=digest_bytes(Path(native_claim_localisation.__file__).read_bytes()))
                 if (semantic_policy.implementation_revision != typesafe_judgment.implementation_digest()
