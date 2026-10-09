@@ -155,6 +155,7 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
     from newsroom.authority.canonical import digest_canonical
     from datetime import UTC, datetime
     headline={'actor':'Schools now receive SEND practical education materials.',
+        'occurrence':'Schools now receive fully funded practical education materials as part of the programme.',
         'date':'Schools could receive practical education materials next year.',
         'value':'Schools now receive £0.50 for practical education materials.',
         'terms':'Schools now receive SEND training.',
@@ -306,6 +307,12 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         service.transport=transport
         def render_runner(prompt):
             render_calls.append(prompt)
+            if fault == 'occurrence':
+                return WriterCliExecution(json.dumps({'renderings': [
+                    {'span_id': str(index), 'rendered_assertion_zh_hant_hk_fragments': [text],
+                     'factual_localisations': [], 'quotation_source_keys': []}
+                    for index, text in enumerate(('學校現時獲提供全額資助嘅實用教育教材，作為計劃的一部分。', '教材現時可供家庭使用。'))]}, ensure_ascii=False),
+                    {'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 40, 'output_tokens': 10, 'total_tokens': 50})
             if renderer_fault == 'timeout':
                 raise TimeoutError('unknown rendering transport')
             if renderer_fault == 'invalid':

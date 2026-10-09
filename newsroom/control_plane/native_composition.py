@@ -81,7 +81,7 @@ from .native_assessor_spans import PARTITION_VERSION
 from .native_source_qualification_consumer import (
     CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION, RESOLUTION_CONSUMER_VERSION, CORRECTED_RESOLUTION_CONSUMER_VERSION, REPLAY_CONSUMER_VERSION, RENDERING_REPAIR_CONSUMER_VERSION,
 )
-from .evidence import EvidencePackage
+from .evidence import EvidencePackage, SOURCE_RENDERING_CONTRACT_V3
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
 from .native_weather_sources import poll_other_source
 from .native_weather_evidence import NativeWeatherEvidenceAcquisition, POLICY_DIGEST as WEATHER_TRANSPORT_POLICY
@@ -100,6 +100,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"+{REPLAY_CONSUMER_VERSION}"
     f"+{RENDERING_REPAIR_CONSUMER_VERSION}"
     f"+{CACHED_ASSESSMENT_ORIGIN_VERSION}"
+    f"+{SOURCE_RENDERING_CONTRACT_V3}"
 )
 
 TRANSPORT_POLICY = digest_canonical({

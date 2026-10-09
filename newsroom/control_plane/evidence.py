@@ -1442,6 +1442,94 @@ def localised_fact_is_bound_v2(source, target, claim, excerpt, rendered) -> bool
 
 def factual_rendering_is_bound_v2(source, rendered, pairs=(), *, literals=(), derived_pairs=()) -> bool:
     """Compare ordered complete typed occurrences, never infer source units."""
+    return _factual_rendering_is_bound(source, rendered, pairs, literals=literals,
+        derived_pairs=derived_pairs, occurrences=lambda text, _source: _factual_occurrences_v2(text))
+
+
+def _source_bound_occurrences(text, source, source_side):
+    """Complete grammatical expressions over selected Source, not numeral waivers."""
+    from datetime import date
+    legacy = list(_factual_occurrences_v2(text))
+    overlays, lexical = [], []
+    qualifier = re.compile(r'(?:only|exactly|at least|at most|more than|less than|up to|about|approximately|around|'
+        r'只有|只限|只|僅(?:限|僅)?|仅(?:限|仅)?|恰好|正好|至少|最少|不少於|最多|至多|不多於|超過|多於|少於|不足|大約|約)\s*$', re.I)
+    def preceding(start):
+        return qualifier.search(text[:start])
+    def following(end):
+        return re.match(r'[^，。；、\n]{0,24}(?:而已|為限|为限)(?=$|[，。；、\n])', text[end:])
+    def add(start, end, fact):
+        prefix = preceding(start)
+        if prefix:
+            bound = canonical_localised_fact_v2(prefix.group() + '1')
+            fact = ('BOUND', bound[1], fact) if bound and bound[0] == 'BOUND' and fact is not None else None
+            start = prefix.start()
+        if following(end):
+            fact = None  # A post-nominal restriction is not an indefinite article.
+        if not any(start < right and left < end for left, right, _ in overlays):
+            overlays.append((start, end, fact))
+    weekdays = 'Monday Tuesday Wednesday Thursday Friday Saturday Sunday'.split()
+    pattern = re.compile(r'\b(?:' + '|'.join(weekdays) + r')\b|(?:星期|週|周)[一二三四五六日天]', re.I)
+    weekday_rows, used = list(pattern.finditer(text)), set()
+    def weekday(value):
+        if value.isascii():
+            return [word.casefold() for word in weekdays].index(value.casefold()) + 1
+        return {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '日': 7, '天': 7}[value[-1]]
+    for start, end, fact in legacy:
+        if not fact or fact[0] != 'DATE_TIME':
+            continue
+        adjacent = [match for match in weekday_rows if
+            (match.end() <= start and re.fullmatch(r'\s*', text[match.end():start])) or
+            (match.start() >= end and re.fullmatch(r'\s*[（(]?\s*', text[end:match.start()]))]
+        if len(adjacent) == 1:
+            match = adjacent[0]; number = weekday(match.group()); used.add(match.span())
+            try:
+                consistent = None not in fact[1:4] and date(*fact[1:4]).isoweekday() == number
+            except ValueError:
+                consistent = False
+            add(min(start, match.start()), max(end, match.end()), ('DATED_WEEKDAY', fact, number) if consistent else None)
+    for match in weekday_rows:
+        if match.span() not in used:
+            add(match.start(), match.end(), ('WEEKDAY', weekday(match.group())))
+    for match in re.finditer(r'\b(?:mid[- ]year|year[- ]end)\b|年中|年終', text, re.I):
+        add(match.start(), match.end(), ('PERIOD_PHASE', 'MID_YEAR' if re.fullmatch(r'mid[- ]year|年中', match.group(), re.I) else 'YEAR_END'))
+    number = _FACT_NUMBER_V2
+    counts = (rf'(?P<number>{number})\s+(?:people|persons?|teachers?|students?|learners?|trainees?|employees?|workers?|patients?|children|adults?)(?![A-Za-z])'
+        if source_side else rf'(?P<number>{number})(?:名|位|人)(?=[\u3400-\u9fff]|[，。；、）)])')
+    for match in re.finditer(counts, text, re.I):
+        fact = canonical_localised_fact_v2(match['number'])
+        if fact and fact[0] == 'NUMBER':
+            add(match.start(), match.end(), ('COUNT', 'PERSON', fact[1]))
+    if source_side:
+        for match in re.finditer(r'\b[0-9]+\s+(?P<unit>months?|years?)\s*\(currently\s+(?P<prior>[0-9]+)\)', text, re.I):
+            add(match.start('prior'), match.end('prior'), canonical_localised_fact_v2(match['prior'] + ' ' + match['unit']))
+    else:
+        for match in list(re.finditer(r'一部分', text))[:len(re.findall(r'\bpart of\b', source, re.I))]:
+            if not preceding(match.start()) and not following(match.end()):
+                lexical.append(match.span())
+        available = len(re.findall(r'\b(?:a|an)\s+[a-z][a-z-]*', source))
+        for match in re.finditer(r'一(?:個|份|項|件|種)(?=[\u3400-\u9fff])', text):
+            if (available and not preceding(match.start()) and not following(match.end())
+                    and not any(match.start() < end and start < match.end() and fact is not None for start, end, fact in legacy)
+                    and not any(match.start() < end and start < match.end() for start, end in lexical)):
+                lexical.append(match.span()); available -= 1
+    spans = [(start, end) for start, end, _ in overlays] + lexical
+    return tuple(sorted([row for row in legacy if not any(row[0] < end and start < row[1] for start, end in spans)] + overlays))
+
+
+def factual_rendering_is_bound_v3(source, rendered, pairs=(), *, literals=(), derived_pairs=()) -> bool:
+    """Source-bound occurrence consumer; historical v4 producer slots stay fixed."""
+    if type(source) is not str:
+        return False
+    context = source
+    if isinstance(literals, (tuple, list)):
+        for literal in literals:
+            if type(literal) is str and literal:
+                context = re.sub(_entity_pattern(literal), lambda match: ' ' * len(match.group()), context)
+    return _factual_rendering_is_bound(source, rendered, pairs, literals=literals,
+        derived_pairs=derived_pairs, occurrences=lambda text, source_side: _source_bound_occurrences(text, context, source_side))
+
+
+def _factual_rendering_is_bound(source, rendered, pairs, *, literals, derived_pairs, occurrences):
     if type(source) is not str or type(rendered) is not str:
         return False
     for rows in (pairs, derived_pairs):
@@ -1464,7 +1552,7 @@ def factual_rendering_is_bound_v2(source, rendered, pairs=(), *, literals=(), de
         for column, matches in enumerate(spans):
             literal_spans[column].extend((match.start(), match.end()) for match in matches)
     for column, spans in enumerate(literal_spans):
-        for start, end, fact in _factual_occurrences_v2(original[column]):
+        for start, end, fact in occurrences(original[column], column == 0):
             if any(left < end and start < right for left, right in spans) and not any(left <= start and end <= right for left, right in spans):
                 if fact is not None or any((original[column][index].isnumeric() or original[column][index] == "半")
                     and not any(left <= index < right for left, right in spans) for index in range(start, end)):
@@ -1477,7 +1565,7 @@ def factual_rendering_is_bound_v2(source, rendered, pairs=(), *, literals=(), de
         return False
     if any((left, right) not in derived and not localised_fact_is_bound_v2(left, right, source, source, rendered) for left, right in pairs):
         return False
-    before, after = _factual_occurrences_v2(source), _factual_occurrences_v2(rendered)
+    before, after = occurrences(source, True), occurrences(rendered, False)
     before, after = list(before), list(after)
     for left, right in derived:
         if not re.fullmatch(r"next year", left, re.I) or not re.fullmatch(r"[0-9]{4}年", right) or not 1 <= int(right[:-1]) <= 9999:
@@ -1522,6 +1610,7 @@ class ClaimAuthorityClass(StrEnum):
 
 SOURCE_RENDERING_CONTRACT = 'newsroom.source-qualified-rendering.v1+newsroom.native-source-term-bindings.v1'
 SOURCE_RENDERING_CONTRACT_V2 = 'newsroom.source-qualified-rendering.v2+newsroom.native-source-term-bindings.v2'
+SOURCE_RENDERING_CONTRACT_V3 = 'newsroom.source-qualified-rendering.v3+newsroom.native-source-term-bindings.v2'
 
 
 def source_rendering_reference(ref):
@@ -1530,7 +1619,7 @@ def source_rendering_reference(ref):
         raise ValueError('Source rendering reference differs')
     value = dict(ref)
     if (len(value) != len(ref) or set(value) != {'contract','operation','invocation_id','raw_admission_id','receipt_admission_id'}
-            or value.get('contract') not in {SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2}
+            or value.get('contract') not in {SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3}
             or value.get('operation') != 'SOURCE_RENDERING'):
         raise ValueError('Source rendering reference differs')
     semantic_witness_reference(tuple(sorted({**{k:v for k,v in value.items() if k != 'operation'},
@@ -1703,7 +1792,7 @@ class GovernedClaimEvidence:
             target for _source, target in self.localised_factual_expressions
         )
         fact_is_bound = (localised_fact_is_bound_v2 if self.source_rendering_ref
-            and dict(self.source_rendering_ref)['contract'] == SOURCE_RENDERING_CONTRACT_V2
+            and dict(self.source_rendering_ref)['contract'] in {SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3}
             else _localised_fact_is_bound)
         if (
             len(set(localised_sources)) != len(localised_sources)
