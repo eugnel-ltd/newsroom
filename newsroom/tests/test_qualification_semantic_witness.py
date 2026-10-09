@@ -144,7 +144,7 @@ def test_semantic_witness_negative_boundaries_are_fail_closed(tmp_path,monkeypat
 
 
 @contextmanager
-def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False, title_body_layout=False, typed_rendering=False):
+def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False, title_body_layout=False, typed_rendering=False, resolve_disagreements=False, resolution_fault=None, batch=False):
     """Genuine disposable QA/TypeSafe/localiser ledgers and CAS; synthetic answers."""
     from newsroom.tests.test_native_assessor_judgments import _case as typed_case
     from newsroom.control_plane.native_assessor_judgments import JudgmentFallback
@@ -165,6 +165,8 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         if fault == 'email' else 'The SEND programme is delivered by Ambition Institute and charity Dingley’s Promise.'
         if fault=='terms' else 'The SEND programme is delivered by charity Dingley’s Promise, under the name “Dingley’s Promise”.'
         if fault=='quoted-terms' else 'The materials are now available to households.')
+    if batch:
+        supporting = 'Colleges now receive fully funded practical education materials.'
     body=headline+('\n\n'if title_body_layout else'\n')+supporting
     if fault == 'email':
         body = headline + '\nHouseholds now receive fully funded education materials.\n' + supporting
@@ -230,6 +232,13 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         if fault=='qa-NO':
             from newsroom.tests.test_native_source_qualification import WIRE
             wire=WIRE
+        if batch:
+            from copy import deepcopy
+            second = deepcopy(wire['package']['qualification_evidence'][0])
+            second['claim_index'] = 1
+            second['test_evidence']['material_relation_span_source_lookup_key'] = supporting
+            second['test_evidence']['practical_effect_source_lookup_key'] = supporting
+            wire['package']['qualification_evidence'].append(second)
         if fault == 'email':
             contact = wire['package']['governed_claims'][1]
             contact['source_range'] = {'first_span_id': 'S1L3', 'last_span_id': 'S1L3'}
@@ -243,13 +252,25 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         qa_calls=[];render_calls=[]
         def qa_runner(_prompt):
             qa_calls.append(_prompt)
-            return NativeAssessmentExecution(canonical_json_bytes(wire).decode(),{'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':10,'total_tokens':50})
+            if len(qa_calls) > 1 and resolution_fault == 'timeout':
+                raise TimeoutError('unknown resolution transport')
+            response = wire
+            if len(qa_calls) > 1 and resolution_fault == 'NO':
+                from newsroom.tests.test_native_source_qualification import WIRE
+                response = WIRE
+            if len(qa_calls) > 1 and resolution_fault == 'changed':
+                from copy import deepcopy
+                response = deepcopy(wire)
+                response['package']['qualification_evidence'][0]['test_evidence']['domain'] = 'HOUSING'
+            return NativeAssessmentExecution(canonical_json_bytes(response).decode(),{'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':10,'total_tokens':50})
         old_transport=service.transport
         def transport(request,**kwargs):
             data=json.loads(request.data)
             if 'criterion' not in data['questions']:return old_transport(request,**kwargs)
             jev_calls.append(data)
-            choice='NO' if fault=='NO' else 'YES'
+            if fault == 'timeout':
+                raise TimeoutError('unknown witness transport')
+            choice=fault if fault in {'NO', 'UNCERTAIN'} else 'YES'
             return 200,request.full_url,json.dumps({'model':'jev-1.13.0','answers':{'criterion':{'type':'choice','choice':choice,
                 'confidence':1,'probabilities':{key:int(key==choice)for key in data['questions']['criterion']['criteria']} }},
                 'usage':{'input_tokens':40,'output_tokens':10}}).encode()
@@ -297,13 +318,167 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         from newsroom.control_plane.native_source_qualification_consumer import NativeQualifiedSourceConsumer
         post=NativeQualifiedSourceConsumer(qualifier,semantic_witnesses=witness,
             localise=lambda request:localiser.localise(request,**identities),
-            read_localisation=lambda reference,request:localiser.read_localisation(reference,request,**identities))
+            read_localisation=lambda reference,request:localiser.read_localisation(reference,request,**identities),
+            **({'resolve_disagreements': True} if resolve_disagreements else {}))
         witness.parent_reader=post.read_semantic_parent
         if typed_rendering:
             from newsroom.control_plane.evidence import SOURCE_RENDERING_CONTRACT_V2
             post.localise.rendering_contract = SOURCE_RENDERING_CONTRACT_V2
             witness.rendering_reader = localiser.read_localisation
         yield post,witness,original,candidate,base,source,acquired,scope,consumer.proof,usage,qa_calls,jev_calls,render_calls
+
+
+@pytest.mark.parametrize('choice', ('NO', 'UNCERTAIN'))
+def test_known_sourceqa_witness_disagreement_has_one_bound_resolution_and_proof_only_admission(tmp_path, monkeypatch, choice):
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    with _selected_qualification_case(tmp_path, monkeypatch, fault=choice, resolve_disagreements=True) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        selected = post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        original_bytes = original.decision_record
+        assessment = AutonomousNativeEvidenceAssessor._validated_execution(selected.execution, candidate, base,
+            (source,), (acquired,), semantic_witnesses=selected.semantic_witnesses,
+            semantic_witness_reader=witness.read, source_renderings=selected.source_renderings)
+        package = replace(base, governed_claims=assessment.governed_claims,
+            qualification_evidence=assessment.qualification_evidence, substantive_new_information=assessment.substantive_new_information)
+        q = package.qualification_evidence[0]
+        assert dict(q.semantic_witness_ref)['contract'] == 'newsroom.qualification-semantic-resolution.v1'
+        assert qualification_relation_is_admitted(q, package.governed_claims[0], package, semantic_witness_reader=witness.read)
+        assert len(qa) == 2 and len(jev) == 2 and render == []
+        assert original.decision_record == original_bytes
+        replay = read_current_result(post.qualifier, candidate, base, (source,), (acquired,), scope=scope, proof=proof)
+        assert replay == original
+        assert post.compose_selected(replay, candidate, base, (source,), (acquired,), proof=proof) == selected
+        assert len(qa) == 2 and len(jev) == 2
+
+
+def test_all_settled_dissent_is_resolved_in_one_batch_not_per_claim(tmp_path, monkeypatch):
+    with _selected_qualification_case(tmp_path, monkeypatch, fault='NO', resolve_disagreements=True, batch=True) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        selected = post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        assert len(selected.semantic_witnesses.references) == 2
+        assert len(qa) == 2 and len(jev) == 3 and render == []
+        resolution = json.loads(qa[1])
+        assert len(resolution['judgments']) == 2
+        assert all(row['answers']['criterion']['choice'] == 'NO' for row in resolution['judgments'])
+        assert len({dict(ref)['resolution_invocation_id'] for _, ref in selected.semantic_witnesses.references}) == 1
+
+
+@pytest.mark.parametrize('fault', (None, 'timeout', 'qa-NO'))
+def test_resolution_has_no_extra_call_without_a_complete_known_disagreement(tmp_path, monkeypatch, fault):
+    with _selected_qualification_case(tmp_path, monkeypatch, fault=fault, resolve_disagreements=True) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        for _ in range(2):
+            if fault == 'timeout':
+                with pytest.raises(ValueError, match='UNKNOWN_HOLD'):
+                    post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+            else:
+                selected = post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+                assert all(dict(ref)['contract'] == 'newsroom.qualification-semantic-witness.v1'
+                           for _, ref in (selected.semantic_witnesses.references if selected.semantic_witnesses else ()))
+        assert len(qa) == 1 and render == []
+
+
+@pytest.mark.parametrize('fault', ('NO', 'changed', 'timeout'))
+def test_negative_changed_or_unknown_resolution_stays_held_without_repeat(tmp_path, monkeypatch, fault):
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    with _selected_qualification_case(tmp_path, monkeypatch, fault='NO', resolve_disagreements=True, resolution_fault=fault) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        for _ in range(2):
+            with pytest.raises((ValueError, TimeoutError)):
+                post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        with pytest.raises(ValueError):
+            read_current_result(post.qualifier, candidate, base, (source,), (acquired,), scope=scope, proof=proof)
+        assert len(qa) == 2 and len(jev) == 2 and render == []
+
+
+@pytest.mark.parametrize('fault', ('source', 'candidate', 'hypothesis', 'fields', 'parent', 'witness-raw', 'witness-receipt',
+                                 'resolution', 'resolution-raw', 'resolution-receipt'))
+def test_resolution_reference_and_exact_source_identity_tamper_are_denied_without_dispatch(tmp_path, monkeypatch, fault):
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
+    with _selected_qualification_case(tmp_path, monkeypatch, fault='NO', resolve_disagreements=True) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        selected = post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        assessment = AutonomousNativeEvidenceAssessor._validated_execution(selected.execution, candidate, base,
+            (source,), (acquired,), semantic_witnesses=selected.semantic_witnesses, semantic_witness_reader=witness.read,
+            source_renderings=selected.source_renderings)
+        package = replace(base, governed_claims=assessment.governed_claims, qualification_evidence=assessment.qualification_evidence)
+        q, claim = package.qualification_evidence[0], package.governed_claims[0]
+        if fault == 'source': package = replace(package, passages=(base.passages[0] + ' Altered.',))
+        elif fault == 'candidate': monkeypatch.setattr(candidate, 'version_id', 'other-candidate-version')
+        elif fault == 'hypothesis': monkeypatch.setattr(candidate.governing_manifest, 'canonical_digest', digest_bytes(b'other-hypothesis'))
+        elif fault == 'fields': q = replace(q, test_evidence=tuple((key, 'HOUSING' if key == 'domain' else value) for key, value in q.test_evidence))
+        else:
+            key = {'parent': 'invocation_id', 'witness-raw': 'raw_admission_id', 'witness-receipt': 'receipt_admission_id',
+                'resolution': 'resolution_invocation_id', 'resolution-raw': 'resolution_raw_admission_id',
+                'resolution-receipt': 'resolution_receipt_admission_id'}[fault]
+            values = dict(q.semantic_witness_ref)
+            values[key] = 'sha256:' + '0' * 64 if key.endswith('invocation_id') else '11111111-1111-4111-8111-111111111111'
+            q = replace(q, semantic_witness_ref=tuple(sorted(values.items())))
+        monkeypatch.setattr(post.qualifier, 'qualify', lambda *_a, **_k: pytest.fail('admission dispatched resolution'))
+        monkeypatch.setattr(witness.judgments, 'evaluate', lambda **_k: pytest.fail('admission dispatched witness'))
+        with pytest.raises((ValueError, RuntimeError, LookupError)):
+            witness.read(q, claim, package)
+        assert len(qa) == 2 and len(jev) == 2 and render == []
+
+
+def test_retained_known_no_current_disposition_is_proof_only_before_one_new_resolution(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    from newsroom.control_plane.native_source_qualification_consumer import current_source_passage
+    with _selected_qualification_case(tmp_path, monkeypatch, fault='NO', resolve_disagreements=True,
+                                     retained_current=True, title_body_layout=True) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        with monkeypatch.context() as legacy:
+            legacy.setattr(post, 'resolve_disagreements', False)
+            with pytest.raises(NativeEvidenceHold, match='QUALIFICATION_SEMANTIC_WITNESS_NO'):
+                post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        source.unit.headline, source.unit.body = base.passages[0].split('\n\n', 1)
+        source.unit.item_key = 'fixture-policy'
+        source.unit.canonical_url = 'https://www.gov.uk/government/news/fixture-policy'
+        assert post.read_current_disposition(candidate, base, (source,), proof=proof,
+            source_passages=(current_source_passage(source),)) is None
+        assert len(qa) == 1 and len(jev) == 2
+        selected = post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        with monkeypatch.context() as reads:
+            reads.setattr(post.qualifier, 'qualify', lambda *_a, **_k: pytest.fail('disposition dispatched resolution'))
+            reads.setattr(witness.judgments, 'evaluate', lambda **_k: pytest.fail('disposition dispatched witness'))
+            assert post.read_current_disposition(candidate, base, (source,), proof=proof,
+                source_passages=(current_source_passage(source),)) is None
+        assert selected.semantic_witnesses and len(qa) == 2 and len(jev) == 2
+
+
+def test_missing_headline_qualification_never_dispatches_witness_or_resolution(tmp_path, monkeypatch):
+    with _selected_qualification_case(tmp_path, monkeypatch, fault='NO', resolve_disagreements=True) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        document = json.loads(original.execution.text)
+        document['package']['qualification_evidence'] = []
+        incomplete = replace(original, execution=replace(original.execution, text=canonical_json_bytes(document).decode()))
+        with pytest.raises(ValueError, match='HEADLINE_UNPROVEN'):
+            post.compose_selected(incomplete, candidate, base, (source,), (acquired,), proof=proof)
+        assert len(qa) == len(jev) == 1
+
+
+@pytest.mark.parametrize('extra', ('original', 'resolution'))
+def test_extra_original_or_resolution_intent_is_ambiguous_not_silently_ignored(tmp_path, monkeypatch, extra):
+    from newsroom.control_plane.native_source_qualification_replay import original_qualification_state, read_current_result
+    from newsroom.control_plane.native_source_qualification_consumer import _resolution_state
+    with _selected_qualification_case(tmp_path, monkeypatch, fault='NO', resolve_disagreements=True) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        selected = post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        decision = json.loads(original.decision_record)
+        if extra == 'original':
+            state = original_qualification_state(post.qualifier, candidate, base, decision['source_binding'], proof=proof)
+        else:
+            references = [{'claim_id': key[0], 'test': key[1], 'reference': {key: value for key, value in dict(ref).items()
+                if not key.startswith('resolution_')}} for key, ref in selected.semantic_witnesses.references]
+            for row in references: row['reference']['contract'] = 'newsroom.qualification-semantic-witness.v1'
+            state, _ = _resolution_state(post.qualifier, candidate, base, decision['qualification_reference'], references, proof=proof)
+        state['issue']['unregistered_extra_purpose'] = True
+        post.qualifier.qualify(state, proof=proof, candidate_id=candidate.candidate_id,
+            hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest)
+        with pytest.raises(ValueError, match='AMBIGUOUS'):
+            read_current_result(post.qualifier, candidate, base, (source,), (acquired,), scope=scope, proof=proof)
+        assert len(qa) == 3
 
 
 @pytest.mark.parametrize('malformed_rendering',[False,True])
@@ -513,7 +688,7 @@ def test_typed_source_rendering_rejects_current_candidate_identity_drift(tmp_pat
         assert len(qa)==1 and len(jev)==2 and len(render)==1
 
 
-@pytest.mark.parametrize('capability',['terms','year','email'])
+@pytest.mark.parametrize('capability',['terms','year','email','resolution'])
 def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path,monkeypatch,capability):
     from newsroom.tests.test_increment10_editorial import _open_editorial_system,_evidence_facade,_native,_decision,_record_decision
     from newsroom.tests.test_increment10_ingress import _candidate,_receive
@@ -529,7 +704,9 @@ def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path
     connection,port,candidate=_candidate(candidate_path)
     ingress=open_evidence_intake_ingress(tmp_path/'selected-ingress.sqlite3')
     ack=_receive(ingress,connection,port,candidate,request_id='typed-rendering')
-    with _selected_qualification_case(tmp_path,monkeypatch,malformed_rendering=True,fault=capability,candidate_binding=candidate,
+    with _selected_qualification_case(tmp_path,monkeypatch,malformed_rendering=True,
+                                      fault='NO' if capability == 'resolution' else capability,candidate_binding=candidate,
+                                      resolve_disagreements=capability == 'resolution',
                                       typed_rendering=capability == 'email')as(q,w,old,c,b,s,a,scope,auth,usage,qa,jev,render):
         original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=auth)
         selected=q.compose_selected(original,c,b,(s,),(a,),proof=auth)
@@ -573,7 +750,7 @@ def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path
                         if row.validator=='QUOTE_FIDELITY').result=='FAIL'
             evidence.semantic_witness_reader=lambda *_:True
             with pytest.raises(EvidencePackageError):evidence.read(retained.package_admission_id,candidate_port=port,proof=proof())
-            assert len(qa)==1 and len(jev)==2 and len(render)==1
+            assert len(qa)==(2 if capability == 'resolution' else 1) and len(jev)==2 and len(render)==1
         finally:
             connection.rollback();connection.close();ingress.close();system.close()
 

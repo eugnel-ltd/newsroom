@@ -2552,3 +2552,18 @@ def test_recent_incomplete_revision_keeps_priority_over_older_attempt_inventory(
         assert extracted[-1] == ('old-reference', 2 if old_served else 1)
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('eligible',[False,True])
+def test_known_qualification_disagreement_enters_consumer_without_repeating_extraction(tmp_path, monkeypatch, eligible):
+    pipeline,journal,connection,units,calls,dispositions=_open(tmp_path,monkeypatch)
+    unit=units[0];journal.land((unit,));dispositions[0]=()
+    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts={
+        'candidate_version_id':'candidate:one','graphiti_receipts':[{'state':'GRAPHITI_COMPLETE'}],
+        'reason':'QUALIFICATION_SEMANTIC_WITNESS_NO'})
+    pipeline._publish.qualification_resolution_due=lambda _facts:eligible
+    try:
+        pipeline.tick(cycle_id='resolution')
+        assert calls.count(('publish',unit.revision_id))==int(eligible)
+        assert not any(kind=='graphiti' for kind,_ in calls)
+    finally:connection.close()

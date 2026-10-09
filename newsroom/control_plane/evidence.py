@@ -1773,7 +1773,10 @@ class EvidenceGateEvidence:
 
 
 SEMANTIC_WITNESS_CONTRACT = "newsroom.qualification-semantic-witness.v1"
+SEMANTIC_RESOLUTION_CONTRACT = "newsroom.qualification-semantic-resolution.v1"
 _SEMANTIC_WITNESS_REF_FIELDS = frozenset({"contract", "invocation_id", "raw_admission_id", "receipt_admission_id", "question_id"})
+_SEMANTIC_RESOLUTION_REF_FIELDS = _SEMANTIC_WITNESS_REF_FIELDS | frozenset({
+    "resolution_invocation_id", "resolution_raw_admission_id", "resolution_receipt_admission_id"})
 
 
 def semantic_witness_reference(ref: tuple[tuple[str, str], ...]) -> dict[str, str]:
@@ -1782,13 +1785,18 @@ def semantic_witness_reference(ref: tuple[tuple[str, str], ...]) -> dict[str, st
             or any(type(part) is not str for part in pair) for pair in ref)):
         raise ValueError('semantic witness reference differs')
     value = dict(ref)
-    if (type(ref) is not tuple or len(value) != len(ref) or set(value) != _SEMANTIC_WITNESS_REF_FIELDS
-            or value.get('contract') != SEMANTIC_WITNESS_CONTRACT
+    resolution = value.get('contract') == SEMANTIC_RESOLUTION_CONTRACT
+    if (type(ref) is not tuple or len(value) != len(ref)
+            or set(value) != (_SEMANTIC_RESOLUTION_REF_FIELDS if resolution else _SEMANTIC_WITNESS_REF_FIELDS)
+            or value.get('contract') not in {SEMANTIC_WITNESS_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT}
             or not all(type(v) is str and v for v in value.values())
             or not re.fullmatch(r'sha256:[0-9a-f]{64}', value['invocation_id'])
             or len(value['question_id'].encode()) > 256
             or any(not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', value[k])
-                   for k in ('raw_admission_id', 'receipt_admission_id'))):
+                   for k in ('raw_admission_id', 'receipt_admission_id'))
+            or resolution and (not re.fullmatch(r'sha256:[0-9a-f]{64}', value['resolution_invocation_id'])
+                or any(not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', value[k])
+                    for k in ('resolution_raw_admission_id', 'resolution_receipt_admission_id')))):
         raise ValueError('semantic witness reference differs')
     return value
 

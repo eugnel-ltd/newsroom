@@ -1069,10 +1069,8 @@ class NativePublicationContinuation:
         return None
 
     @staticmethod
-    def _retain_witness_disposition(facts, error):
-        if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:return
+    def _validated_witness_disposition(disposition):
         from .evidence import semantic_witness_reference
-        disposition=getattr(error,'semantic_witness_disposition',None)
         if type(disposition) is not dict or set(disposition)!={'reference','confidence_ppm','probabilities_ppm'}:
             raise NativePublicationError('semantic witness disposition differs')
         reference=semantic_witness_reference(tuple(sorted(disposition['reference'].items())))
@@ -1081,7 +1079,34 @@ class NativePublicationContinuation:
                 or set(probabilities)!={'YES','NO','UNCERTAIN'}
                 or any(type(value)is not int or not 0<=value<=1000000 for value in probabilities.values())
                 or sum(probabilities.values())!=1000000):raise NativePublicationError('semantic witness probabilities differ')
-        facts['semantic_witness_disposition']={'reference':reference,'confidence_ppm':confidence,'probabilities_ppm':dict(probabilities)}
+        return {'reference':reference,'confidence_ppm':confidence,'probabilities_ppm':dict(probabilities)}
+
+    @staticmethod
+    def _retain_witness_disposition(facts, error):
+        if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:return
+        facts['semantic_witness_disposition']=NativePublicationContinuation._validated_witness_disposition(
+            getattr(error,'semantic_witness_disposition',None))
+
+    def qualification_resolution_due(self, facts):
+        """Schedule only a known disagreement under the explicit new consumer."""
+        from .native_source_qualification_consumer import RESOLUTION_CONSUMER_VERSION
+        from .evidence import SEMANTIC_WITNESS_CONTRACT
+        current=self._assessment_contract_version
+        reason=facts.get('reason')
+        if (type(current)is not str or RESOLUTION_CONSUMER_VERSION not in current.split('+')
+                or reason not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}
+                or not same_assessment_producer(facts.get('assessment_contract_version'),current)
+                or facts.get('assessment_contract_version')==current
+                or facts.get('retained_qualification_checked_contract')==current
+                or not all(facts.get(key)for key in ('candidate_id','candidate_version_id','graphiti_receipts','intake_receipt_id'))
+                or any(facts.get(key)for key in ('package_admission_id','editorial_decision','story_event_id',
+                    'publication_started_at','publication_event_id','delivery_attempt_event_id','delivery_evidence_event_id'))):
+            return False
+        try:
+            disposition=self._validated_witness_disposition(facts.get('semantic_witness_disposition'))
+        except (ValueError,TypeError,KeyError,AttributeError):
+            return False
+        return disposition['reference']['contract']==SEMANTIC_WITNESS_CONTRACT
 
     def _recover_witness_disposition(self, revision_id, progress, before_write):
         facts=progress.get('facts',{})
@@ -1408,6 +1433,8 @@ class NativePublicationContinuation:
                 and progress.get('stage') == 'ASSESSMENT_INTERRUPTED'
                 and facts.get('reason') == 'ACQUISITION_RESULT_NOT_RETAINED'
                 and facts.get('failure_class') in {'QualificationHold', 'LocalisationHold'}
+                or progress.get('stage') == 'EVIDENCE_HOLD'
+                and self.qualification_resolution_due(facts)
             )
             and same_assessment_producer(facts.get('assessment_contract_version'), self._assessment_contract_version)
             and facts.get('assessment_contract_version') != self._assessment_contract_version

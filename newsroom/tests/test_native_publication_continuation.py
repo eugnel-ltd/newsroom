@@ -2283,3 +2283,83 @@ def test_witness_recovery_observes_suppressed_boundary_without_changing_authorit
                 assert data['failure_class']==('JSONDecodeError'if failure=='stdlib-exception'else'NativeEvidenceHold'if failure=='typed-hold'else'ValueError')
                 assert data['function']=='reader'and data['file']=='test_native_publication_continuation.py'
     finally:connection.close()
+
+
+def _known_witness_hold_facts(choice='NO'):
+    from newsroom.control_plane.evidence import SEMANTIC_WITNESS_CONTRACT
+    return {'candidate_id':'candidate','candidate_version_id':'candidate-version',
+        'graphiti_receipts':[{}],'intake_receipt_id':'retained-intake',
+        'assessment_contract_version':'newsroom.native-evidence-assessor.v23+newsroom.source-qualification-consumer.v4',
+        'reason':'QUALIFICATION_SEMANTIC_WITNESS_'+choice,
+        'assessment_started_at':'2026-10-09T14:31:20Z','acquisition_attempt_count':1,
+        'semantic_witness_disposition':{'reference':{'contract':SEMANTIC_WITNESS_CONTRACT,
+            'question_id':'criterion','invocation_id':_DIGEST,
+            'raw_admission_id':str(ObjectAdmissionId.new()),'receipt_admission_id':str(ObjectAdmissionId.new())},
+            'confidence_ppm':330000,'probabilities_ppm':{key:(550000 if key==choice else 220000 if key=='YES' else 230000)
+                for key in ('YES','NO','UNCERTAIN')}}}
+
+
+@pytest.mark.parametrize('choice',['NO','UNCERTAIN'])
+def test_known_disagreement_uses_once_only_retained_consumer_continuation(tmp_path, monkeypatch, choice):
+    from newsroom.control_plane.native_source_qualification_consumer import RESOLUTION_CONSUMER_VERSION
+    unit=_native();connection=connect(str(tmp_path/'disagreement.sqlite3'))
+    journal=NativeRevisionJournal(connection);journal.land((unit,))
+    facts=_known_witness_hold_facts(choice);current=facts['assessment_contract_version']+'+'+RESOLUTION_CONSUMER_VERSION
+    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+    calls=[]
+    def acquire(_self, **request):
+        calls.append(request)
+        assert request['assessment_cached_only'] is True
+        assert request['assessment_qualification_cached_only'] is True
+        assert 'assessment_semantic_only' not in request
+        request['before_assessment']()
+        raise NativeEvidenceHold('QUALIFICATION_RESOLUTION_UNPROVEN_HOLD',unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+    monkeypatch.setattr('newsroom.control_plane.native_publication.open_private_serving_read_port',lambda *_a,**_k:_Reader())
+    runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),
+        policies=SimpleNamespace(publication=SimpleNamespace(target_path=tmp_path/'serving.sqlite3',target_id='private',target_context_digest=_DIGEST)),proof=proof())
+    continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
+        evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
+        assessment_contract_version=current)
+    assert continuation.qualification_resolution_due(facts)
+    continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+    after=journal.current(unit.revision_id)['facts']
+    assert len(calls)==1
+    assert after['retained_qualification_checked_contract']==current
+    assert after['assessment_started_at']==facts['assessment_started_at']
+    assert after['acquisition_attempt_count']==facts['acquisition_attempt_count']+1
+    assert after['semantic_witness_disposition']==facts['semantic_witness_disposition']
+    assert not continuation.qualification_resolution_due(after)
+    continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+    assert len(calls)==1 and runtime.authority.receives==0 and runtime.publication.calls==0
+    connection.close()
+
+
+@pytest.mark.parametrize('defect',['disabled','same-contract','different-producer','checked','missing-disposition',
+    'bad-reference','bad-confidence','unsettled','unknown','missing-intake','missing-graph','committed'])
+def test_disagreement_schedule_does_not_rescue_unknown_or_unbound_work(defect):
+    from newsroom.control_plane.native_source_qualification_consumer import RESOLUTION_CONSUMER_VERSION
+    facts=_known_witness_hold_facts();current=facts['assessment_contract_version']+'+'+RESOLUTION_CONSUMER_VERSION
+    if defect=='disabled':current+='-not-enabled'
+    elif defect=='same-contract':facts['assessment_contract_version']=current
+    elif defect=='different-producer':facts['assessment_contract_version']='newsroom.native-evidence-assessor.v22'
+    elif defect=='checked':facts['retained_qualification_checked_contract']=current
+    elif defect=='missing-disposition':facts.pop('semantic_witness_disposition')
+    elif defect=='bad-reference':facts['semantic_witness_disposition']['reference']['invocation_id']='wrong'
+    elif defect=='bad-confidence':facts['semantic_witness_disposition']['confidence_ppm']=True
+    elif defect=='unsettled':facts['reason']='QUALIFICATION_SEMANTIC_WITNESS_UNKNOWN_HOLD'
+    elif defect=='unknown':facts.update(reason='ACQUISITION_RESULT_NOT_RETAINED',failure_class='CliTimeoutError')
+    elif defect=='missing-intake':facts.pop('intake_receipt_id')
+    elif defect=='missing-graph':facts.pop('graphiti_receipts')
+    elif defect=='committed':facts['package_admission_id']='already-admitted'
+    continuation=object.__new__(NativePublicationContinuation);continuation._assessment_contract_version=current
+    assert not continuation.qualification_resolution_due(facts)
+
+
+def test_disagreement_schedule_uses_authenticated_verdict_not_probability_ranking():
+    from newsroom.control_plane.native_source_qualification_consumer import RESOLUTION_CONSUMER_VERSION
+    facts=_known_witness_hold_facts()
+    facts['semantic_witness_disposition']['probabilities_ppm']={'YES':550000,'NO':220000,'UNCERTAIN':230000}
+    continuation=object.__new__(NativePublicationContinuation)
+    continuation._assessment_contract_version=facts['assessment_contract_version']+'+'+RESOLUTION_CONSUMER_VERSION
+    assert continuation.qualification_resolution_due(facts)

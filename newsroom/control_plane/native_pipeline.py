@@ -406,6 +406,8 @@ class NativePipeline:
                         and self._publish.writer_revalidation_due(previous.get('facts',{})))
                     and not (callable(getattr(self._publish,'context_enrichment_due',None))
                         and self._publish.context_enrichment_due(previous.get('facts',{})))
+                    and not (callable(getattr(self._publish,'qualification_resolution_due',None))
+                        and self._publish.qualification_resolution_due(previous.get('facts',{})))
                     and not assessment_revalidation_due(
                         previous.get("facts", {}), self._assessment_contract_version,
                     )
