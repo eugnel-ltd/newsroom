@@ -864,6 +864,9 @@ def test_native_manual_retains_every_section_and_root_inventory(tmp_path, monkey
         "corporate_report", "/government/publications/annual-report",
         "/government/publications/annual-report/accounts", False,
     ),
+    ("decision", "/government/publications/decision", "/government/publications/decision/detail", False),
+    ("impact_assessment", "/government/publications/impact", "/government/publications/impact/detail", False),
+    ("research", "/government/publications/research", "/government/publications/research/detail", False),
 ])
 def test_feed_parent_settles_each_exact_declared_html_child(
     tmp_path, monkeypatch, document_type, parent_path, child_path, binary,
