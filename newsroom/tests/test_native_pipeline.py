@@ -1323,12 +1323,14 @@ def test_pending_land_order_resumes_route_hold_before_recurring_fresh_work_witho
         connection.close()
 
 
-@pytest.mark.parametrize("stage", ["ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED"])
-def test_unknown_settlement_keeps_priority_but_defers_next_unit_after_quantum(tmp_path, monkeypatch, stage):
+@pytest.mark.parametrize("archive", (False, True))
+@pytest.mark.parametrize("stage", ["PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"])
+def test_publication_effect_settlement_keeps_priority_but_defers_next_unit_after_quantum(tmp_path, monkeypatch, stage, archive):
     pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
     ordinary = _native("ordinary")
     now = [0.0]
     pipeline._monotonic_clock = lambda: now[0]
+    pipeline._spill_archive_turn = archive
     dispositions[0] = ()
     pipeline._intake = NS(poll=lambda: calls.append(("poll", "current")) or ())
     for unit in (ordinary, *units):
@@ -1374,7 +1376,7 @@ def test_unknown_settlement_keeps_priority_but_defers_next_unit_after_quantum(tm
 
 
 @pytest.mark.parametrize("recovery_seconds", [0, 300, 301])
-def test_ready_canonical_revisions_progress_across_repeated_interruption_overruns(
+def test_ready_canonical_revisions_progress_across_repeated_publication_overruns(
     tmp_path, monkeypatch, recovery_seconds,
 ):
     pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
@@ -1388,7 +1390,7 @@ def test_ready_canonical_revisions_progress_across_repeated_interruption_overrun
             "graphiti_receipts": [{"ingest_id": unit.ingest_id, "retained": True}],
         })
     journal.land((interrupted,))
-    journal.advance(interrupted.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+    journal.advance(interrupted.revision_id, stage="PUBLICATION_STARTED", facts={
         "graphiti_receipts": [{"retained": True}],
         "candidate_version_id": "candidate:old-interrupted",
     })
@@ -1410,9 +1412,9 @@ def test_ready_canonical_revisions_progress_across_repeated_interruption_overrun
         if recovery_seconds == 0:
             # The first ready revision exhausts ordinary work; the second uses
             # the existing final quantum, without repeating the first advance.
-            assert first.revision_states == {"ACKNOWLEDGED": 2, "ASSESSMENT_INTERRUPTED": 1}
+            assert first.revision_states == {"ACKNOWLEDGED": 2, "PUBLICATION_STARTED": 1}
         else:
-            assert first.revision_states == {"ACKNOWLEDGED": 1, "GRAPHITI_COMPLETE": 1, "ASSESSMENT_INTERRUPTED": 1}
+            assert first.revision_states == {"ACKNOWLEDGED": 1, "GRAPHITI_COMPLETE": 1, "PUBLICATION_STARTED": 1}
             assert journal.current(units[1].revision_id)["facts"].get("candidate_version_id") is None
         pipeline.tick(cycle_id="ready-next")
         assert journal.current(interrupted.revision_id) == retained
@@ -1438,7 +1440,7 @@ def test_deferred_ready_revision_precedes_changed_producer_reassessment(tmp_path
     dispositions[0] = ()
     for unit, stage, facts in (
         (ready, "GRAPHITI_COMPLETE", {}),
-        (interrupted, "ASSESSMENT_INTERRUPTED", {"candidate_version_id": "candidate:interrupted"}),
+        (interrupted, "PUBLICATION_STARTED", {"candidate_version_id": "candidate:interrupted"}),
         (due, "EVIDENCE_HOLD", {"candidate_version_id": "candidate:due", "assessment_contract_version": "v8",
                                 "reason": "ASSESSOR_CLAIM_BINDING_HOLD"}),
     ):
@@ -1488,7 +1490,7 @@ def test_deferred_ready_work_and_missing_receipts_keep_disjoint_graphiti_turns(
         journal.land((unit,))
     journal.advance(ready.revision_id, stage="GRAPHITI_COMPLETE", facts={"graphiti_receipts": [{"retained": True}]})
     journal.advance(missing.revision_id, stage="GRAPHITI_COMPLETE", facts={})
-    journal.advance(interrupted.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+    journal.advance(interrupted.revision_id, stage="PUBLICATION_STARTED", facts={
         "graphiti_receipts": [{"retained": True}], "candidate_version_id": "candidate:interrupted",
     })
     original = pipeline._publish
@@ -1539,7 +1541,7 @@ def test_deferred_ready_work_honours_stop_and_drain_before_continuation(tmp_path
     dispositions[0] = ()
     for unit, stage, facts in (
         (ready, "GRAPHITI_COMPLETE", {}),
-        (interrupted, "ASSESSMENT_INTERRUPTED", {"candidate_version_id": "candidate:two"}),
+        (interrupted, "PUBLICATION_STARTED", {"candidate_version_id": "candidate:two"}),
     ):
         journal.land((unit,))
         journal.advance(unit.revision_id, stage=stage, facts={"graphiti_receipts": [{"retained": True}], **facts})
@@ -1569,13 +1571,14 @@ def test_deferred_ready_work_honours_stop_and_drain_before_continuation(tmp_path
 
 
 def _overrunning_ready_spill(tmp_path, monkeypatch):
+    """A pending publication effect exhausts ordinary work before ready spill."""
     pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
     now = [0.0]
     pipeline._monotonic_clock = lambda: now[0]
     dispositions[0] = ()
-    interrupted = _native("permanent-interrupted")
+    interrupted = _native("permanent-publication")
     journal.land((interrupted,))
-    journal.advance(interrupted.revision_id, stage="ASSESSMENT_INTERRUPTED", facts={
+    journal.advance(interrupted.revision_id, stage="PUBLICATION_STARTED", facts={
         "graphiti_receipts": [{"retained": True}], "candidate_version_id": "candidate:interrupted",
     })
     original = pipeline._publish
@@ -1627,7 +1630,7 @@ def test_ready_spill_alternates_current_and_archive_despite_fresh_turns(tmp_path
             assert journal.current(weekly.revision_id)['stage'] == 'GRAPHITI_COMPLETE'
         for unit in (*archives, weekly):
             assert journal.current(unit.revision_id)["facts"]["graphiti_receipts"] == retained[unit.revision_id]["facts"]["graphiti_receipts"]
-        interrupted = next(key for key, value in retained.items() if value["stage"] == "ASSESSMENT_INTERRUPTED")
+        interrupted = next(key for key, value in retained.items() if value["stage"] == "PUBLICATION_STARTED")
         assert journal.current(interrupted) == retained[interrupted]
     finally:
         connection.close()
@@ -2047,20 +2050,79 @@ def test_ordinary_current_turn_precedes_archive_and_next_archive_turn_preserves_
         connection.close()
 
 
-def test_ordinary_current_turn_settles_unknown_before_fresh_ready_work(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stage", ("ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED"))
+@pytest.mark.parametrize("archive", (False, True))
+def test_independent_assessment_uses_current_news_or_archive_land_order(tmp_path, monkeypatch, stage, archive):
     pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
-    unknown = replace(_native("ordinary-unknown"), published_at="2021-01-01T00:00:00Z", updated_at=None)
-    current = replace(_native("ordinary-fresh"), published_at="2026-10-01T00:00:00Z", updated_at=None)
-    for unit, stage in ((current, "CANDIDATE_ADMITTED"), (unknown, "ASSESSMENT_INTERRUPTED")):
+    pipeline._spill_archive_turn = archive
+    unknown = replace(_native("ordinary-unknown"), published_at="2021-01-01T00:00:00Z", updated_at=None,
+        canonical_url="https://www.gov.uk/government/publications/reference")
+    current = replace(_native("ordinary-fresh"), published_at="2026-10-01T00:00:00Z", updated_at=None,
+        canonical_url="https://www.gov.uk/government/news/material-update")
+    for unit, retained_stage in ((unknown, stage), (current, "CANDIDATE_ADMITTED")):
         journal.land((unit,))
-        journal.advance(unit.revision_id, stage=stage, facts={
+        journal.advance(unit.revision_id, stage=retained_stage, facts={
             "candidate_version_id": "candidate:" + unit.item_key,
             "graphiti_receipts": [{"retained": True}],
+            "reason": "ACQUISITION_RESULT_NOT_RETAINED", "failure_class": "CliTimeoutError",
         })
+    retained = journal.current(unknown.revision_id)
+    original = pipeline._publish.advance
+    def advance(**request):
+        if request['revision_id'] == unknown.revision_id:
+            calls.append(('assessment', unknown.revision_id))
+        else:
+            original(**request)
+    pipeline._publish = NS(advance=advance)
     try:
-        pipeline.tick(cycle_id="ordinary-unknown-first")
-        assert [revision for kind, revision in calls if kind == "publish"] == [unknown.revision_id, current.revision_id]
+        pipeline.tick(cycle_id="assessment-is-revision-local")
+        expected = [unknown.revision_id, current.revision_id] if archive else [current.revision_id, unknown.revision_id]
+        assert [revision for kind, revision in calls if kind in {'assessment', 'publish'}] == expected
+        assert journal.current(unknown.revision_id) == retained
+        assert journal.current(current.revision_id)['stage'] == 'ACKNOWLEDGED'
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('stage', ('ASSESSMENT_INTERRUPTED', 'ASSESSMENT_STARTED'))
+def test_ready_current_news_precedes_assessment_overrun_and_archive_keeps_its_turn(tmp_path, monkeypatch, stage):
+    pipeline, journal, connection, _, calls, dispositions = _open(tmp_path, monkeypatch)
+    dispositions[0] = ()
+    pipeline._spill_archive_turn = False
+    now, recovery = [0.0], []
+    pipeline._monotonic_clock = lambda: now[0]
+    old = replace(_native('independent-old-assessment'), published_at='2020-01-01T00:00:00Z', updated_at=None,
+        canonical_url='https://www.gov.uk/government/publications/reference')
+    ready = replace(_native('ready-current-news'), published_at='2026-10-05T00:00:00Z', updated_at=None,
+        canonical_url='https://www.gov.uk/government/news/material-update')
+    for unit, retained_stage in ((old, stage), (ready, 'CANDIDATE_ADMITTED')):
+        journal.land((unit,))
+        journal.advance(unit.revision_id, stage=retained_stage, facts={
+            'candidate_version_id': 'candidate:' + unit.item_key, 'graphiti_receipts': [{}],
+            'reason': 'ACQUISITION_RESULT_NOT_RETAINED', 'failure_class': 'CliTimeoutError'})
+    retained = journal.current(old.revision_id)
+    original = pipeline._publish.advance
+    def advance(**request):
+        if request['revision_id'] == old.revision_id:
+            calls.append(('assessment', old.revision_id))
+        else:
+            original(**request)
+        now[0] += 301
+    def recover(revisions, **_request):
+        recovery.append(revisions)
+        return ()
+    pipeline._publish = NS(advance=advance, recover_pre_dispatch=recover)
+    try:
+        pipeline.tick(cycle_id='ready-before-assessment-overrun')
+        assert [item for item in calls if item[0] in {'assessment', 'publish'}] == [('publish', ready.revision_id)]
+        assert recovery == [(ready.revision_id, old.revision_id)]
+        assert journal.current(old.revision_id) == retained and now[0] == 301
+        assert pipeline._spill_archive_turn is True
+        pipeline.tick(cycle_id='archive-assessment-still-served')
+        assert [item for item in calls if item[0] in {'assessment', 'publish'}] == [
+            ('publish', ready.revision_id), ('assessment', old.revision_id)]
+        assert journal.current(old.revision_id) == retained and now[0] == 602
     finally:
         connection.close()
 
@@ -2480,7 +2542,7 @@ def test_current_news_priority_is_exact_metadata_not_a_source_permission(url, pr
 @pytest.mark.parametrize('archive', [False, True])
 @pytest.mark.parametrize('settlement', ['ASSESSMENT_INTERRUPTED', 'ASSESSMENT_STARTED',
     'PUBLICATION_STARTED', 'COPY_CORRECTION_PREPARED'])
-def test_news_priority_keeps_unknown_and_prepared_effect_settlement_first(tmp_path, monkeypatch, archive, settlement):
+def test_news_priority_prioritises_only_prepared_publication_effects(tmp_path, monkeypatch, archive, settlement):
     pipeline, journal, connection, _, _, dispositions = _open(tmp_path, monkeypatch)
     dispositions[0] = ()
     pipeline._spill_archive_turn = archive
@@ -2493,7 +2555,10 @@ def test_news_priority_keeps_unknown_and_prepared_effect_settlement_first(tmp_pa
     pipeline._publish = NS(advance=lambda **request: selected.append(request['revision_id']))
     try:
         pipeline.tick(cycle_id='settlement-before-news')
-        assert selected == [settling.revision_id, news.revision_id]
+        expected = ([settling.revision_id, news.revision_id]
+                    if settlement in {'PUBLICATION_STARTED', 'COPY_CORRECTION_PREPARED'}
+                    else [news.revision_id, settling.revision_id])
+        assert selected == expected
     finally:
         connection.close()
 
