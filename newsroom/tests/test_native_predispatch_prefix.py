@@ -310,7 +310,8 @@ def test_checked_allocated_denial_skips_duplicate_while_unknown_and_protected_re
     before = {revision: context.journal.current(revision) for revision, _ in context.journal.iter_summaries()}
     try:
         context.pipeline.tick(cycle_id="unknown-before-fresh")
-        assert context.ordinary == [unit.revision_id for unit in (unknown, started, publishing)]
+        # Only unresolved publication effects retain global priority.
+        assert context.ordinary == [unit.revision_id for unit in (publishing, unknown, started)]
         assert len(context.batches) == 1 and len(context.batches[0]) == 1
         assert context.batches[0][0] == context.versions[allocated.revision_id]
         assert context.journal.current(allocated.revision_id) == before[allocated.revision_id]

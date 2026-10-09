@@ -303,5 +303,7 @@ def test_real_qualification_composition_opens_without_any_provider_dispatch(tmp_
     assert len(assessors) == 2 and all(callable(item._qualification) for item in assessors)
     assert all(item._judgments.semantic_witness_reader.__self__.resolution_reader.__self__.resolve_disagreements
                for item in assessors)
+    assert all(item._judgments.semantic_witness_reader.__self__.resolution_reader.__self__.resolution_contract ==
+               'newsroom.qualification-semantic-resolution.v2' for item in assessors)
     assert len(pipelines) == 2 and all(callable(item._publish.qualification_resolution_due) for item in pipelines)
     assert all(item._publish.qualification_resolution_due({}) is False for item in pipelines)

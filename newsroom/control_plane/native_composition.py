@@ -79,7 +79,7 @@ from .native_source_rights import (
 )
 from .native_assessor_spans import PARTITION_VERSION
 from .native_source_qualification_consumer import (
-    CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION, RESOLUTION_CONSUMER_VERSION,
+    CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION, RESOLUTION_CONSUMER_VERSION, CORRECTED_RESOLUTION_CONSUMER_VERSION,
 )
 from .evidence import EvidencePackage
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
@@ -96,6 +96,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"+{CONTEXT_MATERIALISATION_VERSION}"
     f"+{QUALIFICATION_CONSUMER_VERSION}"
     f"+{RESOLUTION_CONSUMER_VERSION}"
+    f"+{CORRECTED_RESOLUTION_CONSUMER_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
@@ -858,8 +859,10 @@ def open_native_pipeline(
                     policy=source_qualification_policy, source_fence=judgment_fence, judgments=judgments,
                     implementation_worktree_clean=implementation_worktree_clean, clock=clock)
                 from .native_source_qualification_consumer import NativeQualifiedSourceConsumer, current_source_passage
+                from .evidence import SEMANTIC_RESOLUTION_CONTRACT_V2
                 qualification_consumer = NativeQualifiedSourceConsumer(qualifier, semantic_witnesses=semantic_witnesses,
-                    localise=localise_claims, read_localisation=read_claim_localisation, resolve_disagreements=True)
+                    localise=localise_claims, read_localisation=read_claim_localisation, resolve_disagreements=True,
+                    resolution_contract=SEMANTIC_RESOLUTION_CONTRACT_V2)
                 semantic_witnesses.parent_reader = qualification_consumer.read_semantic_parent
                 def semantic_witness_disposition_reader(candidate,sources):
                     # Already checked retained CURRENT Source projection, not a

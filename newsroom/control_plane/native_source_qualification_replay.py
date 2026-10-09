@@ -12,7 +12,7 @@ from .native_assessor import NativeAssessmentExecution
 from .native_assessor_spans import build_lossless_source_view
 
 
-def original_qualification_reference(qualifier, candidate, base, *, proof, optional=False):
+def original_qualification_reference(qualifier, candidate, base, *, proof, optional=False, include_resolution=False):
     """One original plus at most one authenticated resolution, with overflow HOLD."""
     with sqlite3.connect(Path(qualifier.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
         c.execute('PRAGMA query_only=ON')
@@ -55,20 +55,29 @@ def original_qualification_reference(qualifier, candidate, base, *, proof, optio
     if len(originals) != 1:
         raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
     reference, receipt = originals[0]
+    resolution = None
     for ref, row in values:
         if ref == reference:
             continue
-        from .native_source_qualification_consumer import _resolution_state, _require_resolution_result
-        from .evidence import SEMANTIC_RESOLUTION_CONTRACT
+        from .native_source_qualification_consumer import _resolution_state, _require_resolution_result, _corrected_resolution_package
+        from .evidence import SEMANTIC_RESOLUTION_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT_V2
         marker = row['source_binding']['semantic_resolution']
         parent = {'invocation_id': reference.invocation_id, 'raw_admission_id': str(reference.raw_admission_id),
                   'receipt_admission_id': str(reference.receipt_admission_id)}
-        if set(marker) != {'contract', 'parent', 'witnesses'} or marker['contract'] != SEMANTIC_RESOLUTION_CONTRACT or marker['parent'] != parent:
+        if set(marker) != {'contract', 'parent', 'witnesses'} or marker['contract'] not in {
+                SEMANTIC_RESOLUTION_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT_V2} or marker['parent'] != parent:
             raise QualificationHold('QUALIFICATION_RESOLUTION_PARENT_HOLD')
-        state, package = _resolution_state(qualifier, candidate, base, parent, marker['witnesses'], proof=proof)
+        state, package = _resolution_state(qualifier, candidate, base, parent, marker['witnesses'], proof=proof,
+            contract=marker['contract'])
         result = qualifier.read_qualification(ref, state, proof=proof, candidate_id=candidate.candidate_id,
             hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest)
-        _require_resolution_result(result, package)
+        if marker['contract'] == SEMANTIC_RESOLUTION_CONTRACT_V2:
+            _corrected_resolution_package(result, state, base)
+        else:
+            _require_resolution_result(result, package)
+        resolution = (ref, row)
+    if include_resolution:
+        return reference, receipt, resolution
     return reference, receipt
 
 def read_current_result(qualifier, candidate, base, sources, acquired, *, scope, proof):

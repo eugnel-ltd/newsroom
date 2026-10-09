@@ -16,9 +16,11 @@ CONSUMER_VERSION = 'newsroom.source-qualification-consumer.v4'
 PAID_BINDING_VERSION = 'newsroom.source-qualification-consumer.v1'
 TYPED_CONSUMER_VERSION = 'newsroom.source-qualification-typed-rendering-consumer.v1'
 RESOLUTION_CONSUMER_VERSION = 'newsroom.source-qualification-resolution-consumer.v1'
+CORRECTED_RESOLUTION_CONSUMER_VERSION = 'newsroom.source-qualification-resolution-consumer.v2'
 
 
-def _resolution_state(qualifier, candidate, base, parent, references, *, proof):
+def _resolution_state(qualifier, candidate, base, parent, references, *, proof,
+                      contract='newsroom.qualification-semantic-resolution.v1'):
     """Reconstruct one complete, settled disagreement from original authorities."""
     from .evidence import (QualificationEvidence, Evid012QualificationTest,
         semantic_witness_reference, SEMANTIC_WITNESS_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT)
@@ -84,7 +86,42 @@ def _resolution_state(qualifier, candidate, base, parent, references, *, proof):
                     'and explain the unresolved support; do not change claims, substitute a test or add facts.',
             'requested_package': package},
         'judgments': answers}
+    from .evidence import SEMANTIC_RESOLUTION_CONTRACT_V2
+    if contract == SEMANTIC_RESOLUTION_CONTRACT_V2:
+        state['source_binding']['semantic_resolution']['contract'] = contract
+        state['issue']['task'] = (
+            'Resolve one supported story from the complete Source, not a vote on the original proposal. '
+            'You may correct its headline, selected complete Source ranges, qualification test and witness fields. '
+            'Preserve dates, eligibility conditions, attribution, negation and future/proposed status. '
+            'A confirmed official announcement or decision is distinct from a legally effective rule; '
+            'publication alone does not qualify and an official process requires its actual reader action. '
+            'Use only the existing six independent criteria and exact Source evidence. Return one corrected '
+            'affirmative package only if established; otherwise select no new information and explain why. '
+            'Original verdicts remain untrusted historical data, not affirmative support for corrected claims.')
+    elif contract != SEMANTIC_RESOLUTION_CONTRACT:
+        raise QualificationHold('QUALIFICATION_RESOLUTION_CONTRACT_HOLD')
     return state, package
+
+
+def _corrected_resolution_package(result, state, base):
+    """Existing codec plus complete-range/field bindings; no original-ID vote."""
+    from types import SimpleNamespace
+    from .evidence import QualificationEvidence, Evid012QualificationTest
+    from .native_assessor_judgments import _semantic_witness_inputs
+    package = json.loads(result['materialisation']['materialised_text'])['package']
+    claims = {row['claim_id']: SimpleNamespace(**{**row, 'source_ids': tuple(row['source_ids'])})
+              for row in package['governed_claims']}
+    heads = [row for row in claims.values() if row.claim_role == 'HEADLINE']
+    if (not package['substantive_new_information'] or len(heads) != 1
+            or not any(row.claim_role == 'SUBSTANTIVE' for row in claims.values())
+            or any(row.status != 'CONFIRMED_FACT' for row in claims.values())
+            or not any(row['governed_claim_id'] == heads[0].claim_id for row in package['qualification_evidence'])):
+        raise QualificationHold('QUALIFICATION_RESOLUTION_NOT_AFFIRMATIVE_HOLD')
+    for row in package['qualification_evidence']:
+        q = QualificationEvidence(Evid012QualificationTest(row['test']), row['governed_claim_id'],
+            'corrected-resolution-qualification', tuple(row['test_evidence'].items()), row['policy_version'])
+        _semantic_witness_inputs(q, claims[q.governed_claim_id], base, state['source_binding'])
+    return package
 
 
 def _require_resolution_result(result, original):
@@ -118,13 +155,18 @@ def current_source_passage(source):
 
 
 class NativeQualifiedSourceConsumer:
-    def __init__(self, qualifier, *, semantic_witnesses, localise, read_localisation, resolve_disagreements=False):
+    def __init__(self, qualifier, *, semantic_witnesses, localise, read_localisation, resolve_disagreements=False,
+                 resolution_contract='newsroom.qualification-semantic-resolution.v1'):
         if type(resolve_disagreements) is not bool:
             raise ValueError('semantic resolution opt-in differs')
         self.qualifier, self.objects = qualifier, qualifier.objects
         self.semantic_witnesses = semantic_witnesses
         self.localise, self.read_localisation = localise, read_localisation
         self.resolve_disagreements = resolve_disagreements
+        from .evidence import SEMANTIC_RESOLUTION_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT_V2
+        if resolution_contract not in {SEMANTIC_RESOLUTION_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT_V2}:
+            raise ValueError('semantic resolution contract differs')
+        self.resolution_contract = resolution_contract
         if resolve_disagreements:
             semantic_witnesses.resolution_reader = self.read_resolution
 
@@ -133,8 +175,10 @@ class NativeQualifiedSourceConsumer:
         from .evidence import semantic_witness_reference
         from newsroom.increment10.evidence import _base_package
         value = semantic_witness_reference(qualification.semantic_witness_ref)
+        from .evidence import SEMANTIC_RESOLUTION_CONTRACT_V2
+        corrected = value['contract'] == SEMANTIC_RESOLUTION_CONTRACT_V2
         raw = self.objects.rehydrate(HydrationRequest(ObjectAdmissionId.parse(
-            value['resolution_receipt_admission_id']), 'evidence.record'), proof=self.semantic_witnesses.proof).data
+            value['receipt_admission_id' if corrected else 'resolution_receipt_admission_id']), 'evidence.record'), proof=self.semantic_witnesses.proof).data
         receipt = json.loads(raw)
         if not self.resolve_disagreements or canonical_json_bytes(receipt) != raw:
             raise QualificationHold('QUALIFICATION_RESOLUTION_RECEIPT_HOLD')
@@ -143,12 +187,34 @@ class NativeQualifiedSourceConsumer:
         base = _base_package(package)
         marker = binding['semantic_resolution']
         state, original = _resolution_state(self.qualifier, candidate, base, marker['parent'], marker['witnesses'],
-            proof=self.semantic_witnesses.proof)
-        ref = QualificationReference(value['resolution_invocation_id'], ObjectAdmissionId.parse(value['resolution_raw_admission_id']),
-            ObjectAdmissionId.parse(value['resolution_receipt_admission_id']))
+            proof=self.semantic_witnesses.proof, contract=marker['contract'])
+        prefix = '' if corrected else 'resolution_'
+        ref = QualificationReference(value[prefix+'invocation_id'], ObjectAdmissionId.parse(value[prefix+'raw_admission_id']),
+            ObjectAdmissionId.parse(value[prefix+'receipt_admission_id']))
         checked = self.qualifier.read_qualification(ref, state, proof=self.semantic_witnesses.proof,
             candidate_id=candidate.candidate_id, hypothesis_digest=candidate.governing_manifest.canonical_digest,
             evidence_package_digest=base.digest)
+        if corrected:
+            if marker['contract'] != value['contract'] or value['question_id'] != 'criterion':
+                raise QualificationHold('QUALIFICATION_RESOLUTION_CONTRACT_HOLD')
+            output = _corrected_resolution_package(checked, state, base)
+            current_claims = {row.claim_id: row for row in package.governed_claims}
+            for source_row in output['governed_claims']:
+                current = current_claims.get(source_row['claim_id'])
+                if (current is None or any(source_row[key] != getattr(current, key) for key in
+                        ('claim', 'supporting_excerpt', 'claim_role', 'passage_index', 'rendered_assertion_zh_hant_hk'))
+                        or source_row['source_ids'] != list(current.source_ids) or source_row['status'] != str(current.status)
+                        or source_row['quotations'] != list(current.quotations)
+                        or tuple(map(tuple, source_row['localised_factual_expressions'])) != current.localised_factual_expressions):
+                    raise QualificationHold('QUALIFICATION_RESOLUTION_PACKAGE_HOLD')
+            expected = next((row for row in output['qualification_evidence'] if row['governed_claim_id'] == claim.claim_id
+                             and row['test'] == qualification.test.value), None)
+            source_claim = next((row for row in output['governed_claims'] if row['claim_id'] == claim.claim_id), None)
+            if (expected is None or source_claim is None or expected['test_evidence'] != dict(qualification.test_evidence)
+                    or any(source_claim[key] != getattr(claim, key) for key in ('claim', 'supporting_excerpt', 'claim_role', 'passage_index'))
+                    or source_claim['source_ids'] != list(claim.source_ids) or source_claim['status'] != str(claim.status)):
+                raise QualificationHold('QUALIFICATION_RESOLUTION_CLAIM_HOLD')
+            return True
         _require_resolution_result(checked, original)
         from .evidence import SEMANTIC_WITNESS_CONTRACT
         original_ref = {key: value[key] for key in ('invocation_id', 'raw_admission_id', 'receipt_admission_id', 'question_id')}
@@ -171,7 +237,12 @@ class NativeQualifiedSourceConsumer:
         parent = binding['source_qualification_reference']
         original_binding = {key:value for key,value in binding.items()
             if key not in {'semantic_witness_consumer', 'source_qualification_reference'}}
-        state = original_qualification_state(self.qualifier, candidate, base, original_binding, proof=proof)
+        if 'semantic_resolution' in original_binding:
+            marker = original_binding['semantic_resolution']
+            state, _ = _resolution_state(self.qualifier, candidate, base, marker['parent'], marker['witnesses'],
+                proof=proof, contract=marker['contract'])
+        else:
+            state = original_qualification_state(self.qualifier, candidate, base, original_binding, proof=proof)
         reference = QualificationReference(parent['invocation_id'], ObjectAdmissionId.parse(parent['raw_admission_id']),
             ObjectAdmissionId.parse(parent['receipt_admission_id']))
         return self.qualifier.read_qualification(reference, state, proof=proof, candidate_id=candidate.candidate_id,
@@ -245,6 +316,17 @@ class NativeQualifiedSourceConsumer:
         view = build_lossless_source_view(base.passages, base.source_ids)
         if _reference_binding(view) != binding['source_reference_binding'] or binding['content_digest'] != base.digest:
             raise QualificationHold('QUALIFICATION_CURRENT_SNAPSHOT_HOLD')
+        from .evidence import SEMANTIC_RESOLUTION_CONTRACT_V2
+        active_contract = self.resolution_contract
+        if self.resolve_disagreements and active_contract == SEMANTIC_RESOLUTION_CONTRACT_V2:
+            from .native_source_qualification_replay import original_qualification_reference
+            parent_ref, _, prior_resolution = original_qualification_reference(
+                self.qualifier, candidate, base, proof=proof, include_resolution=True)
+            if decision['qualification_reference'] != {'invocation_id': parent_ref.invocation_id,
+                    'raw_admission_id': str(parent_ref.raw_admission_id), 'receipt_admission_id': str(parent_ref.receipt_admission_id)}:
+                raise QualificationHold('QUALIFICATION_RESOLUTION_PARENT_HOLD')
+            if prior_resolution is not None:
+                active_contract = prior_resolution[1]['source_binding']['semantic_resolution']['contract']
         claims = {row['claim_id']: SimpleNamespace(**{**row,'source_ids':tuple(row['source_ids'])}) for row in package['governed_claims']}
         witnesses = []
         dissent = False
@@ -270,15 +352,29 @@ class NativeQualifiedSourceConsumer:
             references = [{'claim_id': key[0], 'test': key[1], 'reference': dict(ref)}
                           for key, ref in sorted(witnesses)]
             state, expected = _resolution_state(self.qualifier, candidate, base, decision['qualification_reference'],
-                references, proof=proof)
+                references, proof=proof, contract=active_contract)
             identities = dict(candidate_id=candidate.candidate_id, hypothesis_digest=candidate.governing_manifest.canonical_digest,
                 evidence_package_digest=base.digest)
             ref = self.qualifier.qualify(state, proof=proof, **identities)
-            _require_resolution_result(self.qualifier.read_qualification(ref, state, proof=proof, **identities), expected)
+            checked = self.qualifier.read_qualification(ref, state, proof=proof, **identities)
             from .evidence import SEMANTIC_RESOLUTION_CONTRACT
-            witnesses = [(key, tuple(sorted({**dict(original), 'contract': SEMANTIC_RESOLUTION_CONTRACT,
-                'resolution_invocation_id': ref.invocation_id, 'resolution_raw_admission_id': str(ref.raw_admission_id),
-                'resolution_receipt_admission_id': str(ref.receipt_admission_id)}.items()))) for key, original in witnesses]
+            if active_contract == SEMANTIC_RESOLUTION_CONTRACT_V2:
+                package = _corrected_resolution_package(checked, state, base)
+                decision = {**decision, 'original_qualification_reference': decision['qualification_reference'],
+                    'qualification_reference': {'invocation_id': ref.invocation_id, 'raw_admission_id': str(ref.raw_admission_id),
+                        'receipt_admission_id': str(ref.receipt_admission_id)}, 'source_binding': state['source_binding'],
+                    'materialisation_receipt': checked['materialisation']}
+                binding = decision['source_binding']
+                claims = {row['claim_id']: SimpleNamespace(**{**row, 'source_ids': tuple(row['source_ids'])})
+                          for row in package['governed_claims']}
+                reference = tuple(sorted({'contract': SEMANTIC_RESOLUTION_CONTRACT_V2, 'question_id': 'criterion',
+                    **decision['qualification_reference']}.items()))
+                witnesses = [((row['governed_claim_id'], row['test']), reference) for row in package['qualification_evidence']]
+            else:
+                _require_resolution_result(checked, expected)
+                witnesses = [(key, tuple(sorted({**dict(original), 'contract': SEMANTIC_RESOLUTION_CONTRACT,
+                    'resolution_invocation_id': ref.invocation_id, 'resolution_raw_admission_id': str(ref.raw_admission_id),
+                    'resolution_receipt_admission_id': str(ref.receipt_admission_id)}.items()))) for key, original in witnesses]
         # A verifier does not certify actor identity, unsupported factual types,
         # or rendering. Deny impossible current capabilities before any render fee.
         derived = {}
@@ -321,10 +417,14 @@ class NativeQualifiedSourceConsumer:
             and (derived[claim.claim_id][1] is None or derived[claim.claim_id][1][:2] in
                  tuple(map(tuple,claim.localised_factual_expressions)))for claim in claims.values())
         valid_rendering = valid_rendering and not needs_typed
+        if dissent and active_contract == SEMANTIC_RESOLUTION_CONTRACT_V2 and not valid_rendering:
+            raise QualificationHold('QUALIFICATION_RESOLUTION_RENDERING_HOLD')
         if not witnesses and not rendering_sources and valid_rendering:
             return original
         rendering_ref = None
         consumer_version = RESOLUTION_CONSUMER_VERSION if self.resolve_disagreements else CONSUMER_VERSION
+        if self.resolve_disagreements and self.resolution_contract == SEMANTIC_RESOLUTION_CONTRACT_V2:
+            consumer_version = CORRECTED_RESOLUTION_CONSUMER_VERSION
         if not valid_rendering:
             if self.localise is None or self.read_localisation is None:
                 raise QualificationHold('QUALIFICATION_RENDERING_UNAVAILABLE')
@@ -350,7 +450,7 @@ class NativeQualifiedSourceConsumer:
             if typed_result:
                 if rendered.get('original_state') != request or rendered.get('projected_state') != source_rendering_projection(request):
                     raise QualificationHold('QUALIFICATION_RENDERING_BINDING_HOLD')
-                consumer_version = (TYPED_CONSUMER_VERSION + '+' + RESOLUTION_CONSUMER_VERSION
+                consumer_version = (TYPED_CONSUMER_VERSION + '+' + consumer_version
                                     if self.resolve_disagreements else TYPED_CONSUMER_VERSION)
                 reference = tuple(sorted({'contract': SOURCE_RENDERING_CONTRACT_V2, 'operation': 'SOURCE_RENDERING',
                     'invocation_id': rendering_ref.invocation_id, 'raw_admission_id': str(rendering_ref.raw_admission_id),

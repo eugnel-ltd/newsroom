@@ -680,8 +680,8 @@ class NativeSemanticWitnesses:
         from newsroom.authority import HydrationRequest
         self.require_current()
         value = semantic_witness_reference(qualification.semantic_witness_ref)
-        from .evidence import SEMANTIC_RESOLUTION_CONTRACT
-        if value['contract'] == SEMANTIC_RESOLUTION_CONTRACT:
+        from .evidence import SEMANTIC_RESOLUTION_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT_V2
+        if value['contract'] in {SEMANTIC_RESOLUTION_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT_V2}:
             from .native_source_qualification_consumer import NativeQualifiedSourceConsumer
             if (getattr(self.resolution_reader, '__func__', None) is not NativeQualifiedSourceConsumer.read_resolution
                     or type(getattr(self.resolution_reader, '__self__', None)) is not NativeQualifiedSourceConsumer):
