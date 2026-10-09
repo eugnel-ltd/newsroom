@@ -324,7 +324,7 @@ class IndependentEvidenceAssessment:
 class EvidenceAssessor:
     """Deterministic assessment of the independently acquired exact bytes."""
 
-    __slots__ = ("_assess", "_cached_qualification_origin")
+    __slots__ = ("_assess", "_cached_qualification_origin", "_news_candidate_eligibility")
 
     def __init__(
         self,
@@ -339,13 +339,17 @@ class EvidenceAssessor:
         ],
         *,
         cached_qualification_origin: Callable[..., object | None] | None = None,
+        news_candidate_eligibility: Callable[..., frozenset[int] | None] | None = None,
     ) -> None:
         if not callable(assess):
             raise NativeEvidenceError("evidence assessor is required")
         if cached_qualification_origin is not None and not callable(cached_qualification_origin):
             raise NativeEvidenceError("cached qualification origin reader differs")
+        if news_candidate_eligibility is not None and not callable(news_candidate_eligibility):
+            raise NativeEvidenceError("news candidate eligibility differs")
         self._assess = assess
         self._cached_qualification_origin = cached_qualification_origin
+        self._news_candidate_eligibility = news_candidate_eligibility
 
     def assess(
         self,
@@ -359,6 +363,9 @@ class EvidenceAssessor:
         qualification_cached_only: bool = False,
         context_only: bool = False,
     ) -> IndependentEvidenceAssessment:
+        eligible_passages = None
+        if self._news_candidate_eligibility is not None:
+            eligible_passages = self._news_candidate_eligibility(candidate, package, sources, acquired)
         bounded = getattr(self._assess, "assess_with_boundary", None)
         if callable(bounded):
             if (cached_only and not qualification_cached_only and not semantic_only
@@ -387,6 +394,11 @@ class EvidenceAssessor:
             result = self._assess(candidate, package, sources, acquired)
         if type(result) is not IndependentEvidenceAssessment:
             raise NativeEvidenceError("evidence assessment differs")
+        if eligible_passages is not None and result.substantive_new_information:
+            headlines = [claim for claim in result.governed_claims if claim.claim_role == 'HEADLINE']
+            if not headlines or any(claim.passage_index not in eligible_passages for claim in headlines):
+                source_id = sources[0].unit.source_id if sources else candidate.candidate_id
+                raise NativeEvidenceHold('NEWS_CANDIDATE_INITIAL_HEADLINE_OUTSIDE_BASIS', source_id)
         return result
 
 
