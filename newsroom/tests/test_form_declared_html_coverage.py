@@ -134,11 +134,14 @@ def test_observed_form_exposes_exact_complete_html_inventory_not_summary(invento
     assert caught.value.exclusion_signals == ()
 
 
+@pytest.mark.parametrize("document_type", ("form", "decision", "impact_assessment", "research"))
 @pytest.mark.parametrize("collection", (False, True))
 def test_form_retains_full_declared_leaf_with_verified_ancestry_and_replay(
-    tmp_path, monkeypatch, collection,
+    tmp_path, monkeypatch, collection, document_type,
 ):
-    bodies = _bodies(_form_parent(), collection=collection)
+    parent = _form_parent()
+    parent["document_type"] = document_type
+    bodies = _bodies(parent, collection=collection)
     with _poll_fixture(tmp_path, monkeypatch, bodies, source_id="UK-05") as case:
         runtime, intake, result, fetched = case
         assert result.status == "READY" and result.item_holds == ()
@@ -321,7 +324,7 @@ def test_collection_form_handoff_stays_strict_bounded_and_terminal(
         parent["details"]["attachments"][0]["url"] = parent["base_path"] + "/report"
         parent["links"]["children"][0]["base_path"] = parent["base_path"] + "/report"
     elif boundary == "other-type":
-        parent["document_type"] = "research"
+        parent["document_type"] = "unsupported_publication_type"
     elif boundary == "nested":
         leaf["details"]["attachments"] = [{
             "attachment_type": "html", "url": LEAF + "/deeper", "title": "Deeper form",
@@ -346,3 +349,16 @@ def test_collection_form_handoff_stays_strict_bounded_and_terminal(
         if boundary not in {"nested", "missing"}:
             expected = expected[:3]
         assert Counter(fetched) == Counter(expected)
+
+
+@pytest.mark.parametrize("document_type", ("statutory_guidance",))
+def test_known_publication_outside_handoff_inventory_stays_closed(tmp_path, monkeypatch, document_type):
+    parent = _form_parent()
+    parent["document_type"] = document_type
+    bodies = _bodies(parent, collection=True, leaf=_html_leaf())
+    del bodies[API + LEAF]
+    with _poll_fixture(tmp_path, monkeypatch, bodies, source_id="UK-05") as (_, _, result, fetched):
+        assert result.status == "HOLD" and result.units == ()
+        assert result.item_holds == ((CANONICAL + PUBLICATION, "SOURCE_ITEM_ATTACHMENT_COVERAGE_INCOMPLETE"),)
+        assert API + LEAF not in fetched
+        assert Counter(fetched) == Counter(list(bodies)[:3])
