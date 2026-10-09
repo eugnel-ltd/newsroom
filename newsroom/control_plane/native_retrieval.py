@@ -215,7 +215,7 @@ class NativeRetrievalContinuation:
                 exclusions.pop(unit.ingest_id, None)
                 subjects.append(NativeRetrievalSubject(
                     source_revision, record["graph_root_id"], receipt,
-                    unit.headline,
+                    unit.headline, unit.authority.definition_id,
                 ))
                 inventory.append({
                     "revision_id": source_revision, "ingest_id": unit.ingest_id,
@@ -243,6 +243,10 @@ class NativeRetrievalContinuation:
         *,
         proof: AuthenticationProof,
     ):
+        if type(self._documents) is NativeRetrievalDocuments:
+            return self._documents.authenticated_corpus_scope(
+                tuple(item.document_receipt for item in subjects), proof=proof,
+            )
         document_inventory = self._documents.authenticated_document_inventory(
             tuple(item.document_receipt for item in subjects), proof=proof,
         )

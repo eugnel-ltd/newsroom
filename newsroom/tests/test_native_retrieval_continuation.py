@@ -98,6 +98,11 @@ def test_subject_inventory_keeps_cold_pairs_unexpanded_until_an_exclusion_change
     subjects, inventory = continuation._current_subjects()
     assert rights_calls == [unit.ingest_id for unit in units]
     assert len(subjects) == (1 if historical_held else 2)
+    assert all(subject.source_id == next(
+        unit.authority.definition_id for unit in units
+        if unit.revision_id == subject.revision_id
+    ) for subject in subjects)
+    assert all(subject.source_id != units[0].source_id for subject in subjects)
     assert len(inventory) == 2
     assert full_reads == ([units[0].revision_id] if historical_held else [])
     assert len(writes) == int(historical_held)

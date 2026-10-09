@@ -94,7 +94,7 @@ class _Transaction:
     def run(self, query, **parameters):
         self.calls.append((query, parameters))
         if query.startswith("MATCH") and "n.event_id AS event_id" in query:
-            return _Result((self.receipt,))
+            return _Result(self.receipt if isinstance(self.receipt, tuple) else (self.receipt,))
         if "RETURN properties(n) AS properties" in query:
             return _Result(({"properties": parameters},))
         if "fulltext.queryNodes" in query:
@@ -433,3 +433,53 @@ def test_native_context_retains_four_real_branch_receipts_and_round_trips(tmp_pa
         "newsroom.hermes", "newsroom.authority", no_match=False,
     )
     assert NativeRetrievalContextReceipt.from_bytes(receipt.canonical_bytes) == receipt
+
+
+def test_native_projection_compact_corpus_has_no_4096_cliff_or_body_projection():
+    receipts = tuple(replace(_receipt(), event_id=f"event-{n}") for n in range(4_097))
+    rows = tuple({**receipt.projection_value(), "passage_id": f"passage-{n}",
+                  "source_id": "source.one", "revision_id": f"revision-{n}",
+                  "generation_id": "native-generation-1"}
+                 for n, receipt in enumerate(receipts))
+    driver = _Driver(tuple(reversed(rows)))
+    projection = Neo4jNativeRetrievalProjection(driver, database="neo4j",
+        generation_id="native-generation-1", fulltext_index="native_fulltext_1",
+        vector_index="native_vector_1", driver_version=NEO4J_B2_DRIVER_VERSION)
+    assert projection.corpus_metadata(receipts) == rows
+    assert len(driver.calls) == 1
+    query, parameters = driver.calls[0]
+    assert parameters["generation_id"] == "native-generation-1"
+    assert len(parameters["aggregate_ids"]) == 4_097
+    assert "properties(" not in query and ".text" not in query and ".vector" not in query.replace(".vector_admission_id", "")
+    assert driver.sessions == [{"default_access_mode": "READ", "database": "neo4j"}]
+
+
+@pytest.mark.parametrize("defect", ["missing", "extra", "duplicate", "receipt", "generation", "passage", "source", "aggregate-type"])
+def test_native_projection_compact_corpus_rejects_inexact_membership(defect):
+    receipt = _receipt()
+    row = {**receipt.projection_value(), "passage_id": "passage-one", "source_id": "source.one",
+           "revision_id": "revision.one", "generation_id": "native-generation-1"}
+    rows = [row]
+    if defect == "missing": rows = []
+    elif defect in {"extra", "duplicate"}: rows.append(dict(row))
+    elif defect == "receipt": row["document_digest"] = _digest("f")
+    elif defect == "generation": row["generation_id"] = "other-generation"
+    elif defect == "passage": row["passage_id"] = ""
+    elif defect == "source": row["source_id"] = None
+    elif defect == "aggregate-type": row["aggregate_id"] = []
+    projection = Neo4jNativeRetrievalProjection(_Driver(tuple(rows)), database="neo4j",
+        generation_id="native-generation-1", fulltext_index="native_fulltext_1",
+        vector_index="native_vector_1", driver_version=NEO4J_B2_DRIVER_VERSION)
+    with pytest.raises(NativeRetrievalError): projection.corpus_metadata((receipt,))
+
+
+def test_native_projection_compact_corpus_empty_and_repeated_receipts_need_no_io():
+    driver = _Driver(())
+    projection = Neo4jNativeRetrievalProjection(driver, database="neo4j",
+        generation_id="native-generation-1", fulltext_index="native_fulltext_1",
+        vector_index="native_vector_1", driver_version=NEO4J_B2_DRIVER_VERSION)
+    assert projection.corpus_metadata(()) == ()
+    receipt = _receipt()
+    for invalid in ([receipt], (receipt, receipt), (object(),)):
+        with pytest.raises(NativeRetrievalError): projection.corpus_metadata(invalid)
+    assert not driver.calls and not driver.sessions

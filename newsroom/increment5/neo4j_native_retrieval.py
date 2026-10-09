@@ -257,6 +257,52 @@ RETURN properties(n) AS properties
         with self._session("WRITE") as session:
             return session.execute_write(reconcile)
 
+    def corpus_metadata(
+        self, receipts: tuple[NativeDocumentReceipt, ...],
+    ) -> tuple[Mapping[str, object], ...]:
+        """Read the complete compact catalogue, not document text or vectors.
+
+        Projection headers are search hints. The caller still authenticates
+        selected documents against their governed receipts before using them.
+        """
+        if type(receipts) is not tuple or any(type(item) is not NativeDocumentReceipt for item in receipts):
+            raise NativeRetrievalError("native corpus receipts differ")
+        expected = {str(item.aggregate_id): item for item in receipts}
+        if len(expected) != len(receipts) or len({item.event_id for item in receipts}) != len(receipts):
+            raise NativeRetrievalError("native corpus receipts repeat")
+        if not receipts:
+            return ()
+        query = (
+            f"MATCH (n:`{self._label}` {{generation_id:$generation_id}}) "
+            "WHERE n.aggregate_id IN $aggregate_ids "
+            f"RETURN {_receipt_projection('n')},n.passage_id AS passage_id,"
+            "n.source_id AS source_id,n.revision_id AS revision_id,n.generation_id AS generation_id"
+        )
+        with self._session("READ") as session:
+            rows = session.execute_read(lambda transaction: tuple(dict(row) for row in transaction.run(
+                query, generation_id=self._generation, aggregate_ids=list(expected),
+            )))
+        headers = {"passage_id", "source_id", "revision_id", "generation_id"}
+        by_aggregate = {}
+        passages = set()
+        for row in rows:
+            if set(row) != set(_RECEIPT_FIELDS) | headers or type(row["aggregate_id"]) is not str:
+                raise NativeRetrievalError("native corpus metadata differs")
+            retained = expected.get(row["aggregate_id"])
+            if (retained is None or row["aggregate_id"] in by_aggregate
+                    or any(type(row[key]) is not type(value) or row[key] != value
+                           for key, value in retained.projection_value().items())
+                    or any(type(row[key]) is not str or not row[key] or row[key] != row[key].strip()
+                           for key in headers)
+                    or row["generation_id"] != self._generation
+                    or row["passage_id"] in passages):
+                raise NativeRetrievalError("native corpus metadata differs")
+            by_aggregate[row["aggregate_id"]] = row
+            passages.add(row["passage_id"])
+        if set(by_aggregate) != set(expected):
+            raise NativeRetrievalError("native corpus metadata is incomplete")
+        return tuple(by_aggregate[str(item.aggregate_id)] for item in receipts)
+
     def retrieve(self, *, query_text: str, query_vector: tuple[float, ...]) -> tuple[tuple[Mapping[str, object], ...], tuple[Mapping[str, object], ...]]:
         if type(query_text) is not str or not query_text or len(query_vector) != NATIVE_VECTOR_DIMENSIONS:
             raise NativeRetrievalError("native retrieval query differs")

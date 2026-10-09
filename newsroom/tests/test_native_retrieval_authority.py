@@ -10,7 +10,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from newsroom.authority import AggregateId, EventId, UtcTimestamp
+from newsroom.authority import AggregateId, EventId, UtcTimestamp, ObjectAdmissionId
+from newsroom.increment5.fulltext_contracts import FullTextProfile
 from newsroom.authority._graphiti_increment4_system import (
     _AUTHORITY_COMPOSITION_TOKEN,
 )
@@ -41,11 +42,13 @@ from newsroom.increment5.decision import INCREMENT_5A_CONTRACT_DIGEST
 from newsroom.increment5.exact_retriever import SQLiteExactRetriever
 from newsroom.increment5.native_retrieval import (
     NativeDocumentRequest,
+    NativeDocumentReceipt,
     NativeGraphBranchReceipt,
     NativeRetrievalContextReceipt,
     NativeRetrievalContextRequest,
     NativeRetrievalDocuments,
     NativeRetrievalError,
+    NativeRetrievalHold,
     NativeRetrievalPort,
     NativeRetrievalSubject,
     NativeVectorRequest,
@@ -498,3 +501,101 @@ def test_native_documents_admit_retain_context_and_reopen(
         assert documents.require_document(
             document_receipt, proof=reopened.proof
         ).digest == document.digest
+
+
+def test_complete_large_corpus_queries_before_selected_document_authentication(tmp_path, monkeypatch):
+    """Real four-branch/controller flow; only extra corpus metadata is a fixture."""
+    retrieve = NativeRetrievalPort.retrieve
+    exercised = []
+    def observed(port, lead, *, proof):
+        binding = retrieve(port, lead, proof=proof)
+        if exercised:
+            return binding
+        exercised.append(True)
+        documents = port._documents
+        primary = port._subject_receipts[0]
+        primary_document = documents.require_document(primary, proof=proof)
+        verify, read = documents._verify_event, documents._read_with_sequence
+        sequence = verify(primary, proof)
+        for count in (4197, 8193):
+            extras = tuple(NativeDocumentReceipt(
+                f"large-corpus-event-{count}-{index}", f"large-corpus-command-{count}-{index}",
+                AggregateId.new(), 1, ObjectAdmissionId.new(), "sha256:" + "a" * 64,
+                ObjectAdmissionId.new(), ObjectAdmissionId.new(),
+            ) for index in range(count - 1))
+            extra_events, revoked, reads = {item.event_id for item in extras}, set(), []
+            def metadata(receipt, supplied):
+                if receipt.event_id in revoked:
+                    raise PermissionError("current metadata read revoked")
+                return sequence if receipt.event_id in extra_events else verify(receipt, supplied)
+            def selected_read(receipt, supplied):
+                assert receipt.event_id not in extra_events, "unselected body/vector read"
+                reads.append(receipt.event_id)
+                return read(receipt, supplied)
+            monkeypatch.setattr(documents, "_verify_event", metadata)
+            monkeypatch.setattr(documents, "_read_with_sequence", selected_read)
+            actual_subject = next(item for items in port._subjects.values() for item in items
+                                  if item.document_receipt == primary)
+            subjects = (replace(actual_subject, source_id=primary_document.source_id),) + tuple(
+                NativeRetrievalSubject(f"historical-{index}", actual_subject.graph_root_id, item,
+                                       "Historical source", primary_document.source_id)
+                for index, item in enumerate(extras)
+            )
+            def catalogue(receipts):
+                assert receipts == (primary,) + extras
+                return tuple({**item.document_receipt.projection_value(),
+                    "passage_id": primary_document.passage_id if item.document_receipt == primary else f"historical-passage-{index}",
+                    "source_id": primary_document.source_id, "revision_id": item.revision_id,
+                    "generation_id": primary_document.generation_id,
+                } for index, item in enumerate(subjects))
+            monkeypatch.setattr(documents._projector, "corpus_metadata", catalogue, raising=False)
+            scope = documents.authenticated_corpus_scope((primary,) + extras, proof=proof)
+            documents.prepare_corpus_catalogue(scope, subjects, primary_document.generation_id, proof=proof)
+            snapshot = replace(port._fulltext_view.snapshot, profile=FullTextProfile.NATIVE_RUNTIME,
+                               index_document_count=count)
+            view = documents.fulltext_authority_view_for_scope(scope, snapshot, proof=proof)
+            driver, _factory, fulltext = fulltext_system(tmp_path / f"large-{count}", view=view,
+                scenario=default_scenario(projection_snapshot=snapshot, rows=[]))
+            wrong_view = replace(view, corpus_scope=replace(view.corpus_scope,
+                inventory_digest="sha256:" + "f" * 64))
+            with pytest.raises(NativeRetrievalError, match="corpus scope binding"):
+                NativeRetrievalPort(documents=documents, exact=port._exact, fulltext=fulltext,
+                    increment4=port._increment4, fulltext_view=wrong_view, subjects=subjects, document_inventory=scope,
+                    authority_scope_id=port._scope, rights_inventory_digest=port._rights_inventory_digest,
+                    minimum_authority_watermark=sequence)
+            large = NativeRetrievalPort(documents=documents, exact=port._exact, fulltext=fulltext,
+                increment4=port._increment4, fulltext_view=view, subjects=subjects, document_inventory=scope,
+                authority_scope_id=port._scope, rights_inventory_digest=port._rights_inventory_digest,
+                minimum_authority_watermark=sequence)
+            missing_request = replace(lead.request, revision_id=SourceRevisionId.new())
+            missing = replace(lead, request=missing_request, canonical_digest=missing_request.digest)
+            with pytest.raises(NativeRetrievalHold, match="NATIVE_RETRIEVAL_DOCUMENT_MISSING"):
+                retrieve(large, missing, proof=proof)
+            assert reads == [] and driver.read_requests == []
+            primary_hint = scope.by_event[primary.event_id][2]
+            primary_hint["passage_id"] = "spoofed-primary-passage"
+            with pytest.raises(NativeRetrievalError, match="search hint differs"):
+                retrieve(large, lead, proof=proof)
+            assert driver.read_requests == []
+            reads.clear()
+            result = retrieve(large, lead, proof=proof)
+            receipt = NativeRetrievalContextReceipt.from_bytes(result.receipt_bytes)
+            assert all(getattr(branch.outcome, 'value', branch.outcome) == "COMPLETE" for branch in receipt.branch_receipts())
+            assert NativeRetrievalContextRequest.from_bytes(result.request_bytes).selected_documents == (primary,)
+            assert len(driver.read_requests) == 3
+            assert len(driver.read_requests[-1].eligible_passage_ids) == count
+            assert len(reads) <= 16  # Selected reads, independent of corpus membership size.
+            with pytest.raises(NativeRetrievalError, match="corpus scope binding"):
+                NativeRetrievalPort(documents=documents, exact=port._exact, fulltext=fulltext,
+                    increment4=port._increment4, fulltext_view=view, subjects=subjects, document_inventory=scope,
+                    authority_scope_id=port._scope, rights_inventory_digest=port._rights_inventory_digest,
+                    minimum_authority_watermark=sequence)
+            revoked.add(extras[0].event_id)
+            with pytest.raises(PermissionError, match="metadata read revoked"):
+                retrieve(large, lead, proof=proof)
+        monkeypatch.setattr(documents, "_verify_event", verify)
+        monkeypatch.setattr(documents, "_read_with_sequence", read)
+        return binding
+    monkeypatch.setattr(NativeRetrievalPort, "retrieve", observed)
+    test_native_documents_admit_retain_context_and_reopen(tmp_path, monkeypatch)
+    assert exercised == [True]

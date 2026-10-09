@@ -36,6 +36,7 @@ from .fulltext_contracts import (
     FULLTEXT_PURPOSE, NORMALIZATION_COMPONENT_DIGEST, FullTextAuthorityView,
     FullTextBranchRequest, FullTextDocumentBinding, FullTextLanguageMode,
     FullTextProjectionSnapshot,
+    FullTextCorpusScope,
 )
 from .branch_contracts import (
     BRANCH_RESULT_LIMIT, BRANCH_TIMEOUT_MS, EXACT_BRANCH_ACTOR_ID,
@@ -1028,6 +1029,26 @@ _CONTEXT_READ_PORT_TOKEN = object()
 _DOCUMENT_INVENTORY_TOKEN = object()
 
 
+class _AuthenticatedCorpusScope:
+    """Complete admitted receipt metadata for one call; no document/vector cache."""
+
+    def __init__(self, owner, receipts, proof, sequences, *, _token):
+        if _token is not _DOCUMENT_INVENTORY_TOKEN:
+            raise NativeRetrievalError("native corpus scope is factory-owned")
+        self.owner, self.receipts, self.proof = owner, receipts, proof
+        self.watermark = max(sequences)
+        self.latest = receipts[sequences.index(self.watermark)]
+        self.digest = digest_canonical(tuple(item.projection_value() for item in receipts))
+        self.catalogue = None
+        self.by_event = None
+        self.used = False
+
+    def require(self, owner, proof=None):
+        if owner is not self.owner or proof is not None and (type(proof) is not AuthenticationProof or proof != self.proof):
+            raise NativeRetrievalError("native corpus scope binding differs")
+        return self.receipts
+
+
 class _AuthenticatedDocumentInventory:
     """Documents authenticated once for one synchronous retrieval call."""
 
@@ -1136,6 +1157,97 @@ class NativeRetrievalDocuments:
     def require_document(self, receipt: NativeDocumentReceipt, *, proof: AuthenticationProof) -> NativePassageDocument:
         """Re-read one exact governed document and its embedding authority."""
         return self._read(receipt, proof)[0]
+
+    def authenticated_corpus_scope(self, receipts, *, proof):
+        """Authenticate complete metadata membership, not every body/vector."""
+        if (type(receipts) is not tuple or not receipts or type(proof) is not AuthenticationProof
+                or any(type(item) is not NativeDocumentReceipt for item in receipts)
+                or len({item.event_id for item in receipts}) != len(receipts)):
+            raise NativeRetrievalError("native corpus scope inventory differs")
+        sequences = tuple(self._verify_event(item, proof) for item in receipts)
+        return _AuthenticatedCorpusScope(self, receipts, proof, sequences, _token=_DOCUMENT_INVENTORY_TOKEN)
+
+    def corpus_scope_receipts(self, scope, *, proof=None):
+        if type(scope) is not _AuthenticatedCorpusScope:
+            raise NativeRetrievalError("native corpus scope type differs")
+        return scope.require(self, proof)
+
+    def corpus_scope_watermark(self, scope, *, proof):
+        self.corpus_scope_receipts(scope, proof=proof)
+        self._verify_event(scope.latest, proof)
+        return scope.watermark
+
+    def prepare_corpus_catalogue(self, scope, subjects, generation_id, *, proof):
+        """Projection headers are search hints, never authoritative content."""
+        receipts = self.corpus_scope_receipts(scope, proof=proof)
+        expected = {item.document_receipt.event_id: item for item in subjects}
+        if tuple(item.document_receipt for item in subjects) != receipts:
+            raise NativeRetrievalError("native corpus subject membership differs")
+        rows = self._projector.corpus_metadata(receipts)
+        catalogue = {}
+        seen = set()
+        for row in rows:
+            values = {key: row[key] for key in receipts[0].projection_value()}
+            receipt = NativeDocumentReceipt.from_projection(values)
+            subject = expected.get(receipt.event_id)
+            if (subject is None or receipt != subject.document_receipt or receipt.event_id in seen
+                    or row['revision_id'] != subject.revision_id or row['generation_id'] != generation_id
+                    or subject.source_id is not None and row['source_id'] != subject.source_id):
+                raise NativeRetrievalError("native corpus projection membership differs")
+            _text(row['passage_id'], 'corpus passage')
+            _text(row['source_id'], 'corpus source')
+            if row['passage_id'] in catalogue:
+                raise NativeRetrievalError("native corpus passages repeat")
+            catalogue[row['passage_id']] = (receipt, subject, dict(row))
+            seen.add(receipt.event_id)
+        if len(catalogue) != len(receipts):
+            raise NativeRetrievalError("native corpus projection gap")
+        scope.catalogue = catalogue
+        scope.by_event = {item[0].event_id: item for item in catalogue.values()}
+
+    def fulltext_authority_view_for_scope(self, scope, snapshot, *, proof):
+        self.corpus_scope_receipts(scope, proof=proof)
+        if (
+            scope.catalogue is None
+            or snapshot.index_document_count != len(scope.catalogue)
+            or any(item[2]["generation_id"] != str(snapshot.generation_id)
+                   for item in scope.catalogue.values())
+            or snapshot.document_label != getattr(self._projector, "document_label", None)
+            or snapshot.index_name != getattr(self._projector, "fulltext_index", None)
+        ):
+            raise NativeRetrievalError("native corpus snapshot differs")
+        def resolve(passages):
+            if len(passages) > BRANCH_RESULT_LIMIT:
+                raise NativeRetrievalHold("RESULT_LIMIT_EXCEEDED")
+            result = []
+            for passage in passages:
+                receipt, subject, hinted = self.corpus_passage(scope, passage, proof=proof)
+                document = self.require_document(receipt, proof=proof)
+                self._require_corpus_document(document, subject, hinted, str(snapshot.generation_id))
+                result.append(self._fulltext_binding(document))
+            return tuple(result)
+        metadata = tuple(sorted((passage, item[2]['source_id']) for passage, item in scope.catalogue.items()))
+        return FullTextAuthorityView(snapshot, (), (), FullTextCorpusScope(scope.digest, metadata, resolve))
+
+    def corpus_passage(self, scope, passage_id, *, proof):
+        self.corpus_scope_receipts(scope, proof=proof)
+        if scope.catalogue is None or passage_id not in scope.catalogue:
+            raise NativeRetrievalError("native retrieval hit outside current corpus")
+        return scope.catalogue[passage_id]
+
+    @staticmethod
+    def _require_corpus_document(document, subject, hinted, generation_id):
+        if (document.revision_id != subject.revision_id or document.generation_id != generation_id
+                or document.passage_id != hinted['passage_id'] or document.source_id != hinted['source_id']):
+            raise NativeRetrievalError("native corpus search hint differs from admitted document")
+
+    @staticmethod
+    def _fulltext_binding(document):
+        return FullTextDocumentBinding(
+            passage_id=document.passage_id, dependency_root_id=document.dependency_root_id,
+            source_id=document.source_id, source_identity=document.revision_id,
+            provenance_digest=document.digest, language=document.language, rights_current=True, lifecycle="ACTIVE",
+        )
 
     def authenticated_document_inventory(
         self,
@@ -1263,6 +1375,7 @@ class NativeRetrievalDocuments:
         request: NativeVectorRequest,
         *,
         proof: AuthenticationProof,
+        allowed_receipts: tuple[NativeDocumentReceipt, ...] | None = None,
     ) -> NativeVectorBranchReceipt:
         """Execute one attributed production VECTOR branch without embedding work."""
         if type(request) is not NativeVectorRequest:
@@ -1275,7 +1388,7 @@ class NativeRetrievalDocuments:
         ):
             raise NativeRetrievalError("native vector query authority differs")
         rows = self._projector.retrieve_vector(query_vector=query_vector)
-        documents = self._documents(rows, query_document.generation_id, proof)
+        documents = self._documents(rows, query_document.generation_id, proof, allowed_receipts=allowed_receipts)
         hits = tuple(
             NativeVectorBranchHit(
                 rank=index,
@@ -1570,7 +1683,8 @@ class NativeRetrievalDocuments:
             for document, score in self._documents(rows, generation_id, proof)
         )
 
-    def _documents(self, rows: tuple[Mapping[str, object], ...], generation_id: str, proof: AuthenticationProof) -> tuple[tuple[NativePassageDocument, float], ...]:
+    def _documents(self, rows: tuple[Mapping[str, object], ...], generation_id: str, proof: AuthenticationProof,
+                   *, allowed_receipts=None) -> tuple[tuple[NativePassageDocument, float], ...]:
         if len(rows) > NATIVE_RESULT_LIMIT:
             raise NativeRetrievalHold("RESULT_LIMIT_EXCEEDED")
         result: list[tuple[NativePassageDocument, float]] = []
@@ -1579,6 +1693,8 @@ class NativeRetrievalDocuments:
             values = dict(row)
             score = values.pop("score", None)
             receipt = NativeDocumentReceipt.from_projection(values)
+            if allowed_receipts is not None and receipt not in allowed_receipts:
+                raise NativeRetrievalError("projection hit outside current corpus")
             document, _ = self._read(receipt, proof)
             if (
                 document.generation_id != generation_id
@@ -1598,11 +1714,14 @@ class NativeRetrievalSubject:
     graph_root_id: str
     document_receipt: NativeDocumentReceipt
     query_text: str
+    source_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.revision_id, "native retrieval subject revision")
         _text(self.graph_root_id, "native retrieval graph root")
         _text(self.query_text, "native retrieval subject query", 16_384)
+        if self.source_id is not None:
+            _text(self.source_id, "native retrieval subject source")
         if type(self.document_receipt) is not NativeDocumentReceipt:
             raise NativeRetrievalError("native retrieval subject document differs")
 
@@ -1622,7 +1741,7 @@ class NativeRetrievalPort:
         exact: SQLiteExactRetriever, fulltext: FullTextRetriever,
         increment4: Increment4Neo4jController, fulltext_view: FullTextAuthorityView,
         subjects: tuple[NativeRetrievalSubject, ...],
-        document_inventory: _AuthenticatedDocumentInventory,
+        document_inventory: _AuthenticatedDocumentInventory | _AuthenticatedCorpusScope,
         authority_scope_id: str, rights_inventory_digest: str,
         minimum_authority_watermark: int,
     ) -> None:
@@ -1635,26 +1754,28 @@ class NativeRetrievalPort:
         if len({item.document_receipt.event_id for item in subjects}) != len(subjects):
             raise NativeRetrievalError("native retrieval subject documents repeat")
         receipts = tuple(item.document_receipt for item in subjects)
-        document_by_event = documents.require_authenticated_inventory(
-            document_inventory, receipts,
-        )
-        if any(
-            document_by_event[item.document_receipt.event_id].revision_id
-            != item.revision_id
-            or document_by_event[item.document_receipt.event_id].generation_id
-            != str(fulltext_view.snapshot.generation_id)
-            for item in subjects
-        ):
-            raise NativeRetrievalError("native retrieval subject authority differs")
+        corpus = type(document_inventory) is _AuthenticatedCorpusScope
+        if corpus:
+            if (documents.corpus_scope_receipts(document_inventory) != receipts
+                    or document_inventory.used or document_inventory.catalogue is None or fulltext_view.corpus_scope is None
+                    or fulltext_view.corpus_scope.inventory_digest != document_inventory.digest
+                    or fulltext_view.corpus_scope.eligible_passages != tuple(sorted(
+                        (passage, item[2]['source_id']) for passage, item in document_inventory.catalogue.items()))):
+                raise NativeRetrievalError("native corpus scope binding differs")
+        else:
+            document_by_event = documents.require_authenticated_inventory(document_inventory, receipts)
+            if any(document_by_event[item.document_receipt.event_id].revision_id != item.revision_id
+                   or document_by_event[item.document_receipt.event_id].generation_id != str(fulltext_view.snapshot.generation_id)
+                   for item in subjects):
+                raise NativeRetrievalError("native retrieval subject authority differs")
         _text(authority_scope_id, "native retrieval authority scope")
         _digest(rights_inventory_digest, "native retrieval rights inventory")
         if type(minimum_authority_watermark) is not int or minimum_authority_watermark < 0:
             raise NativeRetrievalError("native retrieval authority watermark differs")
         self._documents, self._exact, self._fulltext, self._increment4 = documents, exact, fulltext, increment4
         self._fulltext_view = fulltext_view
-        self._document_inventory: _AuthenticatedDocumentInventory | None = (
-            document_inventory
-        )
+        self._corpus_scope = document_inventory if corpus else None
+        self._document_inventory = None if corpus else document_inventory
         self._subject_receipts = receipts
         grouped: dict[str, list[NativeRetrievalSubject]] = {}
         for item in subjects:
@@ -1671,23 +1792,39 @@ class NativeRetrievalPort:
         from newsroom.discovery import NewsLead
         if type(lead) is not NewsLead:
             raise NativeRetrievalError("native retrieval Lead differs")
-        inventory = self._document_inventory
-        if inventory is None:
-            inventory = self._documents.authenticated_document_inventory(
-                self._subject_receipts, proof=proof,
-            )
-        document_by_event = self._documents.consume_authenticated_inventory(
-            inventory, self._subject_receipts, proof=proof,
-        )
-        self._document_inventory = None
         revision_id = str(lead.request.revision_id)
         subjects = self._subjects.get(revision_id)
         if subjects is None:
             raise NativeRetrievalHold("NATIVE_RETRIEVAL_DOCUMENT_MISSING")
-        retained_subjects = tuple(
-            (subject, document_by_event[subject.document_receipt.event_id])
-            for subject in subjects
-        )
+        if len({item.query_text for item in subjects}) != 1:
+            raise NativeRetrievalError("native retrieval subject query differs")
+        if self._corpus_scope is not None:
+            scope = self._corpus_scope
+            if scope.used:
+                scope = self._documents.authenticated_corpus_scope(self._subject_receipts, proof=proof)
+                all_subjects = tuple(item for items in self._subjects.values() for item in items)
+                by_event = {item.document_receipt.event_id: item for item in all_subjects}
+                self._documents.prepare_corpus_catalogue(scope,
+                    tuple(by_event[item.event_id] for item in self._subject_receipts),
+                    str(self._fulltext_view.snapshot.generation_id), proof=proof)
+                self._fulltext_view = self._documents.fulltext_authority_view_for_scope(
+                    scope, self._fulltext_view.snapshot, proof=proof)
+                self._corpus_scope = scope
+            self._documents.corpus_scope_receipts(scope, proof=proof)
+            scope.used = True
+            subject = min(subjects, key=lambda item: scope.by_event[item.document_receipt.event_id][2]['passage_id'])
+            receipt, _subject, hinted = scope.by_event[subject.document_receipt.event_id]
+            document = self._documents.require_document(receipt, proof=proof)
+            self._documents._require_corpus_document(document, subject, hinted, str(self._fulltext_view.snapshot.generation_id))
+            document_by_event = {receipt.event_id: document}
+            retained_subjects = ((subject, document),)
+        else:
+            inventory = self._document_inventory
+            if inventory is None:
+                inventory = self._documents.authenticated_document_inventory(self._subject_receipts, proof=proof)
+            document_by_event = self._documents.consume_authenticated_inventory(inventory, self._subject_receipts, proof=proof)
+            self._document_inventory = None
+            retained_subjects = tuple((subject, document_by_event[subject.document_receipt.event_id]) for subject in subjects)
         if any(document.revision_id != revision_id for _, document in retained_subjects):
             raise NativeRetrievalError("native retrieval subject authority differs")
         if len({item.query_text for item, _document in retained_subjects}) != 1:
@@ -1760,7 +1897,8 @@ class NativeRetrievalPort:
             FullTextLanguageMode.MIXED_EN_GB_ZH_HANT_HK, (document.source_id,),
             lead.recorded_at, serving, snapshot.contiguous_ledger_seq,
         )
-        fulltext = self._fulltext.retrieve(fulltext_request).receipt
+        fulltext = self._fulltext.retrieve(fulltext_request,
+            **({"authority_view": self._fulltext_view} if self._corpus_scope is not None else {})).receipt
         if fulltext.authority_view_digest != self._fulltext_view.view_digest:
             raise NativeRetrievalError("native full-text authority view differs")
         vector_request = NativeVectorRequest(
@@ -1769,18 +1907,27 @@ class NativeRetrievalPort:
             document.digest, document.generation_id,
             lead.recorded_at.to_text(), serving.to_text(),
         )
-        vector = self._documents.retrieve_vector(vector_request, proof=proof)
+        vector = self._documents.retrieve_vector(vector_request, proof=proof,
+            **({"allowed_receipts": self._subject_receipts} if self._corpus_scope is not None else {}))
         by_passage: dict[str, NativeDocumentReceipt] = {}
-        for items in self._subjects.values():
-            for item in items:
-                retained = document_by_event[item.document_receipt.event_id]
-                by_passage[retained.passage_id] = item.document_receipt
+        if self._corpus_scope is not None:
+            by_passage = {passage: item[0] for passage, item in self._corpus_scope.catalogue.items()}
+        else:
+            for items in self._subjects.values():
+                for item in items:
+                    retained = document_by_event[item.document_receipt.event_id]
+                    by_passage[retained.passage_id] = item.document_receipt
         used = {
             *(str(hit.passage_id) for hit in fulltext.hits if hit.passage_id is not None),
             *(hit.passage_id for hit in vector.hits),
         }
         if not used.issubset(by_passage):
             raise NativeRetrievalError("native retrieval hit lacks governed document")
+        if self._corpus_scope is not None:
+            for passage in used:
+                receipt, selected_subject, hint = self._documents.corpus_passage(self._corpus_scope, passage, proof=proof)
+                selected_document = self._documents.require_document(receipt, proof=proof)
+                self._documents._require_corpus_document(selected_document, selected_subject, hint, document.generation_id)
         selected = tuple(dict.fromkeys((
             subject.document_receipt,
             *(by_passage[item] for item in sorted(used)),

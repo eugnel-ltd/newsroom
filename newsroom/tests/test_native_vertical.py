@@ -86,6 +86,18 @@ class _Projection:
         retained = {row[0] for row in self.rows}
         return tuple(receipt for receipt in receipts if receipt not in retained)
 
+    def corpus_metadata(self, receipts):
+        by_event = {receipt.event_id: (receipt, document)
+                    for receipt, document, _vector in self.rows}
+        result = []
+        for expected in receipts:
+            receipt, document = by_event[expected.event_id]
+            assert receipt == expected
+            result.append({**receipt.projection_value(), "passage_id": document.passage_id,
+                           "source_id": document.source_id, "revision_id": document.revision_id,
+                           "generation_id": document.generation_id})
+        return tuple(result)
+
     def retrieve(self, *, query_text, query_vector):
         rows = tuple(
             {**receipt.projection_value(), "score": 1.0}

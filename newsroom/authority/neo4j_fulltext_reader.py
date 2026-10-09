@@ -9,6 +9,7 @@ import re
 from types import MappingProxyType
 
 from newsroom.projection.models import ProjectionGenerationId
+from newsroom.authority.canonical import validate_sha256_digest
 
 
 class Neo4jFullTextReadError(RuntimeError):
@@ -100,12 +101,17 @@ class Neo4jFullTextReadRequest:
     generation_id: ProjectionGenerationId | None = None
     source_ids: tuple[str, ...] = ()
     eligible_passage_ids: tuple[str, ...] | None = None
+    corpus_scope_digest: str | None = None
     limit: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, Neo4jFullTextReadPhase):
             raise Neo4jFullTextReadError("full-text read phase must be typed")
         _timeout(self.timeout_ns)
+        if self.corpus_scope_digest is not None:
+            validate_sha256_digest(self.corpus_scope_digest)
+            if self.phase is not Neo4jFullTextReadPhase.QUERY or self.eligible_passage_ids is None:
+                raise Neo4jFullTextReadError("complete corpus metadata requires a scoped query")
         if self.phase is Neo4jFullTextReadPhase.COMPONENT:
             if any(
                 value is not None
@@ -169,7 +175,7 @@ class Neo4jFullTextReadRequest:
         else:
             if (
                 not isinstance(self.eligible_passage_ids, tuple)
-                or len(self.eligible_passage_ids) > 4_096
+                or self.corpus_scope_digest is None and len(self.eligible_passage_ids) > 4_096
             ):
                 raise Neo4jFullTextReadError(
                     "native full-text eligible passages exceed their fixed bound"
@@ -222,6 +228,7 @@ class Neo4jFullTextReadRequest:
         limit: int,
         timeout_ns: int,
         eligible_passage_ids: tuple[str, ...] | None = None,
+        corpus_scope_digest: str | None = None,
     ) -> "Neo4jFullTextReadRequest":
         return cls(
             phase=Neo4jFullTextReadPhase.QUERY,
@@ -231,6 +238,7 @@ class Neo4jFullTextReadRequest:
             generation_id=generation_id,
             source_ids=source_ids,
             eligible_passage_ids=eligible_passage_ids,
+            corpus_scope_digest=corpus_scope_digest,
             limit=limit,
         )
 

@@ -323,6 +323,10 @@ def test_native_projection_reconciles_actual_fulltext_and_vector_membership() ->
                 ).consume()
             projection.upsert(receipt_a, document_a, vector)
             projection.upsert(receipt_b, document_b, vector)
+            metadata = projection.corpus_metadata((receipt_b, receipt_a))
+            assert [row["passage_id"] for row in metadata] == [document_b.passage_id, document_a.passage_id]
+            assert all(set(row) == set(receipt_a.projection_value()) | {
+                "passage_id", "source_id", "revision_id", "generation_id"} for row in metadata)
 
             fulltext, vector_hits = projection.retrieve(
                 query_text="common", query_vector=vector,

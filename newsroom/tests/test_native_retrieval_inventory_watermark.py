@@ -1,13 +1,82 @@
 """Call-local watermark uses event evidence already read by actual inventory."""
 from copy import copy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
-from newsroom.authority import AggregateId, GovernedObjects
+from newsroom.authority import AggregateId, GovernedObjects, AuthenticationProof, ObjectAdmissionId
 from newsroom.authority.persistence import AuthorityEvents
-from newsroom.increment5.native_retrieval import NativeRetrievalDocuments, NativeRetrievalError
+from newsroom.increment5.native_retrieval import NativeDocumentReceipt, NativeRetrievalDocuments, NativeRetrievalError
 from newsroom.tests import test_native_retrieval_authority as authority_case
+
+
+@pytest.mark.parametrize("field", ("document_label", "index_name", "generation_id"))
+def test_sparse_fulltext_view_retains_projection_owner_binding(monkeypatch, field):
+    from newsroom.increment5.fulltext_contracts import FullTextProfile
+    from newsroom.increment5.native_retrieval import NativeRetrievalSubject
+    from newsroom.projection.models import ProjectionGenerationId
+    from newsroom.tests.increment5b2_helpers import snapshot
+    documents = object.__new__(NativeRetrievalDocuments)
+    proof = AuthenticationProof(method="STATIC_TOKEN", credential="fixture")
+    receipt = NativeDocumentReceipt("event", "command", AggregateId.new(), 1,
+        ObjectAdmissionId.new(), "sha256:" + "1" * 64,
+        ObjectAdmissionId.new(), ObjectAdmissionId.new())
+    current = snapshot(profile=FullTextProfile.NATIVE_RUNTIME, index_document_count=1)
+    documents._projector = SimpleNamespace(
+        document_label=current.document_label, fulltext_index=current.index_name,
+        corpus_metadata=lambda _: ({**receipt.projection_value(), "passage_id": "passage",
+            "source_id": "source", "revision_id": "revision",
+            "generation_id": str(current.generation_id)},),
+    )
+    monkeypatch.setattr(documents, "_verify_event", lambda *_: 1)
+    monkeypatch.setattr(documents, "_read_with_sequence",
+        lambda *_: pytest.fail("snapshot ownership check hydrated a document"))
+    scope = documents.authenticated_corpus_scope((receipt,), proof=proof)
+    subjects = (NativeRetrievalSubject("revision", "graph-root", receipt, "headline", "source"),)
+    documents.prepare_corpus_catalogue(scope, subjects, str(current.generation_id), proof=proof)
+    assert documents.fulltext_authority_view_for_scope(scope, current, proof=proof).snapshot == current
+    changed = ProjectionGenerationId.new() if field == "generation_id" else "other_projection_owner"
+    with pytest.raises(NativeRetrievalError, match="snapshot differs"):
+        documents.fulltext_authority_view_for_scope(
+            scope, replace(current, **{field: changed}), proof=proof,
+        )
+
+
+def test_complete_corpus_scope_over_4096_never_hydrates_unselected_documents(monkeypatch):
+    documents = object.__new__(NativeRetrievalDocuments)
+    proof = AuthenticationProof(method="STATIC_TOKEN", credential="fixture")
+    receipts = tuple(NativeDocumentReceipt(
+        f"event-{index}", f"command-{index}", AggregateId.new(), 1,
+        ObjectAdmissionId.new(), "sha256:" + "1" * 64,
+        ObjectAdmissionId.new(), ObjectAdmissionId.new(),
+    ) for index in range(4197))
+    verified = []
+    def metadata(self, receipt, supplied):
+        assert self is documents and supplied is proof
+        verified.append(receipt.event_id)
+        return int(receipt.event_id.removeprefix("event-")) + 1
+    monkeypatch.setattr(NativeRetrievalDocuments, "_verify_event", metadata)
+    monkeypatch.setattr(NativeRetrievalDocuments, "_read_with_sequence",
+                        lambda *_args, **_kwargs: pytest.fail("unselected document/vector hydration"))
+    scope = documents.authenticated_corpus_scope(receipts, proof=proof)
+    assert documents.corpus_scope_receipts(scope, proof=proof) == receipts
+    assert documents.corpus_scope_watermark(scope, proof=proof) == 4197
+    assert len(verified) == len(receipts) + 1
+    for owner, supplied in ((copy(documents), proof), (documents, replace(proof, credential="wrong"))):
+        with pytest.raises(NativeRetrievalError):
+            owner.corpus_scope_receipts(scope, proof=supplied)
+
+
+def test_valid_but_current_excluded_vector_event_is_rejected_before_body_read(monkeypatch):
+    documents = object.__new__(NativeRetrievalDocuments)
+    receipt = NativeDocumentReceipt("registered", "command", AggregateId.new(), 1,
+        ObjectAdmissionId.new(), "sha256:" + "1" * 64, ObjectAdmissionId.new(), ObjectAdmissionId.new())
+    excluded = replace(receipt, event_id="current-excluded")
+    monkeypatch.setattr(documents, "_read", lambda *_args: pytest.fail("excluded body/vector read"))
+    with pytest.raises(NativeRetrievalError, match="outside current corpus"):
+        documents._documents(({**excluded.projection_value(), "score": 1.0},), "generation", None,
+                             allowed_receipts=(receipt,))
 
 
 def test_real_inventory_watermark_binds_proof_and_avoids_second_full_event_pass(tmp_path, monkeypatch):
