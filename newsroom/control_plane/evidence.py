@@ -1452,14 +1452,14 @@ def _source_bound_occurrences(text, source, source_side):
     legacy = list(_factual_occurrences_v2(text))
     overlays, lexical = [], []
     qualifier = re.compile(r'(?:only|exactly|at least|at most|more than|less than|up to|about|approximately|around|'
-        r'只有|只限|只|僅(?:限|僅)?|仅(?:限|仅)?|恰好|正好|至少|最少|不少於|最多|至多|不多於|超過|多於|少於|不足|大約|約)\s*$', re.I)
+        r'只有|只限|只得|只|僅(?:限|僅|得)?|仅(?:限|仅|得)?|恰好|正好|至少|最少|不少於|最多|至多|不多於|超過|多於|少於|不足|大約|約)\s*$', re.I)
     def preceding(start):
         return qualifier.search(text[:start])
     def following(end):
         return re.match(r'[^，。；、\n]{0,24}(?:而已|為限|为限)(?=$|[，。；、\n])', text[end:])
     def complete_boundary(start, end):
         return (not (start and text[start - 1].isnumeric())
-            and not text[:start].rstrip().endswith(('+', '−', '-', '負', '负', '£', '$', '€', '¥'))
+            and not text[:start].rstrip().endswith(('+', '−', '-', '負', '负', '第', '頭', '首', '£', '$', '€', '¥'))
             and not (end < len(text) and (text[end].isnumeric() or text[end] == '半')))
     def add(start, end, fact):
         if not complete_boundary(start, end):

@@ -30,6 +30,8 @@ def test_indefinite_classifier_does_not_erase_a_post_nominal_restriction():
 @pytest.mark.parametrize('source,rendered', [
     ('These changes are part of the programme.', '這些改變是計劃的二十一部分。'),
     ('Complete a short survey.', '填寫二十一個簡短調查。'),
+    ('Complete a short survey.', '填寫第一個簡短調查。'),
+    ('These changes are part of the programme.', '這些改變是計劃的第一部分。'),
     ('Recruit 6,500 teachers.', '招聘負6,500名教師。'),
     ('Recruit 6,500 teachers.', '招聘負 6,500名教師。'),
     ('Recruit 6,500 teachers.', '招聘負六千五百名教師。'),
@@ -39,6 +41,28 @@ def test_indefinite_classifier_does_not_erase_a_post_nominal_restriction():
 def test_review_counterexamples_preserve_complete_cardinality_and_sign(source, rendered):
     from newsroom.control_plane.evidence import factual_rendering_is_bound_v3
     assert not factual_rendering_is_bound_v3(source, rendered)
+
+
+@pytest.mark.parametrize('prefix', ['第', '頭', '首', '只得', '僅得', '至少'])
+@pytest.mark.parametrize('boundary', ['primitive', 'full_consumer'])
+@pytest.mark.parametrize('fixture_index,span,old,new,source', [
+    (0, '2', '一部分', '一部分', 'These changes are part of the programme.'),
+    (1, '1', '一份簡短調查', '一個簡短調查', 'Complete a short survey.'),
+])
+def test_grammatical_exemptions_preserve_ordinal_and_restrictive_prefixes(prefix, boundary, fixture_index, span, old, new, source):
+    from newsroom.control_plane.evidence import SOURCE_RENDERING_CONTRACT_V3, factual_rendering_is_bound_v3
+    if boundary == 'primitive':
+        assert not factual_rendering_is_bound_v3(source, '這是' + prefix + new + '。')
+        return
+    fixture = deepcopy(FIXTURES[fixture_index])
+    row = next(row for row in fixture['raw']['renderings'] if row['span_id'] == span)
+    fragments = row['rendered_assertion_zh_hant_hk_fragments']
+    index = next(index for index, text in enumerate(fragments) if old in text)
+    fragments[index] = fragments[index].replace(old, prefix + new, 1)
+    with pytest.raises(m.LocalisationHold, match='LOCALISATION_CONTENT_CONTRACT_HOLD') as caught:
+        m._renderings(canonical_json_bytes(fixture['raw']), fixture['state'], version=m.TYPED_VERSION,
+                      consumer_contract=SOURCE_RENDERING_CONTRACT_V3)
+    assert 'LOCALISATION_NUMERIC_HOLD' in caught.value.reason_codes
 
 
 @pytest.mark.parametrize('fixture', FIXTURES, ids=lambda row: row['candidate_id'][:8])
@@ -67,6 +91,7 @@ def test_reported_v4_occurrence_consumer_preserves_wire_and_only_corrects_three(
     (0, '1', '課程', '「課程」'),
     (0, '2', '一部分', '二部分'),
     (0, '2', '一部分', '二十一部分'),
+    (0, '2', '一部分', '第一部分'),
     (0, '2', '6,500名', '負6,500名'),
     (0, '2', '6,500名', '負 6,500名'),
     (0, '2', '6,500名', '負六千五百名'),
@@ -77,6 +102,7 @@ def test_reported_v4_occurrence_consumer_preserves_wire_and_only_corrects_three(
     (1, '1', '一份簡短調查', '最多一份簡短調查'),
     (1, '1', '一份簡短調查', '兩份簡短調查'),
     (1, '1', '一份簡短調查', '二十一個簡短調查'),
+    (1, '1', '一份簡短調查', '第一個簡短調查'),
     (1, '1', '一份簡短調查', '一個半簡短調查'),
     (2, '0', 'Ofqual 特此', 'Ofqual Ofqual 特此'),
 ])
