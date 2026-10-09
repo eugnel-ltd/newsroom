@@ -128,12 +128,16 @@ REASSESSABLE_HOLDS = frozenset({
     "WEATHER_EVIDENCE_METADATA_HOLD",
     "EVIDENCE_VALIDATION_HOLD",
     "ASSESSOR_REVALIDATION_INPUT_CHANGED_HOLD",
+    "ASSESSOR_REVALIDATION_CACHE_MISSING_HOLD",
     "SEMANTIC_INTENT_INPUT_CHANGED_HOLD",
 })
 
 
 def assessment_revalidation_due(facts: dict, contract_version: str | None) -> bool:
     previous = facts.get("assessment_contract_version")
+    if (facts.get("reason") == "ASSESSOR_REVALIDATION_CACHE_MISSING_HOLD"
+            and not same_assessment_producer(previous, contract_version)):
+        return False  # Missing cached input never authorises a different/new producer.
     if (type(previous) is str and type(contract_version) is str
             and previous.split("+", 1)[0] == _V22_PRODUCER_VERSION
             and contract_version.split("+", 1)[0] == _REFERENCE_PRODUCER_VERSION):

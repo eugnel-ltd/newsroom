@@ -30,6 +30,7 @@ from newsroom.sources.record_models import SourceDefinitionVersion
 from newsroom.sources.types import SourceLifecycleStage
 
 _GATES = ("CLAIM_TRACEABILITY", "EVIDENCE_SUFFICIENCY", "SOURCE_AUTHORITY")
+CACHED_ASSESSMENT_ORIGIN_VERSION = "newsroom.cached-assessment-origin.v1"
 _INTEGRITY_CHECKS = (
     "ACCESS_COMPLETE",
     "ENCODING_VALID",
@@ -323,7 +324,7 @@ class IndependentEvidenceAssessment:
 class EvidenceAssessor:
     """Deterministic assessment of the independently acquired exact bytes."""
 
-    __slots__ = ("_assess",)
+    __slots__ = ("_assess", "_cached_qualification_origin")
 
     def __init__(
         self,
@@ -336,10 +337,15 @@ class EvidenceAssessor:
             ],
             IndependentEvidenceAssessment,
         ],
+        *,
+        cached_qualification_origin: Callable[..., object | None] | None = None,
     ) -> None:
         if not callable(assess):
             raise NativeEvidenceError("evidence assessor is required")
+        if cached_qualification_origin is not None and not callable(cached_qualification_origin):
+            raise NativeEvidenceError("cached qualification origin reader differs")
         self._assess = assess
+        self._cached_qualification_origin = cached_qualification_origin
 
     def assess(
         self,
@@ -355,6 +361,11 @@ class EvidenceAssessor:
     ) -> IndependentEvidenceAssessment:
         bounded = getattr(self._assess, "assess_with_boundary", None)
         if callable(bounded):
+            if (cached_only and not qualification_cached_only and not semantic_only
+                    and not context_only and self._cached_qualification_origin is not None):
+                qualification_cached_only = self._cached_qualification_origin(
+                    candidate, package, sources, acquired,
+                ) is not None
             result = bounded(
                 candidate, package, sources, acquired,
                 before_dispatch=before_assessment,

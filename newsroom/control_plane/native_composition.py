@@ -59,7 +59,7 @@ from .native_discovery import NativeDiscovery
 from .native_embeddings import NativePassageEmbedder
 from .native_evidence import (
     EvidenceAssessor, EvidenceTransport, NativeEvidenceController,
-    NativeEvidenceHold,
+    NativeEvidenceHold, CACHED_ASSESSMENT_ORIGIN_VERSION,
 )
 from .native_graphiti import NativeGraphitiProcessor
 from .native_pipeline import NativePipeline
@@ -99,6 +99,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"+{CORRECTED_RESOLUTION_CONSUMER_VERSION}"
     f"+{REPLAY_CONSUMER_VERSION}"
     f"+{RENDERING_REPAIR_CONSUMER_VERSION}"
+    f"+{CACHED_ASSESSMENT_ORIGIN_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
@@ -803,6 +804,7 @@ def open_native_pipeline(
         )
         typed_proposal_verifier = None
         semantic_witness_disposition_reader = None
+        cached_qualification_origin = None
         if judgment_api_key is not None:
             from .native_assessor_judgments import NativeAssessorJudgments, VERSION as JUDGMENT_CONTRACT
             from .native_claim_localisation import NativeClaimLocaliser
@@ -896,6 +898,24 @@ def open_native_pipeline(
                         raise NativeEvidenceHold(str(exc), sources[0].unit.source_id) from exc
 
                 assessor._retained_qualification = read_qualified_source
+
+                def cached_qualification_origin(candidate, base, sources, acquired):
+                    from .native_source_qualification import QualificationHold
+                    from .native_source_qualification_replay import original_qualification_reference
+                    from .veto import OperatorDrainRequested, VetoError
+                    with stop_fence():
+                        stop_check()
+                        try:
+                            return original_qualification_reference(
+                                qualifier, candidate, base, proof=proof, optional=True,
+                            )
+                        except (OperatorDrainRequested, VetoError):
+                            raise
+                        except Exception as exc:
+                            reason = str(exc) if isinstance(exc, QualificationHold) else "QUALIFICATION_RETAINED_ORIGIN_HOLD"
+                            source_id = sources[0].unit.source_id if sources else candidate.candidate_id
+                            raise NativeEvidenceHold(reason, source_id) from exc
+
                 from .native_context_enrichment import NativeContextEnricher, ContextEnrichmentHold
 
                 def enrich_source_context(original,candidate,base,sources,acquired):
@@ -1163,7 +1183,9 @@ def open_native_pipeline(
         evidence = NativeEvidenceController(
             objects=runtime.authority.objects, candidate_port=runtime.authority.candidate_read_port,
             evidence_packages=runtime.evidence,
-            transport=EvidenceTransport(acquire), assessor=EvidenceAssessor(assessor),
+            transport=EvidenceTransport(acquire), assessor=EvidenceAssessor(
+                assessor, cached_qualification_origin=cached_qualification_origin,
+            ),
             policy_bundle_digest=policies.publication.editorial_policy_bundle_digest,
             transport_policy_digest=TRANSPORT_POLICY, clock=now,
         )
