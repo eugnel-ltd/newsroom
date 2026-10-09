@@ -221,3 +221,10 @@ def test_retired_clustering_path_group_selects_no_evaluator_dependencies() -> No
     clustering_paths = set(contract["classification"]["paths"]["clustering"])
 
     assert clustering_paths == {"newsroom/legacy_operational_stack_retired.py"}
+
+
+def test_focus_service_uses_content_pinned_official_mirror_without_hub_login():
+    image=_load(FOCUS_PATH)['jobs']['focus']['env']['NEO4J_IMAGE']
+    name,digest=image.split('@sha256:')
+    assert name.startswith('public.ecr.aws/docker/library/neo4j:')
+    assert len(digest)==64 and set(digest)<=set('0123456789abcdef')

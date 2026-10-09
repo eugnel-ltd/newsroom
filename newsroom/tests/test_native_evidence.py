@@ -74,6 +74,58 @@ INTEGRITY = tuple(
 )
 
 
+def test_generic_cached_assessment_selects_authenticated_qualification_origin():
+    candidate, package, origin = object(), object(), object()
+    sources, acquired, calls = (), (), []
+    assessment = IndependentEvidenceAssessment(
+        (), (), (), (), (), (), "Retained result", (), (),
+    )
+
+    def read_origin(*inputs):
+        assert inputs == (candidate, package, sources, acquired)
+        calls.append("origin")
+        return origin
+
+    def bounded(*inputs, **mode):
+        assert inputs == (candidate, package, sources, acquired)
+        assert mode["cached_only"] is True
+        assert mode["qualification_cached_only"] is True
+        mode["before_dispatch"]()
+        calls.append("retained qualification")
+        return assessment
+
+    bounded.assess_with_boundary = bounded
+    adapter = EvidenceAssessor(bounded, cached_qualification_origin=read_origin)
+    result = adapter.assess(
+        candidate, package, sources, acquired, cached_only=True,
+        before_assessment=lambda: calls.append("before assessment"),
+    )
+    assert result is assessment
+    assert calls == ["origin", "before assessment", "retained qualification"]
+
+
+@pytest.mark.parametrize("mode", [
+    {}, {"semantic_only": True}, {"context_only": True},
+    {"cached_only": True, "qualification_cached_only": True},
+])
+def test_qualification_origin_probe_does_not_change_other_assessment_modes(mode):
+    assessment = IndependentEvidenceAssessment((), (), (), (), (), (), "Retained result", (), ())
+    seen = []
+
+    def bounded(*_inputs, **request):
+        seen.append(request)
+        return assessment
+
+    def forbidden(*_inputs):
+        pytest.fail("non-generic assessment probed qualification origin")
+
+    bounded.assess_with_boundary = bounded
+    adapter = EvidenceAssessor(bounded, cached_qualification_origin=forbidden)
+    assert adapter.assess(object(), object(), (), (), **mode) is assessment
+    assert seen == [{"before_dispatch": None, "cached_only": mode.get("cached_only", False),
+                     **{key: value for key, value in mode.items() if key != "cached_only"}}]
+
+
 def test_independent_source_evidence_holds_then_reaches_private_ack(tmp_path) -> None:
     candidate_connection, candidate_port, version = _candidate(tmp_path)
     ingress = open_evidence_intake_ingress(tmp_path / "intake.sqlite3")

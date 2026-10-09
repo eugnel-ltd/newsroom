@@ -2447,3 +2447,36 @@ def test_rendering_repair_does_not_reset_unknown_or_semantic_decisions(fault):
     else:facts['reason']='QUALIFICATION_RESOLUTION_NOT_AFFIRMATIVE_HOLD'
     continuation=object.__new__(NativePublicationContinuation);continuation._assessment_contract_version=current
     assert not continuation.qualification_resolution_due(facts)
+
+
+def test_missing_cache_consumer_upgrade_preserves_generic_cached_reader_selection(tmp_path,monkeypatch):
+    unit=_native();connection=connect(str(tmp_path/'cached-origin.sqlite3'))
+    journal=NativeRevisionJournal(connection);journal.land((unit,))
+    prior='newsroom.native-evidence-assessor.v23+consumer.v1'
+    current=prior+'+newsroom.cached-assessment-origin.v1'
+    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts={
+        'candidate_version_id':'candidate-version','graphiti_receipts':[{}],
+        'intake_receipt_id':'retained-intake','reason':'ASSESSOR_REVALIDATION_CACHE_MISSING_HOLD',
+        'assessment_contract_version':prior,'acquisition_retryable':False})
+    calls=[]
+    def acquire(_self,**request):
+        calls.append(request)
+        assert request['assessment_cached_only'] is True
+        assert not request.get('assessment_qualification_cached_only')  # Adapter authenticates the origin.
+        assert request['intake_receipt_id']=='retained-intake'
+        raise NativeEvidenceHold('NO_QUALIFYING_NEW_INFORMATION',unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+    runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),
+                            policies=SimpleNamespace(publication=object()),proof=proof())
+    continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
+        evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
+        assessment_contract_version=current)
+    try:
+        for _ in range(2):continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+        facts=journal.current(unit.revision_id)['facts']
+        assert len(calls)==1
+        assert facts['assessment_contract_version']==current
+        assert facts['assessment_superseded']['reason']=='ASSESSOR_REVALIDATION_CACHE_MISSING_HOLD'
+        assert facts['intake_receipt_id']=='retained-intake'
+        assert runtime.authority.receives==runtime.publication.calls==0
+    finally:connection.close()

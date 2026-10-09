@@ -13,6 +13,8 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from newsroom.authority.canonical import canonical_json_bytes, digest_bytes, digest_canonical
 from newsroom.control_plane import native_assessor as native_assessor_module
+# Historical tests patch VERSION; load dependent current protocol bindings first.
+from newsroom.control_plane import native_source_qualification as _current_source_qualification
 from newsroom.control_plane.admission import DeterministicWriteAdmission
 from newsroom.control_plane.evidence import (
     EvidencePackage,
@@ -3345,3 +3347,19 @@ def test_pending_native_envelope_does_not_expand_unknown_semantic_origin_eligibi
             assert retained.execute('SELECT record_json FROM model_invocation_terminals').fetchone()[0] == terminal
     finally:
         connection.close()
+
+
+def test_cache_origin_consumer_upgrade_rechecks_missing_cache_once():
+    from newsroom.control_plane.native_assessor import assessment_revalidation_due
+    prior=VERSION+'+consumer.v1'
+    current=prior+'+newsroom.cached-assessment-origin.v1'
+    facts={'assessment_contract_version':prior,'reason':'ASSESSOR_REVALIDATION_CACHE_MISSING_HOLD'}
+    assert assessment_revalidation_due(facts,current)
+    facts['assessment_contract_version']=current
+    assert not assessment_revalidation_due(facts,current)
+    facts.pop('assessment_contract_version')
+    assert not assessment_revalidation_due(facts,current)
+    facts['assessment_contract_version']='different-producer+consumer.v1'
+    assert not assessment_revalidation_due(facts,current)
+    facts.update(assessment_contract_version=prior,reason='ACQUISITION_RESULT_NOT_RETAINED',failure_class='CliTimeoutError')
+    assert not assessment_revalidation_due(facts,current)

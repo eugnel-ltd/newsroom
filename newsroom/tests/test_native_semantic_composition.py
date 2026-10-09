@@ -318,5 +318,5 @@ def test_real_qualification_composition_opens_without_any_provider_dispatch(tmp_
         'intake_receipt_id':'retained-intake','assessment_contract_version':prior}
     assert all(item._publish.qualification_resolution_due(recipe) is True for item in pipelines)
     rendering={**recipe,'reason':'QUALIFICATION_RESOLUTION_RENDERING_HOLD','failure_class':None,
-        'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.removesuffix('+newsroom.source-qualification-rendering-repair.v1')}
+        'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.replace('+newsroom.source-qualification-rendering-repair.v1','')}
     assert all(item._publish.qualification_resolution_due(rendering) is True for item in pipelines)

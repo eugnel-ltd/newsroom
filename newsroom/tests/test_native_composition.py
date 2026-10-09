@@ -45,7 +45,133 @@ def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
         "+newsroom.source-qualification-resolution-consumer.v1"
         "+newsroom.source-qualification-resolution-consumer.v2+newsroom.source-qualification-replay.v1"
         "+newsroom.source-qualification-rendering-repair.v1"
+        "+newsroom.cached-assessment-origin.v1"
     )
+
+
+def _composed_cached_origin_adapter(assessor, **bindings):
+    """Execute the composed reader and adapter only, without authority OPEN."""
+    import ast
+
+    tree = ast.parse(Path(native_composition.__file__).read_text())
+    reader = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef) and node.name == "cached_qualification_origin")
+    constructor = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                       and node.func.id == "EvidenceAssessor")
+    namespace = {**vars(native_composition), "assessor": assessor, **bindings}
+    exec(compile(ast.Module(body=[reader], type_ignores=[]), native_composition.__file__, "exec"), namespace)
+    return eval(compile(ast.Expression(constructor), native_composition.__file__, "eval"), namespace)
+
+
+def test_composed_generic_cache_reads_actual_source_qualification_without_dispatch(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_evidence import IndependentEvidenceAssessment
+    from newsroom.control_plane.native_source_qualification_replay import read_current_result
+    from newsroom.tests.test_native_source_qualification import _retained_role_bound_recipe
+
+    with _retained_role_bound_recipe(tmp_path, monkeypatch) as (
+            qualifier, consumer, candidate, base, source, fresh, scope, original,
+            usage, calls, jev_calls):
+        events = []
+        assessment = IndependentEvidenceAssessment((), (), (), (), (), (), "Retained result", (), ())
+
+        @contextmanager
+        def fence():
+            events.append("fence")
+            yield
+
+        def bounded(*inputs, **mode):
+            assert inputs == (candidate, base, (source,), (fresh,))
+            assert mode["cached_only"] is True and mode["qualification_cached_only"] is True
+            mode["before_dispatch"]()
+            assert read_current_result(qualifier, *inputs, scope=scope, proof=consumer.proof) == original
+            return assessment
+
+        bounded.assess_with_boundary = bounded
+        adapter = _composed_cached_origin_adapter(
+            bounded, qualifier=qualifier, proof=consumer.proof,
+            stop_fence=fence, stop_check=lambda: events.append("stop"),
+        )
+        with sqlite3.connect(usage.path) as db:
+            terminals = db.execute("SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id").fetchall()
+        assert adapter.assess(candidate, base, (source,), (fresh,), cached_only=True,
+                              before_assessment=lambda: events.append("before assessment")) is assessment
+        assert events == ["fence", "stop", "before assessment"]
+        assert len(calls) == len(jev_calls) == 1
+        with sqlite3.connect(usage.path) as db:
+            assert db.execute("SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id").fetchall() == terminals
+
+
+@pytest.mark.parametrize("origin", ["absent", "unknown", "ambiguous", "tampered", "stop", "drain"])
+def test_composed_cached_origin_denials_never_fall_back_or_dispatch(tmp_path, monkeypatch, origin):
+    from newsroom.control_plane.native_evidence import IndependentEvidenceAssessment, NativeEvidenceHold
+    from newsroom.control_plane.model_usage import WorkEnvelope, InvocationAllocation, _allocation_from_record
+    from newsroom.control_plane.veto import OperatorDrainRequested, VetoError
+    from newsroom.tests.test_native_source_qualification import (
+        _retained_role_bound_recipe, _drop_fixture_guards,
+    )
+
+    with _retained_role_bound_recipe(tmp_path, monkeypatch, failure="timeout" if origin == "unknown" else None) as (
+            qualifier, consumer, candidate, base, source, fresh, _scope, _original,
+            usage, calls, jev_calls):
+        if origin == "absent":
+            candidate = SimpleNamespace(**{**vars(candidate), "candidate_id": "legacy-without-sourceqa"})
+        elif origin == "ambiguous":
+            with sqlite3.connect(usage.path) as db:
+                row = db.execute("SELECT record_json FROM model_invocation_allocations WHERE route='NATIVE_SOURCE_QUALIFICATION'").fetchone()
+            original = _allocation_from_record(json.loads(row[0]))
+            envelope = WorkEnvelope.create(
+                cycle_id="another-retained-qualified-intent", workload_class=WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
+                admitted_at=NOW, admission_decision_id=None, candidate_id=candidate.candidate_id,
+                hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest,
+                ingest_id=None, graphiti_attempt_id=None,
+            )
+            usage.open_envelope(envelope)
+            values = asdict(original)
+            values.pop("invocation_id"); values.pop("canonical_digest")
+            usage.allocate(InvocationAllocation.create(**{**values, "envelope_id": envelope.envelope_id,
+                           "cycle_id": envelope.cycle_id}), owner_emergency_stop=False)
+        elif origin == "tampered":
+            with sqlite3.connect(usage.path) as db:
+                _drop_fixture_guards(db, "model_invocation_terminals")
+                db.execute("UPDATE model_invocation_terminals SET outcome='QUALIFICATION_FAILED' WHERE invocation_id IN "
+                           "(SELECT invocation_id FROM model_invocation_allocations WHERE route='NATIVE_SOURCE_QUALIFICATION')")
+
+        events = []
+        assessment = IndependentEvidenceAssessment((), (), (), (), (), (), "Legacy result", (), ())
+
+        def bounded(*_inputs, **mode):
+            assert origin == "absent", "unproved origin reached another reader"
+            assert mode["cached_only"] is True and not mode.get("qualification_cached_only")
+            events.append("legacy")
+            return assessment
+
+        def stop_check():
+            if origin in {"stop", "drain"}:
+                raise (VetoError if origin == "stop" else OperatorDrainRequested)("owner stop")
+
+        if origin in {"stop", "drain"}:
+            monkeypatch.setattr(type(qualifier.objects), "committed_admission", lambda *_a, **_k: pytest.fail("stopped origin probe read CAS"))
+        bounded.assess_with_boundary = bounded
+        adapter = _composed_cached_origin_adapter(
+            bounded, qualifier=qualifier, proof=consumer.proof,
+            stop_fence=nullcontext, stop_check=stop_check,
+        )
+        with sqlite3.connect(usage.path) as db:
+            terminals = db.execute("SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id").fetchall()
+        if origin == "absent":
+            assert adapter.assess(candidate, base, (source,), (fresh,), cached_only=True) is assessment
+            assert events == ["legacy"]
+        else:
+            expected = VetoError if origin == "stop" else OperatorDrainRequested if origin == "drain" else NativeEvidenceHold
+            reason = {"unknown": "QUALIFICATION_REPLAY_USAGE_HOLD", "ambiguous": "ABSENT_OR_AMBIGUOUS",
+                      "tampered": "QUALIFICATION_RETAINED_ORIGIN_HOLD"}.get(origin, "owner stop")
+            with pytest.raises(expected, match=reason):
+                adapter.assess(candidate, base, (source,), (fresh,), cached_only=True)
+            assert not events
+        assert len(calls) == len(jev_calls) == 1
+        with sqlite3.connect(usage.path) as db:
+            assert db.execute("SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id").fetchall() == terminals
 
 
 def test_native_cursor_credential_loads_only_provisioned_key_and_restores_environment(
