@@ -9,6 +9,7 @@ from newsroom.authority.neo4j_fulltext_reader import (
     FULLTEXT_SOURCE_SCOPE_CANDIDATE_LIMIT,
 )
 from newsroom.authority.types import TrustScope, UtcTimestamp
+from newsroom.authority.canonical import validate_sha256_digest
 from newsroom.projection.ontology import ProjectionNodeType, ProjectionRelationType
 
 from .models import (
@@ -422,6 +423,7 @@ class _Neo4jAdapter:
         limit: int,
         timeout_ns: int,
         eligible_passage_ids: tuple[str, ...] | None = None,
+        corpus_scope_digest: str | None = None,
     ) -> Any:
         """Execute one fixed phase of the Increment 5 full-text read port."""
 
@@ -548,7 +550,7 @@ class _Neo4jAdapter:
                 else:
                     if (
                         not isinstance(eligible_passage_ids, tuple)
-                        or len(eligible_passage_ids) > 4_096
+                        or corpus_scope_digest is None and len(eligible_passage_ids) > 4_096
                         or eligible_passage_ids
                         != tuple(sorted(set(eligible_passage_ids)))
                         or any(
@@ -565,6 +567,8 @@ class _Neo4jAdapter:
                         raise Neo4jReadError(
                             "Neo4j native full-text query controls are invalid"
                         )
+                    if corpus_scope_digest is not None:
+                        validate_sha256_digest(corpus_scope_digest)
                     callback = lambda transaction: transaction.run(
                         _NATIVE_FULLTEXT_READ_QUERY,
                         {

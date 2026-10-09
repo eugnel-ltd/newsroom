@@ -4,10 +4,46 @@ from dataclasses import replace
 
 import pytest
 
-from newsroom.authority import AggregateId, GovernedObjects
+from newsroom.authority import AggregateId, GovernedObjects, AuthenticationProof, ObjectAdmissionId
 from newsroom.authority.persistence import AuthorityEvents
-from newsroom.increment5.native_retrieval import NativeRetrievalDocuments, NativeRetrievalError
+from newsroom.increment5.native_retrieval import NativeDocumentReceipt, NativeRetrievalDocuments, NativeRetrievalError
 from newsroom.tests import test_native_retrieval_authority as authority_case
+
+
+def test_complete_corpus_scope_over_4096_never_hydrates_unselected_documents(monkeypatch):
+    documents = object.__new__(NativeRetrievalDocuments)
+    proof = AuthenticationProof(method="STATIC_TOKEN", credential="fixture")
+    receipts = tuple(NativeDocumentReceipt(
+        f"event-{index}", f"command-{index}", AggregateId.new(), 1,
+        ObjectAdmissionId.new(), "sha256:" + "1" * 64,
+        ObjectAdmissionId.new(), ObjectAdmissionId.new(),
+    ) for index in range(4197))
+    verified = []
+    def metadata(self, receipt, supplied):
+        assert self is documents and supplied is proof
+        verified.append(receipt.event_id)
+        return int(receipt.event_id.removeprefix("event-")) + 1
+    monkeypatch.setattr(NativeRetrievalDocuments, "_verify_event", metadata)
+    monkeypatch.setattr(NativeRetrievalDocuments, "_read_with_sequence",
+                        lambda *_args, **_kwargs: pytest.fail("unselected document/vector hydration"))
+    scope = documents.authenticated_corpus_scope(receipts, proof=proof)
+    assert documents.corpus_scope_receipts(scope, proof=proof) == receipts
+    assert documents.corpus_scope_watermark(scope, proof=proof) == 4197
+    assert len(verified) == len(receipts) + 1
+    for owner, supplied in ((copy(documents), proof), (documents, replace(proof, credential="wrong"))):
+        with pytest.raises(NativeRetrievalError):
+            owner.corpus_scope_receipts(scope, proof=supplied)
+
+
+def test_valid_but_current_excluded_vector_event_is_rejected_before_body_read(monkeypatch):
+    documents = object.__new__(NativeRetrievalDocuments)
+    receipt = NativeDocumentReceipt("registered", "command", AggregateId.new(), 1,
+        ObjectAdmissionId.new(), "sha256:" + "1" * 64, ObjectAdmissionId.new(), ObjectAdmissionId.new())
+    excluded = replace(receipt, event_id="current-excluded")
+    monkeypatch.setattr(documents, "_read", lambda *_args: pytest.fail("excluded body/vector read"))
+    with pytest.raises(NativeRetrievalError, match="outside current corpus"):
+        documents._documents(({**excluded.projection_value(), "score": 1.0},), "generation", None,
+                             allowed_receipts=(receipt,))
 
 
 def test_real_inventory_watermark_binds_proof_and_avoids_second_full_event_pass(tmp_path, monkeypatch):

@@ -217,6 +217,7 @@ def _open_neo4j_fulltext_reader_with_adapter(
                 ),
                 source_ids=request.source_ids,
                 eligible_passage_ids=request.eligible_passage_ids,
+                **({"corpus_scope_digest": request.corpus_scope_digest} if request.corpus_scope_digest is not None else {}),
                 limit=request.limit,
                 timeout_ns=request.timeout_ns,
             )

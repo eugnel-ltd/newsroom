@@ -47,6 +47,7 @@ from .fulltext_contracts import (
     FullTextAuthorityView,
     FullTextBranchRequest,
     FullTextContractError,
+    FullTextDocumentBinding,
     FullTextIndexState,
     FullTextProfile,
     NormalizedFullTextQuery,
@@ -97,17 +98,17 @@ class FullTextRetriever:
         self._normalizer = normalizer or BilingualSearchNormalizer()
 
     def retrieve(
-        self, request: FullTextBranchRequest
+        self, request: FullTextBranchRequest, *, authority_view: FullTextAuthorityView | None = None,
     ) -> FullTextJournalResult:
         if not isinstance(request, FullTextBranchRequest):
             raise TypeError("full-text retrieval request must be typed")
         return self._journal.execute(
             request,
-            lambda: self._execute(request),
+            lambda: self._execute(request, authority_view=authority_view),
         )
 
     def _execute(
-        self, request: FullTextBranchRequest
+        self, request: FullTextBranchRequest, *, authority_view: FullTextAuthorityView | None = None,
     ) -> FullTextBranchReceipt:
         start_ns = self._monotonic_ns()
         if request.contract_digest != INCREMENT5_RETRIEVAL_CONTRACT_DIGEST:
@@ -152,7 +153,7 @@ class FullTextRetriever:
 
         authority_read_count = 0
         try:
-            view = self._authority_view_provider(request)
+            view = self._authority_view_provider(request) if authority_view is None else authority_view
             if not isinstance(view, FullTextAuthorityView):
                 raise FullTextContractError(
                     "authority provider returned an untyped full-text view"
@@ -246,6 +247,9 @@ class FullTextRetriever:
             query_limit = request.result_limit + 1
             if snapshot.profile is FullTextProfile.NATIVE_RUNTIME:
                 eligible_passage_ids = tuple(
+                    passage for passage, source in view.corpus_scope.eligible_passages
+                    if not request.source_ids or source in request.source_ids
+                ) if view.corpus_scope is not None else tuple(
                     item.passage_id
                     for item in view.document_bindings
                     if (not request.source_ids or item.source_id in request.source_ids)
@@ -259,6 +263,7 @@ class FullTextRetriever:
                     generation_id=snapshot.generation_id,
                     source_ids=request.source_ids,
                     eligible_passage_ids=eligible_passage_ids,
+                    corpus_scope_digest=view.view_digest if view.corpus_scope is not None else None,
                     limit=query_limit,
                     timeout_ns=self._remaining_timeout_ns(
                         start_ns=start_ns,
@@ -592,6 +597,16 @@ class FullTextRetriever:
             )
 
         bindings = view.binding_by_passage_id
+        if view.corpus_scope is not None:
+            requested = tuple(item[0] for item in parsed)
+            try:
+                resolved = view.corpus_scope.resolve(requested) if requested else ()
+            except Exception as error:
+                raise FullTextContractError("full-text selected authority unavailable") from error
+            if (type(resolved) is not tuple or any(type(item) is not FullTextDocumentBinding for item in resolved)
+                    or len(resolved) != len(requested) or {item.passage_id for item in resolved} != set(requested)):
+                raise FullTextContractError("full-text selected binding differs")
+            bindings = {item.passage_id: item for item in resolved}
         hits: list[RetrievalBranchHit] = []
         exclusions: list[BranchExclusion] = []
         scoped_candidate_count = 0

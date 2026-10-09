@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from collections.abc import Callable
 from enum import StrEnum
 import re
 import uuid
@@ -562,10 +563,36 @@ class FullTextDocumentBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class FullTextCorpusScope:
+    """Complete eligibility metadata, separate from bounded authenticated hits."""
+    inventory_digest: str
+    eligible_passages: tuple[tuple[str, str], ...]
+    resolve: Callable = field(repr=False, compare=False)
+
+    def __post_init__(self):
+        validate_sha256_digest(self.inventory_digest)
+        if (type(self.eligible_passages) is not tuple or not callable(self.resolve)
+                or any(type(item) is not tuple or len(item) != 2
+                       for item in self.eligible_passages)):
+            raise FullTextContractError("full-text corpus metadata differs")
+        for passage_id, source_id in self.eligible_passages:
+            _bounded_text(passage_id, field="fulltext_corpus_passage", maximum_bytes=256)
+            _bounded_text(source_id, field="fulltext_corpus_source", maximum_bytes=256)
+        passages = tuple(item[0] for item in self.eligible_passages)
+        if passages != tuple(sorted(set(passages))):
+            raise FullTextContractError("full-text corpus passages must be sorted and unique")
+
+    def canonical_value(self):
+        return {"inventory_digest": self.inventory_digest,
+                "eligible_passages": [list(item) for item in self.eligible_passages]}
+
+
+@dataclass(frozen=True, slots=True)
 class FullTextAuthorityView:
     snapshot: FullTextProjectionSnapshot
     authority_aliases: tuple[AuthorityAliasTerm, ...]
     document_bindings: tuple[FullTextDocumentBinding, ...]
+    corpus_scope: FullTextCorpusScope | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, FullTextProjectionSnapshot):
@@ -602,13 +629,19 @@ class FullTextAuthorityView:
             raise FullTextContractError(
                 "full-text document bindings must be sorted and unique"
             )
+        if self.corpus_scope is not None and (
+            type(self.corpus_scope) is not FullTextCorpusScope or self.document_bindings
+            or self.snapshot.profile is not FullTextProfile.NATIVE_RUNTIME
+            or self.snapshot.index_document_count != len(self.corpus_scope.eligible_passages)
+        ):
+            raise FullTextContractError("full-text complete corpus scope differs")
 
     @property
     def binding_by_passage_id(self) -> dict[str, FullTextDocumentBinding]:
         return {item.passage_id: item for item in self.document_bindings}
 
     def canonical_value(self) -> dict[str, object]:
-        return {
+        value = {
             "snapshot": self.snapshot.canonical_value(),
             "authority_aliases": [
                 item.canonical_value() for item in self.authority_aliases
@@ -617,6 +650,9 @@ class FullTextAuthorityView:
                 item.canonical_value() for item in self.document_bindings
             ],
         }
+        if self.corpus_scope is not None:
+            value["corpus_scope"] = self.corpus_scope.canonical_value()
+        return value
 
     @property
     def view_digest(self) -> str:

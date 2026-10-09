@@ -380,8 +380,10 @@ def test_authority_port_uses_source_scope_only_for_bounded_candidate_scan() -> N
     }
 
 
-def test_native_authority_port_filters_authenticated_passages_before_top_eight() -> None:
-    eligible = tuple(f"p-native-{index:02d}" for index in range(10))
+@pytest.mark.parametrize("count", (10, 4_197))
+def test_native_authority_port_filters_authenticated_passages_before_top_eight(count) -> None:
+    eligible = tuple(f"p-native-{index:05d}" for index in range(count))
+    scope = {} if count <= 4_096 else {"corpus_scope_digest": "sha256:" + "a" * 64}
     clock = SequenceClock((0, 100_000_000, 200_000_000))
     driver = FakeDriver(default_scenario(rows=[]))
 
@@ -419,6 +421,7 @@ def test_native_authority_port_filters_authenticated_passages_before_top_eight()
             eligible_passage_ids=eligible,
             limit=8,
             timeout_ns=5_000_000_000,
+            **scope,
         )
     )
 
@@ -434,6 +437,23 @@ def test_native_authority_port_filters_authenticated_passages_before_top_eight()
         "eligible_passage_ids": list(eligible),
         "limit": 8,
     }
+
+
+def test_legacy_native_read_bound_and_complete_scope_result_bound_remain_fixed():
+    kwargs = {
+        "index_name": snapshot().index_name,
+        "lucene_expression": "retrieval_text:(synthetic)",
+        "generation_id": GENERATION_ID,
+        "source_ids": (),
+        "eligible_passage_ids": tuple(f"p-{index:05d}" for index in range(4_197)),
+        "limit": 8,
+        "timeout_ns": 5_000_000_000,
+    }
+    with pytest.raises(Neo4jFullTextReadError, match="fixed bound"):
+        Neo4jFullTextReadRequest.query(**kwargs)
+    kwargs["corpus_scope_digest"] = "sha256:" + "a" * 64
+    with pytest.raises(Neo4jFullTextReadError, match="result limit must equal 8"):
+        Neo4jFullTextReadRequest.query(**{**kwargs, "limit": 9})
 
 
 def test_authority_read_request_rejects_malformed_source_scope() -> None:

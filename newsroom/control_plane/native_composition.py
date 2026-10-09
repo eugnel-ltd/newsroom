@@ -1067,24 +1067,18 @@ def open_native_pipeline(
 
         def port_for(subjects, document_inventory, rights_inventory_digest):
             receipts = tuple(item.document_receipt for item in subjects)
-            retained_by_event = documents.require_authenticated_inventory(
-                document_inventory, receipts,
-            )
-            retained = tuple(retained_by_event[item.event_id] for item in receipts)
+            documents.corpus_scope_receipts(document_inventory, proof=proof)
             for missing in projector.reconcile_membership(receipts):
                 documents.reproject(missing, proof=proof)
-            watermark = documents.authenticated_inventory_watermark(
-                document_inventory, receipts, proof=proof,
-            )
+            documents.prepare_corpus_catalogue(document_inventory, subjects, generation_id, proof=proof)
+            watermark = documents.corpus_scope_watermark(document_inventory, proof=proof)
             snapshot = projector.snapshot(
                 generation_identity_digest=generation_digest,
-                rights_manifest_digest=digest_canonical(tuple(sorted(
-                    (item.passage_id, item.rights_digest) for item in retained
-                ))), contiguous_ledger_seq=watermark,
+                rights_manifest_digest=rights_inventory_digest, contiguous_ledger_seq=watermark,
                 expected_document_count=len(receipts), clock=now,
             )
-            view = documents.fulltext_authority_view_from_inventory(
-                document_inventory, receipts, snapshot,
+            view = documents.fulltext_authority_view_for_scope(
+                document_inventory, snapshot, proof=proof,
             )
             return NativeRetrievalPort(
                 documents=documents, exact=exact,

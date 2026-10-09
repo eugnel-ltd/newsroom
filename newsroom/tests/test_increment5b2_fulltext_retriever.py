@@ -722,6 +722,72 @@ def test_native_runtime_returns_authorised_top_eight_without_exhaustive_scan(
     )
 
 
+def test_native_complete_corpus_metadata_is_not_a_returned_binding_limit(tmp_path):
+    from newsroom.increment5.fulltext_contracts import FullTextAuthorityView, FullTextCorpusScope
+    eligible = tuple((f"p-corpus-{index:05d}", "source-en") for index in range(4197))
+    selected = replace(bindings()[1], passage_id=eligible[-1][0])
+    resolved = []
+    def resolve(passages):
+        resolved.append(passages)
+        assert passages == (selected.passage_id,)
+        return (selected,)
+    current_view = FullTextAuthorityView(
+        snapshot=snapshot(profile=FullTextProfile.NATIVE_RUNTIME, index_document_count=4197),
+        authority_aliases=(), document_bindings=(),
+        corpus_scope=FullTextCorpusScope(digest("full-corpus"), eligible, resolve),
+    )
+    driver, _factory, retriever = system(tmp_path, view=current_view, scenario=default_scenario(
+        projection_snapshot=current_view.snapshot, rows=[{
+            "generation_id": str(GENERATION_ID), "passage_id": selected.passage_id,
+            "document_digest": selected.provenance_digest, "language": selected.language, "score": 1.0,
+        }],
+    ))
+    receipt = retriever.retrieve(request(idempotency_key="complete-large-corpus", source_ids=("source-en",))).receipt
+    assert receipt.outcome is BranchOutcome.COMPLETE
+    assert [hit.passage_id for hit in receipt.hits] == [selected.passage_id]
+    assert resolved == [(selected.passage_id,)]
+    assert len(driver.read_requests[-1].eligible_passage_ids) == 4197
+    assert driver.read_requests[-1].limit == 8
+    assert len(driver.read_requests) == 3
+
+
+@pytest.mark.parametrize("field", (0, 1))
+def test_complete_corpus_metadata_keeps_existing_text_field_bounds(field):
+    from newsroom.increment5.fulltext_contracts import FullTextCorpusScope
+    pair = ["passage", "source"]
+    pair[field] = "x" * 257
+    with pytest.raises(FullTextContractError, match="bounded canonical text"):
+        FullTextCorpusScope(digest("corpus"), (tuple(pair),), lambda _: ())
+
+
+def test_default_fulltext_authority_view_canonical_value_is_unchanged():
+    view = authority_view()
+    assert view.canonical_value() == {
+        "snapshot": view.snapshot.canonical_value(),
+        "authority_aliases": [item.canonical_value() for item in view.authority_aliases],
+        "document_bindings": [item.canonical_value() for item in view.document_bindings],
+    }
+
+
+@pytest.mark.parametrize("failure", ("revoked", "spoofed"))
+def test_native_selected_authority_failure_is_an_unavailable_branch_not_no_match(tmp_path, failure):
+    from newsroom.increment5.fulltext_contracts import FullTextAuthorityView, FullTextCorpusScope
+    selected = bindings()[1]
+    def resolve(passages):
+        if failure == "revoked":
+            raise PermissionError("selected document rights revoked")
+        return (replace(selected, provenance_digest=digest("wrong-document")),)
+    view = FullTextAuthorityView(snapshot=snapshot(profile=FullTextProfile.NATIVE_RUNTIME, index_document_count=1),
+        authority_aliases=(), document_bindings=(),
+        corpus_scope=FullTextCorpusScope(digest("complete-corpus"), ((selected.passage_id, selected.source_id),), resolve))
+    _driver, _factory, retriever = system(tmp_path, view=view, scenario=default_scenario(
+        projection_snapshot=view.snapshot, rows=[result_row(selected.passage_id, 1.0)]))
+    receipt = retriever.retrieve(request(idempotency_key="selected-authority-failure", source_ids=(selected.source_id,))).receipt
+    assert receipt.outcome is BranchOutcome.UNAVAILABLE
+    assert receipt.reason_code == "PROJECTION_INTEGRITY_ERROR"
+    assert not receipt.hits
+
+
 def test_native_runtime_empty_authorised_inventory_is_bounded_no_match(
     tmp_path: Path,
 ) -> None:
