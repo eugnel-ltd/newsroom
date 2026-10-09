@@ -17,8 +17,8 @@ from newsroom.projection.models import ProjectionGenerationState
 from newsroom.tests.test_graphiti_operational_readiness import _unit
 
 
-def _open(tmp_path, monkeypatch, *, ingest, rights=lambda _: {"current": True}, active_generation=True):
-    connection = connect(str(tmp_path / "private.sqlite3"))
+def _open(tmp_path, monkeypatch, *, ingest, rights=lambda _: {"current": True}, active_generation=True, usage=None):
+    connection = connect(usage.path if usage is not None else str(tmp_path / "private.sqlite3"))
     authority_path = tmp_path / "authority.sqlite3"
     metadata = sqlite3.connect(authority_path)
     metadata.execute("CREATE TABLE projection_generations(generation_id TEXT PRIMARY KEY, family_id TEXT, state TEXT)")
@@ -65,7 +65,7 @@ def _open(tmp_path, monkeypatch, *, ingest, rights=lambda _: {"current": True}, 
     system.increment4 = SimpleNamespace(build_current_and_promote=build_current, generation_status=status)
     system.graphiti = SimpleNamespace(attempt_history=lambda *args, **kwargs: ())
     processor = n.NativeGraphitiProcessor(
-        system=system, connection=connection, usage=None, proof=None,
+        system=system, connection=connection, usage=usage, proof=None,
         rights_for=rights, stop_check=lambda: None, dispatch_fence=fence,
         clock=lambda: datetime(2026, 9, 8, tzinfo=UTC),
     )
@@ -88,6 +88,88 @@ def _complete(connection, **kw):
             generation_id="test-isolated-generation", receipt_digest=unit.digest,
         )
     connection.commit()
+
+
+def test_cancelled_unknown_preflights_successors_without_zero_provider_failure_slots(
+    tmp_path, monkeypatch,
+):
+    from newsroom.control_plane.model_usage import ModelUsageAdmissionError, ModelUsageService
+    from newsroom.control_plane.store import (
+        insert_graphiti_attempt_receipt, record_graphiti_failure,
+        next_graphiti_attempt_number, reserve_graphiti_spend,
+    )
+    from newsroom.tests.test_graphiti_internal_requests import (
+        _historical_unknown_graphiti_request, _independent_request, _original_graphiti_unknown_rows,
+    )
+    service, _envelope, policy, shape, original, identity = _historical_unknown_graphiti_request(
+        tmp_path, native=True, outcome='CANCELLED',
+    )
+    held, independent = _native(), _native('independent')
+    assert held.ingest_id == identity.ingest_obligation_id
+    original_rows = _original_graphiti_unknown_rows(service, original)
+    guard_attempts = []
+
+    def ingest(connection, *, units, defer_before_unit, **_values):
+        for unit in units:
+            if connection.execute("SELECT 1 FROM unpublished_graphiti_ingest WHERE ingest_id=? AND outcome='COMPLETE'",
+                                  (unit.ingest_id,)).fetchone() or defer_before_unit(unit):
+                continue
+            if unit.ingest_id != held.ingest_id:
+                _complete(connection, units=(unit,))
+                continue
+            # Exact old failure: guard/successor starts before admission rejects the same UNKNOWN work.
+            number = next_graphiti_attempt_number(connection, unit.ingest_id)
+            guard_attempts.append(number)
+            reserve_graphiti_spend(connection, spend_id=f'{unit.ingest_id}:{number}',
+                ingest_id=unit.ingest_id, attempt_number=number, proving_run_id=unit.proving_run_id,
+                generation_id='fixture', reserved_gbp_microunits=1, ceiling_gbp_microunits=None)
+            connection.commit()
+            allocation, retry_identity = _independent_request(service, policy, shape,
+                ingest=unit.ingest_id, attempt=number, cycle=f'cancelled-retry:{number}',
+                effective_revision_digest=identity.effective_revision_digest)
+            with pytest.raises(ModelUsageAdmissionError) as failure:
+                service.allocate_graphiti_request(allocation, identity=retry_identity,
+                    max_distinct_internal_requests=shape.max_distinct_internal_requests)
+            assert failure.value.reason_code == 'GRAPHITI_PRIOR_WORK_UNRESOLVED'
+            insert_graphiti_attempt_receipt(connection, ingest_id=unit.ingest_id,
+                attempt_number=number, outcome='FAILED', receipt={
+                    'failure_code':'PRODUCER_INTERNAL_ERROR', 'combined_temporal_failure_code':'PIPELINE_FAILED',
+                    'token_usage':{'usage_basis':'NO_PROVIDER_CALL', 'chat_request_count':0},
+                })
+            record_graphiti_failure(connection, ingest_id=unit.ingest_id, source_id=unit.source_id,
+                item_key=unit.item_key, outcome='FAILED', failure_code='PRODUCER_INTERNAL_ERROR')
+            connection.commit()
+
+    processor, connection, _ = _open(tmp_path, monkeypatch, ingest=ingest, usage=service)
+    reserve_graphiti_spend(connection, spend_id=f'{held.ingest_id}:1',
+        ingest_id=held.ingest_id, attempt_number=1, proving_run_id=held.proving_run_id,
+        generation_id='fixture', reserved_gbp_microunits=1, ceiling_gbp_microunits=None)
+    insert_graphiti_attempt_receipt(connection, ingest_id=held.ingest_id, attempt_number=1,
+        outcome='TIMEOUT', receipt={'failure_code':'EXECUTION_TIMEOUT'})
+    record_graphiti_failure(connection, ingest_id=held.ingest_id, source_id=held.source_id,
+        item_key=held.item_key, outcome='TIMEOUT', failure_code='EXECUTION_TIMEOUT')
+    connection.commit()
+    failure_row = connection.execute('SELECT * FROM unpublished_graphiti_failures WHERE ingest_id=?',
+                                     (held.ingest_id,)).fetchone()
+    envelope_count = connection.execute('SELECT count(*) FROM model_work_envelopes').fetchone()[0]
+    try:
+        for number in (1, 2):
+            processor._usage = ModelUsageService(service.path)
+            outcomes = processor.advance((held, independent), cycle_id=f'cancelled-preflight:{number}')
+        assert [(o.state,o.reason) for o in outcomes] == [
+            ('GRAPHITI_HOLD','GRAPHITI_PRIOR_WORK_UNRESOLVED'), ('GRAPHITI_COMPLETE',None),
+        ]
+        assert guard_attempts == []
+        assert connection.execute('SELECT count(*) FROM unpublished_graphiti_attempt_receipts WHERE ingest_id=?',
+                                  (held.ingest_id,)).fetchone()[0] == 1
+        assert connection.execute('SELECT count(*) FROM unpublished_graphiti_spend WHERE ingest_id=?',
+                                  (held.ingest_id,)).fetchone()[0] == 1
+        assert connection.execute('SELECT * FROM unpublished_graphiti_failures WHERE ingest_id=?',
+                                  (held.ingest_id,)).fetchone() == failure_row
+        assert connection.execute('SELECT count(*) FROM model_work_envelopes').fetchone()[0] == envelope_count
+        assert _original_graphiti_unknown_rows(service, original) == original_rows
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize("cause", ["BrokerError", "GuardWorkspaceBusy"])
@@ -965,6 +1047,7 @@ def test_native_recovered_ambiguous_attempt_crosses_private_attempt_gap_once(
     )
     processor._runner = Runner()
     processor._usage = SimpleNamespace(
+        graphiti_prior_work_hold=lambda **_values: None,
         native_graphiti_ingest_retry_evidence_many=lambda **_values: {
             unit.ingest_id: GraphitiIngestRetryEvidence(
                 attempt_numbers=(1, 2, 3, 4),
@@ -1103,6 +1186,7 @@ def test_native_recovered_gap_allows_only_accounted_attempt_six(
     )
     processor._runner = Runner()
     processor._usage = SimpleNamespace(
+        graphiti_prior_work_hold=lambda **_values: None,
         native_graphiti_ingest_retry_evidence_many=lambda **_values: {
             unit.ingest_id: GraphitiIngestRetryEvidence(
                 attempt_numbers=(1, 2, 3, 4, 5),
@@ -1235,6 +1319,7 @@ def test_native_reenters_retained_recovered_attempt_before_a_new_successor(
         }
 
     processor._usage = SimpleNamespace(
+        graphiti_prior_work_hold=lambda **_values: None,
         native_graphiti_ingest_retry_evidence_many=retry_evidence,
     )
     processor._settle_missing_subscription_usage = lambda _units: None

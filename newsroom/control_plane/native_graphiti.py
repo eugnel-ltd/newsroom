@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from time import perf_counter_ns, process_time_ns
 from pathlib import Path
@@ -427,7 +427,15 @@ class NativeGraphitiProcessor:
             if defer_before_unit(unit):
                 deferred.add(unit.ingest_id)
                 return True
-            offered_attempt = (unit.ingest_id, next_graphiti_attempt_number(self._connection, unit.ingest_id))
+            attempt_number = next_graphiti_attempt_number(self._connection, unit.ingest_id)
+            if self._usage is not None:
+                hold = self._usage.graphiti_prior_work_hold(ingest_id=unit.ingest_id,
+                    effective_revision_digest=digest_canonical(asdict(unit.effective_revision)),
+                    attempt_number=attempt_number)
+                if hold is not None:
+                    terminal_holds[unit.ingest_id] = hold
+                    return True
+            offered_attempt = (unit.ingest_id, attempt_number)
             return False
 
         remaining = {

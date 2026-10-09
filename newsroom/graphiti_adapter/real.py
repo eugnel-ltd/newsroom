@@ -57,6 +57,7 @@ from newsroom.graphiti_adapter.combined_temporal_extraction import (
 )
 from newsroom.graphiti_adapter.combined_temporal_runtime import (
     CliCombinedTemporalTransport,
+    _observe_runtime_failure,
     extract_combined_temporal_async,
     resolve_nodes_with_optional_embeddings,
 )
@@ -1026,6 +1027,7 @@ async def _add_episode(
         try:
             completed = await pipeline._prepare_attempt()
         except CombinedTemporalPipelineError as exc:
+            _observe_runtime_failure("PREPARE_ATTEMPT", exc, None)
             marker = pipeline.recovery_marker
             if isinstance(marker, GuardMarker):
                 _restore_marker_telemetry(telemetry, marker)

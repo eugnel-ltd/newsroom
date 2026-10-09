@@ -1240,16 +1240,21 @@ def test_episode_uses_default_database_and_validates_before_complete(
     [
         ("COMPLETE", "restore_complete"),
         ("PENDING", "rollback_pending"),
+        ("GUARD_ERROR", None),
     ],
 )
 def test_process_recovery_uses_durable_guard_before_provider_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     state: str,
-    expected_event: str,
+    expected_event: str | None,
 ) -> None:
+    import json
     import newsroom.graphiti_adapter.real as real
 
     events: list[str] = []
+    diagnostics = []
+    monkeypatch.setattr("newsroom.control_plane.diagnostic_logging.emit_diagnostic",
+                        lambda event, data: diagnostics.append((event, data)))
 
     class Graphiti:
         def __init__(self, *_args: object, **values: object) -> None:
@@ -1267,6 +1272,9 @@ def test_process_recovery_uses_durable_guard_before_provider_dispatch(
 
     class Guard:
         async def begin(self) -> object:
+            if state == "GUARD_ERROR":
+                from newsroom.graphiti_adapter.neo4j_guard import GuardError
+                raise GuardError("TOKEN_PRIVATE_SOURCE_NOT_FOR_LOGS")
             return real.GuardMarker(
                 state=real.GuardState(state),
                 attempt_number=1,
@@ -1325,12 +1333,23 @@ def test_process_recovery_uses_durable_guard_before_provider_dispatch(
         configuration=configuration,
         revision=revision,
     )
-    if state == "PENDING":
+    if state in {"PENDING", "GUARD_ERROR"}:
         with pytest.raises(real.AmbiguousEpisodeEffect, match="blocks another"):
             asyncio.run(call)
     else:
         asyncio.run(call)
-    assert events == [expected_event, "close"]
+    assert events == ([expected_event] if expected_event else []) + ["close"]
+    if state == "GUARD_ERROR":
+        assert len(diagnostics) == 1
+        event, data = diagnostics[0]
+        assert event == "graphiti_combined_temporal_failure"
+        assert data["stage"] == "PREPARE_ATTEMPT"
+        assert data["cause_exception_class"] == "GuardError"
+        assert data["cause_file"] == "test_graphiti_adapter_real_executor.py"
+        assert data["cause_function"] == "begin"
+        assert type(data["cause_line"]) is int
+        assert "TOKEN_PRIVATE" not in json.dumps(data)
+        assert "request_identity_digest" not in data
 
 
 @pytest.mark.parametrize(
