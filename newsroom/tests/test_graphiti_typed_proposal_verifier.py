@@ -171,12 +171,13 @@ def test_unconfigured_observer_has_no_receipt_or_behaviour_change(monkeypatch, t
     assert [str(edge.fact) for edge in result.edges] == [item['fact'] for item in case.gold['facts']]
 
 
-def test_failed_verifier_retains_only_bounded_reason_and_exact_reference(monkeypatch):
+@pytest.mark.parametrize('reason', ['GRAPHITI_RELATION_DIRECTION_UNPROVEN', 'GRAPHITI_PROPOSAL_UNSUPPORTED'])
+def test_failed_verifier_retains_only_bounded_reason_and_exact_reference(monkeypatch, reason):
     reference = SimpleNamespace(invocation_id='sha256:'+'a'*64,
         raw_admission_id='00000000-0000-4000-8000-000000009821',
         receipt_admission_id='00000000-0000-4000-8000-000000009822')
     failure = ValueError('SECRET raw provider text must never be retained')
-    failure.reason_code = 'GRAPHITI_PROPOSAL_UNSUPPORTED'
+    failure.reason_code = reason
     failure.reference = reference
     def verify(**values):
         raise failure
@@ -185,5 +186,150 @@ def test_failed_verifier_retains_only_bounded_reason_and_exact_reference(monkeyp
     with pytest.raises(ExtractionContractError):
         asyncio.run(call)
     evidence = seen.snapshots[0]['combined']['typed_proposal_verification']
-    assert evidence == {'reason_code':'GRAPHITI_PROPOSAL_UNSUPPORTED', 'judgment_reference':vars(reference)}
+    assert evidence == {'reason_code':reason, 'judgment_reference':vars(reference)}
+    assert seen.snapshots[0]['combined']['failure_code'] == 'EVIDENCE_UNRESOLVED'
     assert 'SECRET' not in str(seen.snapshots) and seen.business == {} and seen.rollback == 0
+
+
+@pytest.mark.parametrize('reason', ['GRAPHITI_RELATION_DIRECTION_UNPROVEN', 'GRAPHITI_PROPOSAL_UNSUPPORTED'])
+@pytest.mark.parametrize('bad_reference', ['missing', 'invocation_id', 'raw_admission_id', 'receipt_admission_id', 'missing_field'])
+def test_semantic_reason_without_canonical_retained_reference_stays_pipeline_failure(
+    monkeypatch, reason, bad_reference,
+):
+    from newsroom.control_plane.native_graphiti_judgments import GraphitiJudgmentError
+    fields = dict(invocation_id='sha256:'+'a'*64,
+        raw_admission_id='00000000-0000-4000-8000-000000009821',
+        receipt_admission_id='00000000-0000-4000-8000-000000009822')
+    if bad_reference == 'missing_field':
+        fields.pop('receipt_admission_id')
+    elif bad_reference != 'missing':
+        fields[bad_reference] = 'invalid-reference'
+    reference = None if bad_reference == 'missing' else SimpleNamespace(**fields)
+
+    def verify(**values):
+        raise GraphitiJudgmentError(reason, reference=reference)
+
+    _with_verifier(monkeypatch, verify)
+    call, seen, _revision, _case = _run(monkeypatch)
+    with pytest.raises(ExtractionContractError):
+        asyncio.run(call)
+    receipt = seen.snapshots[0]['combined']
+    assert receipt['failure_code'] == 'PIPELINE_FAILED'
+    assert receipt['typed_proposal_verification'] == {'reason_code':reason, 'judgment_reference':None}
+    assert seen.model_calls == 1 and len(receipt['transport_calls']) == 1
+    assert seen.business == {} and seen.rollback == 0 and 'episode' not in seen.events
+
+
+@pytest.mark.parametrize('reason', [
+    'GRAPHITI_JUDGMENT_INPUT_BOUND', 'GRAPHITI_JUDGMENT_ANSWER_INVENTORY_INVALID',
+    'GRAPHITI_JUDGMENT_ANSWER_INVALID', 'UNKNOWN_INTERNAL_ERROR',
+])
+def test_nonsemantic_verifier_error_with_reference_stays_pipeline_failure(monkeypatch, reason):
+    from newsroom.control_plane.native_graphiti_judgments import GraphitiJudgmentError
+    reference = SimpleNamespace(invocation_id='sha256:'+'a'*64,
+        raw_admission_id='00000000-0000-4000-8000-000000009821',
+        receipt_admission_id='00000000-0000-4000-8000-000000009822')
+
+    def verify(**values):
+        raise GraphitiJudgmentError(reason, reference=reference)
+
+    _with_verifier(monkeypatch, verify)
+    call, seen, _revision, _case = _run(monkeypatch)
+    with pytest.raises(ExtractionContractError):
+        asyncio.run(call)
+    receipt = seen.snapshots[0]['combined']
+    assert receipt['failure_code'] == 'PIPELINE_FAILED'
+    assert receipt['typed_proposal_verification']['judgment_reference'] == vars(reference)
+    assert seen.model_calls == 1 and len(receipt['transport_calls']) == 1
+    assert seen.business == {} and seen.rollback == 0 and 'episode' not in seen.events
+
+
+def test_explicit_temporal_failure_code_precedes_semantic_reason_carrier(monkeypatch):
+    reference = SimpleNamespace(invocation_id='sha256:'+'a'*64,
+        raw_admission_id='00000000-0000-4000-8000-000000009821',
+        receipt_admission_id='00000000-0000-4000-8000-000000009822')
+    failure = CombinedTemporalError(CombinedTemporalFailureCode.TEMPORAL_INVALID, 'SECRET temporal evidence')
+    failure.reason_code = 'GRAPHITI_PROPOSAL_UNSUPPORTED'
+    failure.reference = reference
+
+    def verify(**values):
+        raise failure
+
+    _with_verifier(monkeypatch, verify)
+    call, seen, _revision, _case = _run(monkeypatch)
+    with pytest.raises(ExtractionContractError):
+        asyncio.run(call)
+    receipt = seen.snapshots[0]['combined']
+    assert receipt['failure_code'] == 'TEMPORAL_INVALID'
+    assert receipt['typed_proposal_verification'] == {
+        'reason_code':'GRAPHITI_PROPOSAL_UNSUPPORTED', 'judgment_reference':vars(reference),
+    }
+    assert seen.model_calls == 1 and len(receipt['transport_calls']) == 1
+    assert seen.business == {} and seen.rollback == 0 and 'episode' not in seen.events
+    assert 'SECRET' not in str(seen.snapshots)
+
+
+@pytest.mark.parametrize('reason', ['GRAPHITI_RELATION_DIRECTION_UNPROVEN', 'GRAPHITI_PROPOSAL_UNSUPPORTED'])
+def test_retained_semantic_rejection_maps_to_reported_invalid_output_not_retry(monkeypatch, reason):
+    from newsroom.control_plane.native_graphiti_judgments import GraphitiJudgmentError
+    from newsroom.extraction.types import ExtractionFailureCode, ExtractionOutcome, ExtractionOutputValidation
+    from newsroom.graphiti_adapter.combined_temporal_fixtures import fixture
+    from newsroom.graphiti_adapter.combined_temporal_runtime import extract_combined_temporal_async
+    from newsroom.tests.test_graphiti_combined_temporal_runtime import _Pipeline, _Transport
+
+    case = fixture('pair-current')
+    reference = SimpleNamespace(invocation_id='sha256:'+'a'*64,
+        raw_admission_id='00000000-0000-4000-8000-000000009821',
+        receipt_admission_id='00000000-0000-4000-8000-000000009822')
+    reported_chat = [{'provider':'cursor-agent-cli', 'model':'composer-2.5', 'outcome':'COMPLETE',
+        'model_invocation_terminal_digest':'sha256:'+'b'*64,
+        'usage':{'usage_basis':'PROVIDER_REPORTED', 'input_tokens':7, 'output_tokens':3,
+                 'cached_read_tokens':0, 'cached_write_tokens':0, 'total_tokens':10}}]
+    completed = []
+
+    def verify(**values):
+        raise GraphitiJudgmentError(reason, reference=reference)
+
+    async def run_runtime(**values):
+        class CompletingPipeline(_Pipeline):
+            async def _execute(self, **kwargs):
+                pytest.fail('A rejected semantic proposal must not reach graph mutation')
+
+            async def _complete_failure(self, receipt):
+                completed.append(dict(receipt))
+                return values['validate_failure']({**receipt,
+                    'pipeline_chat_invocations':reported_chat,
+                    'embedding_usage':{'usage_basis':'NO_EMBEDDING_CALL', 'request_count':0,
+                        'embedding_tokens':0, 'cost_usd_microunits':0, 'requests':[]},
+                }, values['telemetry'])
+
+        leaf = await extract_combined_temporal_async(values['revision'],
+            transport=_Transport(case.gold), pipeline=CompletingPipeline(),
+            typed_proposal_verifier=verify)
+        assert leaf.failure_code is CombinedTemporalFailureCode.EVIDENCE_UNRESOLVED
+        raise ExtractionContractError('fixture completed semantic rejection')
+
+    monkeypatch.setattr(real, '_load_graphiti', lambda: SimpleNamespace())
+    monkeypatch.setattr(real, 'openrouter_api_key', lambda: 'fixture')
+    monkeypatch.setattr(real, 'neo4j_community_password', lambda: 'fixture')
+    monkeypatch.setattr(real, '_add_episode', run_runtime)
+    produced = real.RealGraphitiAdapter()._produce(evaluation_attempt_for((case.revision.body,)),
+        UtcTimestamp.parse('2026-08-20T00:00:00.000000Z'))
+
+    assert produced.outcome is ExtractionOutcome.INVALID_OUTPUT
+    assert produced.failure_code is ExtractionFailureCode.OUTPUT_SCHEMA_INVALID
+    assert produced.validation is ExtractionOutputValidation.INVALID
+    assert produced.proposals == () and produced.attempt_receipt_value is None
+    raw = produced.raw_output_value
+    assert raw['combined_temporal_failure_code'] == 'EVIDENCE_UNRESOLVED'
+    assert raw['chat_invocations'] == reported_chat and raw['chat_invocation_count'] == 1
+    assert raw['token_usage']['usage_basis'] == 'PROVIDER_REPORTED'
+    assert raw['token_usage']['chat_input_tokens'] == 7
+    assert raw['token_usage']['chat_output_tokens'] == 3
+    assert raw['token_usage']['chat_total_tokens'] == 10
+    assert raw['token_usage']['unreported_chat_requests'] == 0
+    assert raw['embedding_usage']['request_count'] == 0
+    assert len(completed) == 1
+    assert completed[0]['typed_proposal_verification'] == {
+        'reason_code':reason, 'judgment_reference':vars(reference),
+    }

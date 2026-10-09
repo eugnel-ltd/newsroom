@@ -597,12 +597,19 @@ async def extract_combined_temporal_async(
         except Exception as exc:
             _observe_runtime_failure("TYPED_VERIFIER", exc, receipt.get("request_identity_digest"))
             failure_evidence = _verification_failure_evidence(exc)
+            failure_code = (exc.code if isinstance(exc, CombinedTemporalError)
+                            else CombinedTemporalFailureCode.PIPELINE_FAILED)
             if failure_evidence is not None:
                 receipt["typed_proposal_verification"] = failure_evidence
+                if (not isinstance(exc, CombinedTemporalError)
+                        and failure_evidence["judgment_reference"] is not None
+                        and failure_evidence["reason_code"] in {
+                            "GRAPHITI_RELATION_DIRECTION_UNPROVEN", "GRAPHITI_PROPOSAL_UNSUPPORTED",
+                        }):
+                    failure_code = CombinedTemporalFailureCode.EVIDENCE_UNRESOLVED
             return await _complete_failure(
                 pipeline, prompt, receipt,
-                failure_code=(exc.code if isinstance(exc, CombinedTemporalError)
-                              else CombinedTemporalFailureCode.PIPELINE_FAILED),
+                failure_code=failure_code,
             )
     try:
         pipeline_result = await pipeline._execute(
