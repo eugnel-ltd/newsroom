@@ -259,6 +259,12 @@ def test_real_qualification_composition_opens_without_any_provider_dispatch(tmp_
     consumers = []
     processors = []
     assessors = []
+    pipelines = []
+    original_pipeline = native_composition.NativePipeline
+    def pipeline(**values):
+        result = original_pipeline(**values)
+        pipelines.append(result)
+        return result
 
     def arguments(path):
         return {**original_arguments(path),
@@ -283,6 +289,7 @@ def test_real_qualification_composition_opens_without_any_provider_dispatch(tmp_
         return result
 
     monkeypatch.setattr(native_composition, 'AutonomousNativeEvidenceAssessor', assessor)
+    monkeypatch.setattr(native_composition, 'NativePipeline', pipeline)
     monkeypatch.setattr(existing, '_arguments', arguments)
     monkeypatch.setattr(native_assessor_judgments, 'NativeAssessorJudgments', consumer)
     monkeypatch.setattr(native_composition, 'NativeGraphitiProcessor', graphiti)
@@ -294,3 +301,7 @@ def test_real_qualification_composition_opens_without_any_provider_dispatch(tmp_
     assert all(callable(processor._runner._typed_proposal_verifier) for processor in processors)
 
     assert len(assessors) == 2 and all(callable(item._qualification) for item in assessors)
+    assert all(item._judgments.semantic_witness_reader.__self__.resolution_reader.__self__.resolve_disagreements
+               for item in assessors)
+    assert len(pipelines) == 2 and all(callable(item._publish.qualification_resolution_due) for item in pipelines)
+    assert all(item._publish.qualification_resolution_due({}) is False for item in pipelines)

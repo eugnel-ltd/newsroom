@@ -6,10 +6,70 @@ import time
 from pathlib import Path
 from newsroom.authority import ObjectAdmissionId, ObjectAdmissionRequest, HydrationRequest
 from newsroom.authority.canonical import canonical_json_bytes, digest_canonical
-from .model_usage import UsageStatus, _retained_terminal_allocation
+from .model_usage import UsageStatus, ModelUsageIntegrityError, _retained_terminal_allocation
 from .native_source_qualification import QualificationHold, QualificationReference, VERSION, ROUTE
 from .native_assessor import NativeAssessmentExecution
 from .native_assessor_spans import build_lossless_source_view
+
+
+def original_qualification_reference(qualifier, candidate, base, *, proof, optional=False):
+    """One original plus at most one authenticated resolution, with overflow HOLD."""
+    with sqlite3.connect(Path(qualifier.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
+        c.execute('PRAGMA query_only=ON')
+        deadline = time.monotonic() + 5
+        c.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
+        rows = c.execute("SELECT a.invocation_id FROM model_invocation_allocations a JOIN model_work_envelopes e USING(envelope_id) "
+            "JOIN model_invocation_policies p ON p.canonical_digest=a.policy_digest "
+            "WHERE a.route=? AND json_extract(e.record_json,'$.candidate_id')=? "
+            "AND json_extract(e.record_json,'$.hypothesis_digest')=? "
+            "AND json_extract(e.record_json,'$.evidence_package_digest')=? "
+            "AND json_extract(p.record_json,'$.prompt_contract_version')=? LIMIT 3",
+            (ROUTE, candidate.candidate_id, candidate.governing_manifest.canonical_digest, base.digest, VERSION)).fetchall()
+        if not rows and optional:
+            return None
+        if not rows or len(rows) > 2:
+            raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
+        values = []
+        for (invocation,) in rows:
+            try:
+                _allocation, terminal = _retained_terminal_allocation(c, invocation)
+            except ModelUsageIntegrityError as error:
+                if len(rows) > 1:
+                    raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS') from error
+                raise
+            if terminal is None or terminal.usage_status is not UsageStatus.REPORTED or terminal.outcome != 'QUALIFICATION_COMPLETE' or terminal.policy_breach:
+                if len(rows) > 1:
+                    raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
+                raise QualificationHold('QUALIFICATION_REPLAY_USAGE_HOLD')
+            admitted = qualifier.objects.committed_admission(ObjectAdmissionRequest('evidence.record',
+                'source-qualification-receipt:'+invocation), proof=proof)
+            if admitted is None:
+                raise QualificationHold('QUALIFICATION_PRIOR_RESULT_UNAVAILABLE')
+            raw = qualifier.objects.rehydrate(HydrationRequest(admitted.admission.admission_id, 'evidence.record'), proof=proof).data
+            receipt = json.loads(raw)
+            if canonical_json_bytes(receipt) != raw or receipt.get('invocation_id') != invocation:
+                raise QualificationHold('QUALIFICATION_REPLAY_BINDING_HOLD')
+            ref = QualificationReference(invocation, ObjectAdmissionId.parse(receipt['raw_admission_id']), admitted.admission.admission_id)
+            values.append((ref, receipt))
+    originals = [(ref, row) for ref, row in values if 'semantic_resolution' not in row['source_binding']]
+    if len(originals) != 1:
+        raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
+    reference, receipt = originals[0]
+    for ref, row in values:
+        if ref == reference:
+            continue
+        from .native_source_qualification_consumer import _resolution_state, _require_resolution_result
+        from .evidence import SEMANTIC_RESOLUTION_CONTRACT
+        marker = row['source_binding']['semantic_resolution']
+        parent = {'invocation_id': reference.invocation_id, 'raw_admission_id': str(reference.raw_admission_id),
+                  'receipt_admission_id': str(reference.receipt_admission_id)}
+        if set(marker) != {'contract', 'parent', 'witnesses'} or marker['contract'] != SEMANTIC_RESOLUTION_CONTRACT or marker['parent'] != parent:
+            raise QualificationHold('QUALIFICATION_RESOLUTION_PARENT_HOLD')
+        state, package = _resolution_state(qualifier, candidate, base, parent, marker['witnesses'], proof=proof)
+        result = qualifier.read_qualification(ref, state, proof=proof, candidate_id=candidate.candidate_id,
+            hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest)
+        _require_resolution_result(result, package)
+    return reference, receipt
 
 def read_current_result(qualifier, candidate, base, sources, acquired, *, scope, proof):
     """Read one proved original retained result; never allocate or call."""
@@ -20,31 +80,7 @@ def read_current_result(qualifier, candidate, base, sources, acquired, *, scope,
         raise QualificationHold('QUALIFICATION_ACQUIRED_BYTES_HOLD')
     ids = dict(candidate_id=candidate.candidate_id,
         hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest)
-    with sqlite3.connect(Path(qualifier.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
-        c.execute('PRAGMA query_only=ON')
-        deadline=time.monotonic()+5
-        c.set_progress_handler(lambda: time.monotonic()>deadline,1000)
-        rows = c.execute(
-            "SELECT a.invocation_id FROM model_invocation_allocations a JOIN model_work_envelopes e USING(envelope_id) "
-            "JOIN model_invocation_policies p ON p.canonical_digest=a.policy_digest "
-            "WHERE a.route=? AND json_extract(e.record_json,'$.candidate_id')=? "
-            "AND json_extract(e.record_json,'$.hypothesis_digest')=? "
-            "AND json_extract(e.record_json,'$.evidence_package_digest')=? "
-            "AND json_extract(p.record_json,'$.prompt_contract_version')=? LIMIT 2",
-            (ROUTE, ids['candidate_id'], ids['hypothesis_digest'], base.digest, VERSION)).fetchall()
-        if len(rows) != 1:
-            raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
-        allocation, terminal = _retained_terminal_allocation(c, rows[0][0])
-        if terminal is None or terminal.usage_status is not UsageStatus.REPORTED or terminal.outcome != 'QUALIFICATION_COMPLETE' or terminal.policy_breach:
-            raise QualificationHold('QUALIFICATION_REPLAY_USAGE_HOLD')
-    receipt_admission = qualifier.objects.committed_admission(ObjectAdmissionRequest('evidence.record',
-        'source-qualification-receipt:'+allocation.invocation_id), proof=proof)
-    if receipt_admission is None:
-        raise QualificationHold('QUALIFICATION_PRIOR_RESULT_UNAVAILABLE')
-    receipt_raw = qualifier.objects.rehydrate(HydrationRequest(receipt_admission.admission.admission_id,'evidence.record'),proof=proof).data
-    receipt = json.loads(receipt_raw)
-    if canonical_json_bytes(receipt) != receipt_raw:
-        raise QualificationHold('QUALIFICATION_REPLAY_BINDING_HOLD')
+    reference, receipt = original_qualification_reference(qualifier, candidate, base, proof=proof)
     binding = receipt['source_binding']
     view = build_lossless_source_view(base.passages, base.source_ids)
     current = NativeAssessorJudgments._binding(candidate,base,scope,view)
@@ -61,7 +97,6 @@ def read_current_result(qualifier, candidate, base, sources, acquired, *, scope,
     if scope.get('newness')=='SOURCE_DECLARED_FIRST_PUBLICATION' and not NativeAssessorJudgments._first_publication_proven(scope,sources,acquired):
         raise QualificationHold('QUALIFICATION_FIRST_PUBLICATION_HOLD')
     state = original_qualification_state(qualifier, candidate, base, binding, proof=proof)
-    reference=QualificationReference(allocation.invocation_id,ObjectAdmissionId.parse(receipt['raw_admission_id']),receipt_admission.admission.admission_id)
     checked=qualifier.read_qualification(reference,state,proof=proof,**ids)
     expected={'schema':VERSION,'source_binding':binding,'materialisation_receipt':checked['materialisation'],
         'qualification_reference':{'invocation_id':reference.invocation_id,'raw_admission_id':str(reference.raw_admission_id),

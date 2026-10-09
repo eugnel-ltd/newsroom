@@ -590,6 +590,17 @@ class NativeSemanticWitnesses:
         self.judgments, self.candidate_for, self.proof, self.require_current = judgments, candidate_for, proof, require_current
         self.parent_reader = parent_reader
         self.rendering_reader = None
+        self.resolution_reader = None
+
+    def collect(self, qualification, claim, package, binding):
+        """Close the existing witness phase, retaining known dissent verbatim."""
+        from .native_evidence import NativeEvidenceHold
+        try:
+            return self.evaluate(qualification, claim, package, binding), 'YES'
+        except NativeEvidenceHold as error:
+            if error.reason_code not in {'QUALIFICATION_SEMANTIC_WITNESS_NO', 'QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}:
+                raise
+            return tuple(sorted(error.semantic_witness_disposition['reference'].items())), error.reason_code.rsplit('_', 1)[-1]
 
     def evaluate(self, qualification, claim, package, binding):
         from .evidence import SEMANTIC_WITNESS_CONTRACT
@@ -669,6 +680,13 @@ class NativeSemanticWitnesses:
         from newsroom.authority import HydrationRequest
         self.require_current()
         value = semantic_witness_reference(qualification.semantic_witness_ref)
+        from .evidence import SEMANTIC_RESOLUTION_CONTRACT
+        if value['contract'] == SEMANTIC_RESOLUTION_CONTRACT:
+            from .native_source_qualification_consumer import NativeQualifiedSourceConsumer
+            if (getattr(self.resolution_reader, '__func__', None) is not NativeQualifiedSourceConsumer.read_resolution
+                    or type(getattr(self.resolution_reader, '__self__', None)) is not NativeQualifiedSourceConsumer):
+                raise ValueError('semantic resolution reader absent')
+            return self.resolution_reader(qualification, claim, package)
         ref = JudgmentReference(value['invocation_id'], ObjectAdmissionId.parse(value['raw_admission_id']),
             ObjectAdmissionId.parse(value['receipt_admission_id']))
         raw = self.judgments.objects.rehydrate(HydrationRequest(ref.receipt_admission_id, 'evidence.record'), proof=self.proof).data

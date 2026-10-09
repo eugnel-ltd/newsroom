@@ -42,6 +42,7 @@ def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
         "newsroom.qualification-relation.v5+newsroom.retained-assessment.v1+"
         "newsroom.native-assessor-spans.v2+newsroom.native-hko-qualification-clause.v1"
         "+newsroom.native-context-materialisation.v3+newsroom.source-qualification-consumer.v4"
+        "+newsroom.source-qualification-resolution-consumer.v1"
     )
 
 

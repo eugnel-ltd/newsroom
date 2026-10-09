@@ -78,7 +78,9 @@ from .native_source_rights import (
     retain_rights_snapshot_bundle, require_rights_assessment, fetch_licensing_observations,
 )
 from .native_assessor_spans import PARTITION_VERSION
-from .native_source_qualification_consumer import CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION
+from .native_source_qualification_consumer import (
+    CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION, RESOLUTION_CONSUMER_VERSION,
+)
 from .evidence import EvidencePackage
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
 from .native_weather_sources import poll_other_source
@@ -93,6 +95,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"+{QUALIFICATION_CLAUSE_CONSUMER_VERSION}"
     f"+{CONTEXT_MATERIALISATION_VERSION}"
     f"+{QUALIFICATION_CONSUMER_VERSION}"
+    f"+{RESOLUTION_CONSUMER_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
@@ -856,7 +859,7 @@ def open_native_pipeline(
                     implementation_worktree_clean=implementation_worktree_clean, clock=clock)
                 from .native_source_qualification_consumer import NativeQualifiedSourceConsumer, current_source_passage
                 qualification_consumer = NativeQualifiedSourceConsumer(qualifier, semantic_witnesses=semantic_witnesses,
-                    localise=localise_claims, read_localisation=read_claim_localisation)
+                    localise=localise_claims, read_localisation=read_claim_localisation, resolve_disagreements=True)
                 semantic_witnesses.parent_reader = qualification_consumer.read_semantic_parent
                 def semantic_witness_disposition_reader(candidate,sources):
                     # Already checked retained CURRENT Source projection, not a
@@ -1169,6 +1172,11 @@ def open_native_pipeline(
             def semantic_intent_revalidation_due(self, facts):
                 return judgment_api_key is not None and NativePublicationContinuation.semantic_intent_revalidation_due(
                     facts, JUDGMENT_CONTRACT + ('+' + QUALIFICATION_CONTRACT if source_qualification_policy is not None else ''))
+
+            def qualification_resolution_due(self, facts):
+                return (judgment_api_key is not None and source_qualification_policy is not None
+                        and facts.get('reason') in {'QUALIFICATION_SEMANTIC_WITNESS_NO', 'QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}
+                        and self.continuation({}).qualification_resolution_due(facts))
 
             def restore_current_output(self):
                 return runtime.publication.restore_current_publisher_output(journal,proof=proof)
