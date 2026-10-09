@@ -7126,6 +7126,40 @@ class ModelUsageService:
         self, connection: sqlite3.Connection, allocation: InvocationAllocation,
         identity: GraphitiInternalRequestIdentity,
     ) -> None:
+        self._require_graphiti_work_identity(connection,
+            invocation_id=allocation.invocation_id,
+            ingest_id=identity.ingest_obligation_id,
+            effective_revision_digest=identity.effective_revision_digest,
+            graphiti_attempt_id=identity.graphiti_attempt_id)
+
+    def graphiti_prior_work_hold(
+        self, *, ingest_id: str, effective_revision_digest: str, attempt_number: int,
+    ) -> str | None:
+        """Read the existing work veto before preparing a successor guard/attempt."""
+        _token(ingest_id, field="graphiti_ingest_id")
+        validate_sha256_digest(effective_revision_digest)
+        if type(attempt_number) is not int or attempt_number <= 0:
+            raise ValueError("Graphiti preflight attempt number differs")
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN")
+            try:
+                self._require_graphiti_work_identity(connection,
+                    invocation_id=None, ingest_id=ingest_id,
+                    effective_revision_digest=effective_revision_digest,
+                    graphiti_attempt_id=f"{ingest_id}:{attempt_number}")
+            except ModelUsageAdmissionError as error:
+                if error.reason_code != "GRAPHITI_PRIOR_WORK_UNRESOLVED":
+                    raise
+                return error.reason_code
+            return None
+        finally:
+            connection.close()
+
+    def _require_graphiti_work_identity(
+        self, connection: sqlite3.Connection, *, invocation_id: str | None,
+        ingest_id: str, effective_revision_digest: str, graphiti_attempt_id: str,
+    ) -> None:
         """An unknown old work identity cannot acquire a new attempt or backend."""
         rows = connection.execute(
             "SELECT invocation_id,active,unresolved,policy_breach FROM model_usage_current "
@@ -7145,23 +7179,23 @@ class ModelUsageService:
             "WHERE e.workload_class='GRAPHITI_CHAT_PRIMARY' "
             "AND json_extract(e.record_json,'$.ingest_id')=? "
             "AND t.usage_status IN ('UNREPORTED','AMBIGUOUS')",
-            (identity.effective_revision_digest, identity.ingest_obligation_id),
+            (effective_revision_digest, ingest_id),
         ).fetchall()
-        for (invocation_id,) in unknown:
-            pending.setdefault(invocation_id, False)
-        for invocation_id, active in pending.items():
-            if invocation_id == allocation.invocation_id:
+        for (unknown_invocation_id,) in unknown:
+            pending.setdefault(unknown_invocation_id, False)
+        for prior_invocation_id, active in pending.items():
+            if prior_invocation_id == invocation_id:
                 continue
             prior = (
-                model_usage_current._active_allocation(connection, invocation_id) if active
-                else _retained_terminal_allocation(connection, invocation_id)[0]
+                model_usage_current._active_allocation(connection, prior_invocation_id) if active
+                else _retained_terminal_allocation(connection, prior_invocation_id)[0]
             )
             previous = _retained_graphiti_request_identity(connection, prior)
             if previous is None:
                 raise ModelUsageAdmissionError("Graphiti unresolved work identity is absent")
-            same_work = (previous.ingest_obligation_id == identity.ingest_obligation_id
-                         or previous.effective_revision_digest == identity.effective_revision_digest)
-            if same_work and (not active or previous.graphiti_attempt_id != identity.graphiti_attempt_id):
+            same_work = (previous.ingest_obligation_id == ingest_id
+                         or previous.effective_revision_digest == effective_revision_digest)
+            if same_work and (not active or previous.graphiti_attempt_id != graphiti_attempt_id):
                 raise ModelUsageAdmissionError(
                     "Graphiti work has an active or unresolved prior attempt",
                     reason_code="GRAPHITI_PRIOR_WORK_UNRESOLVED",

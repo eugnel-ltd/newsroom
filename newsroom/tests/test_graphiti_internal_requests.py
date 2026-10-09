@@ -3151,7 +3151,7 @@ def test_graphiti_attempt_cannot_complete_before_every_leaf_has_a_terminal(
     )
 
 
-def _historical_unknown_graphiti_request(tmp_path, *, native=False):
+def _historical_unknown_graphiti_request(tmp_path, *, native=False, outcome='FAILED'):
     """Use real accounting APIs, not fabricated CURRENT/circuit records."""
     unit = None
     if native:
@@ -3184,7 +3184,7 @@ def _historical_unknown_graphiti_request(tmp_path, *, native=False):
         state='DISPATCH_STARTED', evidence_digest=allocation.request_digest,
     )
     service.complete(InvocationTerminal.create(
-        invocation_id=allocation.invocation_id, outcome='FAILED',
+        invocation_id=allocation.invocation_id, outcome=outcome,
         failure_class='MISSING_PROVIDER_TELEMETRY', usage_status=UsageStatus.UNREPORTED,
         components=UsageComponents(provenance='UNAVAILABLE'),
         dispatch_at=allocation.allocated_at, completed_at=T0 + timedelta(seconds=2),
@@ -3239,6 +3239,29 @@ def _original_graphiti_unknown_rows(service, allocation):
     return values
 
 
+def test_prior_work_preflight_keeps_cancelled_unknown_without_creating_work(tmp_path):
+    service, envelope, _policy, _shape, old, identity = _historical_unknown_graphiti_request(
+        tmp_path, outcome='CANCELLED',
+    )
+    before = _original_graphiti_unknown_rows(service, old)
+    with sqlite3.connect(service.path) as connection:
+        counts = {table: connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
+                  for table in ('model_work_envelopes', 'model_invocation_allocations',
+                                'graphiti_internal_requests', 'model_invocation_terminals')}
+    for attempt in (2, 3):
+        service = ModelUsageService(service.path)
+        assert service.graphiti_prior_work_hold(ingest_id=envelope.ingest_id,
+            effective_revision_digest=identity.effective_revision_digest,
+            attempt_number=attempt) == 'GRAPHITI_PRIOR_WORK_UNRESOLVED'
+    assert service.graphiti_prior_work_hold(ingest_id='independent-ingest',
+        effective_revision_digest=digest_canonical({'revision':'independent'}),
+        attempt_number=1) is None
+    assert _original_graphiti_unknown_rows(service, old) == before
+    with sqlite3.connect(service.path) as connection:
+        assert {table: connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
+                for table in counts} == counts
+
+
 def test_independent_graphiti_work_preserves_historical_unknown_across_restart(tmp_path):
     service, old_envelope, policy, shape, old, _ = _historical_unknown_graphiti_request(tmp_path)
     before = _original_graphiti_unknown_rows(service, old)
@@ -3252,6 +3275,8 @@ def test_independent_graphiti_work_preserves_historical_unknown_across_restart(t
     assert service.route_state(policy.route) == historical
     assert graphiti_required_route_holds(service) == ()
     fresh, identity = _independent_request(service, policy, shape)
+    assert service.graphiti_prior_work_hold(ingest_id=identity.ingest_obligation_id,
+        effective_revision_digest=identity.effective_revision_digest, attempt_number=1) is None
     service.allocate_graphiti_request(
         fresh, identity=identity,
         max_distinct_internal_requests=shape.max_distinct_internal_requests,
@@ -3277,6 +3302,9 @@ def test_independent_graphiti_work_rejects_old_identity_despite_new_cycle_attemp
     )
     if same_identity == 'effective_root':
         assert identity.effective_revision_digest == old_identity.effective_revision_digest
+    assert service.graphiti_prior_work_hold(ingest_id=identity.ingest_obligation_id,
+        effective_revision_digest=identity.effective_revision_digest,
+        attempt_number=2) == 'GRAPHITI_PRIOR_WORK_UNRESOLVED'
     with pytest.raises(ModelUsageAdmissionError):
         service.allocate_graphiti_request(
             fresh, identity=identity,
@@ -3314,6 +3342,8 @@ def test_graphiti_dispatch_rechecks_route_after_independent_allocation(tmp_path)
         max_distinct_internal_requests=shape.max_distinct_internal_requests,
     )
     # Its own active reservation is not an older ambiguous effect.
+    assert service.graphiti_prior_work_hold(ingest_id=identity.ingest_obligation_id,
+        effective_revision_digest=identity.effective_revision_digest, attempt_number=1) is None
     service.require_graphiti_dispatch_available(fresh)
     service.open_route_circuit(
         route=policy.route, reason='AUTHENTICATION', invocation_id=old.invocation_id,
@@ -3392,6 +3422,9 @@ def test_independent_graphiti_work_preserves_disposed_unknown_sticky_head(
     )
     if same_identity == "effective_root":
         assert retry_identity.effective_revision_digest == old_identity.effective_revision_digest
+    assert service.graphiti_prior_work_hold(ingest_id=retry_identity.ingest_obligation_id,
+        effective_revision_digest=retry_identity.effective_revision_digest,
+        attempt_number=2) == 'GRAPHITI_PRIOR_WORK_UNRESOLVED'
     with pytest.raises(ModelUsageAdmissionError):
         service.allocate_graphiti_request(
             retry, identity=retry_identity,
