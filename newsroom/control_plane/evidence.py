@@ -1457,7 +1457,13 @@ def _source_bound_occurrences(text, source, source_side):
         return qualifier.search(text[:start])
     def following(end):
         return re.match(r'[^，。；、\n]{0,24}(?:而已|為限|为限)(?=$|[，。；、\n])', text[end:])
+    def complete_boundary(start, end):
+        return (not (start and text[start - 1].isnumeric())
+            and not text[:start].rstrip().endswith(('+', '−', '-', '負', '负', '£', '$', '€', '¥'))
+            and not (end < len(text) and (text[end].isnumeric() or text[end] == '半')))
     def add(start, end, fact):
+        if not complete_boundary(start, end):
+            return
         prefix = preceding(start)
         if prefix:
             bound = canonical_localised_fact_v2(prefix.group() + '1')
@@ -1504,16 +1510,24 @@ def _source_bound_occurrences(text, source, source_side):
             add(match.start('prior'), match.end('prior'), canonical_localised_fact_v2(match['prior'] + ' ' + match['unit']))
     else:
         for match in list(re.finditer(r'一部分', text))[:len(re.findall(r'\bpart of\b', source, re.I))]:
-            if not preceding(match.start()) and not following(match.end()):
+            if complete_boundary(*match.span()) and not preceding(match.start()) and not following(match.end()):
                 lexical.append(match.span())
         available = len(re.findall(r'\b(?:a|an)\s+[a-z][a-z-]*', source))
         for match in re.finditer(r'一(?:個|份|項|件|種)(?=[\u3400-\u9fff])', text):
-            if (available and not preceding(match.start()) and not following(match.end())
+            if (available and complete_boundary(*match.span()) and not preceding(match.start()) and not following(match.end())
                     and not any(match.start() < end and start < match.end() and fact is not None for start, end, fact in legacy)
                     and not any(match.start() < end and start < match.end() for start, end in lexical)):
                 lexical.append(match.span()); available -= 1
     spans = [(start, end) for start, end, _ in overlays] + lexical
-    return tuple(sorted([row for row in legacy if not any(row[0] < end and start < row[1] for start, end in spans)] + overlays))
+    retained = []
+    for row in legacy:
+        overlapping = [(start, end) for start, end in spans if row[0] < end and start < row[1]]
+        if not overlapping:
+            retained.append(row)
+        elif not any(start <= row[0] and row[1] <= end for start, end in overlapping):
+            # No new binding may erase the uncovered part of a quantity.
+            return ((row[0], row[1], None),)
+    return tuple(sorted(retained + overlays))
 
 
 def factual_rendering_is_bound_v3(source, rendered, pairs=(), *, literals=(), derived_pairs=()) -> bool:
