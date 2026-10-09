@@ -311,9 +311,12 @@ def test_real_qualification_composition_opens_without_any_provider_dispatch(tmp_
     from newsroom.control_plane.native_source_qualification_consumer import REPLAY_CONSUMER_VERSION
     from newsroom.control_plane.native_publication import NativePublicationContinuation
     monkeypatch.setattr(native_composition,'NativePublicationContinuation',NativePublicationContinuation)
-    prior=ASSESSMENT_CONTRACT_VERSION.removesuffix('+'+REPLAY_CONSUMER_VERSION)
+    prior=ASSESSMENT_CONTRACT_VERSION.replace('+'+REPLAY_CONSUMER_VERSION,'')
     assert prior!=ASSESSMENT_CONTRACT_VERSION
     recipe={'reason':'QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED','failure_class':'QualificationHold',
         'candidate_id':'candidate','candidate_version_id':'version','graphiti_receipts':[{}],
         'intake_receipt_id':'retained-intake','assessment_contract_version':prior}
     assert all(item._publish.qualification_resolution_due(recipe) is True for item in pipelines)
+    rendering={**recipe,'reason':'QUALIFICATION_RESOLUTION_RENDERING_HOLD','failure_class':None,
+        'assessment_contract_version':ASSESSMENT_CONTRACT_VERSION.removesuffix('+newsroom.source-qualification-rendering-repair.v1')}
+    assert all(item._publish.qualification_resolution_due(rendering) is True for item in pipelines)

@@ -44,6 +44,7 @@ def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
         "+newsroom.native-context-materialisation.v3+newsroom.source-qualification-consumer.v4"
         "+newsroom.source-qualification-resolution-consumer.v1"
         "+newsroom.source-qualification-resolution-consumer.v2+newsroom.source-qualification-replay.v1"
+        "+newsroom.source-qualification-rendering-repair.v1"
     )
 
 

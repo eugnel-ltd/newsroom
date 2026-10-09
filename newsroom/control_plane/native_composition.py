@@ -79,7 +79,7 @@ from .native_source_rights import (
 )
 from .native_assessor_spans import PARTITION_VERSION
 from .native_source_qualification_consumer import (
-    CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION, RESOLUTION_CONSUMER_VERSION, CORRECTED_RESOLUTION_CONSUMER_VERSION, REPLAY_CONSUMER_VERSION,
+    CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION, RESOLUTION_CONSUMER_VERSION, CORRECTED_RESOLUTION_CONSUMER_VERSION, REPLAY_CONSUMER_VERSION, RENDERING_REPAIR_CONSUMER_VERSION,
 )
 from .evidence import EvidencePackage
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
@@ -98,6 +98,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"+{RESOLUTION_CONSUMER_VERSION}"
     f"+{CORRECTED_RESOLUTION_CONSUMER_VERSION}"
     f"+{REPLAY_CONSUMER_VERSION}"
+    f"+{RENDERING_REPAIR_CONSUMER_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
@@ -1180,7 +1181,7 @@ def open_native_pipeline(
             def qualification_resolution_due(self, facts):
                 return (judgment_api_key is not None and source_qualification_policy is not None
                         and facts.get('reason') in {'QUALIFICATION_SEMANTIC_WITNESS_NO', 'QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN',
-                                                    'QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED'}
+                                                    'QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED', 'QUALIFICATION_RESOLUTION_RENDERING_HOLD'}
                         and self.continuation({}).qualification_resolution_due(facts))
 
             def restore_current_output(self):
