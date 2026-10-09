@@ -1774,6 +1774,7 @@ class EvidenceGateEvidence:
 
 SEMANTIC_WITNESS_CONTRACT = "newsroom.qualification-semantic-witness.v1"
 SEMANTIC_RESOLUTION_CONTRACT = "newsroom.qualification-semantic-resolution.v1"
+SEMANTIC_RESOLUTION_CONTRACT_V2 = "newsroom.qualification-semantic-resolution.v2"
 _SEMANTIC_WITNESS_REF_FIELDS = frozenset({"contract", "invocation_id", "raw_admission_id", "receipt_admission_id", "question_id"})
 _SEMANTIC_RESOLUTION_REF_FIELDS = _SEMANTIC_WITNESS_REF_FIELDS | frozenset({
     "resolution_invocation_id", "resolution_raw_admission_id", "resolution_receipt_admission_id"})
@@ -1788,7 +1789,7 @@ def semantic_witness_reference(ref: tuple[tuple[str, str], ...]) -> dict[str, st
     resolution = value.get('contract') == SEMANTIC_RESOLUTION_CONTRACT
     if (type(ref) is not tuple or len(value) != len(ref)
             or set(value) != (_SEMANTIC_RESOLUTION_REF_FIELDS if resolution else _SEMANTIC_WITNESS_REF_FIELDS)
-            or value.get('contract') not in {SEMANTIC_WITNESS_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT}
+            or value.get('contract') not in {SEMANTIC_WITNESS_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT_V2}
             or not all(type(v) is str and v for v in value.values())
             or not re.fullmatch(r'sha256:[0-9a-f]{64}', value['invocation_id'])
             or len(value['question_id'].encode()) > 256
