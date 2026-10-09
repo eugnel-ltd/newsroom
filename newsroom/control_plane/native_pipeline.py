@@ -179,11 +179,11 @@ class NativePipeline:
             # work; recent source updates must not wait behind old recovery backlog.
             if not self._spill_archive_turn:
                 ordinary.sort(key=lambda item: (_news_or_speech_header(item), _source_update_time(item)), reverse=True)
-            # Interrupted/unknown effects still settle before ordinary work. The
-            # stable sort preserves source recency, or LAND order on archive turns.
+            # Pending publication effects retain priority. Assessment guards are
+            # revision-local; preserve news recency, or LAND order on archive turns.
             # Each turn has the existing quantum; an atomic revision may overrun it.
             ordinary.sort(key=lambda item: self._journal.summary(item[0]).get("stage")
-                          not in {"ASSESSMENT_INTERRUPTED", "ASSESSMENT_STARTED", "PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
+                          not in {"PUBLICATION_STARTED", "COPY_CORRECTION_PREPARED"})
             ordinary_deadline = self._monotonic_clock() + self._reassessment_quantum
             ordinary_before = {revision: self._journal.progress_ordinal(revision) for revision, _ in ordinary}
         with _native_phase("ORDINARY_RECOVERY", cycle_id=cycle_id, cohort_count=len(ordinary)):
