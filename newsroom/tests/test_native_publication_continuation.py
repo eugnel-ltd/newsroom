@@ -2379,3 +2379,53 @@ def test_corrected_resolution_upgrade_does_not_reopen_prior_negative_or_unknown(
     continuation._assessment_contract_version=ASSESSMENT_CONTRACT_VERSION
     assert continuation._assessment_contract_version!=facts['assessment_contract_version']
     assert not continuation.qualification_resolution_due(facts)
+
+
+def test_known_recipe_repair_uses_once_only_cached_consumer(tmp_path, monkeypatch):
+    from newsroom.control_plane.native_source_qualification_consumer import REPLAY_CONSUMER_VERSION
+    unit=_native();connection=connect(str(tmp_path/'recipe.sqlite3'))
+    journal=NativeRevisionJournal(connection);journal.land((unit,))
+    facts=_known_witness_hold_facts()
+    facts.pop('semantic_witness_disposition')
+    facts.update(reason='QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED',failure_class='QualificationHold')
+    current=facts['assessment_contract_version']+'+'+REPLAY_CONSUMER_VERSION
+    journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
+    calls=[]
+    def acquire(_self,**request):
+        calls.append(request)
+        assert request['assessment_cached_only'] is True
+        assert request['assessment_qualification_cached_only'] is True
+        request['before_assessment']()
+        raise NativeEvidenceHold('KNOWN_RECIPE_TEST_STOP',unit.source_id)
+    monkeypatch.setattr(NativeEvidenceController,'acquire_and_retain',acquire)
+    monkeypatch.setattr('newsroom.control_plane.native_publication.open_private_serving_read_port',lambda *_a,**_k:_Reader())
+    runtime=SimpleNamespace(authority=_Authority(),ingress=object(),publication=_Publication(),
+        policies=SimpleNamespace(publication=SimpleNamespace(target_path=tmp_path/'serving.sqlite3',target_id='private',target_context_digest=_DIGEST)),proof=proof())
+    continuation=NativePublicationContinuation(journal=journal,runtime=runtime,
+        evidence_controller=object.__new__(NativeEvidenceController),sources={unit.revision_id:(_source(unit),)},
+        assessment_contract_version=current)
+    try:
+        assert continuation.qualification_resolution_due(facts)
+        continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+        after=journal.current(unit.revision_id)['facts']
+        assert after['retained_qualification_checked_contract']==current
+        assert after['assessment_started_at']==facts['assessment_started_at']
+        assert after['acquisition_attempt_count']==facts['acquisition_attempt_count']+1
+        continuation.advance(revision_id=unit.revision_id,candidate_version_id='candidate-version')
+        assert len(calls)==1 and runtime.authority.receives==0 and runtime.publication.calls==0
+        assert not continuation.qualification_resolution_due(after)
+    finally:connection.close()
+
+
+@pytest.mark.parametrize('fault',['disabled','unknown','missing-intake','checked'])
+def test_recipe_repair_does_not_reopen_unproved_or_already_checked_work(fault):
+    from newsroom.control_plane.native_source_qualification_consumer import REPLAY_CONSUMER_VERSION
+    facts=_known_witness_hold_facts();facts.pop('semantic_witness_disposition')
+    facts.update(reason='QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED',failure_class='QualificationHold')
+    current=facts['assessment_contract_version']+'+'+REPLAY_CONSUMER_VERSION
+    if fault=='disabled':current+='-disabled'
+    elif fault=='unknown':facts['failure_class']='CliTimeoutError'
+    elif fault=='missing-intake':facts.pop('intake_receipt_id')
+    else:facts['retained_qualification_checked_contract']=current
+    continuation=object.__new__(NativePublicationContinuation);continuation._assessment_contract_version=current
+    assert not continuation.qualification_resolution_due(facts)

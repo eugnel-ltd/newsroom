@@ -147,7 +147,7 @@ def original_qualification_state(qualifier, candidate, base, binding, *, proof):
     refs=binding.get('prior_judgments',[])
     inventory=binding.get('failure_inventory')
     if (binding.get('qualification_contract')!=VERSION or type(refs)is not list
-            or len(refs)not in {1,2} or type(inventory)is not list or len(inventory)!=1
+            or len(refs)not in {0,1,2} or type(inventory)is not list or len(inventory)!=1
             or type(inventory[0])is not dict
             or any(type(row)is not dict or set(row)!={'invocation_id','raw_admission_id','receipt_admission_id'}
                    or any(type(value)is not str for value in row.values())for row in refs)
@@ -165,6 +165,11 @@ def original_qualification_state(qualifier, candidate, base, binding, *, proof):
     elif (set(failure)=={'question_id','reason'} and failure['reason']=='NONE'
             and type(failure['question_id'])is str and len(refs)==2):
         reason='QUALIFICATION_WITNESS_MISSING'
+    elif set(failure)=={'reason'} and type(failure['reason'])is str and failure['reason']:
+        # Plain-reason fallbacks use the same frozen recipe, including the
+        # zero-judgment early exit. The original request/manifest authenticates
+        # the label and full reconstructed input; it is not a new model request.
+        reason=failure['reason']
     else:
         raise QualificationHold('QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED')
     candidates={segment.span_id:{'source_id':segment.source_id,
@@ -182,7 +187,8 @@ def original_qualification_state(qualifier, candidate, base, binding, *, proof):
             caller_identity='NATIVE_ASSESSOR',cycle_id=digest_canonical([JUDGMENT_VERSION,phase,original,state,questions]),
             candidate_id=candidate.candidate_id,hypothesis_digest=ids['hypothesis_digest'],proof=proof)
         return {'questions':questions,'answers':record['answers'],'outcome':record['outcome']}
-    judgments=[read_batch(refs[0],'SOURCE_ROLES',role_state,source_role_questions(candidates))]
+    judgments=([read_batch(refs[0],'SOURCE_ROLES',role_state,source_role_questions(candidates))]
+               if refs else [])
     if len(refs)==2:
         material=[identity for identity,answer in judgments[0]['answers'].items()
                   if answer['choice']=='MATERIAL']

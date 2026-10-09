@@ -1088,13 +1088,17 @@ class NativePublicationContinuation:
             getattr(error,'semantic_witness_disposition',None))
 
     def qualification_resolution_due(self, facts):
-        """Schedule only a known disagreement under the explicit new consumer."""
-        from .native_source_qualification_consumer import RESOLUTION_CONSUMER_VERSION
+        """Schedule an explicit cached recipe repair or known disagreement."""
+        from .native_source_qualification_consumer import RESOLUTION_CONSUMER_VERSION, REPLAY_CONSUMER_VERSION
         from .evidence import SEMANTIC_WITNESS_CONTRACT
         current=self._assessment_contract_version
         reason=facts.get('reason')
-        if (type(current)is not str or RESOLUTION_CONSUMER_VERSION not in current.split('+')
-                or reason not in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}
+        components=current.split('+') if type(current)is str else ()
+        recipe=(reason=='QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED' and facts.get('failure_class')=='QualificationHold'
+                and REPLAY_CONSUMER_VERSION in components)
+        resolution=(reason in {'QUALIFICATION_SEMANTIC_WITNESS_NO','QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN'}
+                    and RESOLUTION_CONSUMER_VERSION in components)
+        if (not (recipe or resolution)
                 or not same_assessment_producer(facts.get('assessment_contract_version'),current)
                 or facts.get('assessment_contract_version')==current
                 or facts.get('retained_qualification_checked_contract')==current
@@ -1102,6 +1106,8 @@ class NativePublicationContinuation:
                 or any(facts.get(key)for key in ('package_admission_id','editorial_decision','story_event_id',
                     'publication_started_at','publication_event_id','delivery_attempt_event_id','delivery_evidence_event_id'))):
             return False
+        if recipe:
+            return True  # Actual replay still authenticates the original paid input/result.
         try:
             disposition=self._validated_witness_disposition(facts.get('semantic_witness_disposition'))
         except (ValueError,TypeError,KeyError,AttributeError):

@@ -396,6 +396,9 @@ def _retained_closed_recipe(tmp_path, monkeypatch, recipe):
 
     def answers(value):
         for key, answer in value.items():
+            if recipe == 'material_bound' and 'MATERIAL' in answer['probabilities']:
+                answer.update(choice='MATERIAL', probabilities={c: int(c == 'MATERIAL')
+                              for c in answer['probabilities']})
             if ((recipe == 'witness_missing' and key.endswith('_source_lookup_key'))
                     or (recipe == 'announcement' and key.endswith(':announced_event'))):
                 choice = 'NONE' if recipe == 'witness_missing' else 'NO'
@@ -403,6 +406,10 @@ def _retained_closed_recipe(tmp_path, monkeypatch, recipe):
                               for c in answer['probabilities']})
 
     kwargs = dict(source_id='UK-03', answer_change=answers)
+    if recipe in {'material_bound', 'candidate_bound'}:
+        count = 33 if recipe == 'material_bound' else 254
+        kwargs['body'] = '\n'.join(['Schools now receive fully funded practical education materials.',
+            'Materials are now available to households.'] + ['The provision remains documented.'] * (count - 2))
     if recipe == 'coverage':
         kwargs['body'] = ('The authority confirms a material policy change '
                           + 'for affected residents ' * 16 + '.\nSupporting details apply.')
@@ -432,13 +439,31 @@ def _retained_closed_recipe(tmp_path, monkeypatch, recipe):
         expected = {'coverage': 'QUALIFICATION_WITNESS_COVERAGE_UNPROVEN',
                     'witness_missing': 'QUALIFICATION_WITNESS_MISSING',
                     'announcement': 'FIRST_PUBLICATION_ANNOUNCEMENT_UNPROVEN',
-                    'typed_output': 'MATERIALISATION_VALIDATION_FAILED'}
+                    'typed_output': 'MATERIALISATION_VALIDATION_FAILED',
+                    'material_bound': 'MISSING_OR_UNBOUNDED_MATERIAL_CLAIMS',
+                    'candidate_bound': 'CANDIDATE_COVERAGE_LIMIT'}
         assert fallback.reason == expected[recipe]
         calls = []
+        wire = WIRE
+        if recipe in {'material_bound', 'candidate_bound'}:
+            wire = {'package': {'select_new_information': True, 'governed_claims': [
+                {'claim_role': role, 'status': 'CONFIRMED_FACT',
+                 'source_range': {'first_span_id': span, 'last_span_id': span},
+                 'rendered_assertion_zh_hant_hk_fragments': [render],
+                 'factual_localisations': [], 'quotation_source_keys': []}
+                for role, span, render in [('HEADLINE', 'S1L1', '學校現時獲提供全額資助嘅實用教育教材。'),
+                                          ('SUBSTANTIVE', 'S1L2', '教材現時可供家庭使用。')]],
+                'qualification_evidence': [{'test': 'HOUSEHOLD_PRACTICAL_EFFECT', 'claim_index': 0,
+                    'test_evidence': {'domain': 'EDUCATION', 'event_polarity': 'AFFIRMED',
+                        'effect_relation': 'MATERIAL_PRACTICAL_EFFECT',
+                        'material_relation_span_source_lookup_key': base.passages[0].split('\n')[0],
+                        'practical_effect_source_lookup_key': base.passages[0].split('\n')[0]}}],
+                'selection_rationale': 'An affirmed practical education provision.',
+                'geography': [], 'categories': [], 'explicit_exclusions': []}}
 
         def runner(prompt):
             calls.append(prompt)
-            return NativeAssessmentExecution(canonical_json_bytes(WIRE).decode(),
+            return NativeAssessmentExecution(canonical_json_bytes(wire).decode(),
                 {'usage_basis': 'PROVIDER_REPORTED', 'input_tokens': 40,
                  'output_tokens': 10, 'total_tokens': 50})
 
@@ -452,7 +477,8 @@ def _retained_closed_recipe(tmp_path, monkeypatch, recipe):
         yield qualifier, consumer, candidate, base, source, acquired, scope, original, usage, calls, jev_calls, local_calls
 
 
-@pytest.mark.parametrize('recipe', ['coverage', 'witness_missing', 'announcement', 'typed_output'])
+@pytest.mark.parametrize('recipe', ['coverage', 'witness_missing', 'announcement', 'typed_output',
+                                    'material_bound', 'candidate_bound'])
 def test_known_closed_qualification_recipes_replay_exact_original_without_dispatch(
         tmp_path, monkeypatch, recipe):
     from newsroom.control_plane.native_source_qualification_replay import (
@@ -470,6 +496,9 @@ def test_known_closed_qualification_recipes_replay_exact_original_without_dispat
                                              proof=consumer.proof)
         prompt, _, _, _ = qualifier._input(state, **_ids(state))
         assert prompt == calls[0]
+        if recipe in {'material_bound', 'candidate_bound'}:
+            assert json.loads(original.execution.text)['package']['substantive_new_information'] == base.passages[0].split('\n')[:2]
+            assert len(jev_calls) == (1 if recipe == 'material_bound' else 0)
         assert read_current_result(qualifier, candidate, base, (source,), (acquired,),
                                    scope=scope, proof=consumer.proof) == original
         assert (len(calls), len(jev_calls), len(local_calls)) == before
@@ -513,3 +542,23 @@ def test_closed_recipe_replay_denies_missing_ambiguous_or_tampered_prior_evidenc
                                                  proof=consumer.proof)
             qualifier.read_qualification(reference, state, proof=consumer.proof, **_ids(state))
         assert (len(calls), len(jev_calls), len(local_calls)) == before
+
+
+@pytest.mark.parametrize('recipe',['material_bound','candidate_bound'])
+def test_plain_reason_replay_requires_the_original_authenticated_request(tmp_path,monkeypatch,recipe):
+    from copy import deepcopy
+    from newsroom.authority import ObjectAdmissionId
+    from newsroom.control_plane.native_source_qualification import QualificationReference
+    from newsroom.control_plane.native_source_qualification_replay import original_qualification_state
+    with _retained_closed_recipe(tmp_path,monkeypatch,recipe) as (
+            qualifier,consumer,candidate,base,_source,_acquired,_scope,original,
+            _usage,calls,jev_calls,local_calls):
+        decision=json.loads(original.decision_record);binding=deepcopy(decision['source_binding'])
+        binding['failure_inventory']=[{'reason':'NOT_THE_ORIGINAL_REASON'}]
+        state=original_qualification_state(qualifier,candidate,base,binding,proof=consumer.proof)
+        ref=decision['qualification_reference'];before=(len(calls),len(jev_calls),len(local_calls))
+        reference=QualificationReference(ref['invocation_id'],ObjectAdmissionId.parse(ref['raw_admission_id']),
+                                        ObjectAdmissionId.parse(ref['receipt_admission_id']))
+        with pytest.raises(QualificationHold,match='REPLAY_CONTEXT'):
+            qualifier.read_qualification(reference,state,proof=consumer.proof,**_ids(state))
+        assert (len(calls),len(jev_calls),len(local_calls))==before
