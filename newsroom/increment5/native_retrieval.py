@@ -1207,7 +1207,14 @@ class NativeRetrievalDocuments:
 
     def fulltext_authority_view_for_scope(self, scope, snapshot, *, proof):
         self.corpus_scope_receipts(scope, proof=proof)
-        if scope.catalogue is None or snapshot.index_document_count != len(scope.catalogue):
+        if (
+            scope.catalogue is None
+            or snapshot.index_document_count != len(scope.catalogue)
+            or any(item[2]["generation_id"] != str(snapshot.generation_id)
+                   for item in scope.catalogue.values())
+            or snapshot.document_label != getattr(self._projector, "document_label", None)
+            or snapshot.index_name != getattr(self._projector, "fulltext_index", None)
+        ):
             raise NativeRetrievalError("native corpus snapshot differs")
         def resolve(passages):
             if len(passages) > BRANCH_RESULT_LIMIT:

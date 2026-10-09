@@ -1,6 +1,7 @@
 """Call-local watermark uses event evidence already read by actual inventory."""
 from copy import copy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +9,38 @@ from newsroom.authority import AggregateId, GovernedObjects, AuthenticationProof
 from newsroom.authority.persistence import AuthorityEvents
 from newsroom.increment5.native_retrieval import NativeDocumentReceipt, NativeRetrievalDocuments, NativeRetrievalError
 from newsroom.tests import test_native_retrieval_authority as authority_case
+
+
+@pytest.mark.parametrize("field", ("document_label", "index_name", "generation_id"))
+def test_sparse_fulltext_view_retains_projection_owner_binding(monkeypatch, field):
+    from newsroom.increment5.fulltext_contracts import FullTextProfile
+    from newsroom.increment5.native_retrieval import NativeRetrievalSubject
+    from newsroom.projection.models import ProjectionGenerationId
+    from newsroom.tests.increment5b2_helpers import snapshot
+    documents = object.__new__(NativeRetrievalDocuments)
+    proof = AuthenticationProof(method="STATIC_TOKEN", credential="fixture")
+    receipt = NativeDocumentReceipt("event", "command", AggregateId.new(), 1,
+        ObjectAdmissionId.new(), "sha256:" + "1" * 64,
+        ObjectAdmissionId.new(), ObjectAdmissionId.new())
+    current = snapshot(profile=FullTextProfile.NATIVE_RUNTIME, index_document_count=1)
+    documents._projector = SimpleNamespace(
+        document_label=current.document_label, fulltext_index=current.index_name,
+        corpus_metadata=lambda _: ({**receipt.projection_value(), "passage_id": "passage",
+            "source_id": "source", "revision_id": "revision",
+            "generation_id": str(current.generation_id)},),
+    )
+    monkeypatch.setattr(documents, "_verify_event", lambda *_: 1)
+    monkeypatch.setattr(documents, "_read_with_sequence",
+        lambda *_: pytest.fail("snapshot ownership check hydrated a document"))
+    scope = documents.authenticated_corpus_scope((receipt,), proof=proof)
+    subjects = (NativeRetrievalSubject("revision", "graph-root", receipt, "headline", "source"),)
+    documents.prepare_corpus_catalogue(scope, subjects, str(current.generation_id), proof=proof)
+    assert documents.fulltext_authority_view_for_scope(scope, current, proof=proof).snapshot == current
+    changed = ProjectionGenerationId.new() if field == "generation_id" else "other_projection_owner"
+    with pytest.raises(NativeRetrievalError, match="snapshot differs"):
+        documents.fulltext_authority_view_for_scope(
+            scope, replace(current, **{field: changed}), proof=proof,
+        )
 
 
 def test_complete_corpus_scope_over_4096_never_hydrates_unselected_documents(monkeypatch):
