@@ -18,6 +18,7 @@ PAID_BINDING_VERSION = 'newsroom.source-qualification-consumer.v1'
 TYPED_CONSUMER_VERSION = 'newsroom.source-qualification-typed-rendering-consumer.v1'
 RESOLUTION_CONSUMER_VERSION = 'newsroom.source-qualification-resolution-consumer.v1'
 CORRECTED_RESOLUTION_CONSUMER_VERSION = 'newsroom.source-qualification-resolution-consumer.v2'
+RENDERING_REPAIR_CONSUMER_VERSION = 'newsroom.source-qualification-rendering-repair.v1'
 
 
 def _resolution_state(qualifier, candidate, base, parent, references, *, proof,
@@ -203,11 +204,17 @@ class NativeQualifiedSourceConsumer:
             for source_row in output['governed_claims']:
                 current = current_claims.get(source_row['claim_id'])
                 if (current is None or any(source_row[key] != getattr(current, key) for key in
-                        ('claim', 'supporting_excerpt', 'claim_role', 'passage_index', 'rendered_assertion_zh_hant_hk'))
-                        or source_row['source_ids'] != list(current.source_ids) or source_row['status'] != str(current.status)
+                        ('claim', 'supporting_excerpt', 'claim_role', 'passage_index'))
+                        or source_row['source_ids'] != list(current.source_ids) or source_row['status'] != str(current.status)):
+                    raise QualificationHold('QUALIFICATION_RESOLUTION_PACKAGE_HOLD')
+                if (source_row['rendered_assertion_zh_hant_hk'] != current.rendered_assertion_zh_hant_hk
                         or source_row['quotations'] != list(current.quotations)
                         or tuple(map(tuple, source_row['localised_factual_expressions'])) != current.localised_factual_expressions):
-                    raise QualificationHold('QUALIFICATION_RESOLUTION_PACKAGE_HOLD')
+                    from .evidence import source_rendering_reference, SOURCE_RENDERING_CONTRACT_V2
+                    presentation = source_rendering_reference(current.source_rendering_ref)
+                    if (presentation['contract'] != SOURCE_RENDERING_CONTRACT_V2
+                            or self.semantic_witnesses._read_typed_source_rendering(presentation, current, package) is not True):
+                        raise QualificationHold('QUALIFICATION_RESOLUTION_PACKAGE_HOLD')
             expected = next((row for row in output['qualification_evidence'] if row['governed_claim_id'] == claim.claim_id
                              and row['test'] == qualification.test.value), None)
             source_claim = next((row for row in output['governed_claims'] if row['claim_id'] == claim.claim_id), None)
@@ -413,12 +420,15 @@ class NativeQualifiedSourceConsumer:
                 rendering_sources.append((claim.claim_id,ref))
         # A new immutable rendering view leaves the paid SourceQA view untouched.
         from .admission import _valid_zh_hant_hk_rendering
+        from .evidence import rendered_named_entities
         valid_rendering = all(_valid_zh_hant_hk_rendering(SimpleNamespace(**vars(claim),
             named_entities=tuple(name for name,_kind in derived[claim.claim_id][2])))
+            and rendered_named_entities(claim.rendered_assertion_zh_hant_hk,
+                frozenset(derived[claim.claim_id][2])) == set(derived[claim.claim_id][2])
             and (derived[claim.claim_id][1] is None or derived[claim.claim_id][1][:2] in
                  tuple(map(tuple,claim.localised_factual_expressions)))for claim in claims.values())
         valid_rendering = valid_rendering and not needs_typed
-        if dissent and active_contract == SEMANTIC_RESOLUTION_CONTRACT_V2 and not valid_rendering:
+        if dissent and active_contract == SEMANTIC_RESOLUTION_CONTRACT_V2 and not valid_rendering and not typed_capable:
             raise QualificationHold('QUALIFICATION_RESOLUTION_RENDERING_HOLD')
         if not witnesses and not rendering_sources and valid_rendering:
             return original
@@ -448,11 +458,14 @@ class NativeQualifiedSourceConsumer:
                 raise QualificationHold('QUALIFICATION_RENDERING_BINDING_HOLD')
             from .native_claim_localisation import TYPED_VERSION
             typed_result = rendered.get('version') == TYPED_VERSION
+            if dissent and active_contract == SEMANTIC_RESOLUTION_CONTRACT_V2 and not typed_result:
+                raise QualificationHold('QUALIFICATION_RENDERING_BINDING_HOLD')
             if typed_result:
                 if rendered.get('original_state') != request or rendered.get('projected_state') != source_rendering_projection(request):
                     raise QualificationHold('QUALIFICATION_RENDERING_BINDING_HOLD')
                 consumer_version = (TYPED_CONSUMER_VERSION + '+' + consumer_version
                                     if self.resolve_disagreements else TYPED_CONSUMER_VERSION)
+                consumer_version += '+' + RENDERING_REPAIR_CONSUMER_VERSION
                 reference = tuple(sorted({'contract': SOURCE_RENDERING_CONTRACT_V2, 'operation': 'SOURCE_RENDERING',
                     'invocation_id': rendering_ref.invocation_id, 'raw_admission_id': str(rendering_ref.raw_admission_id),
                     'receipt_admission_id': str(rendering_ref.receipt_admission_id)}.items()))

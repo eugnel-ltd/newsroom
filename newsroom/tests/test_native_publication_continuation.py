@@ -2381,7 +2381,8 @@ def test_corrected_resolution_upgrade_does_not_reopen_prior_negative_or_unknown(
     assert not continuation.qualification_resolution_due(facts)
 
 
-def test_known_recipe_repair_uses_once_only_cached_consumer(tmp_path, monkeypatch):
+@pytest.mark.parametrize('rendering_repair',[False,True])
+def test_known_qualification_repair_uses_once_only_cached_consumer(tmp_path, monkeypatch, rendering_repair):
     from newsroom.control_plane.native_source_qualification_consumer import REPLAY_CONSUMER_VERSION
     unit=_native();connection=connect(str(tmp_path/'recipe.sqlite3'))
     journal=NativeRevisionJournal(connection);journal.land((unit,))
@@ -2389,6 +2390,9 @@ def test_known_recipe_repair_uses_once_only_cached_consumer(tmp_path, monkeypatc
     facts.pop('semantic_witness_disposition')
     facts.update(reason='QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED',failure_class='QualificationHold')
     current=facts['assessment_contract_version']+'+'+REPLAY_CONSUMER_VERSION
+    if rendering_repair:
+        facts.update(reason='QUALIFICATION_RESOLUTION_RENDERING_HOLD',failure_class=None)
+        current=facts['assessment_contract_version']+'+newsroom.source-qualification-rendering-repair.v1'
     journal.advance(unit.revision_id,stage='EVIDENCE_HOLD',facts=facts)
     calls=[]
     def acquire(_self,**request):
@@ -2427,5 +2431,19 @@ def test_recipe_repair_does_not_reopen_unproved_or_already_checked_work(fault):
     elif fault=='unknown':facts['failure_class']='CliTimeoutError'
     elif fault=='missing-intake':facts.pop('intake_receipt_id')
     else:facts['retained_qualification_checked_contract']=current
+    continuation=object.__new__(NativePublicationContinuation);continuation._assessment_contract_version=current
+    assert not continuation.qualification_resolution_due(facts)
+
+
+@pytest.mark.parametrize('fault',['disabled','unknown','checked','committed','declined'])
+def test_rendering_repair_does_not_reset_unknown_or_semantic_decisions(fault):
+    facts=_known_witness_hold_facts();facts.pop('semantic_witness_disposition')
+    facts.update(reason='QUALIFICATION_RESOLUTION_RENDERING_HOLD',failure_class=None)
+    current=facts['assessment_contract_version']+'+newsroom.source-qualification-rendering-repair.v1'
+    if fault=='disabled':current+='-disabled'
+    elif fault=='unknown':facts['failure_class']='CliTimeoutError'
+    elif fault=='checked':facts['retained_qualification_checked_contract']=current
+    elif fault=='committed':facts['package_admission_id']='already-admitted'
+    else:facts['reason']='QUALIFICATION_RESOLUTION_NOT_AFFIRMATIVE_HOLD'
     continuation=object.__new__(NativePublicationContinuation);continuation._assessment_contract_version=current
     assert not continuation.qualification_resolution_due(facts)

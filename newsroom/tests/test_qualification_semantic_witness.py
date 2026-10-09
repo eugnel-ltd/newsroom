@@ -144,7 +144,7 @@ def test_semantic_witness_negative_boundaries_are_fail_closed(tmp_path,monkeypat
 
 
 @contextmanager
-def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False, title_body_layout=False, typed_rendering=False, resolve_disagreements=False, resolution_fault=None, batch=False, resolution_contract=None):
+def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=False, fault=None, candidate_binding=None, retained_current=False, title_body_layout=False, typed_rendering=False, resolve_disagreements=False, resolution_fault=None, batch=False, resolution_contract=None, renderer_fault=None):
     """Genuine disposable QA/TypeSafe/localiser ledgers and CAS; synthetic answers."""
     from newsroom.tests.test_native_assessor_judgments import _case as typed_case
     from newsroom.control_plane.native_assessor_judgments import JudgmentFallback
@@ -170,6 +170,8 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         supporting = 'Colleges now receive fully funded practical education materials.'
     if fault == 'corrected':
         supporting = 'The authority has launched a public consultation and invites residents to submit views on proposed controls.'
+    if fault == 'law-names':
+        supporting = 'Section 43 of the Immigration Act 2016 amended the Immigration Act 1971 to complement the power in section 47 of the Immigration Act 2014, by creating a power to search for and seize any driving licence (both revoked and unrevoked), where the holder requires permission to enter or stay in the UK but does not have it.'
     body=headline+('\n\n'if title_body_layout else'\n')+supporting
     if fault == 'email':
         body = headline + '\nHouseholds now receive fully funded education materials.\n' + supporting
@@ -235,6 +237,9 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         if fault=='qa-NO':
             from newsroom.tests.test_native_source_qualification import WIRE
             wire=WIRE
+        if fault == 'law-names':
+            wire['package']['governed_claims'][1].update(claim_role='CONTEXT', rendered_assertion_zh_hant_hk_fragments=[
+                '《2016年入境法》第43條修訂《1971年入境法》，以補足《2014年入境法》第47條的權力，設立搜查及檢取任何駕駛執照的權力，對象為需要許可才可進入或在', '逗留、但未持有該許可的人。'])
         if batch:
             from copy import deepcopy
             second = deepcopy(wire['package']['qualification_evidence'][0])
@@ -301,6 +306,27 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         service.transport=transport
         def render_runner(prompt):
             render_calls.append(prompt)
+            if renderer_fault == 'timeout':
+                raise TimeoutError('unknown rendering transport')
+            if renderer_fault == 'invalid':
+                return WriterCliExecution(json.dumps({'renderings':[
+                    {'span_id': index, 'rendered_assertion_zh_hant_hk_fragments':['Unapproved English text.'] * row['rendering_fragment_count'],
+                     'factual_localisations':[],'quotation_source_keys':[]}for index,row in json.loads(prompt)['claims'].items()]}),
+                    {'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':10,'total_tokens':50})
+            if fault == 'law-names':
+                return WriterCliExecution(json.dumps({'renderings':[
+                    {'span_id':'0','rendered_assertion_zh_hant_hk_fragments':['學校現時獲提供全額資助嘅實用教育教材。'],
+                     'factual_localisations':[],'quotation_source_keys':[]},
+                    {'span_id':'1','rendered_assertion_zh_hant_hk_fragments':['條文43（入境法2016）修訂入境法1971，以補足條文47（入境法2014）的權力，設立搜查及檢取任何駕駛執照（包括已撤銷及未撤銷者）的權力，對象為需要許可才可進入或在', '逗留、但未持有該許可的人。'],
+                     'factual_localisations':[],'quotation_source_keys':[]}]},ensure_ascii=False),
+                    {'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':10,'total_tokens':50})
+            if fault == 'corrected':
+                return WriterCliExecution(json.dumps({'renderings':[
+                    {'span_id':'0','rendered_assertion_zh_hant_hk_fragments':['當局已啟動公眾諮詢，邀請居民就擬議管制措施提交意見。'],
+                     'factual_localisations':[],'quotation_source_keys':[]},
+                    {'span_id':'1','rendered_assertion_zh_hant_hk_fragments':['當局計劃推行新管制措施，措施將於獲批准後適用。'],
+                     'factual_localisations':[],'quotation_source_keys':[]}]},ensure_ascii=False),
+                    {'usage_basis':'PROVIDER_REPORTED','input_tokens':40,'output_tokens':10,'total_tokens':50})
             if fault == 'email':
                 requested = json.loads(prompt)['claims']
                 assert requested['2']['entities'] == [['contact.help@education.gov.uk', 'SOURCE_LITERAL'], ['post-16', 'SOURCE_LITERAL']]
@@ -396,6 +422,67 @@ def test_corrected_resolution_changes_headline_and_criterion_without_relabelling
         assert original.decision_record == original_bytes and len(qa) == 2 and len(jev) == 2 and not render
         assert post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof) == selected
         assert len(qa) == 2 and len(jev) == 2
+
+
+@pytest.mark.parametrize('case', ('law-names', 'corrected'))
+def test_known_sourceqa_presentation_repairs_through_existing_typed_renderer_once(tmp_path, monkeypatch, case):
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
+    with _selected_qualification_case(tmp_path, monkeypatch, fault=case, typed_rendering=True,
+            resolve_disagreements=case == 'corrected', resolution_fault='bad-render' if case == 'corrected' else None,
+            resolution_contract='newsroom.qualification-semantic-resolution.v2' if case == 'corrected' else None) as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        selected = post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        assessment = AutonomousNativeEvidenceAssessor._validated_execution(selected.execution, candidate, base,
+            (source,), (acquired,), semantic_witnesses=selected.semantic_witnesses,
+            semantic_witness_reader=witness.read, source_renderings=selected.source_renderings)
+        assert assessment.governed_claims and selected.source_renderings
+        assert len(qa) == (2 if case == 'corrected' else 1) and len(jev) == 2 and len(render) == 1
+        assert post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof) == selected
+        assert len(qa) == (2 if case == 'corrected' else 1) and len(jev) == 2 and len(render) == 1
+
+
+@pytest.mark.parametrize('fault', ('missing-proof', 'wrong-proof', 'changed-rendering', 'changed-source', 'changed-semantics', 'facts'))
+def test_corrected_semantics_allow_only_authenticated_typed_presentation_replacement(tmp_path, monkeypatch, fault):
+    from newsroom.control_plane.native_assessor import AutonomousNativeEvidenceAssessor
+    with _selected_qualification_case(tmp_path, monkeypatch, fault='corrected', typed_rendering=True,
+            resolve_disagreements=True, resolution_fault='bad-render',
+            resolution_contract='newsroom.qualification-semantic-resolution.v2') as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        selected = post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        assessment = AutonomousNativeEvidenceAssessor._validated_execution(selected.execution, candidate, base,
+            (source,), (acquired,), semantic_witnesses=selected.semantic_witnesses,
+            semantic_witness_reader=witness.read, source_renderings=selected.source_renderings)
+        package = replace(base, governed_claims=assessment.governed_claims, qualification_evidence=assessment.qualification_evidence)
+        current = package.governed_claims[0]
+        if fault == 'missing-proof': current = replace(current, source_rendering_ref=())
+        elif fault == 'wrong-proof': current = replace(current, source_rendering_ref=tuple((key,
+            '11111111-1111-4111-8111-111111111111' if key == 'receipt_admission_id' else value) for key,value in current.source_rendering_ref))
+        elif fault == 'changed-rendering': current = replace(current, rendered_assertion_zh_hant_hk='當局已正式實施所有管制措施。')
+        elif fault == 'changed-semantics': current = replace(current, claim=current.claim + ' Invented.', supporting_excerpt=current.claim + ' Invented.')
+        elif fault == 'facts':
+            with pytest.raises(ValueError):
+                replace(current, localised_factual_expressions=(('source missing', '新增事實'),))
+            assert len(qa) == 2 and len(jev) == 2 and len(render) == 1
+            return
+        else: package = replace(package, passages=(base.passages[0] + ' Different source.',))
+        package = replace(package, governed_claims=(current, *package.governed_claims[1:]))
+        monkeypatch.setattr(post.qualifier, 'qualify', lambda *_a, **_k:pytest.fail('admission dispatched SourceQA'))
+        monkeypatch.setattr(witness.judgments, 'evaluate', lambda **_k:pytest.fail('admission dispatched semantic vote'))
+        with pytest.raises((ValueError, RuntimeError, LookupError)):
+            witness.read(package.qualification_evidence[0], current, package)
+        assert len(qa) == 2 and len(jev) == 2 and len(render) == 1
+
+
+@pytest.mark.parametrize('failure', ('invalid', 'timeout'))
+def test_known_or_unknown_typed_renderer_failure_never_retries_presentation_repair(tmp_path, monkeypatch, failure):
+    with _selected_qualification_case(tmp_path, monkeypatch, fault='corrected', typed_rendering=True,
+            resolve_disagreements=True, resolution_fault='bad-render', renderer_fault=failure,
+            resolution_contract='newsroom.qualification-semantic-resolution.v2') as (
+            post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):
+        for _ in range(2):
+            with pytest.raises((ValueError, TimeoutError)):
+                post.compose_selected(original, candidate, base, (source,), (acquired,), proof=proof)
+        assert len(qa) == 2 and len(jev) == 2 and len(render) == 1
 
 
 @pytest.mark.parametrize('failure', ('NO', 'timeout', 'invented', 'bad-render'))
@@ -639,14 +726,15 @@ def test_typed_consumer_keeps_deployed_v2_object_distinct_without_paid_redispatc
 
         typed=q.compose_selected(original,c,b,(s,),(a,),proof=proof)
         typed_decision=json.loads(typed.decision_record)
-        assert typed_decision['consumer_contract']==consumer_module.TYPED_CONSUMER_VERSION
+        typed_contract = consumer_module.TYPED_CONSUMER_VERSION + '+' + consumer_module.RENDERING_REPAIR_CONSUMER_VERSION
+        assert typed_decision['consumer_contract']==typed_contract
         assert typed_decision['qualification_reference']==parent
         typed_contact=json.loads(typed.execution.text)['package']['governed_claims'][2]['rendered_assertion_zh_hant_hk']
         legacy_contact=json.loads(legacy.execution.text)['package']['governed_claims'][2]['rendered_assertion_zh_hant_hk']
         assert 'contact.help@education.gov.uk' in typed_contact
         assert 'contact.help@education.gov.uk' not in legacy_contact
         legacy_key='source-qualification-consumer:'+digest_canonical([legacy_version,parent])
-        typed_key='source-qualification-consumer:'+digest_canonical([consumer_module.TYPED_CONSUMER_VERSION,parent])
+        typed_key='source-qualification-consumer:'+digest_canonical([typed_contract,parent])
         assert typed_key!=legacy_key
         legacy_admission=q.objects.committed_admission(ObjectAdmissionRequest('evidence.record',legacy_key),proof=proof).admission
         typed_admission=q.objects.committed_admission(ObjectAdmissionRequest('evidence.record',typed_key),proof=proof).admission
@@ -801,7 +889,7 @@ def test_typed_source_rendering_rejects_current_candidate_identity_drift(tmp_pat
         assert len(qa)==1 and len(jev)==2 and len(render)==1
 
 
-@pytest.mark.parametrize('capability',['terms','year','email','resolution','corrected-resolution'])
+@pytest.mark.parametrize('capability',['terms','year','email','resolution','corrected-resolution','repaired-resolution'])
 def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path,monkeypatch,capability):
     from newsroom.tests.test_increment10_editorial import _open_editorial_system,_evidence_facade,_native,_decision,_record_decision
     from newsroom.tests.test_increment10_ingress import _candidate,_receive
@@ -818,10 +906,11 @@ def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path
     ingress=open_evidence_intake_ingress(tmp_path/'selected-ingress.sqlite3')
     ack=_receive(ingress,connection,port,candidate,request_id='typed-rendering')
     with _selected_qualification_case(tmp_path,monkeypatch,malformed_rendering=True,
-                                      fault='corrected' if capability == 'corrected-resolution' else 'NO' if capability == 'resolution' else capability,candidate_binding=candidate,
-                                      resolve_disagreements=capability in {'resolution','corrected-resolution'},
-                                      resolution_contract='newsroom.qualification-semantic-resolution.v2' if capability == 'corrected-resolution' else None,
-                                      typed_rendering=capability == 'email')as(q,w,old,c,b,s,a,scope,auth,usage,qa,jev,render):
+                                      fault='corrected' if capability in {'corrected-resolution','repaired-resolution'} else 'NO' if capability == 'resolution' else capability,candidate_binding=candidate,
+                                      resolve_disagreements=capability in {'resolution','corrected-resolution','repaired-resolution'},
+                                      resolution_contract='newsroom.qualification-semantic-resolution.v2' if capability in {'corrected-resolution','repaired-resolution'} else None,
+                                      resolution_fault='bad-render' if capability == 'repaired-resolution' else None,
+                                      typed_rendering=capability in {'email','repaired-resolution'})as(q,w,old,c,b,s,a,scope,auth,usage,qa,jev,render):
         original=read_current_result(q.qualifier,c,b,(s,),(a,),scope=scope,proof=auth)
         selected=q.compose_selected(original,c,b,(s,),(a,),proof=auth)
         assessment=AutonomousNativeEvidenceAssessor._validated_execution(selected.execution,c,b,(s,),(a,),
@@ -864,7 +953,7 @@ def test_source_rendering_full_governed_retention_and_final_write_chain(tmp_path
                         if row.validator=='QUOTE_FIDELITY').result=='FAIL'
             evidence.semantic_witness_reader=lambda *_:True
             with pytest.raises(EvidencePackageError):evidence.read(retained.package_admission_id,candidate_port=port,proof=proof())
-            assert len(qa)==(2 if capability in {'resolution','corrected-resolution'} else 1) and len(jev)==2
+            assert len(qa)==(2 if capability in {'resolution','corrected-resolution','repaired-resolution'} else 1) and len(jev)==2
             assert len(render)==(0 if capability == 'corrected-resolution' else 1)
         finally:
             connection.rollback();connection.close();ingress.close();system.close()
