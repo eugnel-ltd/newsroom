@@ -2369,16 +2369,25 @@ def test_disagreement_schedule_uses_authenticated_verdict_not_probability_rankin
     'QUALIFICATION_RESOLUTION_NOT_AFFIRMATIVE_HOLD',
     'ACQUISITION_RESULT_NOT_RETAINED',
 ])
-def test_corrected_resolution_upgrade_does_not_reopen_prior_negative_or_unknown(reason):
+@pytest.mark.parametrize('proposal_scoped', [False, True])
+def test_corrected_resolution_requires_explicit_proposal_scope_and_never_reopens_unknown(reason, proposal_scoped):
     from newsroom.control_plane.native_composition import ASSESSMENT_CONTRACT_VERSION
+    from newsroom.control_plane.native_source_qualification_consumer import PROPOSAL_SCOPE_CONSUMER_VERSION
     facts=_known_witness_hold_facts()
     facts['assessment_contract_version']+='+newsroom.source-qualification-resolution-consumer.v1'
     facts['retained_qualification_checked_contract']=facts['assessment_contract_version']
     facts['reason']=reason
     continuation=object.__new__(NativePublicationContinuation)
-    continuation._assessment_contract_version=ASSESSMENT_CONTRACT_VERSION
-    assert continuation._assessment_contract_version!=facts['assessment_contract_version']
-    assert not continuation.qualification_resolution_due(facts)
+    current=ASSESSMENT_CONTRACT_VERSION
+    if not proposal_scoped:
+        current=current.replace('+'+PROPOSAL_SCOPE_CONSUMER_VERSION,'')
+    continuation._assessment_contract_version=current
+    assert current!=facts['assessment_contract_version']
+    expected=proposal_scoped and reason=='QUALIFICATION_RESOLUTION_NOT_AFFIRMATIVE_HOLD'
+    assert continuation.qualification_resolution_due(facts) is expected
+    if expected:
+        facts['retained_qualification_checked_contract']=current
+        assert not continuation.qualification_resolution_due(facts)
 
 
 @pytest.mark.parametrize('rendering_repair',[False,True])
