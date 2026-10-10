@@ -306,11 +306,11 @@ def test_real_qualification_composition_opens_without_any_provider_dispatch(tmp_
     assert all(item._judgments.semantic_witness_reader.__self__.resolution_reader.__self__.resolution_contract ==
                'newsroom.qualification-semantic-resolution.v2' for item in assessors)
     assert len(pipelines) == 2 and all(callable(item._publish.qualification_resolution_due) for item in pipelines)
-    assert all(item._publish.qualification_resolution_due({}) is False for item in pipelines)
     from newsroom.control_plane.native_composition import ASSESSMENT_CONTRACT_VERSION
     from newsroom.control_plane.native_source_qualification_consumer import REPLAY_CONSUMER_VERSION
     from newsroom.control_plane.native_publication import NativePublicationContinuation
     monkeypatch.setattr(native_composition,'NativePublicationContinuation',NativePublicationContinuation)
+    assert all(item._publish.qualification_resolution_due({}) is False for item in pipelines)
     prior=ASSESSMENT_CONTRACT_VERSION.replace('+'+REPLAY_CONSUMER_VERSION,'')
     assert prior!=ASSESSMENT_CONTRACT_VERSION
     recipe={'reason':'QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED','failure_class':'QualificationHold',
