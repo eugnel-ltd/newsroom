@@ -12,8 +12,8 @@ from .native_assessor import NativeAssessmentExecution
 from .native_assessor_spans import build_lossless_source_view
 
 
-def original_qualification_reference(qualifier, candidate, base, *, proof, optional=False, include_resolution=False):
-    """One original plus at most one authenticated resolution, with overflow HOLD."""
+def original_qualification_reference(qualifier, candidate, base, *, proof, optional=False, include_resolution=False, allow_declined_resolution=False):
+    """One original and at most one verdict per qualified proposal contract."""
     with sqlite3.connect(Path(qualifier.usage.path).resolve().as_uri()+'?mode=ro', uri=True) as c:
         c.execute('PRAGMA query_only=ON')
         deadline = time.monotonic() + 5
@@ -23,11 +23,11 @@ def original_qualification_reference(qualifier, candidate, base, *, proof, optio
             "WHERE a.route=? AND json_extract(e.record_json,'$.candidate_id')=? "
             "AND json_extract(e.record_json,'$.hypothesis_digest')=? "
             "AND json_extract(e.record_json,'$.evidence_package_digest')=? "
-            "AND json_extract(p.record_json,'$.prompt_contract_version')=? LIMIT 3",
+            "AND json_extract(p.record_json,'$.prompt_contract_version')=? LIMIT 4",
             (ROUTE, candidate.candidate_id, candidate.governing_manifest.canonical_digest, base.digest, VERSION)).fetchall()
         if not rows and optional:
             return None
-        if not rows or len(rows) > 2:
+        if not rows or len(rows) > 3:
             raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
         values = []
         for (invocation,) in rows:
@@ -55,7 +55,11 @@ def original_qualification_reference(qualifier, candidate, base, *, proof, optio
     if len(originals) != 1:
         raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
     reference, receipt = originals[0]
-    resolution = None
+    resolutions = {}
+    contracts = [row['source_binding'].get('semantic_resolution', {}).get('contract')
+                 for ref, row in values if ref != reference]
+    if len(contracts) != len(set(contracts)):
+        raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
     for ref, row in values:
         if ref == reference:
             continue
@@ -71,16 +75,26 @@ def original_qualification_reference(qualifier, candidate, base, *, proof, optio
             contract=marker['contract'])
         result = qualifier.read_qualification(ref, state, proof=proof, candidate_id=candidate.candidate_id,
             hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest)
-        if marker['contract'] == SEMANTIC_RESOLUTION_CONTRACT_V2:
-            _corrected_resolution_package(result, state, base)
-        else:
-            _require_resolution_result(result, package)
-        resolution = (ref, row)
+        if marker['contract'] in resolutions:
+            raise QualificationHold('QUALIFICATION_KNOWN_RESULT_ABSENT_OR_AMBIGUOUS')
+        affirmative = bool(json.loads(result['materialisation']['materialised_text'])['package']['substantive_new_information'])
+        if affirmative:
+            if marker['contract'] == SEMANTIC_RESOLUTION_CONTRACT_V2:
+                _corrected_resolution_package(result, state, base)
+            else:
+                _require_resolution_result(result, package)
+        elif not (include_resolution or allow_declined_resolution):
+            raise QualificationHold('QUALIFICATION_RESOLUTION_NOT_AFFIRMATIVE_HOLD')
+        # A fully authenticated NO is a verdict on this proposal, not positive
+        # evidence and not permission to repeat the same inference purpose.
+        resolutions[marker['contract']] = (ref, row, affirmative)
     if include_resolution:
-        return reference, receipt, resolution
+        from .evidence import SEMANTIC_RESOLUTION_CONTRACT, SEMANTIC_RESOLUTION_CONTRACT_V2
+        return reference, receipt, (resolutions.get(SEMANTIC_RESOLUTION_CONTRACT_V2)
+                                    or resolutions.get(SEMANTIC_RESOLUTION_CONTRACT))
     return reference, receipt
 
-def read_current_result(qualifier, candidate, base, sources, acquired, *, scope, proof):
+def read_current_result(qualifier, candidate, base, sources, acquired, *, scope, proof, allow_declined_resolution=False):
     """Read one proved original retained result; never allocate or call."""
     from copy import deepcopy
     from .native_assessor_judgments import NativeAssessorJudgments, JudgedAssessment
@@ -89,7 +103,8 @@ def read_current_result(qualifier, candidate, base, sources, acquired, *, scope,
         raise QualificationHold('QUALIFICATION_ACQUIRED_BYTES_HOLD')
     ids = dict(candidate_id=candidate.candidate_id,
         hypothesis_digest=candidate.governing_manifest.canonical_digest, evidence_package_digest=base.digest)
-    reference, receipt = original_qualification_reference(qualifier, candidate, base, proof=proof)
+    reference, receipt = original_qualification_reference(qualifier, candidate, base, proof=proof,
+        allow_declined_resolution=allow_declined_resolution)
     binding = receipt['source_binding']
     view = build_lossless_source_view(base.passages, base.source_ids)
     current = NativeAssessorJudgments._binding(candidate,base,scope,view)
@@ -155,6 +170,8 @@ def original_qualification_state(qualifier, candidate, base, binding, *, proof):
         raise QualificationHold('QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED')
     failure=inventory[0]
     if failure=={'stage':'SELECTED_QUALIFICATION','reason':'INPUT_BOUND'} and len(refs)==1:
+        reason='JUDGMENT_INPUT_BOUND'
+    elif failure=={'stage':'SOURCE_ROLES','reason':'INPUT_BOUND'} and not refs:
         reason='JUDGMENT_INPUT_BOUND'
     elif failure=={'reason':'QUALIFICATION_WITNESS_COVERAGE_UNPROVEN'} and len(refs)==1:
         reason='QUALIFICATION_WITNESS_COVERAGE_UNPROVEN'

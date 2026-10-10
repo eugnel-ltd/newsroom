@@ -19,6 +19,7 @@ TYPED_CONSUMER_VERSION = 'newsroom.source-qualification-typed-rendering-consumer
 RESOLUTION_CONSUMER_VERSION = 'newsroom.source-qualification-resolution-consumer.v1'
 CORRECTED_RESOLUTION_CONSUMER_VERSION = 'newsroom.source-qualification-resolution-consumer.v2'
 RENDERING_REPAIR_CONSUMER_VERSION = 'newsroom.source-qualification-rendering-repair.v1'
+PROPOSAL_SCOPE_CONSUMER_VERSION = 'newsroom.source-qualification-proposal-scope.v1'
 
 
 def _resolution_state(qualifier, candidate, base, parent, references, *, proof,
@@ -334,7 +335,11 @@ class NativeQualifiedSourceConsumer:
                     'raw_admission_id': str(parent_ref.raw_admission_id), 'receipt_admission_id': str(parent_ref.receipt_admission_id)}:
                 raise QualificationHold('QUALIFICATION_RESOLUTION_PARENT_HOLD')
             if prior_resolution is not None:
-                active_contract = prior_resolution[1]['source_binding']['semantic_resolution']['contract']
+                prior_contract = prior_resolution[1]['source_binding']['semantic_resolution']['contract']
+                if prior_resolution[2] or prior_contract == SEMANTIC_RESOLUTION_CONTRACT_V2:
+                    active_contract = prior_contract
+                # Only a settled v1 NO may enter the already qualified, distinct
+                # v2 corrected-proposal purpose. Its original verdict stays intact.
         claims = {row['claim_id']: SimpleNamespace(**{**row,'source_ids':tuple(row['source_ids'])}) for row in package['governed_claims']}
         witnesses = []
         dissent = False
