@@ -261,7 +261,9 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
         qa_calls=[];render_calls=[]
         def qa_runner(_prompt):
             qa_calls.append(_prompt)
-            if len(qa_calls) > 1 and resolution_fault == 'timeout':
+            response_fault = (resolution_fault[min(max(len(qa_calls)-2, 0), len(resolution_fault)-1)]
+                              if isinstance(resolution_fault, tuple) else resolution_fault)
+            if len(qa_calls) > 1 and response_fault == 'timeout':
                 raise TimeoutError('unknown resolution transport')
             response = wire
             if len(qa_calls) > 1 and fault == 'corrected':
@@ -277,18 +279,18 @@ def _selected_qualification_case(tmp_path, monkeypatch, *, malformed_rendering=F
                         'action_relation': 'NEW_OR_CHANGED_OFFICIAL_ACTION',
                         'material_relation_span_source_lookup_key': 'The authority has launched a public consultation',
                         'reader_action_source_lookup_key': 'invites residents to submit views'}}]
-            if len(qa_calls) > 1 and resolution_fault == 'NO':
+            if len(qa_calls) > 1 and response_fault == 'NO':
                 from newsroom.tests.test_native_source_qualification import WIRE
                 response = WIRE
-            if len(qa_calls) > 1 and resolution_fault == 'changed':
+            if len(qa_calls) > 1 and response_fault == 'changed':
                 from copy import deepcopy
                 response = deepcopy(wire)
                 response['package']['qualification_evidence'][0]['test_evidence']['domain'] = 'HOUSING'
-            if len(qa_calls) > 1 and resolution_fault == 'invented':
+            if len(qa_calls) > 1 and response_fault == 'invented':
                 from copy import deepcopy
                 response = deepcopy(response)
                 response['package']['qualification_evidence'][0]['test_evidence']['reader_action_source_lookup_key'] = 'all permits are unconditional'
-            if len(qa_calls) > 1 and resolution_fault == 'bad-render':
+            if len(qa_calls) > 1 and response_fault == 'bad-render':
                 from copy import deepcopy
                 response = deepcopy(response)
                 response['package']['governed_claims'][0]['rendered_assertion_zh_hant_hk_fragments'] = ['English prose is not the requested rendering.']
@@ -503,8 +505,8 @@ def test_corrected_resolution_negative_or_invalid_output_never_reopens_on_replay
         assert len(qa) == 2 and len(jev) == 2 and render == []
 
 
-@pytest.mark.parametrize('failure', ('NO', 'timeout'))
-def test_corrected_contract_upgrade_authenticates_and_preserves_old_negative_or_unknown_attempt(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize('failure', ('changed', 'timeout'))
+def test_corrected_contract_upgrade_preserves_invalid_or_unknown_old_attempt(tmp_path, monkeypatch, failure):
     with _selected_qualification_case(tmp_path, monkeypatch, fault='NO', resolve_disagreements=True,
                                      resolution_fault=failure) as (
             post, witness, original, candidate, base, source, acquired, scope, proof, usage, qa, jev, render):

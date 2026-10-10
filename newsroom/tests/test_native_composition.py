@@ -48,6 +48,7 @@ def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
         "+newsroom.cached-assessment-origin.v1"
         "+newsroom.source-qualified-rendering.v3+newsroom.native-source-term-bindings.v2"
         "+newsroom.native-news-candidate-eligibility.v1"
+        "+newsroom.source-qualification-proposal-scope.v1"
     )
 
 

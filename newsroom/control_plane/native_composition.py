@@ -79,6 +79,7 @@ from .native_source_rights import (
 )
 from .native_assessor_spans import PARTITION_VERSION
 from .native_source_qualification_consumer import (
+    PROPOSAL_SCOPE_CONSUMER_VERSION,
     CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION, RESOLUTION_CONSUMER_VERSION, CORRECTED_RESOLUTION_CONSUMER_VERSION, REPLAY_CONSUMER_VERSION, RENDERING_REPAIR_CONSUMER_VERSION,
 )
 from .evidence import EvidencePackage, SOURCE_RENDERING_CONTRACT_V3
@@ -105,6 +106,7 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"+{CACHED_ASSESSMENT_ORIGIN_VERSION}"
     f"+{SOURCE_RENDERING_CONTRACT_V3}"
     f"+{NEWS_CANDIDATE_ELIGIBILITY_VERSION}"
+    f"+{PROPOSAL_SCOPE_CONSUMER_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
@@ -897,7 +899,8 @@ def open_native_pipeline(
                     from .native_source_qualification_replay import read_current_result
                     try:
                         original = read_current_result(qualifier, candidate, base, sources, acquired,
-                            scope=judgment_scope(candidate, base, sources, acquired), proof=proof)
+                            scope=judgment_scope(candidate, base, sources, acquired), proof=proof,
+                            allow_declined_resolution=True)
                         return qualification_consumer.compose_selected(original,candidate,base,sources,acquired,proof=proof)
                     except QualificationHold as exc:
                         raise NativeEvidenceHold(str(exc), sources[0].unit.source_id) from exc
@@ -912,7 +915,7 @@ def open_native_pipeline(
                         stop_check()
                         try:
                             return original_qualification_reference(
-                                qualifier, candidate, base, proof=proof, optional=True,
+                                qualifier, candidate, base, proof=proof, optional=True, allow_declined_resolution=True,
                             )
                         except (OperatorDrainRequested, VetoError):
                             raise

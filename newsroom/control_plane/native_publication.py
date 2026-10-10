@@ -1089,7 +1089,8 @@ class NativePublicationContinuation:
 
     def qualification_resolution_due(self, facts):
         """Schedule one explicit cached qualification-consumer continuation."""
-        from .native_source_qualification_consumer import RESOLUTION_CONSUMER_VERSION, REPLAY_CONSUMER_VERSION, RENDERING_REPAIR_CONSUMER_VERSION
+        from .native_source_qualification_consumer import (RESOLUTION_CONSUMER_VERSION, REPLAY_CONSUMER_VERSION,
+            RENDERING_REPAIR_CONSUMER_VERSION, PROPOSAL_SCOPE_CONSUMER_VERSION, CORRECTED_RESOLUTION_CONSUMER_VERSION)
         from .evidence import SEMANTIC_WITNESS_CONTRACT
         current=self._assessment_contract_version
         reason=facts.get('reason')
@@ -1101,7 +1102,11 @@ class NativePublicationContinuation:
         rendering=(reason=='QUALIFICATION_RESOLUTION_RENDERING_HOLD'
                    and facts.get('failure_class') in {None,'QualificationHold'}
                    and RENDERING_REPAIR_CONSUMER_VERSION in components)
-        if (not (recipe or resolution or rendering)
+        corrected_proposal=(reason=='QUALIFICATION_RESOLUTION_NOT_AFFIRMATIVE_HOLD'
+            and facts.get('failure_class') in {None,'QualificationHold'}
+            and PROPOSAL_SCOPE_CONSUMER_VERSION in components
+            and CORRECTED_RESOLUTION_CONSUMER_VERSION in components)
+        if (not (recipe or resolution or rendering or corrected_proposal)
                 or not same_assessment_producer(facts.get('assessment_contract_version'),current)
                 or facts.get('assessment_contract_version')==current
                 or facts.get('retained_qualification_checked_contract')==current
@@ -1109,7 +1114,7 @@ class NativePublicationContinuation:
                 or any(facts.get(key)for key in ('package_admission_id','editorial_decision','story_event_id',
                     'publication_started_at','publication_event_id','delivery_attempt_event_id','delivery_evidence_event_id'))):
             return False
-        if recipe or rendering:
+        if recipe or rendering or corrected_proposal:
             return True  # Actual replay still authenticates the original paid input/result.
         try:
             disposition=self._validated_witness_disposition(facts.get('semantic_witness_disposition'))

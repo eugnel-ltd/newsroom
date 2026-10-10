@@ -406,10 +406,12 @@ def _retained_closed_recipe(tmp_path, monkeypatch, recipe):
                               for c in answer['probabilities']})
 
     kwargs = dict(source_id='UK-03', answer_change=answers)
-    if recipe in {'material_bound', 'candidate_bound'}:
-        count = 33 if recipe == 'material_bound' else 254
+    if recipe in {'material_bound', 'candidate_bound', 'source_roles_bound'}:
+        count = {'material_bound': 33, 'candidate_bound': 254, 'source_roles_bound': 2}[recipe]
         kwargs['body'] = '\n'.join(['Schools now receive fully funded practical education materials.',
             'Materials are now available to households.'] + ['The provision remains documented.'] * (count - 2))
+    if recipe == 'source_roles_bound':
+        kwargs['max_prompt_bytes'] = 1
     if recipe == 'coverage':
         kwargs['body'] = ('The authority confirms a material policy change '
                           + 'for affected residents ' * 16 + '.\nSupporting details apply.')
@@ -441,11 +443,12 @@ def _retained_closed_recipe(tmp_path, monkeypatch, recipe):
                     'announcement': 'FIRST_PUBLICATION_ANNOUNCEMENT_UNPROVEN',
                     'typed_output': 'MATERIALISATION_VALIDATION_FAILED',
                     'material_bound': 'MISSING_OR_UNBOUNDED_MATERIAL_CLAIMS',
-                    'candidate_bound': 'CANDIDATE_COVERAGE_LIMIT'}
+                    'candidate_bound': 'CANDIDATE_COVERAGE_LIMIT',
+                    'source_roles_bound': 'JUDGMENT_INPUT_BOUND'}
         assert fallback.reason == expected[recipe]
         calls = []
         wire = WIRE
-        if recipe in {'material_bound', 'candidate_bound'}:
+        if recipe in {'material_bound', 'candidate_bound', 'source_roles_bound'}:
             wire = {'package': {'select_new_information': True, 'governed_claims': [
                 {'claim_role': role, 'status': 'CONFIRMED_FACT',
                  'source_range': {'first_span_id': span, 'last_span_id': span},
@@ -478,7 +481,7 @@ def _retained_closed_recipe(tmp_path, monkeypatch, recipe):
 
 
 @pytest.mark.parametrize('recipe', ['coverage', 'witness_missing', 'announcement', 'typed_output',
-                                    'material_bound', 'candidate_bound'])
+                                    'material_bound', 'candidate_bound', 'source_roles_bound'])
 def test_known_closed_qualification_recipes_replay_exact_original_without_dispatch(
         tmp_path, monkeypatch, recipe):
     from newsroom.control_plane.native_source_qualification_replay import (
@@ -496,9 +499,12 @@ def test_known_closed_qualification_recipes_replay_exact_original_without_dispat
                                              proof=consumer.proof)
         prompt, _, _, _ = qualifier._input(state, **_ids(state))
         assert prompt == calls[0]
-        if recipe in {'material_bound', 'candidate_bound'}:
+        if recipe in {'material_bound', 'candidate_bound', 'source_roles_bound'}:
             assert json.loads(original.execution.text)['package']['substantive_new_information'] == base.passages[0].split('\n')[:2]
             assert len(jev_calls) == (1 if recipe == 'material_bound' else 0)
+        if recipe == 'source_roles_bound':
+            assert binding['prior_judgments'] == []
+            assert binding['failure_inventory'] == [{'stage': 'SOURCE_ROLES', 'reason': 'INPUT_BOUND'}]
         assert read_current_result(qualifier, candidate, base, (source,), (acquired,),
                                    scope=scope, proof=consumer.proof) == original
         assert (len(calls), len(jev_calls), len(local_calls)) == before
@@ -542,6 +548,50 @@ def test_closed_recipe_replay_denies_missing_ambiguous_or_tampered_prior_evidenc
                                                  proof=consumer.proof)
             qualifier.read_qualification(reference, state, proof=consumer.proof, **_ids(state))
         assert (len(calls), len(jev_calls), len(local_calls)) == before
+
+
+@pytest.mark.parametrize('mutation', ['candidate', 'candidate-version', 'hypothesis', 'base',
+                                     'source', 'stage', 'reason', 'prior-judgment'])
+def test_source_roles_bound_replay_preserves_exact_caller_and_recipe_boundaries(
+        tmp_path, monkeypatch, mutation):
+    from copy import deepcopy
+    from dataclasses import replace
+    from newsroom.authority import ObjectAdmissionId
+    from newsroom.control_plane.native_source_qualification import QualificationReference
+    from newsroom.control_plane.native_source_qualification_replay import original_qualification_state
+
+    with _retained_closed_recipe(tmp_path, monkeypatch, 'source_roles_bound') as (
+            qualifier, consumer, candidate, base, _source, _acquired, _scope, original,
+            _usage, calls, jev_calls, local_calls):
+        decision = json.loads(original.decision_record)
+        binding = deepcopy(decision['source_binding'])
+        if mutation == 'candidate':
+            candidate = SimpleNamespace(**{**vars(candidate), 'candidate_id': 'other-candidate'})
+        elif mutation == 'candidate-version':
+            candidate = SimpleNamespace(**{**vars(candidate), 'version_id': 'other-version'})
+        elif mutation == 'hypothesis':
+            candidate = SimpleNamespace(**{**vars(candidate), 'governing_manifest':
+                SimpleNamespace(canonical_digest=digest_bytes(b'other hypothesis'))})
+        elif mutation == 'base':
+            body = base.passages[0] + ' Changed.'
+            base = replace(base, passages=(body,), observation_digests=(digest_bytes(body.encode()),))
+        elif mutation == 'source':
+            binding['current_scope']['sources'][0]['body'] = 'Changed source.'
+        elif mutation == 'stage':
+            binding['failure_inventory'][0]['stage'] = 'SELECTED_QUALIFICATION'
+        elif mutation == 'reason':
+            binding['failure_inventory'] = [{'reason': 'NOT_THE_ORIGINAL_REASON'}]
+        else:
+            binding['prior_judgments'] = [decision['qualification_reference']]
+        parent = decision['qualification_reference']
+        reference = QualificationReference(parent['invocation_id'],
+            ObjectAdmissionId.parse(parent['raw_admission_id']),
+            ObjectAdmissionId.parse(parent['receipt_admission_id']))
+        before = (len(calls), len(jev_calls), len(local_calls))
+        with pytest.raises(QualificationHold, match='REPLAY_CONTEXT' if mutation == 'reason' else 'PARENT|RECIPE'):
+            state = original_qualification_state(qualifier, candidate, base, binding, proof=consumer.proof)
+            qualifier.read_qualification(reference, state, proof=consumer.proof, **_ids(state))
+        assert (len(calls), len(jev_calls), len(local_calls)) == before == (1, 0, 0)
 
 
 @pytest.mark.parametrize('recipe',['material_bound','candidate_bound'])
