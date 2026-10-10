@@ -1459,3 +1459,46 @@ def test_composed_initial_baseline_stops_before_model_or_retained_reader(mode):
         adapter.assess(object(), object(), (source,),
             (SimpleNamespace(publication_time='2025-07-02T13:37:48.000000Z'),),
             before_assessment=unexpected, **mode)
+
+
+@pytest.mark.parametrize('boundary', (
+    'eligible', 'checked', 'unknown', 'admitted', 'same_contract',
+    'unrelated_hold', 'no_judgment', 'no_qualification',
+))
+def test_pipeline_uses_composed_qualification_due_without_a_second_reason_policy(tmp_path, monkeypatch, boundary):
+    from types import SimpleNamespace
+    from newsroom.control_plane.native_publication import NativePublicationContinuation
+    from newsroom.control_plane.native_source_qualification_consumer import PROPOSAL_SCOPE_CONSUMER_VERSION
+    from newsroom.tests.test_native_pipeline import _open
+
+    pipeline, journal, connection, units, calls, dispositions = _open(tmp_path, monkeypatch)
+    unit = units[0]
+    journal.land((unit,))
+    dispositions[0] = ()
+    current = native_composition.ASSESSMENT_CONTRACT_VERSION
+    facts = {'reason': 'QUALIFICATION_RESOLUTION_NOT_AFFIRMATIVE_HOLD',
+        'candidate_id': 'candidate', 'candidate_version_id': 'candidate:one',
+        'graphiti_receipts': [{'state': 'GRAPHITI_COMPLETE'}], 'intake_receipt_id': 'intake',
+        'assessment_contract_version': current.replace('+' + PROPOSAL_SCOPE_CONSUMER_VERSION, '')}
+    if boundary == 'checked': facts['retained_qualification_checked_contract'] = current
+    elif boundary == 'unknown': facts['failure_class'] = 'TimeoutError'
+    elif boundary == 'admitted': facts['package_admission_id'] = 'package'
+    elif boundary == 'same_contract': facts['assessment_contract_version'] = current
+    elif boundary == 'unrelated_hold': facts['reason'] = 'SOURCE_POLICY_FACTS_HOLD'
+    journal.advance(unit.revision_id, stage='EVIDENCE_HOLD', facts=facts)
+    caller = SimpleNamespace(_assessment_contract_version=current)
+    continuation = SimpleNamespace(qualification_resolution_due=lambda value:
+        NativePublicationContinuation.qualification_resolution_due(caller, value))
+    facade = _publication_caller_without_bootstrap(
+        judgment_api_key=None if boundary == 'no_judgment' else 'fixture-key',
+        source_qualification_policy=None if boundary == 'no_qualification' else object())
+    facade.continuation = lambda _receipts: continuation
+    pipeline._publish.qualification_resolution_due = facade.qualification_resolution_due
+    try:
+        pipeline.tick(cycle_id='composed-qualified-consumer')
+        assert calls.count(('publish', unit.revision_id)) == int(boundary == 'eligible')
+        assert not any(kind == 'graphiti' for kind, _ in calls)
+        pipeline.tick(cycle_id='composed-qualified-consumer-replay')
+        assert calls.count(('publish', unit.revision_id)) == int(boundary == 'eligible')
+    finally:
+        connection.close()

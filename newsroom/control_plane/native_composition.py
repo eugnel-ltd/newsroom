@@ -1214,8 +1214,6 @@ def open_native_pipeline(
 
             def qualification_resolution_due(self, facts):
                 return (judgment_api_key is not None and source_qualification_policy is not None
-                        and facts.get('reason') in {'QUALIFICATION_SEMANTIC_WITNESS_NO', 'QUALIFICATION_SEMANTIC_WITNESS_UNCERTAIN',
-                                                    'QUALIFICATION_ORIGINAL_RECIPE_UNSUPPORTED', 'QUALIFICATION_RESOLUTION_RENDERING_HOLD'}
                         and self.continuation({}).qualification_resolution_due(facts))
 
             def restore_current_output(self):
