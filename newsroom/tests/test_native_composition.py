@@ -46,6 +46,8 @@ def test_assessment_consumer_contract_binds_producer_and_rendering_policies():
         "+newsroom.source-qualification-resolution-consumer.v2+newsroom.source-qualification-replay.v1"
         "+newsroom.source-qualification-rendering-repair.v1"
         "+newsroom.cached-assessment-origin.v1"
+        "+newsroom.source-qualified-rendering.v3+newsroom.native-source-term-bindings.v2"
+        "+newsroom.native-news-candidate-eligibility.v1"
     )
 
 
@@ -91,6 +93,7 @@ def test_composed_generic_cache_reads_actual_source_qualification_without_dispat
         adapter = _composed_cached_origin_adapter(
             bounded, qualifier=qualifier, proof=consumer.proof,
             stop_fence=fence, stop_check=lambda: events.append("stop"),
+            journal=object(), _judgment_scope=lambda *_: scope,
         )
         with sqlite3.connect(usage.path) as db:
             terminals = db.execute("SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id").fetchall()
@@ -156,6 +159,7 @@ def test_composed_cached_origin_denials_never_fall_back_or_dispatch(tmp_path, mo
         adapter = _composed_cached_origin_adapter(
             bounded, qualifier=qualifier, proof=consumer.proof,
             stop_fence=nullcontext, stop_check=stop_check,
+            journal=object(), _judgment_scope=lambda *_: _scope,
         )
         with sqlite3.connect(usage.path) as db:
             terminals = db.execute("SELECT invocation_id,record_json FROM model_invocation_terminals ORDER BY invocation_id").fetchall()
@@ -1424,3 +1428,33 @@ def test_retained_witness_callback_uses_its_real_module_globals():
     assert package.passages==('Exact title\n\nExact body',)
     assert package.observation_digests==(expected_digest(package.passages[0].encode()),)
     assert kwargs['source_passages']==package.passages and kwargs['proof']is namespace['proof']
+
+
+@pytest.mark.parametrize('mode', [{}, {'cached_only': True}, {'context_only': True}])
+def test_composed_initial_baseline_stops_before_model_or_retained_reader(mode):
+    """The production adapter wiring protects every unpublished-story route."""
+    from newsroom.control_plane.native_evidence import NativeEvidenceHold
+    from newsroom.sources.types import BaselinePolicy, BaselinePolicyKind, VersionedPolicyRef
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail('An old initial reference reached assessment or cache-origin work')
+
+    unexpected.assess_with_boundary = unexpected
+    adapter = _composed_cached_origin_adapter(
+        unexpected, journal=object(),
+        _judgment_scope=lambda *_: {
+            'coverage': 'COMPLETE', 'newness': 'SOURCE_DECLARED_FIRST_PUBLICATION', 'prior_scope': None,
+        },
+        qualifier=object(), proof=object(), stop_fence=unexpected, stop_check=unexpected,
+    )
+    source = SimpleNamespace(
+        unit=SimpleNamespace(source_id='UK-05', coverage_first_observed_at='2026-10-07T12:32:22.905193Z'),
+        source_version=SimpleNamespace(request=SimpleNamespace(baseline_policy=BaselinePolicy(
+            VersionedPolicyRef('native-source-baseline', 'v1'), BaselinePolicyKind.BOUNDED_BACKFILL,
+            freshness_window_seconds=604800,
+        ))),
+    )
+    with pytest.raises(NativeEvidenceHold, match='NEWS_CANDIDATE_OUTSIDE_BACKFILL_WINDOW'):
+        adapter.assess(object(), object(), (source,),
+            (SimpleNamespace(publication_time='2025-07-02T13:37:48.000000Z'),),
+            before_assessment=unexpected, **mode)

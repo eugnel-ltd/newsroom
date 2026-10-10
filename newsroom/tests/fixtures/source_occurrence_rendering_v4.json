@@ -1,0 +1,422 @@
+[
+  {
+    "accepted": true,
+    "candidate_id": "d0d70b76-ae28-4328-a61f-cc24e4af90cf",
+    "original_prompt_digest": "sha256:20e94d586e063989a0c812673653c4d88573bdccd5dc10f1388900d8aacf394b",
+    "raw": {
+      "renderings": [
+        {
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "資訊：較短的教學學徒制由2025年8月起提供。由2025年8月1日星期五起，研究生教學學徒制（",
+            "）的建議為期將縮短至9個月（目前為12個月），以配合學年，並使人更易接受教師培訓。"
+          ],
+          "span_id": "0"
+        },
+        {
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "課程仍會提供同樣高質素的內容，但長度會縮短，學員在完成課程後會取得合格教師資格。"
+          ],
+          "span_id": "1"
+        },
+        {
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "這些改變是政府額外招聘6,500名教師的努力的一部分，與新的學位程度教師學徒制及教學助理學徒制並行。"
+          ],
+          "span_id": "2"
+        }
+      ]
+    },
+    "state": {
+      "claims": {
+        "0": {
+          "entities": [
+            [
+              "PGTA",
+              "SOURCE_LITERAL"
+            ]
+          ],
+          "rendering_fragment_count": 2,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L7",
+            "last_span_id": "S1L7"
+          },
+          "text": "Information: Shorter teaching apprenticeships available from August 2025 From Friday 1 August 2025, the recommended duration of postgraduate teaching apprenticeships (PGTA) will be reduced to 9 months (currently 12), aligning with the school year and making easier for people to train to teach. "
+        },
+        "1": {
+          "entities": [],
+          "rendering_fragment_count": 1,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L8",
+            "last_span_id": "S1L8"
+          },
+          "text": "Courses will still offer the same high-quality content but at a reduced length, with trainees obtaining qualified teacher status after they have completed the programme. "
+        },
+        "2": {
+          "entities": [],
+          "rendering_fragment_count": 1,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L11",
+            "last_span_id": "S1L11"
+          },
+          "text": "These changes are part of the government’s efforts to recruit an additional 6,500 teachers, alongside the new degree level teacher apprenticeship and teaching assistant apprenticeships. "
+        }
+      },
+      "source_binding": {
+        "content_digest": "sha256:8ec4fe110ea00b03e261b0365a20ac6425023c144f0ed9181e5d2d9acd42a570",
+        "current_scope": {
+          "sources": [
+            {
+              "body": "DfE Update academies: 2 July 2025\n\n1. Information: Updated learning aim references for generation 2 T Levels We have published a revised version of the T Level and transition programme cost weighting and funding bands spreadsheet. This now contains all learning aim references for the qualifications that have been updated under the ‘generation 2’ new delivery contract with the awarding organisation. 2. Information: Shorter teaching apprenticeships available from August 2025 From Friday 1 August 2025, the recommended duration of postgraduate teaching apprenticeships (PGTA) will be reduced to 9 months (currently 12), aligning with the school year and making easier for people to train to teach. Courses will still offer the same high-quality content but at a reduced length, with trainees obtaining qualified teacher status after they have completed the programme. The PGTA has seen a 58% growth in recent years, showing how popular the route is, giving participants the chance to earn while they learn and gain hands-on experience in the classroom. The PGTA is a great way for schools to recruit and train the high-quality teachers they need. These changes are part of the government’s efforts to recruit an additional 6,500 teachers, alongside the new degree level teacher apprenticeship and teaching assistant apprenticeships. Search and apply for teacher training courses in England. 3. Your feedback: Tell us about your experience of our funding service If you receive education and skills funding, we want to hear about your experience. Please complete this short survey by Friday 4 July 2025, it should take you 5 to 10 minutes to complete. We aspire to run an excellent education and skills funding service that gives providers as much certainty as possible. The survey, run twice a year, asks whether we deliver: certainty on what we pay you and when clarity on how to comply with funding rules services that are accessible and easy to use answers when you have funding-related queries We will keep your personal data confidential, and your feedback will help us to improve the service. 4. Webinar: Get help buying for schools webinar Tuesday 8 July 2025, 9:30am to 10am. Register online. 5. Webinar: Hiring supply teachers and agency workers for your school or trust webinar Tuesday 8 July 2025, 11am to 11:30am. Register online. 6. Webinar: Academy Finance Professionals July Power Hour: Academy Trust Handbook Thursday 10 July 2025 3pm to 4pm. Register on Eventbrite. 7. Webinar: Academies technical update 2025 to 2026 Tuesday 15 July 2025, midday to 12:45pm. Register on Eventbrite. 8. Event: School flooding solution Is your school affected by surface water flooding? We match funding (up to 50%) for sustainable drainage systems that reduce flood risk on your grounds. Projects range from simple planters to comprehensive solutions including rain gardens, tree pits and detention basins. DfE’s Schools Water Strategy team will be holding an event that will help you understand how this funding could benefit your school through reduced flood risks and enhanced outdoor learning spaces. You’ll learn about the application process and have the opportunity to connect with potential partners including local flood authorities and water companies who could strengthen your funding bid. Funding for the Sustainable Drainage Systems (SuDS) in the schools grant scheme is subject to approval in the 2026 government budget. Register your interest through our online form to secure your place and help create a more sustainable, flood-resilient school environment.",
+              "published_at": "2025-07-02T13:37:48.000000Z",
+              "retrieved_at": "2026-10-08T12:37:32.738537Z",
+              "source_id": "UK-05",
+              "updated_at": "2025-07-02T13:37:47.000000Z"
+            }
+          ]
+        },
+        "source_reference_binding": {
+          "body_digests": [
+            "sha256:b35a774c7fb50dd96a5a13a2644dad387bf8566d36793746f4974ceb85e44e74"
+          ],
+          "manifest_digest": "sha256:1fdb09e662d8f341908dce97c909b1ddad9ffd6005fe38cdff6bae1041014a88",
+          "partition_version": "newsroom.native-assessor-spans.v2",
+          "version": "newsroom.native-assessor-references.v1"
+        }
+      }
+    }
+  },
+  {
+    "accepted": true,
+    "candidate_id": "4187192d-9077-47c0-9d65-c7e8618da276",
+    "original_prompt_digest": "sha256:65da0a5fed13a0cf8dbb183e7322e495e0014fca61dfdeded48c7031fd33f830",
+    "raw": {
+      "renderings": [
+        {
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "你的意見：基礎學徒計劃調查。首批基礎學徒計劃已於2025年8月1日（星期五）推出，現已可供開辦。"
+          ],
+          "span_id": "0"
+        },
+        {
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "推出後，我們正邀請現有學徒培訓提供者填寫一份簡短調查。"
+          ],
+          "span_id": "1"
+        },
+        {
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "基礎學徒計劃調查將維持開放至2025年10月1日（星期三）。"
+          ],
+          "span_id": "2"
+        }
+      ]
+    },
+    "state": {
+      "claims": {
+        "0": {
+          "entities": [],
+          "rendering_fragment_count": 1,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L4",
+            "last_span_id": "S1L4"
+          },
+          "text": "Your feedback: Foundation apprenticeships survey The first foundation apprenticeships launched on Friday 1 August 2025 and are now available for delivery. "
+        },
+        "1": {
+          "entities": [],
+          "rendering_fragment_count": 1,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L5",
+            "last_span_id": "S1L5"
+          },
+          "text": "Following the launch, we are inviting existing apprenticeship training providers to complete a short survey. "
+        },
+        "2": {
+          "entities": [],
+          "rendering_fragment_count": 1,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L8",
+            "last_span_id": "S1L8"
+          },
+          "text": "The foundation apprenticeship survey will remain open until Wednesday 1 October 2025."
+        }
+      },
+      "source_binding": {
+        "content_digest": "sha256:be6743cddfda6c24d079770647ffd4567ca5f761b742288908c1f2ac29409b86",
+        "current_scope": {
+          "sources": [
+            {
+              "body": "DfE Update local authorities: 6 August 2025\n\n1. Your feedback: Foundation apprenticeships survey The first foundation apprenticeships launched on Friday 1 August 2025 and are now available for delivery. Following the launch, we are inviting existing apprenticeship training providers to complete a short survey. The survey is designed to capture your current thinking and help us to understand real-time intentions and respond proactively, including: your organisation’s plans for delivering foundation apprenticeships which occupational standards you intend to offer (or reasons for not engaging at this stage) your confidence in engaging employers and learners what support you may need to deliver this provision effectively We know many of you are actively planning your offer for the year ahead, and with much of the apprenticeship provision delivered year-round, we want to give you as much time and flexibility as possible to provide feedback, particularly ahead of the autumn term and new learner intakes. Your responses will help us to assess provider readiness and shape the support we offer during the early stages of delivery and help ensure successful early implementation of your foundation apprenticeships. The foundation apprenticeship survey will remain open until Wednesday 1 October 2025.",
+              "published_at": "2025-08-06T11:59:59.000000Z",
+              "retrieved_at": "2026-10-08T10:01:58.207607Z",
+              "source_id": "UK-05",
+              "updated_at": "2025-08-06T11:59:59.000000Z"
+            }
+          ]
+        },
+        "source_reference_binding": {
+          "body_digests": [
+            "sha256:55999ccf3497bd7061ca475d8ee40c2ae5b8e1aa48bb618cee13be710f11a48c"
+          ],
+          "manifest_digest": "sha256:46c5eb31df6e211dc4a18e9e3c1aa94f1e5bb09ed3d0b0440678fd66d0d3ea0d",
+          "partition_version": "newsroom.native-assessor-spans.v2",
+          "version": "newsroom.native-assessor-references.v1"
+        }
+      }
+    }
+  },
+  {
+    "accepted": false,
+    "candidate_id": "6c04b5eb-bf65-401c-a9b6-bc7b752658c2",
+    "original_prompt_digest": "sha256:ee4e758903f94309902cbd40b7af1202e688106991718398c62c6d437aca62d1",
+    "raw": {
+      "renderings": [
+        {
+          "factual_localisations": [
+            {
+              "rendered_expression": "00:01時",
+              "source_lookup_key": "00:01 hours"
+            },
+            {
+              "rendered_expression": "2023年3月3日星期五",
+              "source_lookup_key": "Friday 3 March 2023"
+            }
+          ],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "Ofqual 特此根據第147(2)條 ",
+            " 向 iBSL 發出通知，iBSL 將不再獲 Ofqual 認可的日期將為2023年3月3日星期五00:01時（即交回日期）。"
+          ],
+          "span_id": "0"
+        }
+      ]
+    },
+    "state": {
+      "claims": {
+        "0": {
+          "entities": [
+            [
+              "ASCLA",
+              "SOURCE_LITERAL"
+            ]
+          ],
+          "rendering_fragment_count": 2,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L8",
+            "last_span_id": "S1L8"
+          },
+          "text": "Ofqual hereby gives notice to iBSL under s147(2) ASCLA that the date on which iBSL will cease to be recognised by Ofqual will be 00:01 hours on Friday 3 March 2023 (‘the Surrender Date’). "
+        }
+      },
+      "source_binding": {
+        "content_digest": "sha256:9c37d01186423afada50e291c4e6fb24e2e0add4579e703af7eadb1db83326ed",
+        "current_scope": {
+          "sources": [
+            {
+              "body": "Notice of surrender date: The Institute of British Sign Language\n\n1. The Institute of British Sign Language (‘iBSL’) is an awarding body recognised by the Office of Qualifications and Examinations Regulation (‘Ofqual’), within the meaning of section 132 of the Apprenticeships, Skills, Children and Learning Act 2009 (‘ASCLA’). 2. On 27 January 2023, iBSL gave formal notice to Ofqual under s147(1) ASCLA that it wished to cease to be recognised in respect of any qualification or description of qualification (‘the Surrender Notice’). 3. Ofqual hereby gives notice to iBSL under s147(2) ASCLA that the date on which iBSL will cease to be recognised by Ofqual will be 00:01 hours on Friday 3 March 2023 (‘the Surrender Date’). 4. In deciding on the Surrender Date, Ofqual has had regard to the need to avoid prejudicing persons who are seeking, or might reasonably be expected to seek, to obtain an iBSL qualification. 5. At any time before the Surrender Date specified in this notice, Ofqual may vary that date by giving further notice to iBSL. Saving and transitional provisions 6. Under s147(5) ASCLA, Ofqual has decided to make the following saving and transitional provisions in connection with iBSL’s surrender of recognition. 7. After the Surrender Date: (a) iBSL may continue to issue results and certificates to Learners, (b) All of the General Conditions of Recognition will continue to apply to iBSL and in particular, iBSL must continue to comply with: (i) General Condition H5 in relation to the marking of assessments, (ii) General Condition H6 in relation to the issuing of results, (iii) General Condition I4 in relation to the issuing of certificates, (iv) General Condition I1 in relation to any request for an appeal that it receives, (v) General Condition A8 in relation to the prevention and investigation of, and dealing with, malpractice and maladministration, (vi) General Condition D4 in relation to any enquiries or complaints it receives from Users of qualifications. (c) Special Conditions IBSL 1-6 (as amended on 8 February 2023) will continue to apply to iBSL. 8. The saving and transitional provisions will come into force on the Surrender Date and will apply until either: (a) iBSL ceases trading, or (b) Ofqual gives notice to iBSL that the saving and transitional provisions no longer apply, whichever is the earliest. Notes 9. Qualifications awarded by iBSL on or after the Surrender Date, and while the saving and transitional provisions are in force, will continue to be regulated qualifications under s147(5) ASCLA. 10. This section has been redacted to remove information that may be commercially sensitive. Signed Yun Ding Associate Director, VQ AO Performance Dated 8 February 2023",
+              "published_at": "2023-02-28T09:30:06.000000Z",
+              "retrieved_at": "2026-10-09T19:59:31.716251Z",
+              "source_id": "UK-05",
+              "updated_at": "2023-04-18T08:30:02.000000Z"
+            }
+          ]
+        },
+        "source_reference_binding": {
+          "body_digests": [
+            "sha256:9957fb47e915c39f57124a0bdff4ed27aeee4acb93345f3284a76b89c064103b"
+          ],
+          "manifest_digest": "sha256:653adcd52658160f680aca43cc0dcb415538103e77e307a1f3097ee5c944649c",
+          "partition_version": "newsroom.native-assessor-spans.v2",
+          "version": "newsroom.native-assessor-references.v1"
+        }
+      }
+    }
+  },
+  {
+    "accepted": false,
+    "candidate_id": "357d12d9-6de6-4e50-825b-76326e89c8fa",
+    "original_prompt_digest": "sha256:49d73ebadbfa12c52baebac3cd6c0d76a699b503abb84dd1ed3b5965d8ad4cfd",
+    "raw": {
+      "renderings": [
+        {
+          "factual_localisations": [
+            {
+              "rendered_expression": "2027至2028年",
+              "source_lookup_key": "2027 to 2028"
+            },
+            {
+              "rendered_expression": "2027年9月",
+              "source_lookup_key": "September 2027"
+            }
+          ],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "2027至2028年的學校",
+            "將包括有關自2027年9月起改善產假薪酬的額外撥款，正如《每個孩子成就與茁壯》學校白皮書所承諾。"
+          ],
+          "span_id": "0"
+        }
+      ]
+    },
+    "state": {
+      "claims": {
+        "0": {
+          "entities": [
+            [
+              "NFF",
+              "OFFICIAL_TERM"
+            ]
+          ],
+          "rendering_fragment_count": 2,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L16",
+            "last_span_id": "S1L16"
+          },
+          "text": "The schools NFF for 2027 to 2028 will include additional funding in respect of improved maternity pay from September 2027, as committed to in the Every child achieving and thriving schools white paper. "
+        }
+      },
+      "source_binding": {
+        "content_digest": "sha256:be0078c9226a3c9aa7b867b336738436986b6d4cfe6283275a925e7c9b5c0d1e",
+        "current_scope": {
+          "sources": [
+            {
+              "body": "Schools national funding formula summary policy document for 2027 to 2028\n\nThis document outlines key elements of the mainstream schools national funding formula (NFF) for 2027 to 2028. Its purpose is to support planning by local authorities, schools, and academy trusts, before the schools NFF allocations for 2027 to 2028 are published later in autumn 2026. Ahead of publication of the schools operational guide in autumn 2026, this document also sets out some additional guidance related to disapplication requests for 2027 to 2028. This note does not cover the outcomes of consultation exercises that are relevant to this area of policy. Responses to those will be published separately. The structure of the schools NFF for 2027 to 2028 The schools NFF for 2027 to 2028 will use the same factors that were used in the 2026 to 2027 NFF. The core formula factors are: pupil-led factors: basic entitlement, deprivation (free school meals ever6 (FSM6)[footnote 1] and income deprivation affecting children index 2019 (IDACI))[footnote 2], low prior attainment, English as an additional language and mobility school led factors: lump sum, sparsity and premises factors (rates, private finance initiative (PFI)[footnote 3], split sites and exceptional premises). The area cost adjustment (ACA) in the schools NFF will continue to provide an uplift to the allocations for some local authorities to reflect variations in labour market costs across the country. We will also continue to provide funding protection in 2027 to 2028 through the operation of a minimum per-pupil level (MPPL) and the funding floor. These factors will operate in the same way in the NFF for 2027 to 2028 as they did in 2026 to 2027, though the factor values will be updated. More detailed information on the different factors can be found in annex A of the 2026 to 2027 policy document. In addition to the schools NFF factors, we will also continue to provide growth and falling rolls funding to local authorities. The factor values assigned to each factor for 2027 to 2028 will be confirmed alongside the publication of the schools NFF allocations later in autumn 2026. The schools NFF for 2027 to 2028 will include additional funding in respect of improved maternity pay from September 2027, as committed to in the Every child achieving and thriving schools white paper. Funding adjustments in respect of the schools budget support grant 2026 (SBSG 26) and teachers’ pension contributions Rolling the SBSG 26 into the 2027 to 2028 schools NFF The SBSG 26 is providing additional funding in 2026 to 2027 to support schools with their overall costs, including teacher and support staff pay awards. The mainstream schools’ element of the SBSG 26 is being rolled into the schools NFF for 2027 to 2028, ensuring that this funding continues to form part of schools’ core budgets going forward. Information on how this funding will be rolled in to the schools NFF in 2027 to 2028 is available in the schools budget support grant 2026: methodology document. Teachers’ pension employer contributions funding adjustment From April 2027, employer contribution rates for the teachers’ pension scheme (TPS) will decrease from 28.6% to 17.6%. This change will not reduce the value of the defined benefit teachers’ pension for current or retired teachers. The TPS is a defined benefit scheme, which means that the pensions teachers receive depend on their salary as well as the number of years they have been working for. Funding for schools will be reduced to reflect the decrease to employer contribution rates for the TPS from April 2027. The funding reduction will reflect the decreased cost at a national level. The spending power of the schools sector as a whole will therefore not decrease. Further information on this funding adjustment, and how it will be reflected in the schools NFF in 2027 to 2028 is available in the teachers’ pension employer contributions funding adjustment: methodology document. Local authority funding formulae in 2027 to 2028 Local authorities will continue to be responsible for deciding local funding formulae for mainstream schools in their area for 2027 to 2028. The funding levels that schools, both maintained schools and academies, receive will be determined by the respective local formulae. Local authorities must continue to move their local formula factor values at least a further 10% closer to the corresponding NFF values (the comparison is made after the latter is adjusted by the ACA), except where local formulae are already ‘mirroring’ the NFF. These criteria do not apply to rates, PFI or exceptional circumstances factors. As in previous years, local factor values within 2.5% of the respective NFF values will be taken as ‘mirroring’ the NFF. This means that local authorities with factor values within +/- 2.5% of the NFF values in 2026 to 2027 can set their 2027 to 2028 factor values anywhere within +/- 2.5% of the 2027 to 2028 NFF values. Additionally, no local authority will be required to adjust their factor values closer than +/- 2.5% of the 2027 to 2028 NFF due to the 10% tightening requirement. As part of the tightening requirements, local authorities are not allowed to ‘overshoot’ the NFF value by more than the 2.5% mirroring threshold. As such, a local authority which had a local factor value below the NFF value in 2026 to 2027 should increase the local factor value in 2027 to 2028 to get closer to the NFF, but it cannot set the factor value more than 2.5% above the NFF value. Conversely, a local authority which had a local factor value above the NFF value in 2026 to 2027 cannot set that factor value more than 2.5% below the 2027 to 2028 NFF value. For 2027 to 2028, there are 16 funding factors, most of which are mandatory for all local authorities. These mandatory factors remain unchanged from 2026 to 2027. The specific factor value requirements for each local authority in the local funding formulae will be confirmed when the NFF allocations are published. Mandatory factors Basic entitlement Free school meals (FSM) FSM6 IDACI Minimum level of per-pupil funding Low prior attainment English as an additional language Pupil mobility Sparsity Lump sum London fringe (for the eligible authorities) Split sites Minimum funding guarantee (MFG) Optional factors Rates PFI contracts, with Department for Education (DfE) agreement Exceptional circumstances, with DfE agreement Funding implications of the expansion to free school meals From the start of the 2026 to 2027 academic year, FSM eligibility was extended to all children in households receiving Universal Credit. Due to the lag in data used to calculate the 2027 to 2028 NFF, the funding allocated to local authorities through the schools NFF will not take into account the FSM expansion. As a result, local authorities will receive additional funding through their dedicated schools grant (DSG) schools block allocations, when that is issued in December 2026. This will reflect the increase in FSM-eligible pupils that they will have to fund through their local mainstream schools formula. Timeline We plan to publish the schools NFF and supporting documentation (including operational guidance) as soon as possible in autumn 2026. We expect that the consequent DSG allocations will be published in December 2026 as in previous years. The authority proforma tool (APT) will be released for local authority submissions in mid-December 2026 with a deadline return date towards the end of January 2027. This is like previous years. The APT will again be populated from schools block data, primarily drawn from the autumn 2026 school census. Disapplication requests The Secretary of State for Education requires a local authority to submit a disapplication request to DfE where its local approach to school funding would not ordinarily be allowable within the Schools and Early Years Finance Regulations and DSG conditions of grant. Where such situations arise, the disapplication request service provides local authorities with a process for submitting an exceptional request to the Secretary of State for Education to disregard aspects of the respective regulations and DSG conditions of grant. Wherever possible, schools forum meetings should be arranged so that requests have been considered prior to the disapplication deadline of Monday 16 November 2026. Transfer between blocks Local authorities can transfer up to and including 0.5% of the schools block into another block, with schools forum approval. For a transfer exceeding 0.5%, or without schools forum approval, a disapplication request must be submitted to the Secretary of State for Education. If the local authority wishes to make a transfer out of the schools block in 2027 to 2028 they should consult their local maintained schools and academies, and schools forum should take these views into account before making its decision. It is important that the consultation sets out the full amount of the proposed transfer for 2027 to 2028. For example, if they want to transfer 1%, the consultation documents must clearly state this. Schools forum discussions should include appropriate representation from special schools and other specialist providers. Local authorities have the option to request a disapplication of the MPPLs funding requirement as part of the block transfer process (to note that the MFG protection would remain in place). This provision is intended to offer flexibility in circumstances where a proposed block transfer, typically from the schools block to the high needs block, would result in a disproportionate financial impact on certain schools within the local authority’s area. Disapplications should show the impact of the block transfer on schools’ budgets in the scenario where MPPLs are disapplied compared against the scenario where they are not disapplied. Disapplications must be submitted by the local authority using the digital form, in cases where: the local authority wishes to transfer more than 0.5% of the schools block in total schools forum has turned down a proposal to transfer any amount of funding out of the schools block, but the local authority wishes to proceed with the transfer There may be exceptional situations where a local authority has previously submitted a request and needs to amend this request, where circumstances change significantly. In these situations, the local authority should contact us as soon as possible. Any resulting changes to the transfer request would need to be submitted by 8 January 2027 at the latest. In such circumstances, the local authority should also have considered how they will manage the timetable for setting their school budgets so that the notifications to schools of their budget shares, and our parallel process for notification of academy allocations, are not delayed. We suggest appropriate timetabling of schools forum meetings to discuss budgets and to agree the process should any amendments to disapplications need to be made. This allows for schools forum to be informed and vote on proposed changes. Further to this, arrangements for political approval should be timetabled to take account of this later date for amended requests. When submitting disapplication requests for transfers from the schools block, the local authority should provide the evidence detailed in the digital form provided by us. The information required has changed and will now include the following: an explanation of how the block transfer fits in with the ‘Local special educational needs and disabilities (SEND) reform plan’ - if the block transfer is not yet included in the plan because it is a new development, the local authority will need to provide an explanation of when and how it will be added to the plan information presented to all schools through consultation and to the schools forum, and details of responses to the transfer proposal, including papers for and minutes of schools forum meetings, showing details of the vote Each request will be considered on a case-by-case basis. To support requests, the local authority should provide detail on the level of support from local schools and the schools forum for this plan, and if they do not support the plan, the specific arguments for the request. To note, for the first time in 2027 to 2028, there is an opportunity for local authorities to provide upfront SEND funding to mainstream schools by transferring funding from the high needs budget to the schools budget using the ‘local SEND inclusion factor’. In general, we do not expect local authorities using the local SEND inclusion factor to also propose a transfer of money from their schools block to the high needs block. However, we will consider cases where there would be local support for a transfer in both directions for different purposes. General (schools and central school services) General disapplications are used where a local authority wishes to depart from schools funding regulations or conditions of grant because local circumstances cannot be adequately addressed through the standard funding arrangements. Requests may relate to exceptional cost pressures, variations in pupil numbers, technical adjustments to local funding arrangements, or other specific circumstances requiring regulatory flexibility. As part of the request, local authorities should explain the rationale for the proposal, alternative options considered and the likely impact on affected schools. High needs High needs disapplications are used where a local authority wishes to depart from certain high needs funding arrangements set out in the funding regulations or conditions of grant. The request should explain: why the proposed approach is necessary how it supports the provision of services for children and young people with SEND the impact on affected institutions and pupils Local authorities should refer to the current high needs funding operational guide when preparing their submission. Early years: pass-through only Local authorities may submit a disapplication request where they wish to use a pass-through rate lower than the level required by the early years funding regulations. As part of the request, local authorities will be asked to identify the relevant entitlement funding stream, explain the implications for provider funding rates, and calculate the proposed pass-through percentage using the calculator provided within the form. Early years: all other requests This category covers all early years disapplications that do not relate to pass-through requirements. Requests should clearly explain the regulatory requirement being disapplied, the reason for the proposed approach, the impact on providers and children, and any consultation or engagement undertaken. Local authorities should refer to the current early years entitlements: local authority funding operational guide when preparing their submission. FSM6 refers to pupils who are, or have been, recorded as eligible for free school meals at any point in the last 6 years. ↩ IDACI – an area based index measuring the relative deprivation of lower-layer super output areas (LSOAs) ↩ PFI factor funding is provided in respect of some schools subject to PFI contracts. ↩",
+              "published_at": "2026-10-02T07:52:39.000000Z",
+              "retrieved_at": "2026-10-09T15:46:45.448372Z",
+              "source_id": "UK-05",
+              "updated_at": "2026-10-09T11:30:42.000000Z"
+            }
+          ]
+        },
+        "source_reference_binding": {
+          "body_digests": [
+            "sha256:4b5ae40105e019dc5b2093310db637bdf75140b86b786406f90bb12c39a864d2"
+          ],
+          "manifest_digest": "sha256:7b5d62b3db228fd230338c64708519ce2f10f523966c0fe6d63ee62880ac0888",
+          "partition_version": "newsroom.native-assessor-spans.v2",
+          "version": "newsroom.native-assessor-references.v1"
+        }
+      }
+    }
+  },
+  {
+    "accepted": true,
+    "candidate_id": "d940e988-2cad-4f3c-92e9-92bce0bc249e",
+    "original_prompt_digest": "sha256:13f9a2362359bbbc3161085c89f3682d56bf4329813024211fdc75c056e53403",
+    "raw": {
+      "renderings": [
+        {
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "我們已取消在管理你的教育及技能撥款服務中簽署最終撥款申索的要求。"
+          ],
+          "span_id": "0"
+        },
+        {
+          "factual_localisations": [
+            {
+              "rendered_expression": "16至19",
+              "source_lookup_key": "16 to 19"
+            }
+          ],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "這項改動適用於所有提供者，並意味着16至19撥款不再納入撥款申索程序。"
+          ],
+          "span_id": "1"
+        },
+        {
+          "factual_localisations": [],
+          "quotation_source_keys": [],
+          "rendered_assertion_zh_hant_hk_fragments": [
+            "提供獲補助金資助成人教育服務的提供者，仍須在已公布指引所載各截止日期或之前，透過提交學習者數據（",
+            "）入門網站提交年中、年終及最終申索。"
+          ],
+          "span_id": "2"
+        }
+      ]
+    },
+    "state": {
+      "claims": {
+        "0": {
+          "entities": [],
+          "rendering_fragment_count": 1,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L26",
+            "last_span_id": "S1L26"
+          },
+          "text": "We have removed the requirement to sign the final funding claim in the Manage your education and skills funding service. "
+        },
+        "1": {
+          "entities": [],
+          "rendering_fragment_count": 1,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L27",
+            "last_span_id": "S1L27"
+          },
+          "text": "This change applies to all providers and means that 16 to 19 funding is no longer included in the funding claims process. "
+        },
+        "2": {
+          "entities": [
+            [
+              "SLD",
+              "OFFICIAL_TERM"
+            ]
+          ],
+          "rendering_fragment_count": 2,
+          "source_id": "UK-05",
+          "source_range": {
+            "first_span_id": "S1L28",
+            "last_span_id": "S1L28"
+          },
+          "text": "Providers delivering grant-funded adult provision must still submit mid-year, year-end, and final claims through the Submit Learner Data (SLD) portal by the deadlines in the published guidance. "
+        }
+      },
+      "source_binding": {
+        "content_digest": "sha256:fe909c81a7117cc3d02d8964bd55971ea7e07cc1a443dbfe775120c514b94628",
+        "current_scope": {
+          "sources": [
+            {
+              "body": "DfE Update local authorities: 17 December 2025\n\n1. Action: View your devolved continuing learners adult skills fund allocation for academic year 2025 to 2026 As set out in the allocations guidance, we have calculated the continuing learner funding required for learners who started learning before 31 July 2025 and meet the following criteria: live in devolved authority areas for the strategic authorities East Midlands, Cornwall and York and North Yorkshire were enrolled in procured institutions where delivery has transferred to local authorities set for devolution in 2026 to 2027 procured institutions whose contract has ended The amended allocations will be available by Friday 19 December in Manage your education and skills funding. If you have any questions after reading our guidance, visit our customer help portal. 2. Information: Publication of local authorities’ early years entitlements funding for 2026 to 2027 On Monday 15 December we published details of local authorities’ early years entitlements funding for 2026 to 2027, including the related early years funding rates and operational guidance for 2026 to 2027. If you have any questions, after reading the guidance, contact us via our customer help portal. 3. Information: Schools, high needs, central school services and early years funding 2026 to 2027 Today, we announced the schools, high needs, central schools services and early years funding for 2026 to 2027. We have published: the dedicated schools grant (DSG) funding allocations for the 2026 to 2027 financial year pupil premium funding rates for the 2026 to 2027 financial year the high needs operational guide for 2026 to 2027 an updated schools operational guide for 2026 to 2027 with links to the published documents We have also released the 2026 to 2027 authority proforma tool (APT). Emails were sent to local authorities with the details to access the tool and the password to open their APT. If you have not received this email, contact: APTsubmissions.QUESTIONS@education.gov.uk. The deadline for returning the completed APT is on or before Thursday 22 January 2026. 4. Information: 16 to 19 funding arrangements for high value courses premium for academic year 2026 to 2027 We have previously published details on how the high value courses premium (HVCP) will work for academic year 2026 to 2027. This explained that for academic year 2026 to 2027, there will be both a HVCP and a HVCP for construction. The HVCP guidance explains how HVCP will apply to qualifications in SSA5.2 building and construction in academic year 2026 to 2027. We have published the list of qualifications attracting high value courses premium for the 2026 to 2027 allocations. There are 2 lists of qualifications in the workbook that attract HVCP funding: HVCP HVCP for building and construction We have removed any construction qualifications in SSA 5.2 that attract HVCP from that list and created a separate list called ‘building and construction’ for level 2 and level 3 construction qualifications. If you have any questions after reading our guidance, contact our customer help portal. 5. Information: 16 to 19 funding allocation and outturn statement R14 2024 to 2025 Final outturn statements are now available on Document exchange for all providers who have submitted a final 16 to 19 individualised learner record funding claim and data return. If you have any queries, contact us through the customer help portal. 6. Information: 2025 to 2026 funding claims guidance We have published the 2025 to 2026 funding claims guidance. We have removed the requirement to sign the final funding claim in the Manage your education and skills funding service. This change applies to all providers and means that 16 to 19 funding is no longer included in the funding claims process. Providers delivering grant-funded adult provision must still submit mid-year, year-end, and final claims through the Submit Learner Data (SLD) portal by the deadlines in the published guidance. The guidance also sets out changes to the exceptional adjustments process and the deadlines for submitting claims. 7. Information: Apprenticeship funding rules 2025 to 2026 – Version 3 We have published version 3 of the apprenticeship funding rules for 2025 to 2026. This is to reflect the changes to the funding of Level 7 apprenticeships as well as a small number of other clarifications. These are detailed in the accompanying summary of changes document. We have also published rules and guidance that explain the current arrangements for privately funded learners. The off-the-job training: minimum requirement for each apprenticeship standard (known as Annex C) has been updated to include any new / changed / revised standards approved since 8 July 2025. Providers are reminded that all transition arrangements end on Wednesday 31 December 2025. All new starts from Thursday 1 January 2026 must comply with the minimum requirement for the standard as shown in the Annex. 8. Information: 16 to 19 maths and English condition of funding 2026 to 2027 We have published our maths and English condition of funding guidance for academic year 2026 to 2027 to help you plan your maths and English delivery. We will update the funding calculation and interactive tool sections when we publish details on 16 to 19 funding for 2026 to 2027. Key points: No substantial policy changes, the core requirements introduced last year remain: minimum teaching hours for English and maths 2.5% tolerance unchanged Updates focus on clarity and usability, including: terminology update: ‘stepping stone qualifications’ replaced with ‘level 1 and entry level’ qualifications to avoid confusion with the new level 1 progression-to-GCSE qualifications, that we committed to developing in the white paper clarification for excluded students: students excluded under the tolerance must still include literacy and numeracy in their study programmes, in line with 16 to 19 study programme guidance and Ofsted’s inclusion pillar improved layout: reorganised guidance for easier navigation based on sector feedback 9. Information: 2026 to 2027 high needs place change process – updated student numbers for 2024 to 2025 and 2025 to 2026 academic year We have updated the high needs student and pupil numbers for the 2024 to 2025 and 2025 to 2026 academic years. This data now includes 2024 to 2025 Individualised Learner Record (ILR) R14 data and place numbers for the 2024 to 2025 and 2025 to 2026 academic years, for further education providers, 16 to 19 academies and free schools and independent learning providers. This workbook also includes data for special post-16 institutions for information. The ILR R14 data for SPIs is not used to determine place numbers. This data will be used to determine the outcomes of ‘not agreed’ cases submitted by local authorities, as part of the 2026 to 2027 place change process, in line with the published guidance. The outcomes will be published in February 2026. You can also use this to inform local discussions about commissioning arrangements for the 2026 to 2027 academic year. 10. Events and webinars: Risk protection arrangement members only: Contract works workshop Thursday 15 January 2026, at 10am to midday. Register online",
+              "published_at": "2025-12-17T14:07:14.000000Z",
+              "retrieved_at": "2026-10-08T02:12:58.843663Z",
+              "source_id": "UK-05",
+              "updated_at": "2025-12-17T14:07:13.000000Z"
+            }
+          ]
+        },
+        "source_reference_binding": {
+          "body_digests": [
+            "sha256:d3f5cf719b9b0a9d858d0ea6cc2946152f9a913f8caad85600f74c8a461b3ce0"
+          ],
+          "manifest_digest": "sha256:813d73fbcc3735da850bd529904a3312a48dcd27621ec40ba340f839403dac97",
+          "partition_version": "newsroom.native-assessor-spans.v2",
+          "version": "newsroom.native-assessor-references.v1"
+        }
+      }
+    }
+  }
+]

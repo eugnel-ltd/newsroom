@@ -193,8 +193,10 @@ class NativeContextEnricher:
         from .native_assessor_judgments import SourceRenderingMetadata
         source_renderings = original.source_renderings
         if rendering.get('version') == TYPED_VERSION:
-            from .evidence import SOURCE_RENDERING_CONTRACT_V2
-            ref = tuple(sorted({'contract': SOURCE_RENDERING_CONTRACT_V2,
+            from .evidence import SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3
+            contract = (SOURCE_RENDERING_CONTRACT_V3 if rendering.get('consumer_revalidation', {}).get('consumer_contract') == SOURCE_RENDERING_CONTRACT_V3
+                        else SOURCE_RENDERING_CONTRACT_V2)
+            ref = tuple(sorted({'contract': contract,
                 'operation': 'SOURCE_RENDERING', **_reference(rendering_ref)}.items()))
             original_ids = {row['claim_id'] for row in json.loads(original.execution.text)['package']['governed_claims']}
             context_refs = tuple((row['claim_id'], ref) for row in record['execution']['package']['governed_claims']

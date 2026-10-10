@@ -356,6 +356,9 @@ class NativeAssessorJudgments:
             renderings=record['renderings'];render_proof={'mode':'QUALIFIED_LOCALISATION','invocation_id':record['invocation_id'],
                 'terminal_digest':record['terminal_digest'],'raw_admission_id':str(reference.raw_admission_id),
                 'receipt_admission_id':str(reference.receipt_admission_id)}
+            from .evidence import SOURCE_RENDERING_CONTRACT_V3
+            if record.get('consumer_revalidation', {}).get('consumer_contract') == SOURCE_RENDERING_CONTRACT_V3:
+                render_proof['consumer_contract'] = SOURCE_RENDERING_CONTRACT_V3
             from .native_claim_localisation import TYPED_VERSION
             if record.get('version') == TYPED_VERSION:
                 if record.get('original_state') != request or record.get('projected_state') != source_rendering_projection(request):
@@ -363,6 +366,8 @@ class NativeAssessorJudgments:
                 renderings = {identity: original_rendering_slots(request['claims'][identity],
                     record['projected_state']['claims'][identity], renderings[identity]) for identity in ordered}
                 rendering_reference = {key: render_proof[key] for key in ('invocation_id', 'raw_admission_id', 'receipt_admission_id')}
+                if 'consumer_contract' in render_proof:
+                    rendering_reference['contract'] = render_proof['consumer_contract']
         else:return fallback('QUALIFIED_LOCALISATION_REQUIRED',first,second)
         claims=[{'claim_role':'HEADLINE'if identity==headline else 'SUBSTANTIVE'if roles[identity]['choice']=='MATERIAL'else 'CONTEXT',
             'status':'CONFIRMED_FACT','source_range':render_candidates[identity]['source_range'],
@@ -409,9 +414,11 @@ class SourceRenderingMetadata:
 
 def source_rendering_details(claim, body, chronology, *, contract=None):
     from .native_source_term_bindings import source_term_bindings, derive_relative_year, VERSION as TERM_VERSION
-    from .evidence import SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2
+    from .evidence import SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3
     from .native_source_term_bindings import VERSION_V2
     contract = SOURCE_RENDERING_CONTRACT if contract is None else contract
+    if contract == SOURCE_RENDERING_CONTRACT_V3:
+        contract = SOURCE_RENDERING_CONTRACT_V2  # Same immutable Source literal slots.
     term_version = VERSION_V2 if contract == SOURCE_RENDERING_CONTRACT_V2 else TERM_VERSION
     if contract not in {SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2} or not contract.endswith(term_version):
         raise ValueError('Source term consumer identity differs')
@@ -430,9 +437,11 @@ def source_rendering_details(claim, body, chronology, *, contract=None):
 
 def source_rendering_names(claim, body, *, contract=None):
     from .native_source_term_bindings import source_term_bindings
-    from .evidence import bounded_named_entities, SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2
+    from .evidence import bounded_named_entities, SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3
     from .native_source_term_bindings import VERSION, VERSION_V2
     contract = SOURCE_RENDERING_CONTRACT if contract is None else contract
+    if contract == SOURCE_RENDERING_CONTRACT_V3:
+        contract = SOURCE_RENDERING_CONTRACT_V2
     if contract not in {SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2}:
         raise ValueError('Source rendering contract differs')
     from newsroom.authority.canonical import digest_bytes
@@ -722,13 +731,13 @@ class NativeSemanticWitnesses:
         return choice == 'YES'
 
     def _read_source_rendering(self, claim, package):
-        from .evidence import source_rendering_reference, _localised_fact_is_bound, SOURCE_RENDERING_CONTRACT_V2
+        from .evidence import source_rendering_reference, _localised_fact_is_bound, SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3
         from .native_source_qualification import VERSION as QA_VERSION
         from .native_source_qualification_consumer import NativeQualifiedSourceConsumer
         from newsroom.increment10.evidence import _base_package
         self.require_current()
         value = source_rendering_reference(claim.source_rendering_ref)
-        if value['contract'] == SOURCE_RENDERING_CONTRACT_V2:
+        if value['contract'] in {SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3}:
             return self._read_typed_source_rendering(value, claim, package)
         if (getattr(self.parent_reader,'__func__',None) is not NativeQualifiedSourceConsumer.read_semantic_parent
                 or type(getattr(self.parent_reader,'__self__',None)) is not NativeQualifiedSourceConsumer):
@@ -770,7 +779,7 @@ class NativeSemanticWitnesses:
     def _read_typed_source_rendering(self, value, claim, package):
         """Authenticate literal/fact rendering only; never certify selection or YES."""
         from .native_claim_localisation import NativeClaimLocaliser, LocalisationReference, TYPED_VERSION
-        from .evidence import factual_rendering_is_bound_v2
+        from .evidence import factual_rendering_is_bound_v2, factual_rendering_is_bound_v3, SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3
         from newsroom.increment10.evidence import _base_package
         if (getattr(self.rendering_reader, '__func__', None) is not NativeClaimLocaliser.read_localisation
                 or type(getattr(self.rendering_reader, '__self__', None)) is not NativeClaimLocaliser):
@@ -799,6 +808,10 @@ class NativeSemanticWitnesses:
             **{key: binding[key] for key in ('candidate_id', 'hypothesis_digest', 'evidence_package_digest')})
         if checked.get('original_state') != state or checked.get('projected_state') != source_rendering_projection(state):
             raise ValueError('typed Source rendering authenticated projection differs')
+        occurrence = checked.get('consumer_revalidation', {}).get('consumer_contract') == SOURCE_RENDERING_CONTRACT_V3
+        if value['contract'] != (SOURCE_RENDERING_CONTRACT_V3 if occurrence else SOURCE_RENDERING_CONTRACT_V2):
+            raise ValueError('typed Source rendering consumer identity differs')
+        factual_bound = factual_rendering_is_bound_v3 if occurrence else factual_rendering_is_bound_v2
         view = build_lossless_source_view(base.passages, base.source_ids,
             version=binding.get('source_reference_binding', {}).get('partition_version', 'newsroom.native-assessor-spans.v2'))
         for identity, selected in state['claims'].items():
@@ -820,7 +833,7 @@ class NativeSemanticWitnesses:
                     and expected == frozenset((name, kind) for name, kind, _ref in claim.named_entity_evidence)
                     and pairs == tuple(claim.localised_factual_expressions)
                     and tuple(item['quotation_source_keys']) == tuple(claim.quotations)
-                    and factual_rendering_is_bound_v2(claim.claim, rendered, pairs,
+                    and factual_bound(claim.claim, rendered, pairs,
                         literals=tuple(name for name, _kind in expected),
                         derived_pairs=tuple(map(tuple, selected.get('source_derived_facts', ()))))):
                 return True

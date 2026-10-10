@@ -81,7 +81,10 @@ from .native_assessor_spans import PARTITION_VERSION
 from .native_source_qualification_consumer import (
     CONSUMER_VERSION as QUALIFICATION_CONSUMER_VERSION, RESOLUTION_CONSUMER_VERSION, CORRECTED_RESOLUTION_CONSUMER_VERSION, REPLAY_CONSUMER_VERSION, RENDERING_REPAIR_CONSUMER_VERSION,
 )
-from .evidence import EvidencePackage
+from .evidence import EvidencePackage, SOURCE_RENDERING_CONTRACT_V3
+from .native_story_eligibility import (
+    VERSION as NEWS_CANDIDATE_ELIGIBILITY_VERSION, require_news_candidate_eligibility,
+)
 from .native_source_definitions import MISSING_SOURCE_IDS, register_missing_native_source_definitions
 from .native_weather_sources import poll_other_source
 from .native_weather_evidence import NativeWeatherEvidenceAcquisition, POLICY_DIGEST as WEATHER_TRANSPORT_POLICY
@@ -100,6 +103,8 @@ ASSESSMENT_CONTRACT_VERSION = (
     f"+{REPLAY_CONSUMER_VERSION}"
     f"+{RENDERING_REPAIR_CONSUMER_VERSION}"
     f"+{CACHED_ASSESSMENT_ORIGIN_VERSION}"
+    f"+{SOURCE_RENDERING_CONTRACT_V3}"
+    f"+{NEWS_CANDIDATE_ELIGIBILITY_VERSION}"
 )
 
 TRANSPORT_POLICY = digest_canonical({
@@ -1185,6 +1190,10 @@ def open_native_pipeline(
             evidence_packages=runtime.evidence,
             transport=EvidenceTransport(acquire), assessor=EvidenceAssessor(
                 assessor, cached_qualification_origin=cached_qualification_origin,
+                news_candidate_eligibility=lambda _candidate, _base, sources, acquired:
+                    require_news_candidate_eligibility(
+                        sources, acquired, scope=_judgment_scope(journal, sources, acquired),
+                    ),
             ),
             policy_bundle_digest=policies.publication.editorial_policy_bundle_digest,
             transport_policy_digest=TRANSPORT_POLICY, clock=now,

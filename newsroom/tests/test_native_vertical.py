@@ -293,20 +293,17 @@ def _install_boundaries(monkeypatch, counters):
                 return _Response(json.dumps(embedding_response()).encode(), url=url)
             counters["source"] += 1
             successor = counters.get("document_body") != "Official deadline changed."
+            # This fixture models fresh news, not a sixteen-year-old initial baseline.
+            publication_date = NOW.date().isoformat()
+            feed = ATOM.replace(b"2026-09-08", publication_date.encode())
             return _Response(
-                (
-                    ATOM.replace(
-                        b"2026-09-08T11:00:00Z", b"2026-09-08T11:05:00Z"
-                    )
-                    if successor else ATOM
-                )
+                feed.replace(b"T11:00:00Z", b"T11:05:00Z") if ".atom" in url and successor
+                else feed
                 if ".atom" in url
                 else _document(
                     body=counters.get("document_body", "Official deadline changed."),
-                    updated=(
-                        "2026-09-08T11:05:00Z"
-                        if successor else "2026-09-08T11:00:00Z"
-                    ),
+                    published=f"{publication_date}T10:00:00Z",
+                    updated=f"{publication_date}T11:{'05' if successor else '00'}:00Z",
                 ),
                 url=url,
                 content_type=("application/atom+xml" if ".atom" in url else "application/json"),

@@ -210,7 +210,10 @@ def _source_span_aliases(state):
     return aliases
 
 
-def _renderings(raw, state, *, version=VERSION):
+def _renderings(raw, state, *, version=VERSION, consumer_contract=None):
+    from .evidence import SOURCE_RENDERING_CONTRACT_V3
+    if consumer_contract is not None and (consumer_contract != SOURCE_RENDERING_CONTRACT_V3 or version != TYPED_VERSION):
+        raise LocalisationHold('LOCALISATION_REPLAY_VERSION_HOLD')
     state = _project_state(state, version)
     value = json.loads(raw.decode(), object_pairs_hook=_unique_object)
     validate(value, _contract(version)[0])
@@ -244,11 +247,11 @@ def _renderings(raw, state, *, version=VERSION):
                 *(pair['rendered_expression'] for pair in item['factual_localisations']))):
             raise LocalisationHold('LOCALISATION_SOURCE_KEY_BOUND_HOLD')
     if version in {ALIGNED_VERSION, TYPED_VERSION}:
-        _validate_content(renderings, state, version=version)
+        _validate_content(renderings, state, version=version, consumer_contract=consumer_contract)
     return renderings
 
 
-def _validate_content(renderings, state, *, version=ALIGNED_VERSION):
+def _validate_content(renderings, state, *, version=ALIGNED_VERSION, consumer_contract=None):
     """Complete deterministic claim boundary, not translation semantic proof."""
     from types import SimpleNamespace
     from .admission import _valid_zh_hant_hk_rendering
@@ -298,7 +301,9 @@ def _validate_content(renderings, state, *, version=ALIGNED_VERSION):
         if derived is not None and derived not in bound:
             reasons.add('LOCALISATION_DERIVED_FACT_HOLD')
         if version == TYPED_VERSION:
-            if not factual_rendering_is_bound_v2(claim['text'], rendered, pairs,
+            from .evidence import SOURCE_RENDERING_CONTRACT_V3, factual_rendering_is_bound_v3
+            factual_bound = factual_rendering_is_bound_v3 if consumer_contract == SOURCE_RENDERING_CONTRACT_V3 else factual_rendering_is_bound_v2
+            if not factual_bound(claim['text'], rendered, pairs,
                     literals=names, derived_pairs=() if derived is None else (derived,)):
                 reasons.add('LOCALISATION_NUMERIC_HOLD')
         else:
@@ -614,6 +619,13 @@ class NativeClaimLocaliser:
                 reference = LocalisationReference(allocation.invocation_id, raw_admission.admission_id,
                     admitted.admission_id)
         if failure is not None:
+            if (version == TYPED_VERSION and reference is not None
+                    and isinstance(failure, LocalisationHold)
+                    and str(failure) == 'LOCALISATION_CONTENT_CONTRACT_HOLD'
+                    and getattr(failure, 'reason_codes', ()) == ('LOCALISATION_NUMERIC_HOLD',)):
+                # Read the paid response under a new consumer, never a new purpose.
+                self.read_localisation(reference, state, proof=proof, **scope)
+                return reference
             raise failure
         if terminal.usage_status is not UsageStatus.REPORTED or terminal.policy_breach:
             raise LocalisationHold('LOCALISATION_USAGE_HOLD')
@@ -637,14 +649,20 @@ class NativeClaimLocaliser:
             and terminal.failure_class == 'LocalisationHold'
             and receipt.get('diagnostic') == {'failure_class': 'LocalisationHold',
                                              'reason': 'LOCALISATION_SPAN_PARTITION_HOLD'})
-        expected_outcome = 'LOCALISATION_FAILED' if revalidate else 'LOCALISATION_COMPLETE'
+        from .evidence import SOURCE_RENDERING_CONTRACT_V3
+        occurrence_revalidation = (version == TYPED_VERSION and terminal.outcome == 'LOCALISATION_FAILED'
+            and terminal.failure_class == 'LocalisationHold'
+            and receipt.get('diagnostic') == {'failure_class': 'LocalisationHold',
+                'reason': 'LOCALISATION_CONTENT_CONTRACT_HOLD', 'reason_codes': ['LOCALISATION_NUMERIC_HOLD']})
+        expected_outcome = 'LOCALISATION_FAILED' if revalidate or occurrence_revalidation else 'LOCALISATION_COMPLETE'
         if (canonical_json_bytes(receipt) != receipt_raw or not policy.qualified
                 or allocation.envelope_id != envelope.envelope_id or allocation.prompt_digest != digest_bytes(_prompt_value.encode())
                 or allocation.route != ROUTE or allocation.provider != 'grok-build-cli'
                 or policy.prompt_contract_version != version or policy.output_schema_digest != schema_digest
                 or allocation.prompt_contract_version != version or allocation.output_schema_digest != schema_digest
                 or (version != LEGACY_VERSION and (receipt.get('schema_digest') != schema_digest
-                    or receipt.get('outcome') != expected_outcome or (not revalidate and receipt.get('diagnostic') is not None)))
+                    or receipt.get('outcome') != expected_outcome
+                    or (not (revalidate or occurrence_revalidation) and receipt.get('diagnostic') is not None)))
                 or terminal is None or terminal.outcome != expected_outcome or terminal.usage_status is not UsageStatus.REPORTED
                 or terminal.policy_breach or receipt['invocation_id'] != reference.invocation_id
                 or receipt['allocation_digest'] != allocation.canonical_digest or receipt['terminal_digest'] != terminal.terminal_digest
@@ -652,13 +670,16 @@ class NativeClaimLocaliser:
                 or (version == TYPED_VERSION and receipt.get('original_claims') != state['claims'])
                 or receipt['raw_admission_id'] != str(reference.raw_admission_id) or receipt['raw_digest'] != digest_bytes(raw)):
             raise LocalisationHold('LOCALISATION_REPLAY_BINDING_HOLD')
-        renderings = _renderings(raw, state, version=version)
+        renderings = _renderings(raw, state, version=version,
+            consumer_contract=SOURCE_RENDERING_CONTRACT_V3 if occurrence_revalidation else None)
         revalidation = {}
-        if revalidate:
-            aliases = _source_span_aliases(state)
-            applied = {item['span_id']: aliases[item['span_id']]
-                       for item in json.loads(raw)['renderings'] if item['span_id'] in aliases}
-            if (not applied or len(raw) > 262144 or terminal.pre_dispatch_zero_proved
+        if revalidate or occurrence_revalidation:
+            applied = {}
+            if revalidate:
+                aliases = _source_span_aliases(state)
+                applied = {item['span_id']: aliases[item['span_id']]
+                           for item in json.loads(raw)['renderings'] if item['span_id'] in aliases}
+            if ((revalidate and not applied) or len(raw) > 262144 or terminal.pre_dispatch_zero_proved
                     or terminal.dispatch_at is None or terminal.components.provenance != 'PROVIDER_REPORTED'
                     or ModelUsageService._validate_terminal(terminal, WorkloadClass.NATIVE_EVIDENCE_ASSESSOR,
                         policy, requested_max_output_tokens=allocation.max_output_tokens) is not None):
@@ -670,9 +691,11 @@ class NativeClaimLocaliser:
                     "WHERE invocation_id=? AND state='DISPATCH_STARTED'", (allocation.invocation_id,)).fetchall()
                 if len(dispatches) != 1 or tuple(dispatches[0]) != (_utc_text(terminal.dispatch_at), allocation.request_digest):
                     raise LocalisationHold('LOCALISATION_REPLAY_USAGE_HOLD')
-            revalidation['consumer_revalidation'] = {'consumer_contract': CONSUMER_VERSION,
+            revalidation['consumer_revalidation'] = {'consumer_contract': SOURCE_RENDERING_CONTRACT_V3 if occurrence_revalidation else CONSUMER_VERSION,
                 'original_outcome': terminal.outcome, 'original_terminal_digest': terminal.terminal_digest,
-                'raw_response_digest': digest_bytes(raw), 'source_span_aliases': applied}
+                'raw_response_digest': digest_bytes(raw),
+                **({'source_snapshot_digest': snapshot, 'retry_authorised': False} if occurrence_revalidation
+                   else {'source_span_aliases': applied})}
         original = ({'source_binding': receipt['source_binding'], 'claims': receipt['original_claims']}
                     if version == TYPED_VERSION else None)
         projection = ({'original_state': original, 'projected_state': _project_state(original, version)}

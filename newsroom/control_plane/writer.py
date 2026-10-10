@@ -413,12 +413,14 @@ def _writer_numeric_localisations(claim: GovernedClaimEvidence) -> tuple[tuple[s
 
 def _typed_claim_numeric_relation(claim: GovernedClaimEvidence) -> bool | None:
     """Opt-in fact fidelity; the SourceRendering parent is admitted separately."""
-    from .evidence import SOURCE_RENDERING_CONTRACT_V2, factual_rendering_is_bound_v2
-    if dict(claim.source_rendering_ref or ()).get('contract') != SOURCE_RENDERING_CONTRACT_V2:
+    from .evidence import SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3, factual_rendering_is_bound_v2, factual_rendering_is_bound_v3
+    contract = dict(claim.source_rendering_ref or ()).get('contract')
+    if contract not in {SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3}:
         return None
     derived = tuple((source, target) for source, target in claim.localised_factual_expressions
                     if re.fullmatch(r'next year', source, re.I) and re.fullmatch(r'[0-9]{4}年', target))
-    return factual_rendering_is_bound_v2(claim.claim, claim.rendered_assertion_zh_hant_hk,
+    factual_bound = factual_rendering_is_bound_v3 if contract == SOURCE_RENDERING_CONTRACT_V3 else factual_rendering_is_bound_v2
+    return factual_bound(claim.claim, claim.rendered_assertion_zh_hant_hk,
         claim.localised_factual_expressions, literals=claim.named_entities, derived_pairs=derived)
 
 

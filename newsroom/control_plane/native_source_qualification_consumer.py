@@ -210,9 +210,9 @@ class NativeQualifiedSourceConsumer:
                 if (source_row['rendered_assertion_zh_hant_hk'] != current.rendered_assertion_zh_hant_hk
                         or source_row['quotations'] != list(current.quotations)
                         or tuple(map(tuple, source_row['localised_factual_expressions'])) != current.localised_factual_expressions):
-                    from .evidence import source_rendering_reference, SOURCE_RENDERING_CONTRACT_V2
+                    from .evidence import source_rendering_reference, SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3
                     presentation = source_rendering_reference(current.source_rendering_ref)
-                    if (presentation['contract'] != SOURCE_RENDERING_CONTRACT_V2
+                    if (presentation['contract'] not in {SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3}
                             or self.semantic_witnesses._read_typed_source_rendering(presentation, current, package) is not True):
                         raise QualificationHold('QUALIFICATION_RESOLUTION_PACKAGE_HOLD')
             expected = next((row for row in output['qualification_evidence'] if row['governed_claim_id'] == claim.claim_id
@@ -309,7 +309,7 @@ class NativeQualifiedSourceConsumer:
         from .native_assessor_judgments import (JudgedAssessment, SemanticWitnessMetadata, SourceRenderingMetadata,
             source_rendering_details, source_rendering_names, source_rendering_projection, original_rendering_slots)
         from .evidence import (QualificationEvidence, Evid012QualificationTest, bounded_named_entities,
-            _canonical_localised_fact, SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2,
+            _canonical_localised_fact, SOURCE_RENDERING_CONTRACT, SOURCE_RENDERING_CONTRACT_V2, SOURCE_RENDERING_CONTRACT_V3,
             _localised_fact_is_bound)
         from .admission import _qualification_relation_is_proven
         import re
@@ -466,7 +466,11 @@ class NativeQualifiedSourceConsumer:
                 consumer_version = (TYPED_CONSUMER_VERSION + '+' + consumer_version
                                     if self.resolve_disagreements else TYPED_CONSUMER_VERSION)
                 consumer_version += '+' + RENDERING_REPAIR_CONSUMER_VERSION
-                reference = tuple(sorted({'contract': SOURCE_RENDERING_CONTRACT_V2, 'operation': 'SOURCE_RENDERING',
+                rendering_contract = SOURCE_RENDERING_CONTRACT_V2
+                if rendered.get('consumer_revalidation', {}).get('consumer_contract') == SOURCE_RENDERING_CONTRACT_V3:
+                    rendering_contract = SOURCE_RENDERING_CONTRACT_V3
+                    consumer_version += '+' + rendering_contract
+                reference = tuple(sorted({'contract': rendering_contract, 'operation': 'SOURCE_RENDERING',
                     'invocation_id': rendering_ref.invocation_id, 'raw_admission_id': str(rendering_ref.raw_admission_id),
                     'receipt_admission_id': str(rendering_ref.receipt_admission_id)}.items()))
                 rendering_sources = [(claim.claim_id, reference) for claim in claims.values()]
